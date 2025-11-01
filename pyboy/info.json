@@ -1,0 +1,20 @@
+{
+    "author": ["RobLoach"],
+    "install_msg": "Assistant MCP installed. Now add some MCP servers with: `[p]assistantmcp`",
+    "name": "Hello",
+    "short": "Says hello!",
+    "description" : "Assistant MCP adds MCP support to the Assistant cog.",
+    "required_cogs": {
+        "assistant": "https://github.com/vertyco/vrt-cogs"
+    },
+    "requirements": [
+        "pyboy"
+    ],
+    "permissions" : [
+        "read_messages",
+        "send_messages",
+        "embed_links",
+        "attach_files"
+    ],
+    "tags" : []
+}

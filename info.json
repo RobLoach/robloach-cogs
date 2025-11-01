@@ -1,0 +1,8 @@
+{
+    "author" : ["RobLoach"],
+    "install_msg" : "The `robloach-cogs` repository has been installed. See `[p]repo list robloach-cogs` for a list of available cogs to install.",
+    "name" : "robloach-cogs",
+    "short" : "Experimental cogs by RobLoach",
+    "description" : "This is a list of experimental cogs. Not production ready.",
+    "tags" : []
+}
