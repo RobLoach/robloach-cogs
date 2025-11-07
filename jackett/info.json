@@ -1,0 +1,18 @@
+{
+    "author": ["RobLoach"],
+    "install_msg": "Jackett installed. Configure with: `[p]jackettset`",
+    "name": "Jackett",
+    "short": "API Support for your favorite torrent trackers",
+    "description" : "Jackett",
+    "required_cogs": {
+    },
+    "requirements": [
+    ],
+    "permissions" : [
+        "read_messages",
+        "send_messages",
+        "embed_links",
+        "attach_files"
+    ],
+    "tags" : []
+}
