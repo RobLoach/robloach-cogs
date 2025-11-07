@@ -69,7 +69,7 @@ class JackettCog(commands.Cog):
             await ctx.send("No results found.")
             return
 
-        for item in items[:1]:  # Limit to first 5 results
+        for item in items[:20]:  # Limit to first 5 results
             title = item.findtext("title", default="No Title")
             link = item.findtext("link", default="No Link")
             if title and link and "magnet:" in link:
@@ -79,6 +79,7 @@ class JackettCog(commands.Cog):
                     colour=await ctx.embed_colour(),
                 )
                 await ctx.send(embed=embed)
+                break
 
     @commands.group()
     @commands.admin_or_permissions(manage_guild=True)
