@@ -1,185 +1,197 @@
-from redbot.core import commands
-import discord  # isort:skip
-import typing  # isort:skip
-
 import asyncio
-from redbot.core.utils.menus import start_adding_reactions
-from redbot.core.utils.predicates import MessagePredicate
+import io
+import logging
+import typing
+
+import discord
+from redbot.core import commands
+
+from .emulator import EmulatorError, GameBoyEmulator
+
+log = logging.getLogger("red.robloach.pyboy")
+
+# Frames to hold a button down, and frames to run afterwards so the game
+# visibly reacts to the press (60 frames is one second of game time).
+HOLD_FRAMES = 8
+RELEASE_FRAMES = 40
+ADVANCE_FRAMES = 300
+BOOT_FRAMES = 180
+SESSION_TIMEOUT = 10 * 60
 
 
 class PyBoyView(discord.ui.View):
+    """
+    An interactive Game Boy controller.
+
+    Anyone in the channel can press the buttons (it's a social feature);
+    only the person who started the game, moderators, and the bot owner can
+    stop the session.
+    """
+
     def __init__(
         self,
         cog: commands.Cog,
-        filename: string,
+        emulator: GameBoyEmulator,
+        game_name: str,
     ) -> None:
-        super().__init__()
-        self.ctx: commands.Context = None
+        super().__init__(timeout=SESSION_TIMEOUT)
         self.cog: commands.Cog = cog
-        self.max_attempts: int = max_attempts
+        self.emulator: GameBoyEmulator = emulator
+        self.game_name: str = game_name
+        self.ctx: typing.Optional[commands.Context] = None
+        self.message: typing.Optional[discord.Message] = None
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self.closed: bool = False
 
-        self.word: str = None
-        self.has_won: bool = False
-        self.attempts: typing.List[str] = []
-        self._message: discord.Message = None
-
-    async def start(self, ctx: commands.Context) -> typing.Tuple[bool, typing.List[str]]:
-        self.ctx: commands.Context = ctx
-
-        if not (words := self.cog.words[self.lang.value][self.length]):
-            raise commands.UserFeedbackCheckFailure(
-                _("There are no words in this language with {length} letters.").format(
-                    length=self.length
-                )
-            )
-        self.word: str = random.choice(words)
-        self._message: discord.Message = await ctx.send(
-            **await self.cog.get_kwargs(
-                self.ctx,
-                self.lang,
-                self.word,
-                max_attempts=self.max_attempts,
-            ),
+    async def start(self, ctx: commands.Context) -> discord.Message:
+        """Boot the emulator and post the first screenshot with the controls."""
+        self.ctx = ctx
+        png = await asyncio.to_thread(self._boot)
+        embed = await self._make_embed()
+        self.message = await ctx.send(
+            embed=embed,
+            file=discord.File(io.BytesIO(png), filename="screen.png"),
             view=self,
-            reference=self.ctx.message.to_reference(fail_if_not_exists=False),
+            reference=ctx.message.to_reference(fail_if_not_exists=False),
         )
-        self.cog.views[self._message] = self
+        return self.message
 
-        try:
-            while not self.has_won and len(self.attempts) < self.max_attempts:
-                guess = await self.ctx.bot.wait_for(
-                    "message_without_command",
-                    check=lambda message: (
-                        MessagePredicate.same_context(ctx)(message)
-                        and (
-                            (len(message.content) == self.length and message.content.isalpha())
-                            or message.content.lower() == "cancel"
-                        )
-                    ),
-                    timeout=60 * 5,
-                )
-                if guess.content.lower() == "cancel":
-                    await self.ctx.send(
-                        _("You have cancelled the game. The word was: **{word}**.").format(
-                            word=self.word
-                        ),
-                        reference=self._message.to_reference(fail_if_not_exists=False),
-                        allowed_mentions=discord.AllowedMentions(replied_user=False),
-                    )
-                    break
+    def _boot(self) -> bytes:
+        self.emulator.start()
+        self.emulator.advance(BOOT_FRAMES)
+        return self.emulator.screenshot()
 
-                attempt = guess.content.lower().translate(
-                    str.maketrans(
-                        {v: key for key, value in DIACRITIC_SYMBOLS.items() for v in value}
-                    )
-                )
-                if attempt not in self.cog.dictionaries[self.lang.value][self.length]:
-                    if ctx.bot_permissions.add_reactions:
-                        start_adding_reactions(guess, "❌")
-                    await self.ctx.send(
-                        _("This word is not a valid word in the dictionary."),
-                        delete_after=3,
-                        reference=guess.to_reference(fail_if_not_exists=False),
-                        allowed_mentions=discord.AllowedMentions(replied_user=False),
-                    )
-                    continue
-                self.attempts.append(attempt)
+    async def _make_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=self.game_name,
+            colour=await self.ctx.embed_colour(),
+        )
+        embed.set_image(url="attachment://screen.png")
+        embed.set_footer(
+            text="Anyone can press the buttons. The session ends after "
+            f"{SESSION_TIMEOUT // 60} minutes without input."
+        )
+        return embed
 
-                try:
-                    await self._message.delete()
-                except discord.HTTPException:
-                    pass
-                self._message: discord.Message = await ctx.send(
-                    **await self.cog.get_kwargs(
-                        self.ctx,
-                        self.lang,
-                        self.word,
-                        attempts=self.attempts,
-                        max_attempts=self.max_attempts,
-                    ),
-                    view=self,
-                    reference=self.ctx.message.to_reference(fail_if_not_exists=False),
-                )
-                self.cog.views[self._message] = self
-                if attempt == self.word:
-                    self.has_won = True
-        except asyncio.TimeoutError:
-            await self.ctx.send(
-                _("You took too long to guess the word. The word was: **{word}**.").format(
-                    word=self.word,
-                ),
-                reference=self._message.to_reference(fail_if_not_exists=False),
-                allowed_mentions=discord.AllowedMentions(replied_user=False),
+    async def _press(self, interaction: discord.Interaction, button: typing.Optional[str]) -> None:
+        if self.closed:
+            return
+        await interaction.response.defer()
+        if self.lock.locked():
+            # Someone else's press is still being emulated; drop this one.
+            return
+        async with self.lock:
+            if self.closed:
+                return
+            try:
+                png = await asyncio.to_thread(self._run_press, button)
+            except EmulatorError as error:
+                log.exception("Emulation failed in channel %s", interaction.channel_id)
+                await self.close(f"The emulator crashed: {error}")
+                return
+            await self._update_screen(png)
+
+    def _run_press(self, button: typing.Optional[str]) -> bytes:
+        if button is None:
+            self.emulator.advance(ADVANCE_FRAMES)
+        else:
+            self.emulator.press(
+                button, hold_frames=HOLD_FRAMES, release_frames=RELEASE_FRAMES
             )
+        return self.emulator.screenshot()
 
-        self.cancel.disabled = True
+    async def _update_screen(self, png: bytes) -> None:
+        if self.message is None:
+            return
         try:
-            await self._message.edit(view=self)
+            await self.message.edit(
+                embed=await self._make_embed(),
+                attachments=[discord.File(io.BytesIO(png), filename="screen.png")],
+                view=self,
+            )
         except discord.HTTPException:
-            pass
-        return self.has_won, self.attempts
+            log.warning("Failed to update the PyBoy screen.", exc_info=True)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.data["custom_id"] == "WordleGameView_explanation":
+    async def _can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
+        if user.id == self.ctx.author.id:
             return True
-        if interaction.user.id not in [self.ctx.author.id] + list(self.ctx.bot.owner_ids):
-            await interaction.response.send_message(
-                _("You are not allowed to use this interaction."), ephemeral=True
-            )
-            return False
-        return True
+        if await self.ctx.bot.is_owner(user):
+            return True
+        if isinstance(user, discord.Member) and user.guild_permissions.manage_messages:
+            return True
+        return False
+
+    async def close(self, reason: str) -> None:
+        """Stop the session, free the emulator, and disable the controls."""
+        if self.closed:
+            return
+        self.closed = True
+        self.stop()
+        if self.ctx is not None:
+            self.cog.sessions.pop(self.ctx.channel.id, None)
+        await asyncio.to_thread(self.emulator.stop)
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+        if self.message is not None:
+            try:
+                embed = await self._make_embed()
+                embed.set_footer(text=reason)
+                await self.message.edit(embed=embed, view=self)
+            except discord.HTTPException:
+                pass
 
     async def on_timeout(self) -> None:
-        for child in self.children:
-            child: discord.ui.Item
-            if hasattr(child, "disabled") and not (
-                isinstance(child, discord.ui.Button) and child.style == discord.ButtonStyle.url
-            ):
-                child.disabled = True
-        try:
-            await self._message.edit(view=self)
-        except discord.HTTPException:
-            pass
-        await self.cancel.callback(None)
+        await self.close("The Game Boy session timed out.")
 
-    @discord.ui.button(
-        label=_("Explanation"),
-        style=discord.ButtonStyle.secondary,
-        custom_id="WordleGameView_explanation",
-    )
-    async def explanation(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title=_("Wordle Game - Explanation"),
-                description=_(
-                    "The game is simple, you have to guess a word in some attempts. A word is chosen randomly from a dictionary of words in a language and with a specific length. The game ends when you guess the word or when you reach the maximum number of attempts.\n"
-                    "• If the letter is **🟩 Green**, it is in the correct position.\n"
-                    "• If the letter is **🟨 Yellow**, it is in the word but not in the correct position.\n"
-                    "• If the letter is **⬛ Grey**, it is not in the word.\n"
-                    "You can cancel the game at any time by clicking on the button or typing `cancel`.\n\n"
-                    "**Launch a new game by executing `{prefix}wordle`!**\n"
-                    "Available languages: `en`, `fr`, `de`, `es`, `it`, `pt`, `nl`, `cs`, `el`, `id`, `ie`, `ph`, `pl`, `ua`, `ru`, `sv` and `tr`."
-                ).format(prefix=self.ctx.prefix),
-                color=await self.ctx.embed_color(),
-            ),
-            ephemeral=True,
-        )
+    # -- Buttons ------------------------------------------------------------
 
-    @discord.ui.button(emoji="✖️", label=_("Cancel"), style=discord.ButtonStyle.danger)
-    async def cancel(
-        self,
-        interaction: typing.Optional[discord.Interaction],
-        button: discord.ui.Button,
-    ) -> None:
-        if interaction is not None:
-            await interaction.response.defer()
-        await CogsUtils.invoke_command(
-            bot=self.ctx.bot,
-            author=self.ctx.author,
-            channel=self.ctx.channel,
-            command="cancel",
-            prefix="",
-            dispatch_message=True,
-        )
+    @discord.ui.button(emoji="\N{UPWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}", style=discord.ButtonStyle.secondary, row=0)
+    async def up(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._press(interaction, "up")
+
+    @discord.ui.button(emoji="\N{DOWNWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}", style=discord.ButtonStyle.secondary, row=0)
+    async def down(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._press(interaction, "down")
+
+    @discord.ui.button(emoji="\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}", style=discord.ButtonStyle.secondary, row=0)
+    async def left(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._press(interaction, "left")
+
+    @discord.ui.button(emoji="\N{BLACK RIGHTWARDS ARROW}\N{VARIATION SELECTOR-16}", style=discord.ButtonStyle.secondary, row=0)
+    async def right(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._press(interaction, "right")
+
+    @discord.ui.button(label="A", style=discord.ButtonStyle.primary, row=1)
+    async def a(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._press(interaction, "a")
+
+    @discord.ui.button(label="B", style=discord.ButtonStyle.primary, row=1)
+    async def b(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._press(interaction, "b")
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.secondary, row=1)
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._press(interaction, "start")
+
+    @discord.ui.button(label="Select", style=discord.ButtonStyle.secondary, row=1)
+    async def select_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._press(interaction, "select")
+
+    @discord.ui.button(emoji="\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE}", label="Wait", style=discord.ButtonStyle.secondary, row=2)
+    async def wait_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # Run the game for a few seconds without pressing anything.
+        await self._press(interaction, None)
+
+    @discord.ui.button(emoji="\N{BLACK SQUARE FOR STOP}\N{VARIATION SELECTOR-16}", label="Stop", style=discord.ButtonStyle.danger, row=2)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._can_stop(interaction.user):
+            await interaction.response.send_message(
+                "Only the person who started the game, moderators, or the "
+                "bot owner can stop it.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer()
+        async with self.lock:
+            await self.close(f"Stopped by {interaction.user.display_name}.")

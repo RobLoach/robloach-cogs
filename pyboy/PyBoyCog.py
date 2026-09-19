@@ -1,36 +1,277 @@
+import io
+import logging
+import platform
+import re
+import sys
+import typing
+import zipfile
+from pathlib import Path
 
-from redbot.core import commands
+import aiohttp
+import discord
+from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core import Config
+from redbot.core.data_manager import cog_data_path
 
+from .emulator import EmulatorError, GameBoyEmulator
 from .PyBoyView import PyBoyView
 
+log = logging.getLogger("red.robloach.pyboy")
+
+MAX_ROM_SIZE = 8 * 1024 * 1024  # 8 MiB, larger than any Game Boy ROM
+ROM_EXTENSIONS = (".gb", ".gbc")
+BUILDBOT = "https://buildbot.libretro.com/nightly"
+
+
 class PyBoyCog(commands.Cog):
-    """Play Gameboy"""
+    """
+    Play Game Boy games together in Discord, emulated with libretro.
+    """
+
     def __init__(self, bot: Red) -> None:
-        super().__init__(bot=bot)
+        self.bot = bot
         self.config: Config = Config.get_conf(
             self,
-            identifier=11411198108111979910445991111031154711212198111121,
+            identifier=114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121,
             force_registration=True
         )
-        #self.config.register_global(servers={})
+        self.config.register_global(
+            core_path=""
+        )
+        self.sessions: typing.Dict[int, PyBoyView] = {}
 
-    @commands.max_concurrency(1, commands.BucketType.member)
+    async def cog_unload(self) -> None:
+        for view in list(self.sessions.values()):
+            try:
+                await view.close("The PyBoy cog was unloaded.")
+            except Exception:
+                log.exception("Failed to close a PyBoy session on unload.")
+        self.sessions.clear()
+
+    # -- Helpers ------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_filename(filename: str) -> str:
+        name = Path(filename).name
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "rom"
+        return name[-64:]
+
+    @staticmethod
+    def _buildbot_core() -> typing.Optional[typing.Tuple[str, str]]:
+        """Return (url, core filename) for this platform, or None if unknown."""
+        machine = platform.machine().lower()
+        if sys.platform.startswith("linux"):
+            arch = {
+                "x86_64": "x86_64",
+                "amd64": "x86_64",
+                "i686": "x86",
+                "aarch64": "aarch64",
+                "arm64": "aarch64",
+                "armv7l": "armhf",
+            }.get(machine)
+            if arch is None:
+                return None
+            core = "gambatte_libretro.so"
+            return f"{BUILDBOT}/linux/{arch}/latest/{core}.zip", core
+        if sys.platform == "darwin":
+            arch = "arm64" if machine in ("arm64", "aarch64") else "x86_64"
+            core = "gambatte_libretro.dylib"
+            return f"{BUILDBOT}/apple/osx/{arch}/latest/{core}.zip", core
+        if sys.platform in ("win32", "cygwin"):
+            arch = "x86_64" if machine in ("amd64", "x86_64") else "x86"
+            core = "gambatte_libretro.dll"
+            return f"{BUILDBOT}/windows/{arch}/latest/{core}.zip", core
+        return None
+
+    async def _fetch_rom(
+        self, ctx: commands.Context, url: typing.Optional[str]
+    ) -> typing.Optional[typing.Tuple[str, bytes]]:
+        """Return (filename, data) from the attachment or URL, or None on error."""
+        if ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+            if attachment.size > MAX_ROM_SIZE:
+                await ctx.send("That file is too big to be a Game Boy ROM.")
+                return None
+            return attachment.filename, await attachment.read()
+
+        if url:
+            if not url.lower().startswith(("http://", "https://")):
+                await ctx.send("The ROM URL must start with `http://` or `https://`.")
+                return None
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            await ctx.send(f"Downloading the ROM failed with status {resp.status}.")
+                            return None
+                        if (resp.content_length or 0) > MAX_ROM_SIZE:
+                            await ctx.send("That file is too big to be a Game Boy ROM.")
+                            return None
+                        data = await resp.content.read(MAX_ROM_SIZE + 1)
+            except aiohttp.ClientError as error:
+                await ctx.send(f"Downloading the ROM failed: {error}")
+                return None
+            if len(data) > MAX_ROM_SIZE:
+                await ctx.send("That file is too big to be a Game Boy ROM.")
+                return None
+            filename = Path(str(resp.url.path)).name or "rom.gb"
+            return filename, data
+
+        await ctx.send(
+            "Attach a Game Boy ROM (`.gb` or `.gbc`) to your message, or pass "
+            f"a URL: `{ctx.clean_prefix}pyboy <url>`. Only use ROMs you have "
+            "the rights to, such as homebrew games."
+        )
+        return None
+
+    # -- Commands -----------------------------------------------------------
+
+    @commands.max_concurrency(1, commands.BucketType.channel)
     @commands.guild_only()
     @commands.bot_has_permissions(embed_links=True, attach_files=True)
     @commands.command()
-    async def pyboy(self, ctx: commands.Context) -> None:
-        """Loads the given Gameboy game."""
-        if not ctx.message.attachments:
-            await ctx.send("Attach a Gameboy rom")
-            return
-        
-        attachment = ctx.message.attachments[0]
-        filename = attachment.filename
-        await attachment.save(filename)
+    async def pyboy(self, ctx: commands.Context, url: typing.Optional[str] = None) -> None:
+        """
+        Play a Game Boy game in this channel.
 
-        await PyBoyView(
-            self,
-            filename
-        ).start(ctx)
+        Attach a `.gb` or `.gbc` ROM to the message, or pass a URL to one.
+        Anyone in the channel can press the buttons. Only use ROMs you have
+        the rights to, such as homebrew games.
+
+        **Examples:**
+        - `[p]pyboy` (with a ROM attached)
+        - `[p]pyboy https://example.com/homebrew.gb`
+        """
+        core_path = await self.config.core_path()
+        if not core_path or not Path(core_path).is_file():
+            await ctx.send(
+                "No Game Boy core is configured. Ask the bot owner to run "
+                f"`{ctx.clean_prefix}pyboyset download` first."
+            )
+            return
+
+        if ctx.channel.id in self.sessions:
+            await ctx.send(
+                "A game is already running in this channel. Stop it first "
+                "with its Stop button."
+            )
+            return
+
+        rom = await self._fetch_rom(ctx, url)
+        if rom is None:
+            return
+        filename, data = rom
+
+        filename = self._sanitize_filename(filename)
+        if not filename.lower().endswith(ROM_EXTENSIONS):
+            await ctx.send("That doesn't look like a Game Boy ROM (`.gb` or `.gbc`).")
+            return
+
+        rom_dir = cog_data_path(self) / "roms"
+        rom_dir.mkdir(parents=True, exist_ok=True)
+        rom_path = rom_dir / f"{ctx.channel.id}-{filename}"
+        rom_path.write_bytes(data)
+
+        emulator = GameBoyEmulator(core_path, rom_path)
+        view = PyBoyView(self, emulator, Path(filename).stem)
+        self.sessions[ctx.channel.id] = view
+        try:
+            await view.start(ctx)
+        except EmulatorError as error:
+            self.sessions.pop(ctx.channel.id, None)
+            await ctx.send(f"The game could not be started: {error}")
+        except Exception:
+            self.sessions.pop(ctx.channel.id, None)
+            raise
+        finally:
+            try:
+                rom_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @commands.group()
+    @commands.is_owner()
+    async def pyboyset(self, ctx: commands.Context):
+        """
+        Configure PyBoy cog settings.
+        """
+
+    @pyboyset.command(name="core")
+    async def pyboyset_core(self, ctx: commands.Context, *, path: str) -> None:
+        """
+        Set the path to a Game Boy libretro core (e.g. gambatte_libretro.so).
+        """
+        core_path = Path(path.strip().strip('"'))
+        if not core_path.is_file():
+            await ctx.send(f"No file found at `{core_path}`.")
+            return
+        await self.config.core_path.set(str(core_path))
+        await ctx.send(f"Game Boy core set to: `{core_path}`")
+
+    @pyboyset.command(name="download")
+    async def pyboyset_download(self, ctx: commands.Context) -> None:
+        """
+        Download the Gambatte Game Boy core from the libretro buildbot.
+        """
+        target = self._buildbot_core()
+        if target is None:
+            await ctx.send(
+                "There is no prebuilt core for this platform. Download a "
+                "Gambatte core manually and set it with "
+                f"`{ctx.clean_prefix}pyboyset core <path>`."
+            )
+            return
+        url, core_name = target
+
+        async with ctx.typing():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            await ctx.send(
+                                f"The libretro buildbot returned status {resp.status} for <{url}>."
+                            )
+                            return
+                        payload = await resp.read()
+            except aiohttp.ClientError as error:
+                await ctx.send(f"Downloading the core failed: {error}")
+                return
+
+            core_dir = cog_data_path(self) / "cores"
+            core_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                    member = next(
+                        (name for name in archive.namelist() if name.endswith(core_name)),
+                        None,
+                    )
+                    if member is None:
+                        await ctx.send("The downloaded archive did not contain the core.")
+                        return
+                    core_path = core_dir / core_name
+                    core_path.write_bytes(archive.read(member))
+            except zipfile.BadZipFile:
+                await ctx.send("The libretro buildbot did not return a valid zip file.")
+                return
+
+        await self.config.core_path.set(str(core_path))
+        await ctx.send(f"Downloaded the Gambatte core to: `{core_path}`")
+
+    @pyboyset.command(name="settings")
+    @commands.bot_has_permissions(embed_links=True)
+    async def pyboyset_settings(self, ctx: commands.Context) -> None:
+        """
+        Show the current PyBoy settings.
+        """
+        core_path = await self.config.core_path()
+        core_status = "Not configured"
+        if core_path:
+            exists = Path(core_path).is_file()
+            core_status = f"`{core_path}` ({'found' if exists else 'missing'})"
+        embed = discord.Embed(
+            title="PyBoy Settings",
+            colour=await ctx.embed_colour(),
+        )
+        embed.add_field(name="Game Boy core", value=core_status, inline=False)
+        embed.add_field(name="Active sessions", value=str(len(self.sessions)), inline=False)
+        await ctx.send(embed=embed)

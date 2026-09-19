@@ -1,14 +1,14 @@
 {
-    "author": ["RobLoach"],
-    "install_msg": "Assistant MCP installed. Now add some MCP servers with: `[p]assistantmcp`",
-    "name": "Hello",
-    "short": "Says hello!",
-    "description" : "Assistant MCP adds MCP support to the Assistant cog.",
+    "author": ["Rob Loach"],
+    "install_msg": "PyBoy installed. Have the bot owner run `[p]pyboyset download` to grab a Game Boy core, then play with `[p]pyboy` and an attached ROM.",
+    "name": "PyBoy",
+    "short": "Play Game Boy games in Discord",
+    "description" : "Play Game Boy games together in Discord. Attach a .gb or .gbc ROM (homebrew, or one you have the rights to) and control it with buttons, emulated through libretro.",
     "required_cogs": {
-        "assistant": "https://github.com/vertyco/vrt-cogs"
     },
     "requirements": [
-        "pyboy"
+        "libretro.py",
+        "pillow"
     ],
     "permissions" : [
         "read_messages",
@@ -16,5 +16,6 @@
         "embed_links",
         "attach_files"
     ],
-    "tags" : []
+    "tags" : ["games", "emulation"],
+    "min_bot_version": "3.5.3"
 }
