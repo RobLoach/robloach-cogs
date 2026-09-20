@@ -8,7 +8,7 @@ Experimental Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-Disco
 | --- | --- |
 | [AssistantExtras](assistantextras) | Give Assistant extra tooling from your cogs |
 | [Jackett](jackett) | API support for your favorite torrent trackers |
-| [PyBoy](pyboy) | Play Game Boy games in Discord |
+| [Retro](retro) | Play Game Boy games in Discord |
 
 ## Installation
 

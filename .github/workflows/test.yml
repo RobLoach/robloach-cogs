@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Compile all Python sources
-        run: python -m compileall assistantextras jackett pyboy
+        run: python -m compileall assistantextras jackett retro
       - name: Validate the info.json files
         run: |
           for file in info.json */info.json; do
@@ -45,7 +45,7 @@ jobs:
       - name: Download the dmg-acid2 test ROM
         run: curl -fsSLO https://github.com/mattcurrie/dmg-acid2/releases/download/v1.0/dmg-acid2.gb
       - name: Run the emulator
-        run: python pyboy/emulator.py ./gambatte_libretro.so dmg-acid2.gb out.png 120
+        run: python retro/emulator.py ./gambatte_libretro.so dmg-acid2.gb out.png 120
       - name: Check the screenshot
         run: |
           python - <<'EOF'
@@ -71,4 +71,4 @@ jobs:
       - name: Install Red-DiscordBot
         run: pip install Red-DiscordBot
       - name: Import the cogs
-        run: python -c "import pyboy.PyBoyCog, pyboy.PyBoyView, jackett.JackettCog"
+        run: python -c "import retro.RetroCog, retro.RetroView, jackett.JackettCog"

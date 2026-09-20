@@ -17,15 +17,15 @@ from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.chat_formatting import pagify
 
-from .emulator import MIN_ROM_SIZE, EmulatorError, GameBoyEmulator
-from .PyBoyView import (
+from .emulator import MIN_ROM_SIZE, EmulatorError, RetroEmulator
+from .RetroView import (
     BOOT_FRAMES,
     DEFAULT_TIMEOUT_MINUTES,
     SAVE_STATE_EVERY_PRESSES,
-    PyBoyView,
+    RetroView,
 )
 
-log = logging.getLogger("red.robloach.pyboy")
+log = logging.getLogger("red.robloach.retro")
 
 MAX_ROM_SIZE = 8 * 1024 * 1024  # 8 MiB, larger than any Game Boy ROM
 ROM_EXTENSIONS = (".gb", ".gbc")
@@ -47,7 +47,7 @@ IDLE_CHECK_SECONDS = 60
 MAX_CACHED_GAMES_PER_CHANNEL = 5
 
 
-class PyBoyCog(commands.Cog):
+class RetroCog(commands.Cog):
     """
     Play Game Boy games together in Discord, emulated with libretro.
     """
@@ -69,7 +69,7 @@ class PyBoyCog(commands.Cog):
         self.config.register_channel(
             session=None
         )
-        self.sessions: typing.Dict[int, PyBoyView] = {}
+        self.sessions: typing.Dict[int, RetroView] = {}
         # Serializes every core operation across all channels.
         self.emulator_lock: asyncio.Lock = asyncio.Lock()
         self._idle_task: typing.Optional[asyncio.Task] = None
@@ -78,7 +78,7 @@ class PyBoyCog(commands.Cog):
         try:
             await self._restore_sessions()
         except Exception:
-            log.exception("Failed to restore PyBoy sessions.")
+            log.exception("Failed to restore Libretro sessions.")
         self._idle_task = asyncio.create_task(self._hibernation_loop())
 
     async def cog_unload(self) -> None:
@@ -93,7 +93,7 @@ class PyBoyCog(commands.Cog):
                     "where you left off.",
                 )
             except Exception:
-                log.exception("Failed to hibernate a PyBoy session on unload.")
+                log.exception("Failed to hibernate a Libretro session on unload.")
             # The buttons stay enabled on the message so the game can be
             # resumed after a reload, but this now-orphaned view object must
             # not answer them; cog_load builds fresh ones.
@@ -111,24 +111,24 @@ class PyBoyCog(commands.Cog):
                 continue
             record.setdefault("channel_id", channel_id)
             try:
-                view = PyBoyView.from_record(self, record, timeout_minutes)
+                view = RetroView.from_record(self, record, timeout_minutes)
             except Exception:
                 log.exception(
-                    "Ignoring an unreadable PyBoy session record for channel %s",
+                    "Ignoring an unreadable Libretro session record for channel %s",
                     channel_id,
                 )
                 continue
             self.sessions[channel_id] = view
             self._register_view(view)
         if self.sessions:
-            log.info("Restored %s hibernated PyBoy session(s).", len(self.sessions))
+            log.info("Restored %s hibernated Libretro session(s).", len(self.sessions))
 
-    def _register_view(self, view: PyBoyView) -> None:
+    def _register_view(self, view: RetroView) -> None:
         """
         Teach the bot to route this message's button clicks to this view.
 
         Persistent views need a fixed custom_id on every child and no
-        timeout, both of which PyBoyView guarantees.
+        timeout, both of which RetroView guarantees.
         """
         if view.message_id is None:
             return
@@ -136,11 +136,11 @@ class PyBoyCog(commands.Cog):
             self.bot.add_view(view, message_id=view.message_id)
         except Exception:
             log.exception(
-                "Could not register the PyBoy controls for message %s",
+                "Could not register the Libretro controls for message %s",
                 view.message_id,
             )
 
-    async def _save_record(self, view: PyBoyView) -> None:
+    async def _save_record(self, view: RetroView) -> None:
         await self.config.channel_from_id(view.channel_id).session.set(view.to_record())
 
     # -- Files --------------------------------------------------------------
@@ -211,7 +211,7 @@ class PyBoyCog(commands.Cog):
 
     # -- Emulator lifecycle -------------------------------------------------
 
-    async def run_press(self, view: PyBoyView, button: typing.Optional[str]) -> bytes:
+    async def run_press(self, view: RetroView, button: typing.Optional[str]) -> bytes:
         """
         Emulate one press for a session, waking it up first if it was asleep.
 
@@ -228,12 +228,12 @@ class PyBoyCog(commands.Cog):
                 await self._save_record(view)
             return gif
 
-    async def hibernate(self, view: PyBoyView, reason: typing.Optional[str] = None) -> None:
+    async def hibernate(self, view: RetroView, reason: typing.Optional[str] = None) -> None:
         """Save the game, free the emulator, and keep the controls usable."""
         async with self.emulator_lock:
             await self._hibernate_locked(view, reason)
 
-    async def _retire(self, view: PyBoyView, reason: str) -> None:
+    async def _retire(self, view: RetroView, reason: str) -> None:
         """
         Save a session and take its message out of service for good.
 
@@ -247,7 +247,7 @@ class PyBoyCog(commands.Cog):
         await view.refresh(reason)
 
     async def _hibernate_locked(
-        self, view: PyBoyView, reason: typing.Optional[str] = None
+        self, view: RetroView, reason: typing.Optional[str] = None
     ) -> None:
         emulator, view.emulator = view.emulator, None
         if emulator is not None:
@@ -260,7 +260,7 @@ class PyBoyCog(commands.Cog):
         if reason is not None:
             await view.refresh(reason)
 
-    async def _wake_locked(self, view: PyBoyView) -> None:
+    async def _wake_locked(self, view: RetroView) -> None:
         """Load the core and the last save state for a hibernated session."""
         if view.live:
             return
@@ -282,9 +282,9 @@ class PyBoyCog(commands.Cog):
             try:
                 state = state_path.read_bytes()
             except OSError:
-                log.warning("Could not read the PyBoy save state %s", state_path)
+                log.warning("Could not read the Libretro save state %s", state_path)
 
-        emulator = GameBoyEmulator(core_path, rom_path)
+        emulator = RetroEmulator(core_path, rom_path)
 
         def _resume() -> bool:
             emulator.start()
@@ -296,7 +296,7 @@ class PyBoyCog(commands.Cog):
                     # A state from another core or a truncated file should
                     # cost the player their progress, not the whole session.
                     log.warning(
-                        "Discarding an unusable PyBoy save state for %s: %s",
+                        "Discarding an unusable Libretro save state for %s: %s",
                         view.slug,
                         error,
                     )
@@ -316,7 +316,7 @@ class PyBoyCog(commands.Cog):
         view.emulator = emulator
         view._sync_children()
 
-    async def _evict_locked(self, exclude: typing.Optional[PyBoyView] = None) -> None:
+    async def _evict_locked(self, exclude: typing.Optional[RetroView] = None) -> None:
         """Put other sessions to sleep so only MAX_LIVE_EMULATORS stay loaded."""
         live = [v for v in self.sessions.values() if v.live and v is not exclude]
         live.sort(key=lambda v: v.last_active)
@@ -328,7 +328,7 @@ class PyBoyCog(commands.Cog):
             )
 
     async def _write_state(
-        self, view: PyBoyView, emulator: typing.Optional[GameBoyEmulator] = None
+        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
     ) -> bool:
         """Save the session's progress to disk. Never raises."""
         emulator = emulator if emulator is not None else view.emulator
@@ -337,13 +337,13 @@ class PyBoyCog(commands.Cog):
         try:
             data = await asyncio.to_thread(emulator.save_state)
         except EmulatorError as error:
-            log.warning("Could not save the PyBoy state for %s: %s", view.slug, error)
+            log.warning("Could not save the Libretro state for %s: %s", view.slug, error)
             return False
         path = self._state_path(view.channel_id, view.slug)
         try:
             await asyncio.to_thread(self._write_atomic, path, data)
         except OSError:
-            log.warning("Could not write the PyBoy state %s", path, exc_info=True)
+            log.warning("Could not write the Libretro state %s", path, exc_info=True)
             return False
         return True
 
@@ -360,7 +360,7 @@ class PyBoyCog(commands.Cog):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("The PyBoy hibernation task hit an error.")
+                log.exception("The Libretro hibernation task hit an error.")
 
     async def _hibernate_idle(self) -> None:
         minutes = await self.config.session_timeout_minutes()
@@ -475,7 +475,7 @@ class PyBoyCog(commands.Cog):
         presets = await self.config.games()
         lines = [
             "Attach a Game Boy ROM (`.gb` or `.gbc`) to your message, or pass "
-            f"a URL: `{ctx.clean_prefix}pyboy <url>`.",
+            f"a URL: `{ctx.clean_prefix}retro <url>`.",
         ]
         if presets:
             names = ", ".join(f"`{name}`" for name in sorted(presets)[:15])
@@ -483,14 +483,14 @@ class PyBoyCog(commands.Cog):
         else:
             lines.append(
                 "The bot owner can save games by name with "
-                f"`{ctx.clean_prefix}pyboyset game add <name> <url>`."
+                f"`{ctx.clean_prefix}retroset game add <name> <url>`."
             )
         lines.append(
             "Only use ROMs you have the rights to, such as homebrew games."
         )
         await ctx.send("\n".join(lines))
 
-    async def _resume_session(self, ctx: commands.Context, view: PyBoyView) -> None:
+    async def _resume_session(self, ctx: commands.Context, view: RetroView) -> None:
         """Point the channel at its existing session instead of starting over."""
         message = await view.resolve_message()
         if message is not None:
@@ -505,7 +505,7 @@ class PyBoyCog(commands.Cog):
         # game back on screen with a fresh one.
         await self._repost_session(ctx, view)
 
-    async def _repost_session(self, ctx: commands.Context, view: PyBoyView) -> None:
+    async def _repost_session(self, ctx: commands.Context, view: RetroView) -> None:
         """Wake a session up and post a new message for it."""
         async with ctx.typing():
             try:
@@ -531,7 +531,7 @@ class PyBoyCog(commands.Cog):
     @commands.guild_only()
     @commands.bot_has_permissions(embed_links=True, attach_files=True)
     @commands.command()
-    async def pyboy(self, ctx: commands.Context, *, game: typing.Optional[str] = None) -> None:
+    async def retro(self, ctx: commands.Context, *, game: typing.Optional[str] = None) -> None:
         """
         Play a Game Boy game in this channel.
 
@@ -545,25 +545,25 @@ class PyBoyCog(commands.Cog):
         the rights to, such as homebrew games.
 
         **Examples:**
-        - `[p]pyboy` (with a ROM attached, or to resume this channel's game)
-        - `[p]pyboy tobu`
-        - `[p]pyboy https://example.com/homebrew.gb`
+        - `[p]retro` (with a ROM attached, or to resume this channel's game)
+        - `[p]retro tobu`
+        - `[p]retro https://example.com/homebrew.gb`
 
         **Arguments:**
-        - `[game]` - A saved game name (see `[p]pyboyset game list`) or a ROM URL.
+        - `[game]` - A saved game name (see `[p]retroset game list`) or a ROM URL.
         """
         core_path = await self.config.core_path()
         if not core_path or not Path(core_path).is_file():
             await ctx.send(
                 "No Game Boy core is configured. Ask the bot owner to run "
-                f"`{ctx.clean_prefix}pyboyset download` first."
+                f"`{ctx.clean_prefix}retroset download` first."
             )
             return
 
         game = game.strip() if game else None
         existing = self.sessions.get(ctx.channel.id)
 
-        # Bare `[p]pyboy` with a session in the channel means "bring it back".
+        # Bare `[p]retro` with a session in the channel means "bring it back".
         if game is None and not ctx.message.attachments:
             if existing is not None:
                 await self._resume_session(ctx, existing)
@@ -583,7 +583,7 @@ class PyBoyCog(commands.Cog):
             else:
                 await ctx.send(
                     f"There's no saved game called `{game}`. Pass a ROM URL, "
-                    f"attach a ROM, or see `{ctx.clean_prefix}pyboyset game list`."
+                    f"attach a ROM, or see `{ctx.clean_prefix}retroset game list`."
                 )
                 return
             # Asking for the game that is already going here resumes it
@@ -657,7 +657,7 @@ class PyBoyCog(commands.Cog):
         self._prune_cached_games(ctx.channel.id, slug)
 
         timeout_minutes = await self.config.session_timeout_minutes()
-        view = PyBoyView(
+        view = RetroView(
             self,
             game_name=game_name,
             slug=slug,
@@ -671,7 +671,7 @@ class PyBoyCog(commands.Cog):
         self.sessions[ctx.channel.id] = view
 
         core_path = await self.config.core_path()
-        emulator = GameBoyEmulator(core_path, rom_path)
+        emulator = RetroEmulator(core_path, rom_path)
         try:
             async with ctx.typing():
                 async with self.emulator_lock:
@@ -691,7 +691,7 @@ class PyBoyCog(commands.Cog):
 
     @commands.guild_only()
     @commands.command()
-    async def pyboystop(self, ctx: commands.Context) -> None:
+    async def retrostop(self, ctx: commands.Context) -> None:
         """
         Put this channel's Game Boy session to sleep.
 
@@ -702,7 +702,7 @@ class PyBoyCog(commands.Cog):
         Messages permission, and the bot owner can stop it.
 
         **Examples:**
-        - `[p]pyboystop`
+        - `[p]retrostop`
         """
         view = self.sessions.get(ctx.channel.id)
         if view is None:
@@ -724,7 +724,7 @@ class PyBoyCog(commands.Cog):
         except Exception:
             # Even if the view or its message is stale, make sure the
             # emulator is freed.
-            log.exception("Failed to stop the PyBoy session cleanly.")
+            log.exception("Failed to stop the Libretro session cleanly.")
             if view.emulator is not None:
                 await asyncio.to_thread(view.emulator.stop)
                 view.emulator = None
@@ -735,13 +735,13 @@ class PyBoyCog(commands.Cog):
 
     @commands.group()
     @commands.is_owner()
-    async def pyboyset(self, ctx: commands.Context):
+    async def retroset(self, ctx: commands.Context):
         """
-        Configure PyBoy cog settings.
+        Configure Libretro cog settings.
         """
 
-    @pyboyset.command(name="core")
-    async def pyboyset_core(self, ctx: commands.Context, *, path: str) -> None:
+    @retroset.command(name="core")
+    async def retroset_core(self, ctx: commands.Context, *, path: str) -> None:
         """
         Set the path to a Game Boy libretro core (e.g. gambatte_libretro.so).
         """
@@ -752,8 +752,8 @@ class PyBoyCog(commands.Cog):
         await self.config.core_path.set(str(core_path))
         await ctx.send(f"Game Boy core set to: `{core_path}`")
 
-    @pyboyset.command(name="download")
-    async def pyboyset_download(self, ctx: commands.Context) -> None:
+    @retroset.command(name="download")
+    async def retroset_download(self, ctx: commands.Context) -> None:
         """
         Download the Gambatte Game Boy core from the libretro buildbot.
         """
@@ -762,7 +762,7 @@ class PyBoyCog(commands.Cog):
             await ctx.send(
                 "There is no prebuilt core for this platform. Download a "
                 "Gambatte core manually and set it with "
-                f"`{ctx.clean_prefix}pyboyset core <path>`."
+                f"`{ctx.clean_prefix}retroset core <path>`."
             )
             return
         url, core_name = target
@@ -801,8 +801,8 @@ class PyBoyCog(commands.Cog):
         await self.config.core_path.set(str(core_path))
         await ctx.send(f"Downloaded the Gambatte core to: `{core_path}`")
 
-    @pyboyset.command(name="timeout")
-    async def pyboyset_timeout(self, ctx: commands.Context, minutes: int) -> None:
+    @retroset.command(name="timeout")
+    async def retroset_timeout(self, ctx: commands.Context, minutes: int) -> None:
         """
         Set how long a game can idle before it goes to sleep.
 
@@ -812,7 +812,7 @@ class PyBoyCog(commands.Cog):
         sessions started afterwards. The default is 10 minutes.
 
         **Examples:**
-        - `[p]pyboyset timeout 30`
+        - `[p]retroset timeout 30`
 
         **Arguments:**
         - `<minutes>` - Minutes without input before the game sleeps (1-120).
@@ -824,22 +824,22 @@ class PyBoyCog(commands.Cog):
             "input. Pressing a button wakes them up again."
         )
 
-    @pyboyset.group(name="game")
-    async def pyboyset_game(self, ctx: commands.Context) -> None:
+    @retroset.group(name="game")
+    async def retroset_game(self, ctx: commands.Context) -> None:
         """
         Manage the games players can start by name.
         """
 
-    @pyboyset_game.command(name="add")
-    async def pyboyset_game_add(self, ctx: commands.Context, name: str, url: str) -> None:
+    @retroset_game.command(name="add")
+    async def retroset_game_add(self, ctx: commands.Context, name: str, url: str) -> None:
         """
-        Save a game so anyone can start it with `[p]pyboy <name>`.
+        Save a game so anyone can start it with `[p]retro <name>`.
 
         The URL must be a direct download link to a `.gb` or `.gbc` file.
         Only add ROMs you have the rights to share, such as homebrew games.
 
         **Examples:**
-        - `[p]pyboyset game add tobu https://example.com/tobu.gb`
+        - `[p]retroset game add tobu https://example.com/tobu.gb`
 
         **Arguments:**
         - `<name>` - The name players will type.
@@ -858,16 +858,16 @@ class PyBoyCog(commands.Cog):
             games[key] = url
         verb = "updated" if existed else "added"
         await ctx.send(
-            f"Game `{key}` {verb}. Start it with `{ctx.clean_prefix}pyboy {key}`."
+            f"Game `{key}` {verb}. Start it with `{ctx.clean_prefix}retro {key}`."
         )
 
-    @pyboyset_game.command(name="remove", aliases=["delete", "del"])
-    async def pyboyset_game_remove(self, ctx: commands.Context, name: str) -> None:
+    @retroset_game.command(name="remove", aliases=["delete", "del"])
+    async def retroset_game_remove(self, ctx: commands.Context, name: str) -> None:
         """
         Forget a saved game.
 
         **Examples:**
-        - `[p]pyboyset game remove tobu`
+        - `[p]retroset game remove tobu`
 
         **Arguments:**
         - `<name>` - The saved game to remove.
@@ -880,30 +880,30 @@ class PyBoyCog(commands.Cog):
             del games[key]
         await ctx.send(f"Game `{key}` removed.")
 
-    @pyboyset_game.command(name="list")
-    async def pyboyset_game_list(self, ctx: commands.Context) -> None:
+    @retroset_game.command(name="list")
+    async def retroset_game_list(self, ctx: commands.Context) -> None:
         """
         List the games players can start by name.
 
         **Examples:**
-        - `[p]pyboyset game list`
+        - `[p]retroset game list`
         """
         games = await self.config.games()
         if not games:
             await ctx.send(
                 "No games are saved yet. Add one with "
-                f"`{ctx.clean_prefix}pyboyset game add <name> <url>`."
+                f"`{ctx.clean_prefix}retroset game add <name> <url>`."
             )
             return
         lines = "\n".join(f"- `{name}`: <{games[name]}>" for name in sorted(games))
         for page in pagify(lines):
             await ctx.send(page)
 
-    @pyboyset.command(name="settings")
+    @retroset.command(name="settings")
     @commands.bot_has_permissions(embed_links=True)
-    async def pyboyset_settings(self, ctx: commands.Context) -> None:
+    async def retroset_settings(self, ctx: commands.Context) -> None:
         """
-        Show the current PyBoy settings.
+        Show the current Libretro settings.
         """
         core_path = await self.config.core_path()
         core_status = "Not configured"
@@ -911,7 +911,7 @@ class PyBoyCog(commands.Cog):
             exists = Path(core_path).is_file()
             core_status = f"`{core_path}` ({'found' if exists else 'missing'})"
         embed = discord.Embed(
-            title="PyBoy Settings",
+            title="Libretro Settings",
             colour=await ctx.embed_colour(),
         )
         embed.add_field(name="Game Boy core", value=core_status, inline=False)

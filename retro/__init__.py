@@ -1,6 +1,6 @@
 from redbot.core.bot import Red
-from .PyBoyCog import PyBoyCog
+from .RetroCog import RetroCog
 
 async def setup(bot: Red) -> None:
-    cog = PyBoyCog(bot)
+    cog = RetroCog(bot)
     await bot.add_cog(cog)

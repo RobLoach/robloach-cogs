@@ -1,4 +1,4 @@
-# Discord Red: PyBoy Cog
+# Discord Red: Libretro Cog
 
 Play Game Boy games together in Discord. Attach a `.gb` or `.gbc` ROM and
 control the game with buttons under the screen. Every press posts an animated
@@ -18,27 +18,27 @@ Only use ROMs you have the rights to, such as
 
 ```
 [p]repo add robloach-cogs https://github.com/robloach/robloach-cogs
-[p]cog install robloach-cogs pyboy
-[p]load pyboy
+[p]cog install robloach-cogs libretro
+[p]load libretro
 ```
 
 ## Usage
 
 ```
-[p]pyboyset download
-[p]pyboyset core /path/to/gambatte_libretro.so
-[p]pyboyset game add tobu https://example.com/tobu.gb
-[p]pyboyset settings
-[p]pyboy [name|url]
+[p]retroset download
+[p]retroset core /path/to/gambatte_libretro.so
+[p]retroset game add tobu https://example.com/tobu.gb
+[p]retroset settings
+[p]retro [name|url]
 ```
 
-- `[p]pyboy` starts a game from a saved name, a URL, or an attached `.gb`/`.gbc` ROM. With no arguments it brings back the game already going in the channel.
-- `[p]pyboystop` saves the game and puts it to sleep. The controls keep working.
-- `[p]pyboyset download` (owner) downloads the Gambatte core for your platform from the [libretro buildbot](https://buildbot.libretro.com).
-- `[p]pyboyset core <path>` (owner) points the cog at an already-installed Game Boy libretro core.
-- `[p]pyboyset game add|remove|list` (owner) manages the games anyone can start by name.
-- `[p]pyboyset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
-- `[p]pyboyset settings` (owner) shows the current configuration.
+- `[p]retro` starts a game from a saved name, a URL, or an attached `.gb`/`.gbc` ROM. With no arguments it brings back the game already going in the channel.
+- `[p]retrostop` saves the game and puts it to sleep. The controls keep working.
+- `[p]retroset download` (owner) downloads the Gambatte core for your platform from the [libretro buildbot](https://buildbot.libretro.com).
+- `[p]retroset core <path>` (owner) points the cog at an already-installed Game Boy libretro core.
+- `[p]retroset game add|remove|list` (owner) manages the games anyone can start by name.
+- `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
+- `[p]retroset settings` (owner) shows the current configuration.
 
 ## Saving and sleeping
 
@@ -47,7 +47,7 @@ automatically — every few presses, whenever a game goes to sleep, and when the
 cog is unloaded — next to a cached copy of the ROM.
 
 A game goes to sleep after 10 minutes without input (configurable with
-`[p]pyboyset timeout`), when someone presses Stop, or when the bot shuts down.
+`[p]retroset timeout`), when someone presses Stop, or when the bot shuts down.
 Sleeping frees the emulator but keeps the controls live: the next button press
 wakes the game up exactly where it was, even if the bot has restarted in
 between. The Stop button only appears while a game is awake, since a sleeping

@@ -8,9 +8,9 @@ import typing
 import discord
 from redbot.core import commands
 
-from .emulator import CLIP_FRAMES, EmulatorError, GameBoyEmulator
+from .emulator import CLIP_FRAMES, EmulatorError, RetroEmulator
 
-log = logging.getLogger("red.robloach.pyboy")
+log = logging.getLogger("red.robloach.retro")
 
 # Frames to hold a button down at the start of a clip (60 frames is one
 # second of game time), and frames to run before the first clip so the boot
@@ -28,10 +28,10 @@ SAVE_STATE_EVERY_PRESSES = 3
 # Every button needs a custom_id that survives a restart, because that is how
 # Discord routes a click back to a persistent view. They are scoped per
 # message by bot.add_view(view, message_id=...), so fixed ids are fine.
-CUSTOM_ID_PREFIX = "pyboy"
+CUSTOM_ID_PREFIX = "libretro"
 
 
-class PyBoyView(discord.ui.View):
+class RetroView(discord.ui.View):
     """
     An interactive Game Boy controller.
 
@@ -75,7 +75,7 @@ class PyBoyView(discord.ui.View):
         self.screen_filename: str = self._screen_filename(game_name)
 
         # The live emulator, or None while hibernated.
-        self.emulator: typing.Optional[GameBoyEmulator] = None
+        self.emulator: typing.Optional[RetroEmulator] = None
         # The most recent clip, kept in memory so Replay can re-post it.
         self.last_gif: typing.Optional[bytes] = None
         self.press_count: int = 0
@@ -111,7 +111,7 @@ class PyBoyView(discord.ui.View):
         cog: commands.Cog,
         record: dict,
         timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
-    ) -> "PyBoyView":
+    ) -> "RetroView":
         """Rebuild a hibernated session from Config after a restart."""
         view = cls(
             cog,
@@ -212,7 +212,7 @@ class PyBoyView(discord.ui.View):
             self.message = await channel.fetch_message(self.message_id)
         except discord.HTTPException:
             log.warning(
-                "Could not fetch the PyBoy message %s in channel %s.",
+                "Could not fetch the Libretro message %s in channel %s.",
                 self.message_id,
                 self.channel_id,
             )
@@ -234,11 +234,11 @@ class PyBoyView(discord.ui.View):
         except discord.HTTPException:
             # The message may have been deleted, or the bot may have lost
             # access to the channel; the session state is still correct.
-            log.warning("Failed to refresh the PyBoy message.", exc_info=True)
+            log.warning("Failed to refresh the Libretro message.", exc_info=True)
 
     # -- Starting -----------------------------------------------------------
 
-    async def start(self, ctx: commands.Context, emulator: GameBoyEmulator) -> discord.Message:
+    async def start(self, ctx: commands.Context, emulator: RetroEmulator) -> discord.Message:
         """Boot the emulator and post the first clip with the controls."""
         self.starter_id = ctx.author.id
         self._colour = await ctx.embed_colour()
@@ -257,7 +257,7 @@ class PyBoyView(discord.ui.View):
         return self.message
 
     @staticmethod
-    def _boot(emulator: GameBoyEmulator) -> bytes:
+    def _boot(emulator: RetroEmulator) -> bytes:
         emulator.start()
         # Get past the boot logo first, then record the opening of the game.
         emulator.advance(BOOT_FRAMES)
@@ -311,7 +311,7 @@ class PyBoyView(discord.ui.View):
         try:
             await interaction.response.defer()
         except discord.HTTPException:
-            log.debug("Could not acknowledge a dropped PyBoy press.", exc_info=True)
+            log.debug("Could not acknowledge a dropped Libretro press.", exc_info=True)
 
     async def _disable_now(self, interaction: discord.Interaction, resuming: bool) -> None:
         """
@@ -335,7 +335,7 @@ class PyBoyView(discord.ui.View):
                 embed=await self._make_embed(footer), view=self
             )
         except discord.HTTPException:
-            log.warning("Could not disable the PyBoy controls.", exc_info=True)
+            log.warning("Could not disable the Libretro controls.", exc_info=True)
 
     async def _show(self, interaction: discord.Interaction, gif: bytes) -> None:
         """Re-enable the controls and swap in the new clip, in one edit."""
@@ -353,7 +353,7 @@ class PyBoyView(discord.ui.View):
                 view=self,
             )
         except discord.HTTPException:
-            log.warning("Failed to update the PyBoy screen.", exc_info=True)
+            log.warning("Failed to update the Libretro screen.", exc_info=True)
 
     async def _recover(self, interaction: discord.Interaction, reason: str) -> None:
         """Put the controls back after a failed press and explain why."""
@@ -364,7 +364,7 @@ class PyBoyView(discord.ui.View):
                 embed=await self._make_embed(reason), view=self
             )
         except discord.HTTPException:
-            log.warning("Failed to report a PyBoy failure.", exc_info=True)
+            log.warning("Failed to report a Libretro failure.", exc_info=True)
 
     async def can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
         """Whether this user may stop the session."""
@@ -443,7 +443,7 @@ class PyBoyView(discord.ui.View):
                 view=self,
             )
         except discord.HTTPException:
-            log.warning("Failed to replay the PyBoy clip.", exc_info=True)
+            log.warning("Failed to replay the Libretro clip.", exc_info=True)
 
     @discord.ui.button(emoji="\N{BLACK SQUARE FOR STOP}\N{VARIATION SELECTOR-16}", label="Stop", style=discord.ButtonStyle.danger, row=2, custom_id=f"{CUSTOM_ID_PREFIX}:stop")
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:

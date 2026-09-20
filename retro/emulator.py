@@ -16,7 +16,7 @@ import logging
 from pathlib import Path
 
 __all__ = [
-    "GameBoyEmulator",
+    "RetroEmulator",
     "EmulatorError",
     "BUTTONS",
     "MIN_ROM_SIZE",
@@ -26,7 +26,7 @@ __all__ = [
     "GIF_FPS",
 ]
 
-log = logging.getLogger("red.robloach.pyboy.emulator")
+log = logging.getLogger("red.robloach.retro.emulator")
 
 # Game Boy buttons, named after JoypadState fields.
 BUTTONS = ("a", "b", "start", "select", "up", "down", "left", "right")
@@ -55,13 +55,13 @@ class EmulatorError(RuntimeError):
     """Raised when the emulator cannot be started or run."""
 
 
-class GameBoyEmulator:
+class RetroEmulator:
     """
     Wraps a libretro Game Boy core (e.g. Gambatte) and a loaded ROM.
 
     Usage::
 
-        emulator = GameBoyEmulator("gambatte_libretro.so", "game.gb")
+        emulator = RetroEmulator("gambatte_libretro.so", "game.gb")
         emulator.start()
         emulator.advance(120)
         emulator.press("start", hold_frames=8, release_frames=40)
@@ -402,8 +402,8 @@ def _main() -> int:
     """
     Tiny CLI for smoke-testing:
 
-        python -m pyboy.emulator CORE ROM OUT.png [FRAMES]
-        python -m pyboy.emulator CORE ROM OUT.gif [FRAMES]
+        python -m libretro.emulator CORE ROM OUT.png [FRAMES]
+        python -m libretro.emulator CORE ROM OUT.gif [FRAMES]
 
     A ``.gif`` output records the frames as an animated clip; any other
     extension runs the frames and writes a single PNG of the final screen.
@@ -413,7 +413,7 @@ def _main() -> int:
 
     if len(sys.argv) < 4:
         print(__doc__)
-        print("Usage: python -m pyboy.emulator CORE ROM OUT.png|OUT.gif [FRAMES]")
+        print("Usage: python -m libretro.emulator CORE ROM OUT.png|OUT.gif [FRAMES]")
         return 1
     out_path = Path(sys.argv[3])
     animated = out_path.suffix.lower() == ".gif"
@@ -421,7 +421,7 @@ def _main() -> int:
     frames = int(sys.argv[4]) if len(sys.argv) > 4 else default_frames
 
     started = time.perf_counter()
-    with GameBoyEmulator(sys.argv[1], sys.argv[2]) as emulator:
+    with RetroEmulator(sys.argv[1], sys.argv[2]) as emulator:
         if animated:
             payload = emulator.record(frames)
         else:
