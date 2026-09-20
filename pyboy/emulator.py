@@ -15,7 +15,16 @@ import io
 import logging
 from pathlib import Path
 
-__all__ = ["GameBoyEmulator", "EmulatorError", "BUTTONS", "MIN_ROM_SIZE"]
+__all__ = [
+    "GameBoyEmulator",
+    "EmulatorError",
+    "BUTTONS",
+    "MIN_ROM_SIZE",
+    "FRAMES_PER_SECOND",
+    "CLIP_SECONDS",
+    "CLIP_FRAMES",
+    "GIF_FPS",
+]
 
 log = logging.getLogger("red.robloach.pyboy.emulator")
 
@@ -25,6 +34,21 @@ BUTTONS = ("a", "b", "start", "select", "up", "down", "left", "right")
 # A Game Boy ROM is at least 0x150 bytes: the cartridge header ends at 0x14F,
 # and Gambatte's retro_load_game rejects anything smaller.
 MIN_ROM_SIZE = 0x150
+
+# The Game Boy renders 60 frames a second, so a four second clip is 240
+# emulated frames. Sampling every 4th frame gives a 15 fps GIF of 60 frames,
+# each shown for 1000/15 = 67ms. GIF only stores durations in hundredths of a
+# second, so that is rounded to 70ms and 4 seconds of play takes 4.2 seconds
+# to watch; rounding down instead would play the clip 10% too fast.
+FRAMES_PER_SECOND = 60
+CLIP_SECONDS = 4
+CLIP_FRAMES = FRAMES_PER_SECOND * CLIP_SECONDS
+GIF_FPS = 15
+
+# The Game Boy palette is tiny (4 shades on DMG, a few dozen on GBC), so
+# quantizing to this many colours is effectively lossless and keeps the GIF
+# small. Discord's attachment limit is 8 MiB; a 320x288 clip is well under it.
+GIF_COLORS = 64
 
 
 class EmulatorError(RuntimeError):
@@ -42,6 +66,7 @@ class GameBoyEmulator:
         emulator.advance(120)
         emulator.press("start", hold_frames=8, release_frames=40)
         png_bytes = emulator.screenshot()
+        gif_bytes = emulator.record(press=("a", 8))
         emulator.stop()
     """
 
@@ -202,48 +227,156 @@ class GameBoyEmulator:
 
     # -- Video --------------------------------------------------------------
 
-    def screenshot(self, scale: int = 2) -> bytes:
+    @staticmethod
+    def _pillow():
+        """Import Pillow, turning a missing dependency into an EmulatorError."""
+        try:
+            from PIL import Image
+        except Exception as exc:  # ImportError or a broken install
+            raise EmulatorError(f"Pillow could not be loaded: {exc}") from exc
+        return Image
+
+    def _frame_image(self, scale: int = 2, colors: int = 0):
         """
-        Return the current screen as PNG bytes.
+        Grab the current screen as a Pillow image.
 
         ArrayVideoDriver.screenshot() converts the core's native pixel format
         (RGB565/XRGB8888/RGB1555) into an RGBA byte buffer, so Pillow can read
         it directly. The image is upscaled with nearest-neighbor so the
-        160x144 screen is legible in Discord.
+        160x144 screen is legible in Discord. When ``colors`` is set the image
+        is quantized to a palette first: that is a quarter of the work at
+        scale 2, and a nearest-neighbor resize of a P-mode image keeps the
+        palette indices intact.
         """
-        self._require_started()
-        from PIL import Image
-
+        Image = self._pillow()
         shot = self._video.screenshot()
         if shot is None:
             raise EmulatorError("No video frame is available yet.")
 
         image = Image.frombuffer(
             "RGBA", (shot.width, shot.height), bytes(shot.data), "raw", "RGBA", 0, 1
-        )
+        ).convert("RGB")
+        if colors:
+            image = image.quantize(colors=colors)
         if scale > 1:
             image = image.resize(
                 (shot.width * scale, shot.height * scale), Image.NEAREST
             )
+        return image
+
+    def screenshot(self, scale: int = 2) -> bytes:
+        """Return the current screen as PNG bytes."""
+        self._require_started()
         buffer = io.BytesIO()
-        image.convert("RGB").save(buffer, format="PNG")
+        self._frame_image(scale=scale).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def record(
+        self,
+        frames: int = CLIP_FRAMES,
+        *,
+        scale: int = 2,
+        fps: int = GIF_FPS,
+        press: "tuple | None" = None,
+    ) -> bytes:
+        """
+        Run the core for ``frames`` frames and return the clip as GIF bytes.
+
+        ``press`` is an optional ``(button, hold_frames)`` pair. The button is
+        held down for the first ``hold_frames`` frames *of the recording* and
+        released afterwards, so the GIF shows the game reacting to the press
+        instead of only its end state.
+
+        Roughly every ``60 / fps``-th emulated frame becomes a GIF frame, so
+        the default 240 frames at 15 fps is a 4 second, 60 frame clip.
+        Identical consecutive frames are merged by the encoder, so a game
+        sitting on a static screen produces a handful of kilobytes.
+        """
+        self._require_started()
+        frames = max(1, int(frames))
+        fps = max(1, min(FRAMES_PER_SECOND, int(fps)))
+        step = max(1, round(FRAMES_PER_SECOND / fps))
+        # GIF durations are stored in centiseconds, so round to 10ms here
+        # instead of letting the encoder truncate and speed the clip up.
+        duration_ms = max(10, round(1000 * step / FRAMES_PER_SECOND / 10) * 10)
+
+        release_at = 0
+        if press is not None:
+            button, hold_frames = press
+            button = str(button).lower()
+            if button not in BUTTONS:
+                raise EmulatorError(f"Unknown button {button!r}; expected one of {BUTTONS}")
+            release_at = max(0, min(int(hold_frames), frames))
+            if release_at:
+                self._pressed = frozenset({button})
+
+        images = []
+        try:
+            for index in range(frames):
+                if release_at and index == release_at:
+                    self._pressed = frozenset()
+                self.advance(1)
+                if index % step == 0:
+                    images.append(self._frame_image(scale=scale, colors=GIF_COLORS))
+        finally:
+            self._pressed = frozenset()
+
+        if not images:
+            raise EmulatorError("No video frames were captured.")
+
+        buffer = io.BytesIO()
+        try:
+            images[0].save(
+                buffer,
+                format="GIF",
+                save_all=True,
+                append_images=images[1:],
+                duration=duration_ms,
+                loop=0,
+                optimize=True,
+            )
+        except Exception as exc:
+            raise EmulatorError(f"The clip could not be encoded: {exc}") from exc
         return buffer.getvalue()
 
 
 def _main() -> int:
-    """Tiny CLI for smoke-testing: python -m pyboy.emulator CORE ROM OUT.png [FRAMES]"""
+    """
+    Tiny CLI for smoke-testing:
+
+        python -m pyboy.emulator CORE ROM OUT.png [FRAMES]
+        python -m pyboy.emulator CORE ROM OUT.gif [FRAMES]
+
+    A ``.gif`` output records the frames as an animated clip; any other
+    extension runs the frames and writes a single PNG of the final screen.
+    """
     import sys
+    import time
 
     if len(sys.argv) < 4:
         print(__doc__)
-        print("Usage: python -m pyboy.emulator CORE ROM OUT.png [FRAMES]")
+        print("Usage: python -m pyboy.emulator CORE ROM OUT.png|OUT.gif [FRAMES]")
         return 1
-    frames = int(sys.argv[4]) if len(sys.argv) > 4 else 120
+    out_path = Path(sys.argv[3])
+    animated = out_path.suffix.lower() == ".gif"
+    default_frames = CLIP_FRAMES if animated else 120
+    frames = int(sys.argv[4]) if len(sys.argv) > 4 else default_frames
+
+    started = time.perf_counter()
     with GameBoyEmulator(sys.argv[1], sys.argv[2]) as emulator:
-        emulator.advance(frames)
-        png = emulator.screenshot()
-    Path(sys.argv[3]).write_bytes(png)
-    print(f"Wrote {len(png)} bytes after {frames} frames to {sys.argv[3]}")
+        if animated:
+            payload = emulator.record(frames)
+        else:
+            emulator.advance(frames)
+            payload = emulator.screenshot()
+    elapsed = time.perf_counter() - started
+
+    out_path.write_bytes(payload)
+    kind = "GIF" if animated else "PNG"
+    print(
+        f"Wrote {len(payload)} bytes of {kind} after {frames} frames to "
+        f"{out_path} in {elapsed:.2f}s"
+    )
     return 0
 
 

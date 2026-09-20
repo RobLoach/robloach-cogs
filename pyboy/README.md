@@ -1,8 +1,10 @@
 # Discord Red: PyBoy Cog
 
 Play Game Boy games together in Discord. Attach a `.gb` or `.gbc` ROM and
-control the game with buttons under the screen. Anyone in the channel can
-play, making it a fun social feature. Emulation is provided by
+control the game with buttons under the screen. Every press posts an animated
+GIF of the next four seconds of gameplay, so you see the game react instead of
+a still frame. Anyone in the channel can play, making it a fun social feature.
+Emulation is provided by
 [libretro.py](https://github.com/JesseTG/libretro.py) running the
 [Gambatte](https://github.com/libretro/gambatte-libretro) core.
 

@@ -1,20 +1,21 @@
 import asyncio
 import io
 import logging
+import re
 import typing
 
 import discord
 from redbot.core import commands
 
-from .emulator import EmulatorError, GameBoyEmulator
+from .emulator import CLIP_FRAMES, EmulatorError, GameBoyEmulator
 
 log = logging.getLogger("red.robloach.pyboy")
 
-# Frames to hold a button down, and frames to run afterwards so the game
-# visibly reacts to the press (60 frames is one second of game time).
+# Frames to hold a button down at the start of a clip (60 frames is one
+# second of game time), and frames to run before the first clip so the boot
+# logo is out of the way. CLIP_FRAMES (240, four seconds) of each press is
+# recorded as the GIF that gets posted.
 HOLD_FRAMES = 8
-RELEASE_FRAMES = 40
-ADVANCE_FRAMES = 300
 BOOT_FRAMES = 180
 DEFAULT_TIMEOUT_MINUTES = 10
 
@@ -40,21 +41,28 @@ class PyBoyView(discord.ui.View):
         self.emulator: GameBoyEmulator = emulator
         self.game_name: str = game_name
         self.timeout_minutes: int = timeout_minutes
+        self.screen_filename: str = self._screen_filename(game_name)
         self.ctx: typing.Optional[commands.Context] = None
         self.starter_id: typing.Optional[int] = None
         self.message: typing.Optional[discord.Message] = None
         self.lock: asyncio.Lock = asyncio.Lock()
         self.closed: bool = False
 
+    @staticmethod
+    def _screen_filename(game_name: str) -> str:
+        """A stable, Discord-safe attachment name for this session's clips."""
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "-", game_name).strip("-")[:48]
+        return f"{safe or 'screen'}.gif"
+
     async def start(self, ctx: commands.Context) -> discord.Message:
-        """Boot the emulator and post the first screenshot with the controls."""
+        """Boot the emulator and post the first clip with the controls."""
         self.ctx = ctx
         self.starter_id = ctx.author.id
-        png = await asyncio.to_thread(self._boot)
+        gif = await asyncio.to_thread(self._boot)
         embed = await self._make_embed()
         self.message = await ctx.send(
             embed=embed,
-            file=discord.File(io.BytesIO(png), filename="screen.png"),
+            file=discord.File(io.BytesIO(gif), filename=self.screen_filename),
             view=self,
             reference=ctx.message.to_reference(fail_if_not_exists=False),
         )
@@ -62,15 +70,16 @@ class PyBoyView(discord.ui.View):
 
     def _boot(self) -> bytes:
         self.emulator.start()
+        # Get past the boot logo first, then record the opening of the game.
         self.emulator.advance(BOOT_FRAMES)
-        return self.emulator.screenshot()
+        return self.emulator.record(CLIP_FRAMES)
 
     async def _make_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title=self.game_name,
             colour=await self.ctx.embed_colour(),
         )
-        embed.set_image(url="attachment://screen.png")
+        embed.set_image(url=f"attachment://{self.screen_filename}")
         embed.set_footer(
             text="Anyone can press the buttons. The session ends after "
             f"{self.timeout_minutes} minutes without input."
@@ -80,44 +89,42 @@ class PyBoyView(discord.ui.View):
     async def _press(self, interaction: discord.Interaction, button: typing.Optional[str]) -> None:
         if self.closed:
             return
+        # Acknowledge the click first so Discord never shows "interaction
+        # failed", even when the press is dropped below.
         await interaction.response.defer()
         if self.lock.locked():
-            # Someone else's press is still being emulated; drop this one.
-            try:
-                await interaction.followup.send(
-                    "Still emulating the last press — try again in a moment.",
-                    ephemeral=True,
-                )
-            except discord.HTTPException:
-                log.warning("Failed to send the dropped-press notice.", exc_info=True)
+            # Someone else's press is still being emulated; drop this one
+            # silently rather than nagging everyone who taps a button.
             return
         async with self.lock:
             if self.closed:
                 return
             try:
-                png = await asyncio.to_thread(self._run_press, button)
+                gif = await asyncio.to_thread(self._run_press, button)
             except EmulatorError as error:
                 log.exception("Emulation failed in channel %s", interaction.channel_id)
                 await self.close(f"The emulator crashed: {error}")
                 return
-            await self._update_screen(png)
+            await self._update_screen(gif)
 
     def _run_press(self, button: typing.Optional[str]) -> bytes:
-        if button is None:
-            self.emulator.advance(ADVANCE_FRAMES)
-        else:
-            self.emulator.press(
-                button, hold_frames=HOLD_FRAMES, release_frames=RELEASE_FRAMES
-            )
-        return self.emulator.screenshot()
+        # The press happens inside the recording, so the clip shows the game
+        # reacting to it. A button of None is the "Wait" button: four seconds
+        # of gameplay with no input at all.
+        press = None if button is None else (button, HOLD_FRAMES)
+        return self.emulator.record(CLIP_FRAMES, press=press)
 
-    async def _update_screen(self, png: bytes) -> None:
+    async def _update_screen(self, gif: bytes) -> None:
         if self.message is None:
             return
         try:
+            # attachments= replaces the message's files; omitting it (or
+            # passing file=) would keep the previous clip instead.
             await self.message.edit(
                 embed=await self._make_embed(),
-                attachments=[discord.File(io.BytesIO(png), filename="screen.png")],
+                attachments=[
+                    discord.File(io.BytesIO(gif), filename=self.screen_filename)
+                ],
                 view=self,
             )
         except discord.HTTPException:
