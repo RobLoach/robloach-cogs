@@ -1,9 +1,9 @@
 {
     "author": ["Rob Loach"],
-    "install_msg": "PyBoy installed. Have the bot owner run `[p]pyboyset download` to grab a Game Boy core, then play with `[p]pyboy` and an attached ROM.",
+    "install_msg": "PyBoy installed. Have the bot owner run `[p]pyboyset download` to grab a Game Boy core, then play with `[p]pyboy` and an attached ROM. Save games players can start by name with `[p]pyboyset game add <name> <url>`.",
     "name": "PyBoy",
     "short": "Play Game Boy games in Discord",
-    "description" : "Play Game Boy games together in Discord. Attach a .gb or .gbc ROM (homebrew, or one you have the rights to) and control it with buttons, emulated through libretro.",
+    "description" : "Play Game Boy games together in Discord. Start a game by name, URL, or an attached .gb/.gbc ROM (homebrew, or one you have the rights to) and control it with buttons under the screen. Every press posts an animated clip of the next few seconds. Games save automatically and pick up where they left off, even after the bot restarts. Emulated through libretro.",
     "required_cogs": {
     },
     "requirements": [

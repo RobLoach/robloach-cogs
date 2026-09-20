@@ -67,6 +67,7 @@ class GameBoyEmulator:
         emulator.press("start", hold_frames=8, release_frames=40)
         png_bytes = emulator.screenshot()
         gif_bytes = emulator.record(press=("a", 8))
+        state = emulator.save_state()
         emulator.stop()
     """
 
@@ -225,6 +226,60 @@ class GameBoyEmulator:
             self._pressed = frozenset()
         self.advance(release_frames)
 
+    # -- Save states --------------------------------------------------------
+
+    def save_state(self) -> bytes:
+        """
+        Serialize the whole machine (CPU, RAM, video, audio) into bytes.
+
+        The blob is only meaningful to the same core, but it does not depend
+        on the core *instance*: it can be handed to a freshly started
+        emulator running the same ROM, which is how a session resumes after
+        the emulator has been freed.
+        """
+        self._require_started()
+        try:
+            core = self._session.core
+            size = core.serialize_size()
+            if not size:
+                raise EmulatorError("This core does not support save states.")
+            buffer = bytearray(size)
+            if not core.serialize(buffer):
+                raise EmulatorError("The core refused to write a save state.")
+        except EmulatorError:
+            raise
+        except Exception as exc:
+            raise EmulatorError(f"The save state could not be created: {exc}") from exc
+        return bytes(buffer)
+
+    def load_state(self, data: bytes) -> None:
+        """
+        Restore a blob from :meth:`save_state` into the running core.
+
+        A frame is run afterwards because the video driver still holds the
+        picture from before the restore; without it a screenshot or clip
+        would start on a stale frame.
+        """
+        self._require_started()
+        if not data:
+            raise EmulatorError("The save state is empty.")
+        try:
+            core = self._session.core
+            size = core.serialize_size()
+            if size and len(data) != size:
+                raise EmulatorError(
+                    f"The save state is {len(data)} bytes but this core "
+                    f"expects {size}; it was probably made with a different "
+                    "core or game."
+                )
+            if not core.unserialize(bytes(data)):
+                raise EmulatorError("The core refused to load the save state.")
+        except EmulatorError:
+            raise
+        except Exception as exc:
+            raise EmulatorError(f"The save state could not be loaded: {exc}") from exc
+        self.advance(1)
+
     # -- Video --------------------------------------------------------------
 
     @staticmethod
@@ -326,13 +381,16 @@ class GameBoyEmulator:
 
         buffer = io.BytesIO()
         try:
+            # No loop= argument on purpose: Pillow only writes the NETSCAPE
+            # looping extension when one is given, and loop=0 would mean
+            # "loop forever". Without it the clip plays exactly once and then
+            # holds on its last frame, which is what the Replay button is for.
             images[0].save(
                 buffer,
                 format="GIF",
                 save_all=True,
                 append_images=images[1:],
                 duration=duration_ms,
-                loop=0,
                 optimize=True,
             )
         except Exception as exc:
