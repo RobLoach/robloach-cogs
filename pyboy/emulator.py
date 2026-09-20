@@ -12,12 +12,19 @@ Session constructor API of libretro.py >= 0.7.
 """
 
 import io
+import logging
 from pathlib import Path
 
-__all__ = ["GameBoyEmulator", "EmulatorError", "BUTTONS"]
+__all__ = ["GameBoyEmulator", "EmulatorError", "BUTTONS", "MIN_ROM_SIZE"]
+
+log = logging.getLogger("red.robloach.pyboy.emulator")
 
 # Game Boy buttons, named after JoypadState fields.
 BUTTONS = ("a", "b", "start", "select", "up", "down", "left", "right")
+
+# A Game Boy ROM is at least 0x150 bytes: the cartridge header ends at 0x14F,
+# and Gambatte's retro_load_game rejects anything smaller.
+MIN_ROM_SIZE = 0x150
 
 
 class EmulatorError(RuntimeError):
@@ -57,6 +64,9 @@ class GameBoyEmulator:
             raise EmulatorError(f"Libretro core not found: {self.core_path}")
         if not self.rom_path.is_file():
             raise EmulatorError(f"ROM not found: {self.rom_path}")
+        if self.rom_path.stat().st_size < MIN_ROM_SIZE:
+            self._log_start_failure("ROM file is smaller than a Game Boy ROM header")
+            raise EmulatorError("The file is too small to be a Game Boy ROM.")
 
         try:
             import libretro
@@ -92,11 +102,47 @@ class GameBoyEmulator:
                 )
             session.__enter__()
         except Exception as exc:
+            self._log_start_failure(exc)
+            if "Failed to load game" in str(exc):
+                # libretro.py raises this bare RuntimeError when the core's
+                # retro_load_game() returns false, i.e. the core rejected the
+                # content (corrupt file, HTML page saved as a ROM, ...).
+                raise EmulatorError(
+                    "The core could not load this ROM. It may be corrupt or "
+                    "not a real Game Boy game."
+                ) from exc
             raise EmulatorError(f"Failed to start the core: {exc}") from exc
 
         self._session = session
         self._video = video
         self.started = True
+
+    def _log_start_failure(self, exc) -> None:
+        """Log everything useful for diagnosing a start failure."""
+        rom_exists = self.rom_path.is_file()
+        rom_size: object = None
+        head = b""
+        if rom_exists:
+            try:
+                rom_size = self.rom_path.stat().st_size
+                with open(self.rom_path, "rb") as rom_file:
+                    head = rom_file.read(MIN_ROM_SIZE)
+            except OSError:
+                pass
+        hint = ""
+        if head.lstrip()[:1] == b"<":
+            hint = "; the ROM looks like an HTML page, not a Game Boy ROM"
+        elif rom_exists and isinstance(rom_size, int) and rom_size < MIN_ROM_SIZE:
+            hint = "; the ROM is smaller than a Game Boy ROM header"
+        log.error(
+            "Failed to start the emulator: %s (core=%s, rom=%s, rom_exists=%s, rom_size=%s%s)",
+            exc,
+            self.core_path,
+            self.rom_path,
+            rom_exists,
+            rom_size,
+            hint,
+        )
 
     def stop(self) -> None:
         """Unload the game and free the core. Safe to call more than once."""
