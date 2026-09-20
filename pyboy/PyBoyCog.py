@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 import platform
@@ -13,7 +14,7 @@ from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 
-from .emulator import EmulatorError, GameBoyEmulator
+from .emulator import MIN_ROM_SIZE, EmulatorError, GameBoyEmulator
 from .PyBoyView import PyBoyView
 
 log = logging.getLogger("red.robloach.pyboy")
@@ -54,6 +55,10 @@ class PyBoyCog(commands.Cog):
     def _sanitize_filename(filename: str) -> str:
         name = Path(filename).name
         name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._") or "rom"
+        # libretro.py 0.6.x matches the extension against the core's
+        # valid_extensions case-sensitively, so ".GB" must become ".gb".
+        path = Path(name)
+        name = path.stem + path.suffix.lower()
         return name[-64:]
 
     @staticmethod
@@ -167,6 +172,19 @@ class PyBoyCog(commands.Cog):
             await ctx.send("That doesn't look like a Game Boy ROM (`.gb` or `.gbc`).")
             return
 
+        # Catch obviously-broken content before handing it to the core. The
+        # most common failure is a URL that serves an HTML page (for example
+        # a GitHub "blob" page) instead of the ROM file itself.
+        if data.lstrip()[:1] == b"<":
+            await ctx.send(
+                "That looks like a web page, not a Game Boy ROM. If you used "
+                "a URL, make sure it is a direct download link to the file."
+            )
+            return
+        if len(data) < MIN_ROM_SIZE:
+            await ctx.send("That file is too small to be a Game Boy ROM.")
+            return
+
         rom_dir = cog_data_path(self) / "roms"
         rom_dir.mkdir(parents=True, exist_ok=True)
         rom_path = rom_dir / f"{ctx.channel.id}-{filename}"
@@ -179,9 +197,11 @@ class PyBoyCog(commands.Cog):
             await view.start(ctx)
         except EmulatorError as error:
             self.sessions.pop(ctx.channel.id, None)
+            await asyncio.to_thread(emulator.stop)
             await ctx.send(f"The game could not be started: {error}")
         except Exception:
             self.sessions.pop(ctx.channel.id, None)
+            await asyncio.to_thread(emulator.stop)
             raise
         finally:
             try:
