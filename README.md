@@ -6,8 +6,6 @@ Experimental Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-Disco
 
 | Cog | Description |
 | --- | --- |
-| [AssistantExtras](assistantextras) | Give Assistant extra tooling from your cogs |
-| [Jackett](jackett) | API support for your favorite torrent trackers |
 | [Retro](retro) | Play retro console games in Discord |
 
 ## Installation

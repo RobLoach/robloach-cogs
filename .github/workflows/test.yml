@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Compile all Python sources
-        run: python -m compileall assistantextras jackett retro
+        run: python -m compileall retro
       - name: Validate the info.json files
         run: |
           for file in info.json */info.json; do
@@ -159,4 +159,4 @@ jobs:
       - name: Install Red-DiscordBot
         run: pip install Red-DiscordBot
       - name: Import the cogs
-        run: python -c "import retro.RetroCog, retro.RetroView, retro.systems, jackett.JackettCog"
+        run: python -c "import retro.RetroCog, retro.RetroView, retro.systems"
