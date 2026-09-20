@@ -2,10 +2,10 @@
     "author": [
         "Rob Loach"
     ],
-    "install_msg": "Libretro installed. Have the bot owner run `[p]retroset download` to grab a Game Boy core, then play with `[p]retro` and an attached ROM. Save games players can start by name with `[p]retroset game add <name> <url>`.",
+    "install_msg": "Retro installed. Have the bot owner run `[p]retroset download` to grab the emulator cores (about 5 MiB, no BIOS files needed), then play with `[p]retro` and an attached ROM. Save games players can start by name with `[p]retroset game add <name> <url>`.",
     "name": "Retro",
-    "short": "Play Game Boy games in Discord",
-    "description": "Play Game Boy games together in Discord. Start a game by name, URL, or an attached .gb/.gbc ROM (homebrew, or one you have the rights to) and control it with buttons under the screen. Every press posts an animated clip of the next few seconds. Games save automatically and pick up where they left off, even after the bot restarts. Emulated through libretro.",
+    "short": "Play retro console games in Discord",
+    "description": "Play retro console games together in Discord. Start a game by name, URL, or an attached ROM (homebrew, or one you have the rights to) and control it with buttons under the screen. Eleven consoles are supported, from the Atari 2600 to the Super Nintendo, picked automatically from the file extension, each with its own controller layout. Every press posts an animated clip of the next few seconds. Games save automatically and pick up where they left off, even after the bot restarts. Emulated through libretro.",
     "required_cogs": {},
     "requirements": [
         "libretro.py",
