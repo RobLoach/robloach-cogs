@@ -15,7 +15,7 @@ from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 
 from .emulator import MIN_ROM_SIZE, EmulatorError, GameBoyEmulator
-from .PyBoyView import PyBoyView
+from .PyBoyView import DEFAULT_TIMEOUT_MINUTES, PyBoyView
 
 log = logging.getLogger("red.robloach.pyboy")
 
@@ -37,7 +37,8 @@ class PyBoyCog(commands.Cog):
             force_registration=True
         )
         self.config.register_global(
-            core_path=""
+            core_path="",
+            session_timeout_minutes=DEFAULT_TIMEOUT_MINUTES
         )
         self.sessions: typing.Dict[int, PyBoyView] = {}
 
@@ -158,7 +159,7 @@ class PyBoyCog(commands.Cog):
         if ctx.channel.id in self.sessions:
             await ctx.send(
                 "A game is already running in this channel. Stop it first "
-                "with its Stop button."
+                f"with its Stop button or `{ctx.clean_prefix}pyboystop`."
             )
             return
 
@@ -191,7 +192,8 @@ class PyBoyCog(commands.Cog):
         rom_path.write_bytes(data)
 
         emulator = GameBoyEmulator(core_path, rom_path)
-        view = PyBoyView(self, emulator, Path(filename).stem)
+        timeout_minutes = await self.config.session_timeout_minutes()
+        view = PyBoyView(self, emulator, Path(filename).stem, timeout_minutes=timeout_minutes)
         self.sessions[ctx.channel.id] = view
         try:
             await view.start(ctx)
@@ -208,6 +210,40 @@ class PyBoyCog(commands.Cog):
                 rom_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    @commands.guild_only()
+    @commands.command()
+    async def pyboystop(self, ctx: commands.Context) -> None:
+        """
+        Stop the Game Boy session running in this channel.
+
+        Only the person who started the game, members with the Manage
+        Messages permission, and the bot owner can stop it.
+
+        **Examples:**
+        - `[p]pyboystop`
+        """
+        view = self.sessions.get(ctx.channel.id)
+        if view is None:
+            await ctx.send("No game is running in this channel.")
+            return
+        if not await view.can_stop(ctx.author):
+            await ctx.send(
+                "Only the person who started the game, moderators, or the "
+                "bot owner can stop it."
+            )
+            return
+        try:
+            async with view.lock:
+                await view.close(f"Stopped by {ctx.author.display_name}.")
+        except Exception:
+            # Even if the view or its message is stale, make sure the
+            # emulator is freed and the session entry is removed.
+            log.exception("Failed to close the PyBoy session cleanly.")
+            await asyncio.to_thread(view.emulator.stop)
+        finally:
+            self.sessions.pop(ctx.channel.id, None)
+        await ctx.send("The Game Boy session has been stopped.")
 
     @commands.group()
     @commands.is_owner()
@@ -277,6 +313,24 @@ class PyBoyCog(commands.Cog):
         await self.config.core_path.set(str(core_path))
         await ctx.send(f"Downloaded the Gambatte core to: `{core_path}`")
 
+    @pyboyset.command(name="timeout")
+    async def pyboyset_timeout(self, ctx: commands.Context, minutes: int) -> None:
+        """
+        Set how long a Game Boy session can idle before it ends.
+
+        The value is clamped between 1 and 120 minutes and applies to
+        sessions started afterwards. The default is 10 minutes.
+
+        **Examples:**
+        - `[p]pyboyset timeout 30`
+
+        **Arguments:**
+        - `<minutes>` - Minutes without input before the session ends (1-120).
+        """
+        minutes = max(1, min(120, minutes))
+        await self.config.session_timeout_minutes.set(minutes)
+        await ctx.send(f"Game Boy sessions now end after {minutes} minutes without input.")
+
     @pyboyset.command(name="settings")
     @commands.bot_has_permissions(embed_links=True)
     async def pyboyset_settings(self, ctx: commands.Context) -> None:
@@ -293,5 +347,7 @@ class PyBoyCog(commands.Cog):
             colour=await ctx.embed_colour(),
         )
         embed.add_field(name="Game Boy core", value=core_status, inline=False)
+        timeout_minutes = await self.config.session_timeout_minutes()
+        embed.add_field(name="Session timeout", value=f"{timeout_minutes} minutes", inline=False)
         embed.add_field(name="Active sessions", value=str(len(self.sessions)), inline=False)
         await ctx.send(embed=embed)

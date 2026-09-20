@@ -16,7 +16,7 @@ HOLD_FRAMES = 8
 RELEASE_FRAMES = 40
 ADVANCE_FRAMES = 300
 BOOT_FRAMES = 180
-SESSION_TIMEOUT = 10 * 60
+DEFAULT_TIMEOUT_MINUTES = 10
 
 
 class PyBoyView(discord.ui.View):
@@ -33,12 +33,15 @@ class PyBoyView(discord.ui.View):
         cog: commands.Cog,
         emulator: GameBoyEmulator,
         game_name: str,
+        timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
     ) -> None:
-        super().__init__(timeout=SESSION_TIMEOUT)
+        super().__init__(timeout=timeout_minutes * 60)
         self.cog: commands.Cog = cog
         self.emulator: GameBoyEmulator = emulator
         self.game_name: str = game_name
+        self.timeout_minutes: int = timeout_minutes
         self.ctx: typing.Optional[commands.Context] = None
+        self.starter_id: typing.Optional[int] = None
         self.message: typing.Optional[discord.Message] = None
         self.lock: asyncio.Lock = asyncio.Lock()
         self.closed: bool = False
@@ -46,6 +49,7 @@ class PyBoyView(discord.ui.View):
     async def start(self, ctx: commands.Context) -> discord.Message:
         """Boot the emulator and post the first screenshot with the controls."""
         self.ctx = ctx
+        self.starter_id = ctx.author.id
         png = await asyncio.to_thread(self._boot)
         embed = await self._make_embed()
         self.message = await ctx.send(
@@ -69,7 +73,7 @@ class PyBoyView(discord.ui.View):
         embed.set_image(url="attachment://screen.png")
         embed.set_footer(
             text="Anyone can press the buttons. The session ends after "
-            f"{SESSION_TIMEOUT // 60} minutes without input."
+            f"{self.timeout_minutes} minutes without input."
         )
         return embed
 
@@ -79,6 +83,13 @@ class PyBoyView(discord.ui.View):
         await interaction.response.defer()
         if self.lock.locked():
             # Someone else's press is still being emulated; drop this one.
+            try:
+                await interaction.followup.send(
+                    "Still emulating the last press — try again in a moment.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                log.warning("Failed to send the dropped-press notice.", exc_info=True)
             return
         async with self.lock:
             if self.closed:
@@ -112,10 +123,11 @@ class PyBoyView(discord.ui.View):
         except discord.HTTPException:
             log.warning("Failed to update the PyBoy screen.", exc_info=True)
 
-    async def _can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
-        if user.id == self.ctx.author.id:
+    async def can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
+        """Whether this user may stop the session."""
+        if user.id == self.starter_id:
             return True
-        if await self.ctx.bot.is_owner(user):
+        if await self.cog.bot.is_owner(user):
             return True
         if isinstance(user, discord.Member) and user.guild_permissions.manage_messages:
             return True
@@ -139,7 +151,9 @@ class PyBoyView(discord.ui.View):
                 embed.set_footer(text=reason)
                 await self.message.edit(embed=embed, view=self)
             except discord.HTTPException:
-                pass
+                # The message may have been deleted, or the bot may have
+                # lost access to the channel; the session is closed anyway.
+                log.warning("Failed to edit the PyBoy message on close.", exc_info=True)
 
     async def on_timeout(self) -> None:
         await self.close("The Game Boy session timed out.")
@@ -185,7 +199,7 @@ class PyBoyView(discord.ui.View):
 
     @discord.ui.button(emoji="\N{BLACK SQUARE FOR STOP}\N{VARIATION SELECTOR-16}", label="Stop", style=discord.ButtonStyle.danger, row=2)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await self._can_stop(interaction.user):
+        if not await self.can_stop(interaction.user):
             await interaction.response.send_message(
                 "Only the person who started the game, moderators, or the "
                 "bot owner can stop it.",
