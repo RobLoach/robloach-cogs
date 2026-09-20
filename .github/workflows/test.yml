@@ -5,262 +5,68 @@ on:
     branches:
       - master
   pull_request:
+  schedule:
+    # Weekly, for the buildbot check below: nothing in the repository can go
+    # stale, but the libretro buildbot can.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Where tests/fetch_assets.py puts the cores and ROMs, and where
+  # tests/conftest.py looks for them.
+  RETRO_TEST_ASSETS: ${{ github.workspace }}/test-assets
 
 jobs:
-  lint:
+  # Lint plus the whole fast suite: tables, layouts, archives, the cog
+  # driven against fakes, and the property tests. No cores, no ROMs, no
+  # network -- this is the job that should fail first when something is
+  # wrong, and it takes well under a minute.
+  fast:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Compile all Python sources
-        run: python -m compileall retro
-      - name: Validate the info.json files
-        run: |
-          for file in info.json */info.json; do
-            echo "Checking $file"
-            python -m json.tool "$file" > /dev/null
-          done
-      - name: Check the console/core/button tables
-        run: |
-          python - <<'EOF'
-          import importlib.util
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install the development dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Run the fast tests
+        # Red is not installed here, so tests/stubs stands in for it and the
+        # handful of tests that need the real thing skip; the `red` job below
+        # runs the same suite against a real Red-DiscordBot.
+        run: pytest -m "not emulator and not network" --durations=10
 
-          spec = importlib.util.spec_from_file_location("systems", "retro/systems.py")
-          S = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(S)
-
-          RETROPAD = {"b", "y", "select", "start", "up", "down", "left", "right",
-                      "a", "x", "l", "r", "l2", "r2", "l3", "r3"}
-          # systems.System.rows is the whole controller -- d-pad, face buttons
-          # and layout spacers -- and the view appends Wait/repeat/Replay to
-          # it. validate_layouts() enforces Discord's 5x5x25 budget and runs at
-          # import time; this asserts it covered every console.
-          assert S.validate_layouts() == tuple(x.key for x in S.SYSTEMS)
-          seen = {}
-          for system in S.SYSTEMS:
-              fields = system.fields
-              assert set(fields) <= RETROPAD, (system.key, set(fields) - RETROPAD)
-              assert len(set(fields)) == len(fields), f"{system.key} repeats a button"
-              assert system.confirm in fields, f"{system.key} has no confirm button"
-              rows = system.rows
-              used = len(rows) + (0 if len(rows[-1]) + S.CONTROL_BUTTONS <= 5 else 1)
-              assert used <= 5, f"{system.key} needs {used} action rows"
-              assert all(len(row) <= 5 for row in rows), f"{system.key} row too wide"
-              assert sum(len(r) for r in rows) + S.CONTROL_BUTTONS <= 25, system.key
-              # The d-pad reads as a cross: a spacer, then Up; then Left Down Right.
-              assert rows[0][0] is S.SPACER and rows[0][1] is S.UP, system.key
-              assert rows[1][:3] == (S.LEFT, S.DOWN, S.RIGHT), system.key
-              # Every cell needs a label or an emoji, spacers included, or
-              # Discord refuses the whole message.
-              for row in rows:
-                  for cell in row:
-                      assert cell.label or cell.emoji, (system.key, cell)
-              for extension in system.extensions:
-                  assert extension not in S.AMBIGUOUS_EXTENSIONS, extension
-                  assert extension not in seen, f".{extension}: {seen[extension]} vs {system.key}"
-                  seen[extension] = system.key
-          assert S.system_for_extension(".GBC").key == "gb"
-          assert S.system_for_extension("nes").core == "fceumm"
-          assert S.system_for_extension("bin") is None
-          assert S.core_name_from_filename("/x/snes9x_libretro.so") == "snes9x"
-          # The d-pad is emoji only on every console: four arrows, no words.
-          for button in S.DPAD:
-              assert button.emoji and not button.label, button
-          for system in S.SYSTEMS:
-              print(f"OK {system.key:<10} "
-                    + " | ".join(" ".join(b.emoji or b.label for b in r)
-                                 for r in system.rows))
-          print(f"OK: {len(S.SYSTEMS)} consoles, {len(S.CORES)} cores, {len(seen)} extensions")
-          EOF
-
-      - name: Every button emoji is one Discord will accept
-        # Discord rejects a message outright (400, error code 50035, "Invalid
-        # emoji") if a component carries a character that is not really an
-        # emoji, which takes out the whole command. That happened for real
-        # with U+21BB on the Replay button, so the exact set the cog can
-        # render is reviewed in systems.EMOJI_CODEPOINTS and checked here.
-        run: |
-          python - <<'EOF'
-          import importlib.util
-          import unicodedata
-
-          spec = importlib.util.spec_from_file_location("systems", "retro/systems.py")
-          S = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(S)
-
-          emoji = S.validate_emoji()
-          assert emoji, "no button emoji were found at all"
-          for value in emoji:
-              problem = S.emoji_problem(value)
-              assert problem is None, f"{value!r}: {problem}"
-              base = value[0]
-              assert unicodedata.category(base) == "So", (value, unicodedata.category(base))
-              assert unicodedata.name(base, ""), f"{value!r} has no Unicode name"
-              needs = S.EMOJI_CODEPOINTS[ord(base)]
-              assert needs == value.endswith(S.VARIATION_SELECTOR_16), value
-              print(f"OK {' '.join(f'U+{ord(c):04X}' for c in value):<16} {value}")
-
-          # The Stop button is gone, and its U+23F9 with it.
-          assert not hasattr(S, "STOP_EMOJI"), "STOP_EMOJI should have been removed"
-          assert 0x23F9 not in S.EMOJI_CODEPOINTS, "the stop emoji is unused now"
-          assert len(emoji) == 6, f"expected 4 arrows + Wait + Replay, got {emoji}"
-
-          # The character that broke production must still be refused, and so
-          # must anything new that has not been reviewed.
-          assert S.emoji_problem("↻") is not None, "U+21BB is not an emoji"
-          assert S.emoji_problem("⬆") is not None, "U+2B06 needs U+FE0F"
-          assert S.emoji_problem("") is not None
-          print(f"OK: {len(emoji)} reviewed button emoji")
-          EOF
-
-      - name: Zip handling
-        run: |
-          python - <<'EOF'
-          import importlib.util
-          import io
-          import zipfile
-          from pathlib import Path
-
-          def load(name, path):
-              spec = importlib.util.spec_from_file_location(name, path)
-              module = importlib.util.module_from_spec(spec)
-              spec.loader.exec_module(module)
-              return module
-
-          S = load("systems", "retro/systems.py")
-          A = load("archives", "retro/archives.py")
-
-          def zipped(entries):
-              buf = io.BytesIO()
-              with zipfile.ZipFile(buf, "w") as z:
-                  for name, payload in entries:
-                      z.writestr(name, payload)
-              return buf.getvalue()
-
-          rom = b"\0" * 4096
-          is_rom = lambda n: S.system_for_extension(Path(n).suffix) is not None
-
-          found = A.extract(zipped([("z.gb", rom), ("a.nes", rom), ("r.txt", b"x" * 40)]),
-                            accept=is_rom, max_size=32 * 1024 * 1024, what="ROM")
-          assert found.name == "a.nes", found.name
-          assert found.candidates == ("a.nes", "z.gb"), found.candidates
-
-          nested = A.extract(zipped([("dir/sub/game.gbc", rom)]), accept=is_rom,
-                             max_size=32 * 1024 * 1024)
-          assert nested.name == "dir/sub/game.gbc", nested.name
-
-          for label, data, cap, expected in [
-              ("no ROM", zipped([("a.txt", b"x" * 40)]), 1 << 25, A.NoSupportedMember),
-              ("empty", zipped([]), 1 << 25, A.NoSupportedMember),
-              ("bomb", zipped([("big.gb", b"\0" * (2 << 20))]), 1 << 20, A.ArchiveError),
-              ("corrupt", b"PK\x03\x04garbage" * 40, 1 << 25, A.ArchiveError),
-          ]:
-              try:
-                  A.extract(data, accept=is_rom, max_size=cap, what="ROM")
-                  raise AssertionError(f"{label} should have been refused")
-              except expected as error:
-                  print(f"OK {label}: {error}")
-
-          # A traversing member is read into memory, never extracted to disk.
-          trav = A.extract(zipped([("../../evil.gb", rom)]), accept=is_rom,
-                           max_size=1 << 25)
-          assert trav.data == rom and Path(trav.name).name == "evil.gb"
-          assert not Path("/tmp/evil.gb").exists()
-          print("OK: zip handling")
-          EOF
-
-  cores:
-    # The core names in systems.py have to match what the libretro buildbot
-    # publishes, or [p]retroset download quietly installs nothing.
+  # The same fast suite against the real Red-DiscordBot, on the Python Red
+  # runs. This is where the @pytest.mark.redbot tests (command permissions
+  # and the like) actually execute, and where the cog's import is proved.
+  red:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
-      - name: Install the emulator dependencies
-        run: pip install "libretro.py"
-      - name: Every recommended core exists on the buildbot
-        run: |
-          python - <<'EOF'
-          import importlib.util
-          import io
-          import urllib.request
-          import zipfile
-          from pathlib import Path
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install Red-DiscordBot and the test tools
+        run: pip install Red-DiscordBot pytest pytest-asyncio hypothesis pillow
+      - name: Import the cogs
+        run: python -c "import retro.RetroCog, retro.RetroView, retro.systems, retro.archives"
+      - name: Run the fast tests against the real Red
+        run: pytest -m "not emulator and not network" --durations=10
 
-          spec = importlib.util.spec_from_file_location("systems", "retro/systems.py")
-          S = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(S)
-
-          BASE = "https://buildbot.libretro.com/nightly/linux/x86_64/latest"
-          cores = Path("cores")
-          cores.mkdir(exist_ok=True)
-          total = 0
-          for core in S.CORES:
-              name = f"{core}_libretro.so"
-              with urllib.request.urlopen(f"{BASE}/{name}.zip", timeout=120) as resp:
-                  payload = resp.read()
-              with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                  member = next(e for e in archive.namelist() if e.endswith(name))
-                  size = archive.getinfo(member).file_size
-                  # Kept for the core-option check below, which needs the real
-                  # shared objects rather than just their sizes.
-                  (cores / name).write_bytes(archive.read(member))
-              total += len(payload)
-              print(f"OK {core:<20} {len(payload) // 1024:>5} KiB zip -> {size // 1024:>6} KiB core")
-          print(f"{len(S.CORES)} cores, {total // 1024} KiB of downloads")
-          EOF
-
-      - name: No core uses "reset" as a real option value
-        # `[p]retroset coreoptions <core> <key> reset` puts a core's default
-        # back, so the sentinel must not also be something a core accepts.
-        # "default" and "none" are both out already (mednafen_wswan offers the
-        # first, snes9x and genesis_plus_gx the second); this catches a core
-        # update that would make "reset" ambiguous too.
-        run: |
-          python - <<'EOF'
-          import importlib.util
-          from pathlib import Path
-
-          def load(name, path):
-              spec = importlib.util.spec_from_file_location(name, path)
-              module = importlib.util.module_from_spec(spec)
-              spec.loader.exec_module(module)
-              return module
-
-          S = load("systems", "retro/systems.py")
-          E = load("emulator", "retro/emulator.py")
-          # RetroCog cannot be imported here (it needs Red), so the sentinel is
-          # repeated; the red-import job asserts OPTION_RESET is still "reset".
-          SENTINEL = "reset"
-
-          total = 0
-          for core in sorted(S.CORES):
-              path = Path("cores") / f"{core}_libretro.so"
-              definitions = E.probe_core_options(path)
-              values = {
-                  value
-                  for option in definitions.values()
-                  for value, _ in option["values"]
-              }
-              clash = [
-                  key for key, option in definitions.items()
-                  if any(value.lower() == SENTINEL for value, _ in option["values"])
-              ]
-              assert not clash, f"{core} uses {SENTINEL!r} as a value of {clash}"
-              total += len(definitions)
-              print(f"OK {core:<20} {len(definitions):>3} options, "
-                    f"{len(values):>3} distinct values, no {SENTINEL!r}")
-          # FCEUmm declares nothing until a ROM is loaded, so a zero here is
-          # expected for it and is not a failure; the others must say something.
-          assert total > 150, f"only {total} options across {len(S.CORES)} cores"
-          print(f"{total} core options readable with no ROM at all")
-          EOF
-
-  emulator-smoke:
+  # The slow half: real libretro cores driving real ROMs. The cores and the
+  # freely-distributable ROMs are cached between runs, so an unchanged core
+  # list costs one cache restore instead of ~40 MiB of downloads.
+  emulator:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -273,508 +79,43 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
       - name: Install the emulator dependencies
-        run: pip install "libretro.py" pillow
-      - name: Download the Gambatte core
-        run: |
-          curl -fsSLO https://buildbot.libretro.com/nightly/linux/x86_64/latest/gambatte_libretro.so.zip
-          unzip gambatte_libretro.so.zip
-      - name: Download the dmg-acid2 test ROM
-        run: curl -fsSLO https://github.com/mattcurrie/dmg-acid2/releases/download/v1.0/dmg-acid2.gb
-      - name: Download the uCity ROM
-        # A free, MIT-licensed Game Boy Color city builder whose cartridge has
-        # a 128 KiB battery save -- which is what the SRAM checks below need,
-        # since dmg-acid2's cart has none.
-        run: curl -fsSLO https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc
-      - name: Render a still frame
-        run: python retro/emulator.py ./gambatte_libretro.so dmg-acid2.gb out.png 120
-      - name: The core is given our system (BIOS) directory
-        # Left alone, libretro.py hands every core a throwaway temporary
-        # directory, so a BIOS could never be found. This checks the path
-        # driver really is wired up on whichever libretro.py resolved here.
-        run: |
-          RETRO_SYSTEM_DIR="$PWD/biostest/system" \
-            python retro/emulator.py ./gambatte_libretro.so dmg-acid2.gb sysdir.png 60 \
-            | tee sysdir.log
-          grep -qxF "system directory: $PWD/biostest/system" sysdir.log
-          test -d "$PWD/biostest/system"
-          echo "OK: the core's system directory is $PWD/biostest/system"
-      - name: Check the screenshot
-        run: |
-          python - <<'EOF'
-          from pathlib import Path
+        # Deliberately not Red or discord.py: the emulator tests exercise
+        # retro/emulator.py on its own, and the cog tests skip without them.
+        run: pip install "libretro.py" pillow pytest pytest-asyncio pytest-xdist
+      - name: Restore the cached cores and ROMs
+        uses: actions/cache@v4
+        with:
+          path: test-assets
+          # The core list lives in systems.py, so a new console invalidates
+          # the cache; nothing else changes what is downloaded.
+          key: retro-assets-linux-x86_64-${{ hashFiles('retro/systems.py', 'tests/fetch_assets.py') }}
+          restore-keys: retro-assets-linux-x86_64-
+      - name: Fetch anything the cache did not have
+        run: python tests/fetch_assets.py
+      - name: Run the emulator tests
+        # One libretro core may be loaded per *process*, so -n (separate
+        # processes) is safe and roughly halves this; threads would not be.
+        run: pytest -m emulator -n 2 --durations=10
 
-          from PIL import Image
-
-          assert Path("out.png").is_file(), "out.png was not written"
-          image = Image.open("out.png").convert("RGB")
-          # The Game Boy's pixels are square, so 160x144 doubles to exactly
-          # 320x288 once the core's reported aspect ratio is applied.
-          assert image.size == (320, 288), f"Unexpected screenshot size: {image.size}"
-          colors = image.getcolors(maxcolors=256 * 256 * 256)
-          assert len(colors) >= 3, f"Expected at least 3 distinct colors, got {len(colors)}"
-          print(f"OK: {image.size[0]}x{image.size[1]} with {len(colors)} distinct colors")
-          EOF
-      - name: Record a clip
-        run: python retro/emulator.py ./gambatte_libretro.so dmg-acid2.gb out.webp 300
-      - name: Check the clip
-        run: |
-          python - <<'EOF'
-          from pathlib import Path
-
-          from PIL import Image
-
-          data = Path("out.webp").read_bytes()
-          assert data[:4] == b"RIFF" and data[8:12] == b"WEBP", data[:12]
-          clip = Image.open("out.webp")
-          assert clip.format == "WEBP", clip.format
-          assert clip.size == (320, 288), clip.size
-          assert clip.is_animated and clip.n_frames >= 2, clip.n_frames
-          # loop=1 means "play through once", which is what the Replay button
-          # exists for; loop=0 would flicker forever in a busy channel.
-          assert clip.info.get("loop") == 1, clip.info.get("loop")
-          print(f"OK: {len(data)} byte animated WebP, {clip.n_frames} frames, loop=1")
-          EOF
-
-      - name: The clip plays at the speed the game ran at
-        # Animated WebP stores each frame's duration in milliseconds, so a
-        # 15 fps clip off a 59.73 fps core is 67ms a frame and the whole thing
-        # plays in the time it took to emulate. (GIF stores centiseconds and
-        # cannot be exact; it is a fallback that is never chosen automatically.)
-        run: |
-          python - <<'EOF'
-          import importlib.util
-          import struct
-
-          spec = importlib.util.spec_from_file_location("emulator", "retro/emulator.py")
-          E = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(E)
-
-          def anmf(data):
-              assert data[:4] == b"RIFF" and data[8:12] == b"WEBP", data[:12]
-              off, durations = 12, []
-              while off + 8 <= len(data):
-                  fourcc = data[off:off + 4]
-                  size = struct.unpack("<I", data[off + 4:off + 8])[0]
-                  if fourcc == b"ANMF":
-                      durations.append(
-                          int.from_bytes(data[off + 20:off + 23], "little")
-                      )
-                  off += 8 + size + (size & 1)
-              return durations
-
-          assert E.CLIP_SECONDS == 4, E.CLIP_SECONDS
-          # uCity rather than dmg-acid2: a screen where nothing whatsoever
-          # moves is collapsed by libwebp into a single still frame with no
-          # animation chunks at all, which is correct but has no timing to
-          # check.
-          emulator = E.RetroEmulator("./gambatte_libretro.so", "ucity.gbc")
-          emulator.start()
-          emulator.advance(emulator.frames_for_seconds(3))
-          frames = emulator.frames_for_seconds(E.CLIP_SECONDS)
-          data = emulator.record(frames)
-          durations = anmf(data)
-          step = max(1, round(emulator.fps / E.CLIP_FPS))
-          emulated = 1000 * frames / emulator.fps
-          played = sum(durations)
-          assert durations, "no animation frames at all"
-          # libwebp merges runs of identical frames and sums their durations,
-          # so the total is the contract, not the per-frame value.
-          assert abs(played - emulated) / emulated < 0.01, (played, emulated)
-          assert len(durations) <= -(-frames // step), (len(durations), frames, step)
-          # Milliseconds, not centiseconds: a 15 fps clip is 67ms a frame.
-          assert durations[0] == round(1000 * step / emulator.fps), durations[0]
-          # A press scheduled at frame 0 is down before the first captured
-          # frame, so a clip never opens on the picture from before the press.
-          emulator.advance(60)
-          state = emulator.save_state()
-          quiet = emulator.record(frames)
-          emulator.load_state(state)
-          pressed = emulator.record(frames, presses=[("start", 0, 10)])
-          assert quiet != pressed, "the press never reached the clip"
-          emulator.stop()
-          print(f"OK: {len(durations)} frames, {played}ms played vs "
-                f"{emulated:.0f}ms emulated ({len(data) // 1024} KiB)")
-          EOF
-
-      - name: A core's options can be read without a ROM
-        # Most cores declare their options from retro_set_environment, before
-        # any content exists, so `[p]retroset coreoptions` can read them by
-        # loading the core on its own. This is the low-level Core path, not
-        # the session builder: the builder refuses to run without content.
-        run: |
-          python - <<'EOF'
-          import importlib.util
-
-          spec = importlib.util.spec_from_file_location("emulator", "retro/emulator.py")
-          E = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(E)
-
-          definitions = E.probe_core_options("./gambatte_libretro.so")
-          assert len(definitions) >= 30, f"expected ~32 options, got {len(definitions)}"
-          assert all(isinstance(k, str) for k in definitions), "keys must be text"
-
-          option = definitions["gambatte_gb_colorization"]
-          assert option["desc"] == "GB Colorization", option["desc"]
-          assert option["default"] == "disabled", option["default"]
-          values = [value for value, _ in option["values"]]
-          # libretro pads the value array with NULLs; none of that may leak.
-          assert all(values), values
-          for wanted in ("disabled", "auto", "GBC", "SGB"):
-              assert wanted in values, (wanted, values)
-          assert option["info"], "the option should carry its help text"
-          print(f"OK: {len(definitions)} options read from the core with no ROM")
-          print(f"OK: gambatte_gb_colorization = {option['default']} of {values}")
-          EOF
-
-      - name: A core option changes what the core actually draws
-        # dmg-acid2 is a plain Game Boy ROM, so Gambatte's colorization option
-        # is the difference between the four Game Boy greys and a palette. If
-        # the option never reached the core, all three would be identical.
-        run: |
-          python - <<'EOF'
-          import hashlib
-          import importlib.util
-          import io
-
-          from PIL import Image
-
-          spec = importlib.util.spec_from_file_location("emulator", "retro/emulator.py")
-          E = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(E)
-
-          shots = {}
-          for wanted in ("disabled", "GBC", "SGB"):
-              emulator = E.RetroEmulator(
-                  "./gambatte_libretro.so", "dmg-acid2.gb",
-                  options={"gambatte_gb_colorization": wanted},
-              )
-              emulator.start()
-              emulator.advance(emulator.frames_for_seconds(4))
-              png = emulator.screenshot()
-              image = Image.open(io.BytesIO(png)).convert("RGB")
-              seen = emulator.option_value("gambatte_gb_colorization")
-              assert seen == wanted, (wanted, seen)
-              shots[wanted] = (len(image.getcolors(1 << 24)),
-                               hashlib.sha256(png).hexdigest())
-              emulator.stop()
-              print(f"OK {wanted:<9} {shots[wanted][0]} colours "
-                    f"{shots[wanted][1][:12]}")
-
-          assert shots["disabled"][0] == 4, shots["disabled"]
-          assert shots["GBC"][0] > 4, shots["GBC"]
-          assert len({digest for _, digest in shots.values()}) == 3, shots
-
-          # A key or value the core does not know must not stop a game: the
-          # option driver validates and hands the core its own default.
-          emulator = E.RetroEmulator(
-              "./gambatte_libretro.so", "dmg-acid2.gb",
-              options={"gambatte_not_a_real_option": "x",
-                       "gambatte_gb_colorization": "not-a-real-value"},
-          )
-          emulator.start()
-          emulator.advance(60)
-          assert emulator.started and emulator.screenshot()
-          assert emulator.set_option("gambatte_gb_colorization", "SGB")
-          emulator.stop()
-          print("OK: an unusable core option degrades to the default")
-          EOF
-
-      - name: Battery saves (SRAM) round-trip, and survive a core update
-        # A save state is only loadable by the build of the core that wrote
-        # it, so updating a core invalidates every one on disk. The
-        # cartridge's battery save is not, which is why the cog keeps both.
-        run: |
-          python - <<'EOF'
-          import importlib.util
-
-          spec = importlib.util.spec_from_file_location("emulator", "retro/emulator.py")
-          E = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(E)
-
-          CORE = "./gambatte_libretro.so"
-
-          # A cartridge with no battery must be silent, not an error.
-          plain = E.RetroEmulator(CORE, "dmg-acid2.gb")
-          plain.start()
-          plain.advance(60)
-          assert plain.sram_size == 0, plain.sram_size
-          assert plain.save_sram() is None, "no battery means None, not b''"
-          assert plain.load_sram(b"x" * 16) is False
-          plain.stop()
-          print("OK: dmg-acid2 has no battery, and says so quietly")
-
-          # uCity's cartridge has one.
-          first = E.RetroEmulator(CORE, "ucity.gbc")
-          first.start()
-          first.advance(first.frames_for_seconds(3))
-          size = first.sram_size
-          assert size == 131072, f"expected 128 KiB of SRAM, got {size}"
-          marker = (bytes(range(256)) * (size // 256 + 1))[:size]
-          assert first.load_sram(marker) is True
-          assert first.save_sram() == marker
-          assert first.load_sram(b"\0" * 100) is False, "a wrong size must be refused"
-          assert first.load_sram(b"") is False
-          first.advance(120)
-          kept = first.save_sram()
-          state = first.save_state()
-          first.stop()
-          print(f"OK: {size} bytes of battery save, written and read back")
-
-          # The fallback the whole feature exists for: a save state the core
-          # will not take (faked by truncating it, which is the same failure
-          # a core update produces) still leaves the battery save usable.
-          after = E.RetroEmulator(CORE, "ucity.gbc")
-          after.start()
-          rejected = None
-          try:
-              after.load_state(state[: len(state) // 2])
-          except E.EmulatorError as error:
-              rejected = str(error)
-          assert rejected and "expects" in rejected, rejected
-          assert after.save_sram() != kept, "a fresh boot should not have it yet"
-          assert after.load_sram(kept) is True
-          after.advance(120)
-          assert after.save_sram() == kept, "the in-game save must survive"
-          after.stop()
-          print(f"OK: a rejected save state ({rejected.split(';')[0]}) still "
-                "leaves the battery save restorable")
-
-          # And a matching state still loads, so the fallback is a fallback.
-          exact = E.RetroEmulator(CORE, "ucity.gbc")
-          exact.start()
-          exact.load_state(state)
-          exact.stop()
-          print("OK: a matching save state still restores the exact moment")
-          EOF
-
-  red-import:
+  # Does the buildbot still publish every core systems.py recommends? This
+  # is the one check that can break without anybody touching the repository,
+  # so it runs on master and on a weekly schedule rather than on every PR.
+  buildbot:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
-      - name: Install Red-DiscordBot
-        run: pip install Red-DiscordBot
-      - name: Import the cogs
-        run: python -c "import retro.RetroCog, retro.RetroView, retro.systems, retro.archives"
-      - name: Every console's controls are a payload Discord will accept
-        # A component Discord refuses is a 400 on the send, which takes out the
-        # whole command -- that is exactly how an invalid button emoji broke
-        # this cog in production. So the real view is built for every console
-        # and the dict discord.py would put on the wire is inspected.
-        run: |
-          python - <<'EOF'
-          import discord
-
-          from retro import RetroView as V
-          from retro import systems as S
-
-          class FakeBot:
-              def get_channel(self, _id):
-                  return None
-
-          class FakeCog:
-              bot = FakeBot()
-
-          print(f"discord.py {discord.__version__}")
-          for system in S.SYSTEMS:
-              view = V.RetroView(
-                  FakeCog(), game_name="T", slug="t",
-                  rom_filename=f"t.{system.extensions[0]}",
-                  channel_id=1, system=system,
-              )
-              rows = view.to_components()
-              assert len(rows) <= 5, (system.key, len(rows))
-              buttons = []
-              for row in rows:
-                  assert row["type"] == 1, row
-                  assert 1 <= len(row["components"]) <= 5, (system.key, row)
-                  buttons.extend(row["components"])
-              assert len(buttons) <= 25, (system.key, len(buttons))
-
-              ids = []
-              for button in buttons:
-                  assert button["type"] == 2, button
-                  label, emoji = button.get("label"), button.get("emoji")
-                  # Discord refuses a button with neither, and refuses an
-                  # empty or whitespace-only label.
-                  assert label or emoji, (system.key, button)
-                  if label is not None:
-                      assert 1 <= len(label) <= 80, (system.key, repr(label))
-                      assert label.strip(), (system.key, repr(label))
-                  if emoji is not None:
-                      problem = S.emoji_problem(emoji["name"])
-                      assert problem is None, (system.key, problem)
-                  custom_id = button["custom_id"]
-                  assert 1 <= len(custom_id) <= 100, (system.key, custom_id)
-                  assert custom_id.startswith("libretro:"), custom_id
-                  ids.append(custom_id)
-                  if ":spacer:" in custom_id:
-                      assert button["disabled"], ("a spacer must be inert", button)
-
-              assert len(set(ids)) == len(ids), (system.key, ids)
-              assert view.is_persistent(), system.key
-              # The Stop button was removed; [p]retrostop is the way to stop.
-              assert not any(i.endswith(":stop") for i in ids), ids
-              # Existing messages route clicks by these exact strings.
-              for button in system.buttons:
-                  assert f"libretro:press:{button.field}" in ids, (system.key, button)
-              shape = " | ".join(
-                  " ".join((c.get("emoji") or {}).get("name") or c["label"]
-                           for c in r["components"])
-                  for r in rows
-              )
-              print(f"OK {system.key:<10} {len(buttons):>2} components, "
-                    f"{len(rows)} rows  {shape}")
-
-          # A click whose custom_id this view no longer has (an old message's
-          # Stop button) must be dropped, not raised.
-          store = discord.ui.view.ViewStore(None)
-          class Msg: id = 1
-          class Inter: message = Msg()
-          store.dispatch_view(2, "libretro:stop", Inter())
-          print("OK a click on a removed button is discarded silently")
-          EOF
-      - name: Playing needs no Embed Links permission
-        # The clip is a plain attachment and the controls are buttons, so the
-        # play loop must not ask for Embed Links. One owner-only command does.
-        run: |
-          python - <<'EOF'
-          from retro.RetroCog import RetroCog
-
-          play = {name for name, on in RetroCog.retro.requires.bot_perms if on}
-          assert play == {"attach_files"}, play
-          settings = {n for n, on in RetroCog.retroset_settings.requires.bot_perms if on}
-          assert settings == {"embed_links"}, settings
-          print(f"OK [p]retro needs {sorted(play)}")
-          print(f"OK [p]retroset settings needs {sorted(settings)}")
-          EOF
-      - name: The hold and clip defaults
-        run: |
-          python - <<'EOF'
-          from retro.RetroView import DEFAULT_HOLD_MS, MAX_HOLD_MS, MIN_HOLD_MS
-          import retro.RetroView as V
-          from retro.emulator import CLIP_SECONDS, MAX_CLIP_SECONDS, MIN_CLIP_SECONDS
-
-          assert CLIP_SECONDS == 4, CLIP_SECONDS
-          assert (MIN_CLIP_SECONDS, MAX_CLIP_SECONDS) == (1, 15)
-          assert DEFAULT_HOLD_MS == 160, DEFAULT_HOLD_MS
-          assert (MIN_HOLD_MS, MAX_HOLD_MS) == (50, 2000)
-          # Directions are no longer held longer than anything else: a Game Boy
-          # walk cycle is 16 frames (~270ms), so a longer hold walks two tiles.
-          assert not hasattr(V, "DPAD_HOLD_MULTIPLIER")
-          assert round(59.727 * DEFAULT_HOLD_MS / 1000) < 16
-          print(f"OK {CLIP_SECONDS}s clips, {DEFAULT_HOLD_MS}ms on every button")
-          EOF
-      - name: Core option key resolution and value fallback
-        # These decide what a typed-in option name means and what the core
-        # will really read, so they are checked directly rather than through
-        # Discord. Needs Red, because they are methods on the cog.
-        run: |
-          python - <<'EOF'
-          from retro.RetroCog import OPTION_RESET, RetroCog
-
-          resolve = RetroCog._resolve_option_key
-          definitions = {
-              "gambatte_gb_colorization": {"default": "disabled",
-                                           "values": [["disabled", "disabled"],
-                                                      ["auto", "Auto"],
-                                                      ["GBC", "GBC"]]},
-              "gambatte_gbc_colorization": {"default": "off", "values": [["off", "Off"]]},
-              "gambatte_gbc_color_correction": {"default": "GBC only",
-                                                "values": [["GBC only", "GBC only"]]},
-              "gambatte_mix_frames": {"default": "disabled",
-                                      "values": [["disabled", "disabled"]]},
-              "gambatte_gb_mix_frames": {"default": "disabled",
-                                         "values": [["disabled", "disabled"]]},
-          }
-          for typed, expected in [
-              ("gambatte_gb_colorization", "gambatte_gb_colorization"),  # exact
-              ("gb_colorization", "gambatte_gb_colorization"),           # <core>_<key>
-              ("GB_COLORIZATION", "gambatte_gb_colorization"),           # case
-              ("`gb_colorization`", "gambatte_gb_colorization"),         # backticks
-              ("color_correction", "gambatte_gbc_color_correction"),     # unique suffix
-              ("mix_frames", "gambatte_mix_frames"),  # exact <core>_<key> beats suffix
-          ]:
-              key, error = resolve("gambatte", definitions, typed, "!")
-              assert key == expected and error is None, (typed, key, error)
-              print(f"OK {typed!r:<28} -> {key}")
-
-          # Two options end in `_colorization` and neither is
-          # `gambatte_colorization`, so this must be refused, not guessed.
-          key, error = resolve("gambatte", definitions, "colorization", "!")
-          assert key is None and error and "matches 2" in error, (key, error)
-          assert "gb_colorization" in error and "gbc_colorization" in error, error
-          print(f"OK ambiguity refused: {error}")
-
-          key, error = resolve("gambatte", definitions, "nonsense", "!")
-          assert key is None and "no option called" in error, (key, error)
-          # mednafen_ngp names its option `ngp_language`, so a prefix is never
-          # assumed when nothing is known about the core.
-          key, error = resolve("mednafen_ngp", {}, "language", "!")
-          assert key is None and error is None, (key, error)
-          print("OK an unknown core prefix is not guessed")
-
-          # What the core will really read, which is not always what is stored:
-          # libretro falls back to the default for a value it does not offer.
-          colorization = definitions["gambatte_gb_colorization"]
-          assert RetroCog._option_default(colorization) == "disabled"
-          assert RetroCog._effective_value(colorization, None) == "disabled"
-          assert RetroCog._effective_value(colorization, "GBC") == "GBC"
-          assert RetroCog._effective_value(colorization, "rainbow") == "disabled"
-          # A definition with no declared default uses its first value.
-          assert RetroCog._option_default({"default": "", "values": [["a", "A"]]}) == "a"
-          assert RetroCog._short_key("gambatte", "gambatte_gb_colorization") == "gb_colorization"
-          assert RetroCog._short_key("fceumm", "ngp_language") == "ngp_language"
-          print("OK effective values fall back exactly as libretro does")
-
-          # The sentinel must not collide with a real value; see the cores job.
-          assert OPTION_RESET == "reset", OPTION_RESET
-          assert OPTION_RESET not in ("default", "none", "off", "disabled")
-          print(f"OK the reset sentinel is {OPTION_RESET!r}")
-          EOF
-      - name: Nothing is imported that info.json does not declare
-        # The cog must run on nothing but what Red ships plus what
-        # info.json["requirements"] installs. Red does NOT ship Pillow, so it
-        # has to stay declared.
-        run: |
-          python - <<'EOF'
-          import ast
-          import json
-          import sys
-          from pathlib import Path
-
-          declared = {
-              "libretro.py": "libretro",
-              "pillow": "PIL",
-          }
-          requirements = json.loads(Path("retro/info.json").read_text())["requirements"]
-          assert sorted(requirements) == sorted(declared), requirements
-
-          # Provided by Red-DiscordBot itself.
-          from_red = {"redbot", "discord", "aiohttp"}
-          allowed = set(sys.stdlib_module_names) | from_red | set(declared.values())
-
-          used = {}
-          for path in sorted(Path("retro").glob("*.py")):
-              for node in ast.walk(ast.parse(path.read_text())):
-                  if isinstance(node, ast.Import):
-                      names = [alias.name for alias in node.names]
-                  elif isinstance(node, ast.ImportFrom):
-                      if node.level:
-                          continue  # relative, i.e. this cog
-                      names = [node.module or ""]
-                  else:
-                      continue
-                  for name in names:
-                      used.setdefault(name.split(".")[0], set()).add(path.name)
-
-          undeclared = {k: sorted(v) for k, v in used.items() if k not in allowed}
-          assert not undeclared, f"undeclared imports: {undeclared}"
-          for name in sorted(used):
-              where = "stdlib" if name in sys.stdlib_module_names else (
-                  "Red" if name in from_red else "info.json requirements")
-              print(f"OK {name:<14} {where}")
-          EOF
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install pytest
+        run: pip install pytest pytest-asyncio
+      - name: Every recommended core exists on the buildbot
+        env:
+          RETRO_TEST_NETWORK: "1"
+        run: pytest -m network --durations=10

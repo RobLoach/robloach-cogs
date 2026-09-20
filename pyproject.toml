@@ -1,0 +1,40 @@
+# Tooling configuration for developing this cogs repository.
+#
+# This file is NOT a package definition: the repo is installed by Red's
+# Downloader, which reads only info.json. Nothing here affects what the cog
+# needs at runtime -- retro/info.json's "requirements" stays exactly
+# ["libretro.py", "pillow"]. The development tools live in
+# requirements-dev.txt and are used by CI and by people hacking on the cog.
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config -ra"
+# The cog is async from end to end (commands, button callbacks, the idle
+# task), so every `async def test_` is run without decorating each one.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "emulator: needs libretro.py, Pillow and a real core/ROM (slow)",
+    "slow: takes more than about a second",
+    "network: reaches out to the libretro buildbot; set RETRO_TEST_NETWORK=1",
+    "redbot: needs the real Red-DiscordBot rather than tests/stubs",
+]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["tests/stubs"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import order, UP pyupgrade, B bugbear.
+# Deliberately not the whole catalogue: this is a hobby cog, and a lint that
+# has to be silenced everywhere teaches nobody anything.
+select = ["E", "W", "F", "I", "B"]
+ignore = [
+    "E501",  # long lines: the tables in systems.py are laid out to be read
+    "B011",  # `assert False` reads fine in a test
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The tests build deliberately malformed input and poke at privates.
+"tests/*" = ["B008", "B018"]

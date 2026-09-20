@@ -1,0 +1,18 @@
+# Development and CI dependencies. NOT cog requirements: what the cog needs
+# at runtime is retro/info.json's "requirements" (libretro.py and pillow) and
+# whatever Red-DiscordBot itself ships. Nothing in retro/*.py may import
+# anything from this file -- tests/test_packaging.py enforces that.
+
+pytest>=8.0
+pytest-asyncio>=0.24
+hypothesis>=6.0
+ruff>=0.6
+# Only worth it for `pytest -m emulator -n 2`, which halves the slow half;
+# the fast suite is quicker without it. Must be process-level (-n), because
+# a libretro core is a shared object with process-global state.
+pytest-xdist>=3.0
+
+# What the cog itself needs, so a dev environment can run the whole suite:
+libretro.py
+pillow
+discord.py

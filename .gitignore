@@ -1,1 +1,6 @@
 __pycache__
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+# Cores and ROMs for the slow tests; see tests/README.md.
+test-assets/

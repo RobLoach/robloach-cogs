@@ -16,6 +16,19 @@ Experimental Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-Disco
 [p]load <list of cogs>
 ```
 
+## Development
+
+```
+pip install -r requirements-dev.txt
+pytest -m "not emulator"    # the fast suite, about a second
+pytest                      # everything this machine can run
+ruff check .
+```
+
+The slow tests drive real libretro cores; `python tests/fetch_assets.py`
+downloads the cores and freely-distributable ROMs they need, and they skip
+without them. See [tests/README.md](tests/README.md).
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
