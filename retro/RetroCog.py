@@ -17,7 +17,14 @@ from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.chat_formatting import pagify
 
-from .emulator import MIN_ROM_SIZE, EmulatorError, RetroEmulator
+from .emulator import (
+    CLIP_SECONDS,
+    MAX_CLIP_SECONDS,
+    MIN_CLIP_SECONDS,
+    MIN_ROM_SIZE,
+    EmulatorError,
+    RetroEmulator,
+)
 from .RetroView import (
     BOOT_FRAMES,
     DEFAULT_TIMEOUT_MINUTES,
@@ -62,6 +69,7 @@ class RetroCog(commands.Cog):
         self.config.register_global(
             core_path="",
             session_timeout_minutes=DEFAULT_TIMEOUT_MINUTES,
+            clip_seconds=CLIP_SECONDS,
             games={}
         )
         # A session outlives its emulator, so the record of one lives here
@@ -105,13 +113,16 @@ class RetroCog(commands.Cog):
     async def _restore_sessions(self) -> None:
         """Rebuild hibernated sessions from Config and re-arm their buttons."""
         timeout_minutes = await self.config.session_timeout_minutes()
+        clip_seconds = await self.config.clip_seconds()
         for channel_id, data in (await self.config.all_channels()).items():
             record = data.get("session")
             if not record:
                 continue
             record.setdefault("channel_id", channel_id)
             try:
-                view = RetroView.from_record(self, record, timeout_minutes)
+                view = RetroView.from_record(
+                    self, record, timeout_minutes, clip_seconds
+                )
             except Exception:
                 log.exception(
                     "Ignoring an unreadable Libretro session record for channel %s",
@@ -667,6 +678,7 @@ class RetroCog(commands.Cog):
             starter_id=ctx.author.id,
             source=source,
             timeout_minutes=timeout_minutes,
+            clip_seconds=await self.config.clip_seconds(),
         )
         self.sessions[ctx.channel.id] = view
 
@@ -824,6 +836,28 @@ class RetroCog(commands.Cog):
             "input. Pressing a button wakes them up again."
         )
 
+    @retroset.command(name="cliplength", aliases=["clip"])
+    async def retroset_cliplength(self, ctx: commands.Context, seconds: int) -> None:
+        """
+        Set how many seconds of play each clip shows.
+
+        Every button press posts an animated clip of what happened next.
+        Longer clips show more of the game but take longer to record and
+        upload. The value is clamped between 1 and 15 seconds and applies to
+        clips recorded afterwards. The default is 5 seconds.
+
+        **Examples:**
+        - `[p]retroset cliplength 8`
+
+        **Arguments:**
+        - `<seconds>` - Seconds of play per clip (1-15).
+        """
+        seconds = max(MIN_CLIP_SECONDS, min(MAX_CLIP_SECONDS, seconds))
+        await self.config.clip_seconds.set(seconds)
+        for view in self.sessions.values():
+            view.clip_seconds = seconds
+        await ctx.send(f"Clips now show {seconds} seconds of play.")
+
     @retroset.group(name="game")
     async def retroset_game(self, ctx: commands.Context) -> None:
         """
@@ -922,6 +956,12 @@ class RetroCog(commands.Cog):
                 f"{timeout_minutes} minutes without input. Sleeping games are "
                 "saved and wake up on the next button press."
             ),
+            inline=False,
+        )
+        clip_seconds = await self.config.clip_seconds()
+        embed.add_field(
+            name="Clip length",
+            value=f"{clip_seconds} seconds of play per button press",
             inline=False,
         )
         games = await self.config.games()

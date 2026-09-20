@@ -24,6 +24,8 @@ __all__ = [
     "CLIP_SECONDS",
     "CLIP_FRAMES",
     "GIF_FPS",
+    "MIN_CLIP_SECONDS",
+    "MAX_CLIP_SECONDS",
 ]
 
 log = logging.getLogger("red.robloach.retro.emulator")
@@ -35,15 +37,19 @@ BUTTONS = ("a", "b", "start", "select", "up", "down", "left", "right")
 # and Gambatte's retro_load_game rejects anything smaller.
 MIN_ROM_SIZE = 0x150
 
-# The Game Boy renders 60 frames a second, so a four second clip is 240
-# emulated frames. Sampling every 4th frame gives a 15 fps GIF of 60 frames,
+# The Game Boy renders 60 frames a second, so a five second clip is 300
+# emulated frames. Sampling every 4th frame gives a 15 fps GIF of 75 frames,
 # each shown for 1000/15 = 67ms. GIF only stores durations in hundredths of a
 # second, so that is rounded to 70ms and 4 seconds of play takes 4.2 seconds
 # to watch; rounding down instead would play the clip 10% too fast.
 FRAMES_PER_SECOND = 60
-CLIP_SECONDS = 4
+CLIP_SECONDS = 5
 CLIP_FRAMES = FRAMES_PER_SECOND * CLIP_SECONDS
 GIF_FPS = 15
+
+# Bounds for the configurable clip length.
+MIN_CLIP_SECONDS = 1
+MAX_CLIP_SECONDS = 15
 
 # The Game Boy palette is tiny (4 shades on DMG, a few dozen on GBC), so
 # quantizing to this many colours is effectively lossless and keeps the GIF

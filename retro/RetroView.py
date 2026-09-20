@@ -8,13 +8,13 @@ import typing
 import discord
 from redbot.core import commands
 
-from .emulator import CLIP_FRAMES, EmulatorError, RetroEmulator
+from .emulator import CLIP_SECONDS, FRAMES_PER_SECOND, EmulatorError, RetroEmulator
 
 log = logging.getLogger("red.robloach.retro")
 
 # Frames to hold a button down at the start of a clip (60 frames is one
 # second of game time), and frames to run before the first clip so the boot
-# logo is out of the way. CLIP_FRAMES (240, four seconds) of each press is
+# logo is out of the way. The configured clip length of each press is
 # recorded as the GIF that gets posted.
 HOLD_FRAMES = 8
 BOOT_FRAMES = 180
@@ -58,6 +58,7 @@ class RetroView(discord.ui.View):
         source: str = "",
         message_id: typing.Optional[int] = None,
         timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
+        clip_seconds: int = CLIP_SECONDS,
     ) -> None:
         # Persistent views must not time out; idle sessions are hibernated by
         # the cog's background task instead.
@@ -72,6 +73,7 @@ class RetroView(discord.ui.View):
         self.source: str = source
         self.message_id: typing.Optional[int] = message_id
         self.timeout_minutes: int = timeout_minutes
+        self.clip_seconds: int = clip_seconds
         self.screen_filename: str = self._screen_filename(game_name)
 
         # The live emulator, or None while hibernated.
@@ -111,6 +113,7 @@ class RetroView(discord.ui.View):
         cog: commands.Cog,
         record: dict,
         timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
+        clip_seconds: int = CLIP_SECONDS,
     ) -> "RetroView":
         """Rebuild a hibernated session from Config after a restart."""
         view = cls(
@@ -124,6 +127,7 @@ class RetroView(discord.ui.View):
             source=record.get("source") or "",
             message_id=record.get("message_id"),
             timeout_minutes=timeout_minutes,
+            clip_seconds=clip_seconds,
         )
         view.last_active = float(record.get("last_active") or time.time())
         return view
@@ -256,12 +260,16 @@ class RetroView(discord.ui.View):
         self.message_id = self.message.id
         return self.message
 
-    @staticmethod
-    def _boot(emulator: RetroEmulator) -> bytes:
+    @property
+    def clip_frames(self) -> int:
+        """How many emulated frames one clip covers."""
+        return FRAMES_PER_SECOND * self.clip_seconds
+
+    def _boot(self, emulator: RetroEmulator) -> bytes:
         emulator.start()
         # Get past the boot logo first, then record the opening of the game.
         emulator.advance(BOOT_FRAMES)
-        return emulator.record(CLIP_FRAMES)
+        return emulator.record(self.clip_frames)
 
     def run_press(self, button: typing.Optional[str]) -> bytes:
         """Emulate one press and return the clip. Runs in a worker thread."""
@@ -271,7 +279,7 @@ class RetroView(discord.ui.View):
         if self.emulator is None:
             raise EmulatorError("The emulator is not running.")
         press = None if button is None else (button, HOLD_FRAMES)
-        return self.emulator.record(CLIP_FRAMES, press=press)
+        return self.emulator.record(self.clip_frames, press=press)
 
     # -- Interactions -------------------------------------------------------
 
