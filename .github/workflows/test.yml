@@ -1,0 +1,74 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Compile all Python sources
+        run: python -m compileall assistantextras jackett pyboy
+      - name: Validate the info.json files
+        run: |
+          for file in info.json */info.json; do
+            echo "Checking $file"
+            python -m json.tool "$file" > /dev/null
+          done
+
+  emulator-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # libretro.py resolves to 0.6.x on Python 3.11 (what Red-DiscordBot
+        # runs on) and to the latest release on Python 3.13.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install the emulator dependencies
+        run: pip install "libretro.py" pillow
+      - name: Download the Gambatte core
+        run: |
+          curl -fsSLO https://buildbot.libretro.com/nightly/linux/x86_64/latest/gambatte_libretro.so.zip
+          unzip gambatte_libretro.so.zip
+      - name: Download the dmg-acid2 test ROM
+        run: curl -fsSLO https://github.com/mattcurrie/dmg-acid2/releases/download/v1.0/dmg-acid2.gb
+      - name: Run the emulator
+        run: python pyboy/emulator.py gambatte_libretro.so dmg-acid2.gb out.png 120
+      - name: Check the screenshot
+        run: |
+          python - <<'EOF'
+          from pathlib import Path
+
+          from PIL import Image
+
+          assert Path("out.png").is_file(), "out.png was not written"
+          image = Image.open("out.png").convert("RGB")
+          assert image.size == (320, 288), f"Unexpected screenshot size: {image.size}"
+          colors = image.getcolors(maxcolors=256 * 256 * 256)
+          assert len(colors) >= 3, f"Expected at least 3 distinct colors, got {len(colors)}"
+          print(f"OK: {image.size[0]}x{image.size[1]} with {len(colors)} distinct colors")
+          EOF
+
+  red-import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install Red-DiscordBot
+        run: pip install Red-DiscordBot
+      - name: Import the cogs
+        run: python -c "import pyboy.PyBoyCog, pyboy.PyBoyView, jackett.JackettCog"

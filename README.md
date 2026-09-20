@@ -2,6 +2,14 @@
 
 Experimental Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot).
 
+## Cogs
+
+| Cog | Description |
+| --- | --- |
+| [AssistantExtras](assistantextras) | Give Assistant extra tooling from your cogs |
+| [Jackett](jackett) | API support for your favorite torrent trackers |
+| [PyBoy](pyboy) | Play Game Boy games in Discord |
+
 ## Installation
 
 ```
