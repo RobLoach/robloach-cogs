@@ -133,7 +133,7 @@ class _ReplayButton(discord.ui.Button):
     def __init__(self, row: int) -> None:
         super().__init__(
             label="Replay",
-            emoji="\N{CLOCKWISE OPEN CIRCLE ARROW}",
+            emoji="\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS}",
             style=discord.ButtonStyle.secondary,
             row=row,
             custom_id=f"{CUSTOM_ID_PREFIX}:replay",
