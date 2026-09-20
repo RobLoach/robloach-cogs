@@ -13,6 +13,7 @@ libretro buildbot.
 
 import sys
 import typing
+import unicodedata
 
 __all__ = [
     "Button",
@@ -27,6 +28,13 @@ __all__ = [
     "system_by_key",
     "core_name_from_filename",
     "extensions_for_core",
+    "WAIT_EMOJI",
+    "REPLAY_EMOJI",
+    "STOP_EMOJI",
+    "EMOJI_CODEPOINTS",
+    "all_button_emoji",
+    "emoji_problem",
+    "validate_emoji",
 ]
 
 
@@ -45,6 +53,128 @@ class Button(typing.NamedTuple):
     # so the things you press constantly stand out from Start/Select.
     style: str = "secondary"
     emoji: typing.Optional[str] = None
+
+
+# -- Button emoji -------------------------------------------------------------
+#
+# Discord validates every component emoji server-side. A character that is not
+# a real Unicode emoji is rejected with
+#
+#   400 Bad Request (error code: 50035): Invalid Form Body
+#   In components.2.components.1.emoji.name: Invalid emoji
+#
+# and, because that is a 400 on the *send*, one bad character breaks the whole
+# command rather than rendering a blank button. This happened for real: the
+# Replay button briefly used U+21BB CLOCKWISE OPEN CIRCLE ARROW, which is an
+# ordinary symbol with no emoji form at all.
+#
+# So every emoji the cog can put on a button is listed here, deliberately, and
+# validate_emoji() checks the set. Python's unicodedata carries no emoji
+# properties whatsoever (there is no Emoji or Emoji_Presentation lookup in the
+# standard library), so the one property that matters -- whether the character
+# already renders as an emoji or needs a U+FE0F VARIATION SELECTOR-16 to be
+# coerced into one -- is recorded here by hand from Unicode's emoji-data.txt.
+#
+#   False = Emoji_Presentation=Yes, it is an emoji on its own.
+#   True  = Emoji=Yes but Emoji_Presentation=No, so it MUST carry U+FE0F.
+#
+# A character that is in neither category (U+21BB, for instance) simply is not
+# an emoji and must never appear here.
+EMOJI_CODEPOINTS: typing.Dict[int, bool] = {
+    0x2B06: True,   # UPWARDS BLACK ARROW
+    0x2B07: True,   # DOWNWARDS BLACK ARROW
+    0x2B05: True,   # LEFTWARDS BLACK ARROW
+    0x27A1: True,   # BLACK RIGHTWARDS ARROW
+    0x23E9: False,  # BLACK RIGHT-POINTING DOUBLE TRIANGLE
+    0x23F9: True,   # BLACK SQUARE FOR STOP
+    0x1F501: False,  # CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS
+}
+
+VARIATION_SELECTOR_16 = "\N{VARIATION SELECTOR-16}"
+
+# The three buttons every console's controls end with. They live here rather
+# than in RetroView so that validate_emoji() sees every emoji the cog can
+# render without importing discord.py.
+WAIT_EMOJI = "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE}"
+REPLAY_EMOJI = "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS}"
+STOP_EMOJI = "\N{BLACK SQUARE FOR STOP}\N{VARIATION SELECTOR-16}"
+
+
+def emoji_problem(emoji: str) -> typing.Optional[str]:
+    """
+    Explain why ``emoji`` would not survive a Discord component, or None.
+
+    Only single-codepoint emoji (optionally with a variation selector) are
+    allowed: the cog has no use for flags, skin tones or ZWJ sequences, and
+    refusing them keeps this check exact instead of approximate.
+    """
+    if not isinstance(emoji, str) or not emoji:
+        return "not a non-empty string"
+    characters = list(emoji)
+    selector = False
+    if len(characters) == 2 and characters[1] == VARIATION_SELECTOR_16:
+        selector = True
+        characters.pop()
+    if len(characters) != 1:
+        return (
+            "expected one character, optionally followed by U+FE0F; got "
+            + " ".join(f"U+{ord(c):04X}" for c in emoji)
+        )
+    codepoint = ord(characters[0])
+    if codepoint not in EMOJI_CODEPOINTS:
+        name = unicodedata.name(characters[0], "an unnamed character")
+        return (
+            f"U+{codepoint:04X} ({name}) is not in EMOJI_CODEPOINTS; add it "
+            "there only after checking it really is an emoji Discord accepts"
+        )
+    needs_selector = EMOJI_CODEPOINTS[codepoint]
+    if needs_selector and not selector:
+        return (
+            f"U+{codepoint:04X} has text presentation by default and must be "
+            "followed by U+FE0F VARIATION SELECTOR-16"
+        )
+    if selector and not needs_selector:
+        return (
+            f"U+{codepoint:04X} is already an emoji, so the trailing U+FE0F "
+            "is redundant"
+        )
+    return None
+
+
+def all_button_emoji() -> typing.Tuple[str, ...]:
+    """Every emoji the cog can put on a button, deduplicated and sorted."""
+    found = {WAIT_EMOJI, REPLAY_EMOJI, STOP_EMOJI}
+    for button in DPAD:
+        if button.emoji:
+            found.add(button.emoji)
+    for system in SYSTEMS:
+        for button in system.buttons:
+            if button.emoji:
+                found.add(button.emoji)
+    return tuple(sorted(found))
+
+
+def validate_emoji() -> typing.Tuple[str, ...]:
+    """
+    Check every renderable emoji, raising ValueError on the first bad one.
+
+    Returns the emoji that were checked. Called at import time so a bad
+    character can never reach Discord, and asserted on in CI.
+    """
+    checked = all_button_emoji()
+    for emoji in checked:
+        problem = emoji_problem(emoji)
+        if problem is not None:
+            raise ValueError(f"Unusable button emoji {emoji!r}: {problem}")
+    unused = set(EMOJI_CODEPOINTS) - {
+        ord(e[0]) for e in checked
+    }
+    if unused:
+        raise ValueError(
+            "EMOJI_CODEPOINTS lists codepoints no button uses: "
+            + ", ".join(f"U+{c:04X}" for c in sorted(unused))
+        )
+    return checked
 
 
 # The d-pad is identical on every console here, so every layout starts with
@@ -352,3 +482,8 @@ def core_name_from_filename(filename: str) -> typing.Optional[str]:
     else:
         name = name.rsplit(".", 1)[0]
     return name if name in CORES else None
+
+
+# Fail loudly at import time rather than with a 400 from Discord halfway
+# through somebody's game. This costs a few microseconds once per process.
+validate_emoji()

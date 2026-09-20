@@ -2,10 +2,10 @@
     "author": [
         "Rob Loach"
     ],
-    "install_msg": "Retro installed. Have the bot owner run `[p]retroset download` to grab the emulator cores (about 5 MiB, no BIOS files needed), then play with `[p]retro` and an attached ROM. Save games players can start by name with `[p]retroset game add <name> <url>`.",
+    "install_msg": "Retro installed. Load it with `[p]load retro` and the emulator cores (about 5 MiB, no BIOS files needed) download themselves in the background — `[p]retroset settings` shows the progress, or run `[p]retroset download` to do it now. Then play: attach a ROM or `.zip` to `[p]retro`, or try `[p]retro https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc`. Free homebrew games for every supported console are at https://retrobrews.github.io/ . Save games players can start by name with `[p]retroset game add <name> <url>`.",
     "name": "Retro",
     "short": "Play retro console games in Discord",
-    "description": "Play retro console games together in Discord. Start a game by name, URL, or an attached ROM (homebrew, or one you have the rights to) and control it with buttons under the screen. Eleven consoles are supported, from the Atari 2600 to the Super Nintendo, picked automatically from the file extension, each with its own controller layout. Every press posts an animated clip of the next few seconds. Games save automatically and pick up where they left off, even after the bot restarts. Emulated through libretro.",
+    "description": "Play retro console games together in Discord. Start a game by name, URL, or an attached ROM or .zip (homebrew, or one you have the rights to) and control it with buttons under the screen. Eleven consoles are supported, from the Atari 2600 to the Super Nintendo, picked automatically from the file extension, each with its own controller layout. Every press posts an animated clip of the next few seconds. Games save automatically and pick up where they left off, even after the bot restarts. Cores download themselves, and the bot owner can supply their own BIOS files for cores that need one. Emulated through libretro.",
     "required_cogs": {},
     "requirements": [
         "libretro.py",
@@ -21,5 +21,7 @@
         "games",
         "emulation"
     ],
-    "min_bot_version": "3.5.3"
+    "min_bot_version": "3.5.3",
+    "license": "GPL-3.0-or-later",
+    "end_user_data_statement": "This cog stores the Discord channel and message ID of each game, the ID of the member who started it, the name of the game being played, and a copy of the ROM and its emulator save state, so a game can be resumed later. Nothing is shared with anyone. Cached ROMs and save states are pruned automatically as a channel plays other games."
 }

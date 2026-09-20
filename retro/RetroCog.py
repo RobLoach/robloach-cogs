@@ -17,6 +17,7 @@ from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.chat_formatting import humanize_list, pagify
 
+from . import archives
 from .emulator import (
     CLIP_SECONDS,
     MAX_CLIP_SECONDS,
@@ -51,7 +52,28 @@ log = logging.getLogger("red.robloach.retro")
 MAX_ROM_SIZE = 32 * 1024 * 1024
 MAX_ROM_SIZE_LABEL = "32 MiB"
 
+# Console firmware is small (a Game Boy boot ROM is 256 bytes, a PlayStation
+# BIOS 512 KiB, the largest anyone is likely to install a couple of MiB), so
+# this is only here to stop a mistyped URL filling the bot's disk.
+MAX_BIOS_SIZE = 16 * 1024 * 1024
+MAX_BIOS_SIZE_LABEL = "16 MiB"
+
 BUILDBOT = "https://buildbot.libretro.com/nightly"
+
+# Where to point people who want games they are allowed to play.
+HOMEBREW_URL = "https://retrobrews.github.io/"
+
+# The worked example in the help text: a complete, open source SimCity-like
+# game for the Game Boy Color, MIT licensed, and a direct release download.
+EXAMPLE_GAME = "ucity"
+EXAMPLE_ROM_URL = (
+    "https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc"
+)
+
+# How long to wait before the automatic core download is allowed to try
+# again. Without it, a cog that is reloaded in a loop (or a core the buildbot
+# has stopped publishing) would hit the buildbot on every single load.
+AUTO_DOWNLOAD_COOLDOWN_SECONDS = 6 * 60 * 60
 
 # A libretro core is a shared object with process-global state, so two live
 # cores quietly corrupt each other's emulation (it segfaults the bot often
@@ -67,6 +89,10 @@ IDLE_CHECK_SECONDS = 60
 # switch between games and keep each one's progress. This caps how many of
 # them a single channel keeps on disk.
 MAX_CACHED_GAMES_PER_CHANNEL = 5
+
+
+class DownloadError(RuntimeError):
+    """A download failed for a reason the person who asked should be told."""
 
 
 class RetroCog(commands.Cog):
@@ -90,7 +116,13 @@ class RetroCog(commands.Cog):
             session_timeout_minutes=DEFAULT_TIMEOUT_MINUTES,
             clip_seconds=CLIP_SECONDS,
             hold_ms=DEFAULT_HOLD_MS,
-            games={}
+            games={},
+            # Fetch whatever cores are missing shortly after the cog loads, so
+            # a fresh install can play something without the owner having to
+            # find `[p]retroset download` first.
+            auto_download_cores=True,
+            # When that last ran, so a reload loop cannot hammer the buildbot.
+            auto_download_attempted_at=0.0,
         )
         # A session outlives its emulator, so the record of one lives here
         # and is reloaded when the cog (or the whole bot) starts again.
@@ -101,6 +133,7 @@ class RetroCog(commands.Cog):
         # Serializes every core operation across all channels.
         self.emulator_lock: asyncio.Lock = asyncio.Lock()
         self._idle_task: typing.Optional[asyncio.Task] = None
+        self._download_task: typing.Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
         try:
@@ -112,11 +145,17 @@ class RetroCog(commands.Cog):
         except Exception:
             log.exception("Failed to restore Libretro sessions.")
         self._idle_task = asyncio.create_task(self._hibernation_loop())
+        # Deliberately not awaited: loading the cog must not sit waiting on
+        # the libretro buildbot, and a download that fails must not stop the
+        # cog coming up. _auto_download_loop() swallows everything.
+        self._download_task = asyncio.create_task(self._auto_download_loop())
 
     async def cog_unload(self) -> None:
-        task, self._idle_task = self._idle_task, None
-        if task is not None:
-            task.cancel()
+        for attribute in ("_idle_task", "_download_task"):
+            task = getattr(self, attribute, None)
+            setattr(self, attribute, None)
+            if task is not None:
+                task.cancel()
         for view in list(self.sessions.values()):
             try:
                 await self.hibernate(
@@ -232,7 +271,20 @@ class RetroCog(commands.Cog):
             )
 
     async def _save_record(self, view: RetroView) -> None:
-        await self.config.channel_from_id(view.channel_id).session.set(view.to_record())
+        """Write the session record. Never raises: it is on every save path."""
+        try:
+            await self.config.channel_from_id(view.channel_id).session.set(
+                view.to_record()
+            )
+        except Exception:
+            # A Config write can fail on a full disk or a locked database. The
+            # in-memory session is still correct, and the save state (which is
+            # what actually holds the player's progress) is written
+            # separately, so this must not abort a hibernate.
+            log.exception(
+                "Could not store the Retro session record for channel %s.",
+                view.channel_id,
+            )
 
     # -- Files --------------------------------------------------------------
 
@@ -243,6 +295,55 @@ class RetroCog(commands.Cog):
 
     def _roms_dir(self) -> Path:
         return self._data_dir("roms")
+
+    def _system_dir(self) -> Path:
+        """
+        The folder cores are told to look in for BIOS/firmware files.
+
+        This is what every core gets back from
+        ``RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY``. Left to itself libretro.py
+        hands each session a throwaway temporary directory, which is deleted
+        when the session ends, so nothing could ever be found there.
+        """
+        return self._data_dir("system")
+
+    def _bios_files(self) -> typing.List[typing.Tuple[str, int]]:
+        """(filename, size) for everything the owner has put in the system directory."""
+        try:
+            entries = sorted(self._system_dir().iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            log.warning("Could not read the Retro system directory.", exc_info=True)
+            return []
+        found = []
+        for path in entries:
+            try:
+                if path.is_file():
+                    found.append((path.name, path.stat().st_size))
+            except OSError:
+                continue
+        return found
+
+    @staticmethod
+    def _bios_name(filename: str) -> typing.Optional[str]:
+        """
+        A bare, safe filename for the system directory, or None if unusable.
+
+        Cores want an exact filename (``disksys.rom``, ``scph5501.bin``), so
+        this validates rather than rewrites: silently turning
+        ``../../../.ssh/authorized_keys`` into ``authorized_keys`` would store
+        the file under a name the core will never look for, which is worse
+        than refusing it.
+        """
+        name = str(filename).strip().strip('"').strip("'")
+        if not name:
+            return None
+        if "/" in name or "\\" in name or "\x00" in name:
+            return None
+        if name.startswith("."):
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ +-]{0,63}", name):
+            return None
+        return name
 
     def _rom_path(self, rom_filename: str) -> typing.Optional[Path]:
         if not rom_filename:
@@ -382,7 +483,7 @@ class RetroCog(commands.Cog):
             except OSError:
                 log.warning("Could not read the Libretro save state %s", state_path)
 
-        emulator = RetroEmulator(core_path, rom_path)
+        emulator = RetroEmulator(core_path, rom_path, system_dir=self._system_dir())
 
         def _resume() -> bool:
             emulator.start()
@@ -514,6 +615,127 @@ class RetroCog(commands.Cog):
                     "button to pick up where you left off.",
                 )
 
+    # -- Talking to Discord safely -------------------------------------------
+
+    async def _safe_send(self, ctx, content=None, **kwargs):
+        """
+        ``ctx.send`` that reports a Discord failure instead of raising it.
+
+        Every one of these paths is reachable in production: the bot can lose
+        a permission mid-command, the channel can be deleted, an attachment
+        can be too large for the server's boost tier, and Discord will reject
+        a component outright (that is how an invalid button emoji took out a
+        whole command). None of those should surface as a traceback.
+        """
+        try:
+            return await ctx.send(content, **kwargs)
+        except discord.Forbidden:
+            log.warning(
+                "Missing permission to post a Retro message in channel %s.",
+                getattr(getattr(ctx, "channel", None), "id", None),
+                exc_info=True,
+            )
+        except discord.HTTPException:
+            log.exception(
+                "Discord rejected a Retro message in channel %s.",
+                getattr(getattr(ctx, "channel", None), "id", None),
+            )
+            # Components and files are the usual culprits, so try once more
+            # with nothing but the text. If that fails too, give up quietly.
+            if kwargs:
+                try:
+                    return await ctx.send(content or self._http_error_message(None))
+                except discord.HTTPException:
+                    pass
+        return None
+
+    @staticmethod
+    def _http_error_message(error: typing.Optional[Exception]) -> str:
+        """Turn a Discord rejection into something worth reading."""
+        if isinstance(error, discord.Forbidden):
+            return (
+                "Discord would not let me post that here. I need the **Embed "
+                "Links** and **Attach Files** permissions in this channel."
+            )
+        code = getattr(error, "code", 0) or 0
+        if code == 50035:
+            return (
+                "Discord rejected the message as invalid (`50035 Invalid Form "
+                "Body`). That is a bug in this cog rather than anything you "
+                "did; the details are in the bot's log."
+            )
+        if code == 40005 or getattr(error, "status", 0) == 413:
+            return "That clip was too large for Discord to accept."
+        status = getattr(error, "status", None)
+        if status is None:
+            return "Discord rejected the message. The details are in the bot's log."
+        return (
+            f"Discord rejected the message (HTTP {status}"
+            + (f", code {code}" if code else "")
+            + "). Try again in a moment."
+        )
+
+    def _friendly_error(self, error: BaseException) -> typing.Optional[str]:
+        """A user-facing sentence for an exception, or None if we have none."""
+        if isinstance(error, discord.HTTPException):
+            return self._http_error_message(error)
+        if isinstance(error, EmulatorError):
+            return f"The emulator could not do that: {error}"
+        if isinstance(error, (DownloadError, archives.ArchiveError)):
+            return str(error)
+        if isinstance(error, aiohttp.ClientError):
+            return f"A download failed: {error}"
+        if isinstance(error, asyncio.TimeoutError):
+            return "That took too long and was given up on."
+        if isinstance(error, OSError):
+            # Out of disk, read-only data directory, too many open files.
+            return (
+                f"The bot could not read or write its data folder: {error}. "
+                "It may be out of disk space."
+            )
+        return None
+
+    async def cog_command_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ) -> None:
+        """
+        Turn the failures this cog can actually hit into plain sentences.
+
+        Anything unrecognised is handed back to Red, which logs it properly
+        rather than having this cog guess at a message for it.
+        """
+        if isinstance(error, commands.BotMissingPermissions):
+            # discord.py calls the attribute `missing`; older releases (and
+            # some forks) call it `missing_permissions`.
+            names = getattr(error, "missing_permissions", None) or getattr(
+                error, "missing", []
+            )
+            missing = humanize_list(
+                [f"**{str(name).replace('_', ' ').title()}**" for name in names]
+            ) or "required"
+            await self._safe_send(
+                ctx, f"I need the {missing} permission(s) in this channel to do that."
+            )
+            return
+        if isinstance(error, commands.MaxConcurrencyReached):
+            await self._safe_send(
+                ctx, "This channel is already starting a game. Give it a moment."
+            )
+            return
+        original = getattr(error, "original", None)
+        if original is not None:
+            message = self._friendly_error(original)
+            if message is not None:
+                log.error(
+                    "The %s command failed in channel %s.",
+                    getattr(ctx.command, "qualified_name", "retro"),
+                    getattr(ctx.channel, "id", None),
+                    exc_info=original,
+                )
+                await self._safe_send(ctx, message)
+                return
+        await ctx.bot.on_command_error(ctx, error, unhandled_by_cog=True)
+
     # -- Helpers ------------------------------------------------------------
 
     @staticmethod
@@ -594,9 +816,141 @@ class RetroCog(commands.Cog):
         except OSError as error:
             return False, 0, f"could not be saved: {error}"
 
-        async with self.config.cores() as cores:
-            cores[core] = str(core_path)
+        try:
+            async with self.config.cores() as cores:
+                cores[core] = str(core_path)
+        except Exception as error:
+            log.exception("Could not record the %s core in the config.", core)
+            return False, 0, f"could not be recorded in the settings: {error}"
         return True, len(data), "installed"
+
+    async def _download_bytes(
+        self, url: str, max_size: int, size_label: str, what: str = "file"
+    ) -> typing.Tuple[str, bytes]:
+        """
+        Fetch a URL into memory, capped at ``max_size``.
+
+        Returns (filename, data). Raises DownloadError with a message written
+        for the person who gave us the URL.
+        """
+        if not str(url).lower().startswith(("http://", "https://")):
+            raise DownloadError(f"The {what} URL must start with `http://` or `https://`.")
+        too_big = f"That {what} is bigger than the {size_label} limit."
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        raise DownloadError(
+                            f"Downloading the {what} failed with status {resp.status}."
+                        )
+                    if (resp.content_length or 0) > max_size:
+                        raise DownloadError(too_big)
+                    # read(n) only returns the next chunk, so loop until the
+                    # body ends or the size cap is exceeded.
+                    chunks = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total > max_size:
+                            break
+                    data = b"".join(chunks)
+                    # Redirects (e.g. GitHub release assets) often end at a
+                    # URL whose path has no real filename, so prefer the
+                    # Content-Disposition header, then the URL we were given.
+                    filename = ""
+                    if resp.content_disposition is not None:
+                        filename = resp.content_disposition.filename or ""
+                    if not filename:
+                        filename = Path(urlparse(url).path).name
+                    if not filename:
+                        filename = Path(str(resp.url.path)).name
+        except aiohttp.ClientError as error:
+            raise DownloadError(f"Downloading the {what} failed: {error}") from error
+        except asyncio.TimeoutError as error:
+            raise DownloadError(f"Downloading the {what} timed out.") from error
+        if len(data) > max_size:
+            raise DownloadError(too_big)
+        return filename, data
+
+    async def _auto_download_loop(self) -> None:
+        """
+        Fetch whatever cores are missing, once, in the background.
+
+        Runs from cog_load as a detached task so loading the cog never waits
+        on the buildbot. Every failure is logged and then dropped: a bot that
+        cannot reach the internet must still come up, and a core the buildbot
+        has stopped publishing must not be retried forever.
+        """
+        try:
+            if not await self.config.auto_download_cores():
+                return
+            last = float(await self.config.auto_download_attempted_at() or 0.0)
+            if time.time() - last < AUTO_DOWNLOAD_COOLDOWN_SECONDS:
+                log.debug(
+                    "Skipping the automatic core download; the last attempt "
+                    "was less than %s hours ago.",
+                    AUTO_DOWNLOAD_COOLDOWN_SECONDS // 3600,
+                )
+                return
+            try:
+                await self.bot.wait_until_red_ready()
+            except Exception:
+                pass
+            await self._auto_download_cores()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "The automatic core download failed; giving up until the cog "
+                "is loaded again. Run `[p]retroset download` to retry now."
+            )
+
+    async def _auto_download_cores(self) -> None:
+        """Install every core that is not already on disk. Attempts each once."""
+        installed = await self._installed_cores()
+        missing = [name for name in CORES if name not in installed]
+        if not missing:
+            log.debug("All %s libretro cores are installed already.", len(CORES))
+            return
+        if self._buildbot_url(missing[0]) is None:
+            log.warning(
+                "The libretro buildbot has no builds for %s/%s, so the %s "
+                "missing core(s) cannot be downloaded automatically.",
+                sys.platform,
+                platform.machine(),
+                len(missing),
+            )
+            return
+        # Recorded before the work starts, so a crash mid-download still
+        # counts as an attempt and the cooldown still applies.
+        await self.config.auto_download_attempted_at.set(time.time())
+        log.info(
+            "Downloading %s missing libretro core(s) in the background: %s",
+            len(missing),
+            ", ".join(missing),
+        )
+        succeeded = 0
+        failed = 0
+        timeout = aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for name in missing:
+                ok, size, message = await self._download_core(session, name)
+                if ok:
+                    succeeded += 1
+                    log.info(
+                        "Installed the %s libretro core (%s KiB).", name, size // 1024
+                    )
+                else:
+                    failed += 1
+                    log.warning(
+                        "Could not download the %s libretro core: %s", name, message
+                    )
+        log.info(
+            "Automatic core download finished: %s installed, %s failed.",
+            succeeded,
+            failed,
+        )
 
     async def _fetch_rom(
         self, ctx: commands.Context, url: typing.Optional[str]
@@ -607,70 +961,99 @@ class RetroCog(commands.Cog):
         A URL wins over an attachment, because it is the one the caller named
         explicitly (a preset resolves to a URL before we get here).
         """
-        too_big = f"That file is bigger than the {MAX_ROM_SIZE_LABEL} limit for ROMs."
         if url:
-            if not url.lower().startswith(("http://", "https://")):
-                await ctx.send("The ROM URL must start with `http://` or `https://`.")
-                return None
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            await ctx.send(f"Downloading the ROM failed with status {resp.status}.")
-                            return None
-                        if (resp.content_length or 0) > MAX_ROM_SIZE:
-                            await ctx.send(too_big)
-                            return None
-                        # read(n) only returns the next chunk, so loop until
-                        # the body ends or the size cap is exceeded.
-                        chunks = []
-                        total = 0
-                        async for chunk in resp.content.iter_chunked(64 * 1024):
-                            chunks.append(chunk)
-                            total += len(chunk)
-                            if total > MAX_ROM_SIZE:
-                                break
-                        data = b"".join(chunks)
-            except aiohttp.ClientError as error:
-                await ctx.send(f"Downloading the ROM failed: {error}")
+                filename, data = await self._download_bytes(
+                    url, MAX_ROM_SIZE, MAX_ROM_SIZE_LABEL, "ROM"
+                )
+            except DownloadError as error:
+                await self._safe_send(ctx, str(error))
                 return None
-            if len(data) > MAX_ROM_SIZE:
-                await ctx.send(too_big)
-                return None
-            # Redirects (e.g. GitHub release assets) often end at a URL whose
-            # path has no real filename, so prefer the Content-Disposition
-            # header, then the URL the user actually gave us.
-            filename = ""
-            if resp.content_disposition is not None:
-                filename = resp.content_disposition.filename or ""
-            if not filename:
-                filename = Path(urlparse(url).path).name
-            if not filename:
-                filename = Path(str(resp.url.path)).name or "rom.gb"
-            return filename, data
+            return filename or "rom.gb", data
 
         if ctx.message.attachments:
             attachment = ctx.message.attachments[0]
             if attachment.size > MAX_ROM_SIZE:
-                await ctx.send(too_big)
+                await self._safe_send(
+                    ctx,
+                    f"That file is bigger than the {MAX_ROM_SIZE_LABEL} limit "
+                    "for ROMs.",
+                )
                 return None
-            return attachment.filename, await attachment.read()
+            try:
+                return attachment.filename, await attachment.read()
+            except discord.HTTPException as error:
+                log.warning("Could not read a Retro ROM attachment.", exc_info=True)
+                await self._safe_send(
+                    ctx, f"The attached file could not be downloaded: {error}"
+                )
+                return None
 
         return None
+
+    async def _extract_rom(
+        self, ctx: commands.Context, filename: str, data: bytes
+    ) -> typing.Optional[typing.Tuple[str, bytes]]:
+        """
+        Pull the first playable ROM out of a zip, or explain why we can't.
+
+        The member is read into memory and handed back under its own name;
+        nothing is ever unpacked using the paths stored in the archive.
+        """
+        try:
+            found = await asyncio.to_thread(
+                archives.extract,
+                data,
+                accept=lambda name: system_for_extension(Path(name).suffix) is not None,
+                max_size=MAX_ROM_SIZE,
+                what="ROM",
+            )
+        except archives.NoSupportedMember as error:
+            lines = [f"`{filename}`: {error}", "", "Supported file types:"]
+            lines.extend(self._supported_lines())
+            for page in pagify("\n".join(lines)):
+                await self._safe_send(ctx, page)
+            return None
+        except archives.ArchiveError as error:
+            await self._safe_send(ctx, f"`{filename}`: {error}")
+            return None
+        except Exception:
+            log.exception("Unpacking the zip %s failed unexpectedly.", filename)
+            await self._safe_send(ctx, f"`{filename}` could not be unpacked.")
+            return None
+
+        if len(found.candidates) > 1:
+            await self._safe_send(
+                ctx,
+                f"`{filename}` holds {len(found.candidates)} playable ROMs; "
+                f"starting `{found.name}` (first in alphabetical order). "
+                "Upload the one you want on its own to pick another.",
+            )
+        else:
+            log.debug("Extracted %s from %s.", found.name, filename)
+        return Path(found.name).name, found.data
 
     async def _no_rom_help(self, ctx: commands.Context) -> None:
         presets = await self.config.games()
         lines = [
-            "Attach a console ROM to your message, or pass a URL: "
-            f"`{ctx.clean_prefix}retro <url>`.",
+            "Attach a console ROM (a `.zip` is fine) to your message, or pass "
+            f"a URL: `{ctx.clean_prefix}retro <url>`.",
+            "",
+            "Try \N{GREEK SMALL LETTER MU}City, a free, open source city "
+            "builder for the Game Boy Color:",
+            f"`{ctx.clean_prefix}retro {EXAMPLE_ROM_URL}`",
         ]
         if presets:
             names = ", ".join(f"`{name}`" for name in sorted(presets)[:15])
+            lines.append("")
             lines.append(f"You can also start a saved game by name: {names}")
         else:
+            lines.append("")
             lines.append(
                 "The bot owner can save games by name with "
-                f"`{ctx.clean_prefix}retroset game add <name> <url>`."
+                f"`{ctx.clean_prefix}retroset game add <name> <url>`, for "
+                f"example `{ctx.clean_prefix}retroset game add "
+                f"{EXAMPLE_GAME} {EXAMPLE_ROM_URL}`."
             )
         installed = await self._installed_cores()
         playable = [system for system in SYSTEMS if system.core in installed]
@@ -680,10 +1063,11 @@ class RetroCog(commands.Cog):
             lines.extend(self._supported_lines(playable))
         lines.append("")
         lines.append(
-            "Only use ROMs you have the rights to, such as homebrew games."
+            "Only use ROMs you have the rights to. There are hundreds of free "
+            f"homebrew games for these consoles at <{HOMEBREW_URL}>."
         )
         for page in pagify("\n".join(lines)):
-            await ctx.send(page)
+            await self._safe_send(ctx, page)
 
     async def _resume_session(self, ctx: commands.Context, view: RetroView) -> None:
         """Point the channel at its existing session instead of starting over."""
@@ -691,9 +1075,10 @@ class RetroCog(commands.Cog):
         if message is not None:
             status = "is already running" if view.live else "is asleep"
             await view.refresh()
-            await ctx.send(
+            await self._safe_send(
+                ctx,
                 f"**{view.game_name}** {status} in this channel. Use the "
-                f"controls to play: {message.jump_url}"
+                f"controls to play: {message.jump_url}",
             )
             return
         # The old message is gone (deleted, or the bot lost it), so put the
@@ -706,19 +1091,56 @@ class RetroCog(commands.Cog):
             try:
                 clip = await self.run_press(view, None)
             except EmulatorError as error:
-                await ctx.send(f"The game could not be resumed: {error}")
+                await self._safe_send(ctx, f"The game could not be resumed: {error}")
                 return
         view.last_clip = clip
         view.touch()
         view._sync_children()
-        view.message = await ctx.send(
-            embed=await view._make_embed(),
-            file=view._clip_file(clip),
-            view=view,
-            reference=ctx.message.to_reference(fail_if_not_exists=False),
-        )
+        try:
+            view.message = await ctx.send(
+                embed=await view._make_embed(),
+                file=view._clip_file(clip),
+                view=view,
+                reference=ctx.message.to_reference(fail_if_not_exists=False),
+            )
+        except discord.HTTPException as error:
+            # The game is fine; the new message is not. Put it back to sleep
+            # so a core is not left running for a message nobody can see.
+            log.exception(
+                "Discord rejected the reposted Retro message in channel %s.",
+                view.channel_id,
+            )
+            try:
+                await self.hibernate(view, None)
+            except Exception:
+                log.exception("Could not hibernate after a failed repost.")
+            await self._safe_send(ctx, self._http_error_message(error))
+            return
         view.message_id = view.message.id
         await self._save_record(view)
+
+    async def _abandon_session(
+        self, ctx: commands.Context, view: RetroView, emulator: RetroEmulator
+    ) -> None:
+        """
+        Drop a session that never got off the ground, without losing anything.
+
+        Called when starting a game fails after the core came up: the record
+        is removed, whatever was emulated is written to the save state, and
+        the core is freed. Without this a failed send would leave an emulator
+        loaded forever, and MAX_LIVE_EMULATORS is one.
+        """
+        self.sessions.pop(getattr(ctx.channel, "id", view.channel_id), None)
+        try:
+            await self._write_state(view, emulator)
+        except Exception:
+            log.exception("Could not save the state of an abandoned session.")
+        try:
+            await asyncio.to_thread(emulator.stop)
+        except Exception:
+            log.exception("Could not stop the emulator of an abandoned session.")
+        view.emulator = None
+        view.closed = True
 
     # -- Commands -----------------------------------------------------------
 
@@ -732,18 +1154,21 @@ class RetroCog(commands.Cog):
 
         Pass the name of a saved game, a URL to a ROM, or attach one to the
         message. The console is picked from the file extension, so a `.gb`
-        starts a Game Boy and a `.sfc` starts a Super Nintendo. Run it with no
-        arguments to bring back the game already going in this channel.
+        starts a Game Boy and a `.sfc` starts a Super Nintendo. A `.zip` is
+        unpacked for you. Run it with no arguments to bring back the game
+        already going in this channel.
 
         Games keep their progress: a session goes to sleep when nobody plays,
         and the next button press picks it back up, even after the bot
-        restarts. Anyone in the channel can press the buttons. Only use ROMs
-        you have the rights to, such as homebrew games.
+        restarts. Anyone in the channel can press the buttons.
+
+        Only use ROMs you have the rights to. Hundreds of free homebrew games
+        for these consoles are at <https://retrobrews.github.io/>.
 
         **Examples:**
         - `[p]retro` (with a ROM attached, or to resume this channel's game)
-        - `[p]retro tobu`
-        - `[p]retro https://example.com/homebrew.gb`
+        - `[p]retro https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc`
+        - `[p]retro ucity`
 
         **Arguments:**
         - `[game]` - A saved game name (see `[p]retroset game list`) or a ROM URL.
@@ -790,9 +1215,17 @@ class RetroCog(commands.Cog):
 
         async with ctx.typing():
             rom = await self._fetch_rom(ctx, url)
-        if rom is None:
-            return
-        filename, data = rom
+            if rom is None:
+                return
+            filename, data = rom
+
+            # Homebrew is nearly always distributed zipped, so look inside
+            # before deciding there is no console for this file.
+            if archives.is_zip(data) or filename.lower().endswith(".zip"):
+                unpacked = await self._extract_rom(ctx, Path(filename).name, data)
+                if unpacked is None:
+                    return
+                filename, data = unpacked
 
         filename = self._sanitize_filename(filename)
         system = system_for_extension(Path(filename).suffix)
@@ -857,18 +1290,23 @@ class RetroCog(commands.Cog):
         """Cache the ROM, boot it, and post the controls."""
         extension = Path(filename).suffix.lower() or f".{system.extensions[0]}"
         rom_filename = f"{ctx.channel.id}-{slug}{extension}"
-        rom_path = self._roms_dir() / rom_filename
         try:
+            rom_path = self._roms_dir() / rom_filename
             await asyncio.to_thread(self._write_atomic, rom_path, data)
         except OSError as error:
-            await ctx.send(f"The ROM could not be saved: {error}")
+            log.warning("Could not cache a Retro ROM.", exc_info=True)
+            await self._safe_send(
+                ctx,
+                f"The ROM could not be saved: {error}. The bot may be out of "
+                "disk space.",
+            )
             return
         self._prune_cached_games(ctx.channel.id, slug)
 
         core_path = await self._core_path(system.core)
         if core_path is None:
-            await ctx.send(
-                self._missing_core_message(ctx.clean_prefix, system, system.core)
+            await self._safe_send(
+                ctx, self._missing_core_message(ctx.clean_prefix, system, system.core)
             )
             return
 
@@ -889,7 +1327,7 @@ class RetroCog(commands.Cog):
         )
         self.sessions[ctx.channel.id] = view
 
-        emulator = RetroEmulator(core_path, rom_path)
+        emulator = RetroEmulator(core_path, rom_path, system_dir=self._system_dir())
         try:
             async with ctx.typing():
                 async with self.emulator_lock:
@@ -899,16 +1337,30 @@ class RetroCog(commands.Cog):
                     evicted = await self._evict_locked(exclude=view)
                     notice = self._eviction_notice(ctx, evicted)
                     if notice:
-                        await ctx.send(notice)
+                        # A courtesy message: if Discord refuses it, the game
+                        # should still start.
+                        await self._safe_send(ctx, notice)
                     await view.start(ctx, emulator)
         except EmulatorError as error:
-            self.sessions.pop(ctx.channel.id, None)
-            await asyncio.to_thread(emulator.stop)
-            await ctx.send(f"The game could not be started: {error}")
+            await self._abandon_session(ctx, view, emulator)
+            await self._safe_send(ctx, f"The game could not be started: {error}")
+            return
+        except discord.HTTPException as error:
+            # Discord refused the message itself: a bad component, a missing
+            # permission, an attachment the server will not take. The core is
+            # already running at this point, so bank the progress and free it
+            # rather than leaving an emulator loaded with no message to drive
+            # it. The reply is deliberately plain text, since whatever
+            # Discord objected to was in the rich version.
+            log.exception(
+                "Discord rejected the Retro game message in channel %s.",
+                ctx.channel.id,
+            )
+            await self._abandon_session(ctx, view, emulator)
+            await self._safe_send(ctx, self._http_error_message(error))
             return
         except Exception:
-            self.sessions.pop(ctx.channel.id, None)
-            await asyncio.to_thread(emulator.stop)
+            await self._abandon_session(ctx, view, emulator)
             raise
         await self._save_record(view)
 
@@ -1010,7 +1462,11 @@ class RetroCog(commands.Cog):
         again after a failure. Naming a single core downloads just that one
         and replaces it if it is already there.
 
+        This also happens by itself when the cog loads; see
+        `[p]retroset autodownload`.
+
         The whole set is about 5 MiB. None of these cores need a BIOS file.
+        For one that does, see `[p]retroset bios`.
 
         **Examples:**
         - `[p]retroset download`
@@ -1051,8 +1507,10 @@ class RetroCog(commands.Cog):
             )
             return
 
-        status = await ctx.send(
-            f"Downloading {len(wanted)} core(s) from the libretro buildbot..."
+        # May be None if the channel refused it; the download still runs and
+        # the report at the end is what actually matters.
+        status = await self._safe_send(
+            ctx, f"Downloading {len(wanted)} core(s) from the libretro buildbot..."
         )
         installed: typing.List[str] = []
         failed: typing.List[str] = []
@@ -1067,6 +1525,8 @@ class RetroCog(commands.Cog):
                         total_bytes += size
                     else:
                         failed.append(f"`{name}`: {message}")
+                    if status is None:
+                        continue
                     try:
                         await status.edit(
                             content=(
@@ -1091,13 +1551,18 @@ class RetroCog(commands.Cog):
             lines.extend(f"- {entry}" for entry in failed)
         if not installed and not failed:
             lines.append("Nothing to do.")
-        lines.append(f"Play something with `{ctx.clean_prefix}retro`.")
-        try:
-            await status.delete()
-        except discord.HTTPException:
-            pass
+        lines.append(
+            f"Play something with `{ctx.clean_prefix}retro`, or start with "
+            f"\N{GREEK SMALL LETTER MU}City: `{ctx.clean_prefix}retro "
+            f"{EXAMPLE_ROM_URL}`"
+        )
+        if status is not None:
+            try:
+                await status.delete()
+            except discord.HTTPException:
+                pass
         for page in pagify("\n".join(lines)):
-            await ctx.send(page)
+            await self._safe_send(ctx, page)
 
     @retroset.command(name="timeout")
     async def retroset_timeout(self, ctx: commands.Context, minutes: int) -> None:
@@ -1184,10 +1649,13 @@ class RetroCog(commands.Cog):
         Save a game so anyone can start it with `[p]retro <name>`.
 
         The URL must be a direct download link to a ROM whose file extension
-        matches one of the supported consoles. Only add ROMs you have the
-        rights to share, such as homebrew games.
+        matches one of the supported consoles, or to a `.zip` containing one.
+
+        Only add ROMs you have the rights to share. There are hundreds of free
+        homebrew games at <https://retrobrews.github.io/>.
 
         **Examples:**
+        - `[p]retroset game add ucity https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc`
         - `[p]retroset game add tobu https://example.com/tobu.gb`
 
         **Arguments:**
@@ -1248,6 +1716,245 @@ class RetroCog(commands.Cog):
         for page in pagify(lines):
             await ctx.send(page)
 
+    @retroset.group(name="bios", aliases=["firmware", "system"])
+    async def retroset_bios(self, ctx: commands.Context) -> None:
+        """
+        Manage the BIOS/firmware files cores can use.
+
+        Some consoles cannot boot a game without a copy of their own firmware.
+        Cores look for it in the frontend's *system directory*, which this cog
+        keeps inside its data folder; `[p]retroset settings` shows where.
+
+        **Nothing is downloaded or suggested for you.** This cog ships no
+        firmware, will never fetch any on its own, and names none: console
+        BIOS images are copyrighted, and it is up to you to supply a copy you
+        are entitled to use. Every core the cog installs by default is
+        BIOS-free, so this is only needed if you add a core that is not.
+        """
+
+    @retroset_bios.command(name="add")
+    async def retroset_bios_add(
+        self, ctx: commands.Context, filename: str, url: typing.Optional[str] = None
+    ) -> None:
+        """
+        Put a BIOS file you supply into the system directory.
+
+        Pass a direct URL, or attach the file to your message and leave the
+        URL off. `<filename>` is the exact name the core will look for, so it
+        has to match what that core documents. A `.zip` is unpacked for you: a
+        member whose name matches `<filename>` wins, otherwise the only file
+        inside is used.
+
+        Only add firmware you are entitled to use. This cog does not provide
+        any and cannot tell you where to find it.
+
+        **Examples:**
+        - `[p]retroset bios add somesystem_bios.bin` (with the file attached)
+        - `[p]retroset bios add somesystem_bios.bin https://example.com/bios.zip`
+
+        **Arguments:**
+        - `<filename>` - The exact filename the core expects.
+        - `[url]` - A direct link to the file, if you are not attaching it.
+        """
+        name = self._bios_name(filename)
+        if name is None:
+            await ctx.send(
+                "That is not a usable filename. Give the bare name the core "
+                "looks for, with no folders in it, for example "
+                "`somesystem_bios.bin`."
+            )
+            return
+
+        if url:
+            try:
+                source, data = await self._download_bytes(
+                    url, MAX_BIOS_SIZE, MAX_BIOS_SIZE_LABEL, "BIOS file"
+                )
+            except DownloadError as error:
+                await ctx.send(str(error))
+                return
+        elif ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+            if attachment.size > MAX_BIOS_SIZE:
+                await ctx.send(
+                    f"That BIOS file is bigger than the {MAX_BIOS_SIZE_LABEL} limit."
+                )
+                return
+            try:
+                source, data = attachment.filename, await attachment.read()
+            except discord.HTTPException as error:
+                log.warning("Could not read a Retro BIOS attachment.", exc_info=True)
+                await ctx.send(f"The attached file could not be downloaded: {error}")
+                return
+        else:
+            await ctx.send(
+                "Attach the BIOS file to your message, or pass a direct URL "
+                f"after the filename: `{ctx.clean_prefix}retroset bios add "
+                f"{name} <url>`."
+            )
+            return
+
+        note = ""
+        if archives.is_zip(data) or str(source).lower().endswith(".zip"):
+            wanted = name.lower()
+            try:
+                found = await asyncio.to_thread(
+                    archives.extract,
+                    data,
+                    # Prefer the exact name the core wants; fall back to
+                    # whatever single file the archive holds.
+                    accept=lambda member: Path(member).name.lower() == wanted,
+                    max_size=MAX_BIOS_SIZE,
+                    what="BIOS file",
+                )
+            except archives.NoSupportedMember as error:
+                if len(error.members) == 1:
+                    try:
+                        found = await asyncio.to_thread(
+                            archives.extract,
+                            data,
+                            accept=lambda member: True,
+                            max_size=MAX_BIOS_SIZE,
+                            what="BIOS file",
+                        )
+                    except archives.ArchiveError as inner:
+                        await ctx.send(f"That zip could not be used: {inner}")
+                        return
+                else:
+                    await ctx.send(
+                        f"That zip has no file called `{name}` in it. It "
+                        f"contains: {archives.describe_members(error.members)}. "
+                        "Name one of those, or unzip it yourself."
+                    )
+                    return
+            except archives.ArchiveError as error:
+                await ctx.send(f"That zip could not be read: {error}")
+                return
+            data = found.data
+            note = f" (unpacked from `{found.name}` in the zip)"
+
+        if not data:
+            await ctx.send("That file is empty.")
+            return
+        if len(data) > MAX_BIOS_SIZE:
+            await ctx.send(
+                f"That BIOS file is bigger than the {MAX_BIOS_SIZE_LABEL} limit."
+            )
+            return
+
+        target = self._system_dir() / name
+        try:
+            await asyncio.to_thread(self._write_atomic, target, data)
+        except OSError as error:
+            log.warning("Could not write the BIOS file %s", target, exc_info=True)
+            await ctx.send(f"The file could not be saved: {error}")
+            return
+        log.info("Installed the BIOS file %s (%s bytes).", name, len(data))
+        await ctx.send(
+            f"Stored `{name}` ({len(data):,} bytes){note} in the system "
+            f"directory. Cores will find it from now on. See "
+            f"`{ctx.clean_prefix}retroset bios list`."
+        )
+
+    @retroset_bios.command(name="list")
+    async def retroset_bios_list(self, ctx: commands.Context) -> None:
+        """
+        List the BIOS files in the system directory.
+
+        **Examples:**
+        - `[p]retroset bios list`
+        """
+        files = self._bios_files()
+        directory = self._system_dir()
+        if not files:
+            await ctx.send(
+                f"No BIOS files are installed. The system directory is "
+                f"`{directory}`; add a file you are entitled to use with "
+                f"`{ctx.clean_prefix}retroset bios add <filename>`. Every "
+                "core this cog installs by default works without one."
+            )
+            return
+        lines = [f"System directory: `{directory}`", ""]
+        lines.extend(f"- `{name}` ({size:,} bytes)" for name, size in files)
+        for page in pagify("\n".join(lines)):
+            await ctx.send(page)
+
+    @retroset_bios.command(name="remove", aliases=["delete", "del"])
+    async def retroset_bios_remove(self, ctx: commands.Context, filename: str) -> None:
+        """
+        Delete a BIOS file from the system directory.
+
+        **Examples:**
+        - `[p]retroset bios remove somesystem_bios.bin`
+
+        **Arguments:**
+        - `<filename>` - The file to delete, as shown by `[p]retroset bios list`.
+        """
+        name = self._bios_name(filename)
+        if name is None:
+            await ctx.send("That is not a usable filename.")
+            return
+        target = self._system_dir() / name
+        try:
+            if not target.is_file():
+                await ctx.send(
+                    f"There is no `{name}` in the system directory. See "
+                    f"`{ctx.clean_prefix}retroset bios list`."
+                )
+                return
+            target.unlink()
+        except OSError as error:
+            log.warning("Could not delete the BIOS file %s", target, exc_info=True)
+            await ctx.send(f"`{name}` could not be deleted: {error}")
+            return
+        await ctx.send(f"`{name}` was deleted from the system directory.")
+
+    @retroset.command(name="autodownload")
+    async def retroset_autodownload(
+        self, ctx: commands.Context, enabled: typing.Optional[bool] = None
+    ) -> None:
+        """
+        Fetch missing cores automatically when the cog loads.
+
+        On by default. Missing cores are downloaded in the background shortly
+        after the cog starts, so a fresh install can play something straight
+        away. Cores already on disk are never re-downloaded, and a failed
+        attempt is logged and dropped rather than retried in a loop.
+
+        Run it with no argument to see the current setting.
+
+        **Examples:**
+        - `[p]retroset autodownload`
+        - `[p]retroset autodownload false`
+
+        **Arguments:**
+        - `[enabled]` - `true` or `false`.
+        """
+        if enabled is None:
+            current = await self.config.auto_download_cores()
+            missing = len(CORES) - len(await self._installed_cores())
+            await ctx.send(
+                f"Automatic core downloads are **{'on' if current else 'off'}**. "
+                f"{missing} core(s) are missing. Change it with "
+                f"`{ctx.clean_prefix}retroset autodownload <true|false>`."
+            )
+            return
+        await self.config.auto_download_cores.set(bool(enabled))
+        if enabled:
+            # Clear the cooldown so turning it back on takes effect at the
+            # next load rather than up to six hours later.
+            await self.config.auto_download_attempted_at.set(0.0)
+            await ctx.send(
+                "Missing cores will be downloaded automatically the next time "
+                f"the cog loads. Run `{ctx.clean_prefix}retroset download` to "
+                "do it now."
+            )
+        else:
+            await ctx.send(
+                "Cores will no longer be downloaded automatically. Install "
+                f"them with `{ctx.clean_prefix}retroset download`."
+            )
+
     @retroset.command(name="settings")
     @commands.bot_has_permissions(embed_links=True)
     async def retroset_settings(self, ctx: commands.Context) -> None:
@@ -1289,6 +1996,34 @@ class RetroCog(commands.Cog):
             inline=False,
         )
 
+        auto = await self.config.auto_download_cores()
+        embed.add_field(
+            name="Automatic core downloads",
+            value=(
+                ("**On** \N{EM DASH} missing cores are fetched in the "
+                 "background when the cog loads."
+                 if auto else
+                 "**Off** \N{EM DASH} install cores with "
+                 f"`{ctx.clean_prefix}retroset download`.")
+            ),
+            inline=False,
+        )
+
+        bios = self._bios_files()
+        if bios:
+            listed = "\n".join(f"- `{name}` ({size:,} bytes)" for name, size in bios)
+            bios_value = f"{len(bios)} file(s):\n{listed}"
+        else:
+            bios_value = (
+                "No BIOS files installed. Every core above works without one; "
+                f"add your own with `{ctx.clean_prefix}retroset bios add`."
+            )
+        embed.add_field(
+            name="System directory (BIOS)",
+            value=f"`{self._system_dir()}`\n{bios_value}"[:1024],
+            inline=False,
+        )
+
         timeout_minutes = await self.config.session_timeout_minutes()
         embed.add_field(
             name="Sleep after",
@@ -1326,4 +2061,4 @@ class RetroCog(commands.Cog):
             ),
             inline=False,
         )
-        await ctx.send(embed=embed)
+        await self._safe_send(ctx, embed=embed)

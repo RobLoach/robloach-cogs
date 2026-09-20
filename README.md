@@ -15,3 +15,7 @@ Experimental Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-Disco
 [p]cog install robloach-cogs <list of cogs>
 [p]load <list of cogs>
 ```
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).

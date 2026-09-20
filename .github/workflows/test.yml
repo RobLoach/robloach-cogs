@@ -54,6 +54,97 @@ jobs:
           print(f"OK: {len(S.SYSTEMS)} consoles, {len(S.CORES)} cores, {len(seen)} extensions")
           EOF
 
+      - name: Every button emoji is one Discord will accept
+        # Discord rejects a message outright (400, error code 50035, "Invalid
+        # emoji") if a component carries a character that is not really an
+        # emoji, which takes out the whole command. That happened for real
+        # with U+21BB on the Replay button, so the exact set the cog can
+        # render is reviewed in systems.EMOJI_CODEPOINTS and checked here.
+        run: |
+          python - <<'EOF'
+          import importlib.util
+          import unicodedata
+
+          spec = importlib.util.spec_from_file_location("systems", "retro/systems.py")
+          S = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(S)
+
+          emoji = S.validate_emoji()
+          assert emoji, "no button emoji were found at all"
+          for value in emoji:
+              problem = S.emoji_problem(value)
+              assert problem is None, f"{value!r}: {problem}"
+              base = value[0]
+              assert unicodedata.category(base) == "So", (value, unicodedata.category(base))
+              assert unicodedata.name(base, ""), f"{value!r} has no Unicode name"
+              needs = S.EMOJI_CODEPOINTS[ord(base)]
+              assert needs == value.endswith(S.VARIATION_SELECTOR_16), value
+              print(f"OK {' '.join(f'U+{ord(c):04X}' for c in value):<16} {value}")
+
+          # The character that broke production must still be refused, and so
+          # must anything new that has not been reviewed.
+          assert S.emoji_problem("↻") is not None, "U+21BB is not an emoji"
+          assert S.emoji_problem("⬆") is not None, "U+2B06 needs U+FE0F"
+          assert S.emoji_problem("") is not None
+          print(f"OK: {len(emoji)} reviewed button emoji")
+          EOF
+
+      - name: Zip handling
+        run: |
+          python - <<'EOF'
+          import importlib.util
+          import io
+          import zipfile
+          from pathlib import Path
+
+          def load(name, path):
+              spec = importlib.util.spec_from_file_location(name, path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          S = load("systems", "retro/systems.py")
+          A = load("archives", "retro/archives.py")
+
+          def zipped(entries):
+              buf = io.BytesIO()
+              with zipfile.ZipFile(buf, "w") as z:
+                  for name, payload in entries:
+                      z.writestr(name, payload)
+              return buf.getvalue()
+
+          rom = b"\0" * 4096
+          is_rom = lambda n: S.system_for_extension(Path(n).suffix) is not None
+
+          found = A.extract(zipped([("z.gb", rom), ("a.nes", rom), ("r.txt", b"x" * 40)]),
+                            accept=is_rom, max_size=32 * 1024 * 1024, what="ROM")
+          assert found.name == "a.nes", found.name
+          assert found.candidates == ("a.nes", "z.gb"), found.candidates
+
+          nested = A.extract(zipped([("dir/sub/game.gbc", rom)]), accept=is_rom,
+                             max_size=32 * 1024 * 1024)
+          assert nested.name == "dir/sub/game.gbc", nested.name
+
+          for label, data, cap, expected in [
+              ("no ROM", zipped([("a.txt", b"x" * 40)]), 1 << 25, A.NoSupportedMember),
+              ("empty", zipped([]), 1 << 25, A.NoSupportedMember),
+              ("bomb", zipped([("big.gb", b"\0" * (2 << 20))]), 1 << 20, A.ArchiveError),
+              ("corrupt", b"PK\x03\x04garbage" * 40, 1 << 25, A.ArchiveError),
+          ]:
+              try:
+                  A.extract(data, accept=is_rom, max_size=cap, what="ROM")
+                  raise AssertionError(f"{label} should have been refused")
+              except expected as error:
+                  print(f"OK {label}: {error}")
+
+          # A traversing member is read into memory, never extracted to disk.
+          trav = A.extract(zipped([("../../evil.gb", rom)]), accept=is_rom,
+                           max_size=1 << 25)
+          assert trav.data == rom and Path(trav.name).name == "evil.gb"
+          assert not Path("/tmp/evil.gb").exists()
+          print("OK: zip handling")
+          EOF
+
   cores:
     # The core names in systems.py have to match what the libretro buildbot
     # publishes, or [p]retroset download quietly installs nothing.
@@ -112,6 +203,17 @@ jobs:
         run: curl -fsSLO https://github.com/mattcurrie/dmg-acid2/releases/download/v1.0/dmg-acid2.gb
       - name: Render a still frame
         run: python retro/emulator.py ./gambatte_libretro.so dmg-acid2.gb out.png 120
+      - name: The core is given our system (BIOS) directory
+        # Left alone, libretro.py hands every core a throwaway temporary
+        # directory, so a BIOS could never be found. This checks the path
+        # driver really is wired up on whichever libretro.py resolved here.
+        run: |
+          RETRO_SYSTEM_DIR="$PWD/biostest/system" \
+            python retro/emulator.py ./gambatte_libretro.so dmg-acid2.gb sysdir.png 60 \
+            | tee sysdir.log
+          grep -qxF "system directory: $PWD/biostest/system" sysdir.log
+          test -d "$PWD/biostest/system"
+          echo "OK: the core's system directory is $PWD/biostest/system"
       - name: Check the screenshot
         run: |
           python - <<'EOF'
@@ -159,4 +261,47 @@ jobs:
       - name: Install Red-DiscordBot
         run: pip install Red-DiscordBot
       - name: Import the cogs
-        run: python -c "import retro.RetroCog, retro.RetroView, retro.systems"
+        run: python -c "import retro.RetroCog, retro.RetroView, retro.systems, retro.archives"
+      - name: Nothing is imported that info.json does not declare
+        # The cog must run on nothing but what Red ships plus what
+        # info.json["requirements"] installs. Red does NOT ship Pillow, so it
+        # has to stay declared.
+        run: |
+          python - <<'EOF'
+          import ast
+          import json
+          import sys
+          from pathlib import Path
+
+          declared = {
+              "libretro.py": "libretro",
+              "pillow": "PIL",
+          }
+          requirements = json.loads(Path("retro/info.json").read_text())["requirements"]
+          assert sorted(requirements) == sorted(declared), requirements
+
+          # Provided by Red-DiscordBot itself.
+          from_red = {"redbot", "discord", "aiohttp"}
+          allowed = set(sys.stdlib_module_names) | from_red | set(declared.values())
+
+          used = {}
+          for path in sorted(Path("retro").glob("*.py")):
+              for node in ast.walk(ast.parse(path.read_text())):
+                  if isinstance(node, ast.Import):
+                      names = [alias.name for alias in node.names]
+                  elif isinstance(node, ast.ImportFrom):
+                      if node.level:
+                          continue  # relative, i.e. this cog
+                      names = [node.module or ""]
+                  else:
+                      continue
+                  for name in names:
+                      used.setdefault(name.split(".")[0], set()).add(path.name)
+
+          undeclared = {k: sorted(v) for k, v in used.items() if k not in allowed}
+          assert not undeclared, f"undeclared imports: {undeclared}"
+          for name in sorted(used):
+              where = "stdlib" if name in sys.stdlib_module_names else (
+                  "Red" if name in from_red else "info.json requirements")
+              print(f"OK {name:<14} {where}")
+          EOF

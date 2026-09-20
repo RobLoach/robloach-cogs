@@ -13,6 +13,7 @@ Session constructor API of libretro.py >= 0.7.
 
 import io
 import logging
+import re
 import typing
 from pathlib import Path
 
@@ -32,6 +33,22 @@ __all__ = [
 ]
 
 log = logging.getLogger("red.robloach.retro.emulator")
+
+# Everything a core itself prints goes here, on its own logger so it can be
+# turned up in isolation. See _CoreLogDriver for why it is nearly all DEBUG.
+core_log = logging.getLogger("red.robloach.retro.core")
+
+# A printf conversion specifier that made it into a log message verbatim. The
+# flag characters are deliberately restrictive (no space flag) so that an
+# honest "100% complete" is not mistaken for one.
+FORMAT_SPECIFIER = re.compile(
+    r"%[-+#0]*[0-9]*(?:\.[0-9]+)?(?:hh|h|ll|l|L|z|j|t)?[diouxXeEfFgGaAcsp]"
+)
+
+# How many core errors are allowed through at WARNING before the rest of the
+# session's are demoted to DEBUG. A core that fails once per frame must not be
+# able to fill the bot's log.
+MAX_CORE_WARNINGS = 5
 
 # Every field of libretro's RetroPad, in RETRO_DEVICE_ID_JOYPAD order. Which
 # of them a console actually uses (and what its own manual calls them) lives
@@ -108,14 +125,22 @@ class RetroEmulator:
         emulator.stop()
     """
 
-    def __init__(self, core_path, rom_path) -> None:
+    def __init__(self, core_path, rom_path, system_dir=None) -> None:
         # Resolve to an absolute path: dlopen() does not search the working
         # directory for bare filenames like "gambatte_libretro.so".
         self.core_path = Path(core_path).resolve()
         self.rom_path = Path(rom_path)
+        # Where the core should look for BIOS/firmware files, i.e. what it is
+        # told when it asks RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY. None means
+        # the core is given no system directory at all, which is fine for a
+        # BIOS-free core and is what libretro.py would do on its own (it
+        # hands out a throwaway temporary directory).
+        self.system_dir = Path(system_dir) if system_dir is not None else None
         self._pressed: frozenset = frozenset()
         self._session = None
         self._video = None
+        self._path_driver = None
+        self._audio_buffer = None
         self._joypad_state_cls = None
         self.started = False
 
@@ -133,14 +158,28 @@ class RetroEmulator:
             self._log_start_failure("ROM file is too small to be a game")
             raise EmulatorError("The file is too small to be a ROM.")
 
+        # libretro.py is imported here rather than at module scope so that the
+        # cog still loads, and every command still answers, on an install
+        # where the dependency is missing or broken -- the player gets this
+        # sentence instead of the cog failing to import at all.
         try:
             import libretro
             from libretro import JoypadState
         except Exception as exc:  # ImportError or environment issues
-            raise EmulatorError(f"libretro.py could not be loaded: {exc}") from exc
+            raise EmulatorError(
+                f"libretro.py could not be loaded: {exc}. Reinstall the cog, "
+                "or install it manually with `pip install libretro.py`."
+            ) from exc
 
         self._joypad_state_cls = JoypadState
-        video = _make_video_driver()
+        try:
+            video = _make_video_driver()
+        except Exception as exc:
+            raise EmulatorError(
+                f"This libretro.py is not one the cog can drive: {exc}"
+            ) from exc
+        path_driver = self._make_path_driver(libretro)
+        log_driver = _make_log_driver()
 
         def input_generator():
             while True:
@@ -150,20 +189,30 @@ class RetroEmulator:
             builder_defaults = getattr(libretro, "defaults", None)
             if builder_defaults is not None:
                 # libretro.py <= 0.6.x: SessionBuilder API.
-                session = (
+                builder = (
                     builder_defaults(str(self.core_path))
                     .with_content(str(self.rom_path))
                     .with_input(input_generator)
                     .with_video(video)
-                    .build()
                 )
+                if path_driver is not None and hasattr(builder, "with_paths"):
+                    # Overrides the TempDirPathDriver that defaults() installs,
+                    # whose system directory is a throwaway temp folder.
+                    builder = builder.with_paths(path_driver)
+                if log_driver is not None and hasattr(builder, "with_log"):
+                    builder = builder.with_log(log_driver)
+                session = builder.build()
             else:
                 # libretro.py >= 0.7: Session constructor API.
+                kwargs = {"input": input_generator, "video": video}
+                if path_driver is not None:
+                    kwargs["path"] = path_driver
+                if log_driver is not None:
+                    kwargs["log"] = log_driver
                 session = libretro.Session(
                     str(self.core_path),
                     str(self.rom_path),
-                    input=input_generator,
-                    video=video,
+                    **kwargs,
                 )
             session.__enter__()
         except Exception as exc:
@@ -180,7 +229,118 @@ class RetroEmulator:
 
         self._session = session
         self._video = video
+        self._path_driver = path_driver
         self.started = True
+        self._audio_buffer = self._find_audio_buffer(session)
+
+    @staticmethod
+    def _find_audio_buffer(session):
+        """
+        The live sample array libretro.py appends to, if we can empty it.
+
+        Checked once, on a buffer that is still empty, so the per-frame drain
+        never has to guess.
+        """
+        try:
+            buffer = session.audio.buffer
+            del buffer[:]
+        except Exception:
+            log.debug(
+                "This libretro.py exposes no clearable audio buffer; memory "
+                "use may grow during long sessions.",
+                exc_info=True,
+            )
+            return None
+        return buffer
+
+    def _drain_audio(self) -> None:
+        """
+        Throw away the audio the session has accumulated.
+
+        libretro.py's ArrayAudioDriver appends every sample the core produces
+        to an ``array("h")`` that nothing ever empties: about 176 KiB per
+        emulated second at 44.1 kHz stereo, so a channel that plays for an
+        hour would be sitting on 600 MiB of audio nobody can hear. The cog
+        posts silent clips, so the samples are dropped as they arrive.
+        """
+        buffer = self._audio_buffer
+        if buffer is None:
+            return
+        try:
+            del buffer[:]
+        except Exception:
+            # Whatever this is, it is not the array we thought it was.
+            self._audio_buffer = None
+
+    def _make_path_driver(self, libretro):
+        """
+        Build the driver that answers the core's directory questions.
+
+        A libretro core that needs firmware asks the frontend for its "system
+        directory" (``RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY``) and looks for
+        the BIOS there. libretro.py exposes that through its path driver:
+        ``ExplicitPathDriver(system=...)``, handed to ``with_paths()`` on the
+        0.6.x SessionBuilder or to the ``path=`` argument of the 0.7+
+        ``Session`` constructor. Left alone, libretro.py points every core at
+        a fresh temporary directory, so a BIOS could never be found.
+
+        Returns None (and logs) if anything about it fails: every core this
+        cog ships is BIOS-free, so an old or unusual libretro.py should still
+        play games rather than refuse to start.
+        """
+        if self.system_dir is None:
+            return None
+        driver_cls = getattr(libretro, "ExplicitPathDriver", None)
+        if driver_cls is None:
+            log.warning(
+                "This libretro.py has no ExplicitPathDriver, so cores cannot "
+                "be told where to find BIOS files."
+            )
+            return None
+        try:
+            root = self.system_dir.parent
+            # libretro.py 0.6.0 requires all four of these to be set: it calls
+            # os.makedirs() on each unconditionally, and makedirs(None) throws.
+            # They are passed as str, not Path, because 0.6.0's PathLike branch
+            # does fsencode(value.encode()) and a pathlib.Path has no .encode().
+            directories = {
+                "system": self.system_dir,
+                "assets": root / "assets",
+                "save": root / "save",
+                "playlist": root / "playlist",
+            }
+            for path in directories.values():
+                path.mkdir(parents=True, exist_ok=True)
+            return driver_cls(
+                corepath=str(self.core_path),
+                **{key: str(path) for key, path in directories.items()},
+            )
+        except Exception as exc:
+            log.warning(
+                "Could not point the core at the system directory %s (%s); "
+                "a core that needs a BIOS will not find one.",
+                self.system_dir,
+                exc,
+            )
+            return None
+
+    @property
+    def system_directory(self) -> typing.Optional[str]:
+        """
+        The system directory this session actually reports to the core.
+
+        Read back from libretro.py rather than from what was asked for, so a
+        caller (or a test) can confirm the path really reached the core.
+        """
+        for source in (self._session, self._path_driver):
+            value = getattr(source, "system_directory", None) or getattr(
+                source, "system_dir", None
+            )
+            if isinstance(value, bytes):
+                return value.decode("utf-8", "replace")
+            if isinstance(value, str):
+                return value
+        return None
 
     def _log_start_failure(self, exc) -> None:
         """Log everything useful for diagnosing a start failure."""
@@ -213,6 +373,8 @@ class RetroEmulator:
         """Unload the game and free the core. Safe to call more than once."""
         session, self._session = self._session, None
         self._video = None
+        self._path_driver = None
+        self._audio_buffer = None
         self.started = False
         if session is not None:
             try:
@@ -311,6 +473,10 @@ class RetroEmulator:
                 self._session.run()
         except Exception as exc:
             raise EmulatorError(f"The core crashed while running: {exc}") from exc
+        finally:
+            # Every frame, so the audio libretro.py hoards never outgrows one
+            # frame's worth; see _drain_audio().
+            self._drain_audio()
 
     def press(self, button: str, hold_frames: int = 12, release_frames: int = 40) -> None:
         """
@@ -581,6 +747,65 @@ class RetroEmulator:
         return buffer.getvalue()
 
 
+def _make_log_driver():
+    """
+    Keep the core's own chatter out of the bot's log.
+
+    libretro.py's default log driver builds a logger called ``libretro``,
+    forces it to DEBUG, and staples a StreamHandler onto it, so every line a
+    core prints lands on the bot's stderr at the core's own level. Gambatte
+    alone emits a dozen INFO lines per boot.
+
+    Worse, most of those lines are useless. ``retro_log_printf_t`` is a C
+    *variadic* function, and ctypes cannot express varargs for a callback:
+    libretro.py binds it as ``CFUNCTYPE(None, retro_log_level, c_char_p)``, so
+    only the format string ever arrives and the arguments are gone for good.
+    That is where ``[Gambatte] %s`` in the bot's log comes from, and no log
+    driver can recover it -- the data never crosses the boundary. Those lines
+    carry nothing, so they are dropped outright.
+
+    Everything that survives is logged at DEBUG (bar the first few errors),
+    under ``red.robloach.retro.core``, so turning core logging back on is one
+    logging config change away.
+
+    Returns None if this libretro.py has no usable log driver to subclass, in
+    which case the caller leaves logging alone.
+    """
+    try:
+        from libretro import UnformattedLogDriver
+    except Exception:
+        log.debug("This libretro.py has no UnformattedLogDriver to build on.", exc_info=True)
+        return None
+
+    class _CoreLogDriver(UnformattedLogDriver):
+        def __init__(self) -> None:
+            # Passing a logger is what stops the base class attaching its own
+            # StreamHandler (and its unbounded record-keeping filter) to a
+            # global "libretro" logger.
+            super().__init__(logger=core_log)
+            self._warned = 0
+
+        # 0.6.x calls this with (level, fmt, *args); 0.7+ with (level, fmt).
+        def log(self, level, fmt: bytes, *args) -> None:
+            try:
+                message = bytes(fmt).decode("utf-8", "replace").strip()
+            except Exception:
+                return
+            if not message or FORMAT_SPECIFIER.search(message):
+                return
+            severity = logging.DEBUG
+            if getattr(level, "name", "") == "ERROR" and self._warned < MAX_CORE_WARNINGS:
+                self._warned += 1
+                severity = logging.WARNING
+            core_log.log(severity, "%s", message)
+
+    try:
+        return _CoreLogDriver()
+    except Exception:
+        log.debug("Could not build the core log driver.", exc_info=True)
+        return None
+
+
 def _make_video_driver():
     """
     An ArrayVideoDriver that tolerates SET_GEOMETRY before av_info arrives.
@@ -620,7 +845,12 @@ def _main() -> int:
     A ``.webp`` or ``.gif`` output records the frames as an animated clip; any
     other extension runs the frames and writes a single PNG of the final
     screen.
+
+    Setting ``RETRO_SYSTEM_DIR`` points the core's system (BIOS) directory at
+    that folder and prints back whatever libretro.py reports for it, which is
+    how the wiring is checked in CI.
     """
+    import os
     import sys
     import time
 
@@ -631,9 +861,12 @@ def _main() -> int:
     out_path = Path(sys.argv[3])
     suffix = out_path.suffix.lower()
     clip_format = {".webp": "WEBP", ".gif": "GIF"}.get(suffix)
+    system_dir = os.environ.get("RETRO_SYSTEM_DIR") or None
 
     started = time.perf_counter()
-    with RetroEmulator(sys.argv[1], sys.argv[2]) as emulator:
+    with RetroEmulator(sys.argv[1], sys.argv[2], system_dir=system_dir) as emulator:
+        if system_dir:
+            print(f"system directory: {emulator.system_directory}")
         if len(sys.argv) > 4:
             frames = int(sys.argv[4])
         elif clip_format:

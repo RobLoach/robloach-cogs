@@ -16,7 +16,16 @@ from .emulator import (
     RetroEmulator,
     clip_extension,
 )
-from .systems import SYSTEMS, DPAD, System, system_by_key, system_for_extension
+from .systems import (
+    DPAD,
+    REPLAY_EMOJI,
+    STOP_EMOJI,
+    SYSTEMS,
+    WAIT_EMOJI,
+    System,
+    system_by_key,
+    system_for_extension,
+)
 
 log = logging.getLogger("red.robloach.retro")
 
@@ -103,7 +112,7 @@ class _WaitButton(discord.ui.Button):
     def __init__(self, row: int) -> None:
         super().__init__(
             label="Wait",
-            emoji="\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE}",
+            emoji=WAIT_EMOJI,
             style=discord.ButtonStyle.secondary,
             row=row,
             custom_id=f"{CUSTOM_ID_PREFIX}:wait",
@@ -133,7 +142,7 @@ class _ReplayButton(discord.ui.Button):
     def __init__(self, row: int) -> None:
         super().__init__(
             label="Replay",
-            emoji="\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS}",
+            emoji=REPLAY_EMOJI,
             style=discord.ButtonStyle.secondary,
             row=row,
             custom_id=f"{CUSTOM_ID_PREFIX}:replay",
@@ -147,7 +156,7 @@ class _StopButton(discord.ui.Button):
     def __init__(self, row: int) -> None:
         super().__init__(
             label="Stop",
-            emoji="\N{BLACK SQUARE FOR STOP}\N{VARIATION SELECTOR-16}",
+            emoji=STOP_EMOJI,
             style=discord.ButtonStyle.danger,
             row=row,
             custom_id=f"{CUSTOM_ID_PREFIX}:stop",
@@ -565,6 +574,22 @@ class RetroView(discord.ui.View):
         except discord.HTTPException:
             log.warning("Could not disable the Libretro controls.", exc_info=True)
 
+    @staticmethod
+    async def _whisper(interaction: discord.Interaction, message: str) -> None:
+        """
+        Tell just the person who clicked, without ever raising.
+
+        Used when the message edit itself failed, so there is nowhere else to
+        put the explanation and no point making a second failure louder.
+        """
+        followup = getattr(interaction, "followup", None)
+        if followup is None:
+            return
+        try:
+            await followup.send(message, ephemeral=True)
+        except Exception:
+            log.debug("Could not deliver a Libretro failure notice.", exc_info=True)
+
     async def _show(self, interaction: discord.Interaction, clip: bytes) -> None:
         """Re-enable the controls and swap in the new clip, in one edit."""
         self._set_disabled(False)
@@ -578,8 +603,19 @@ class RetroView(discord.ui.View):
                 attachments=[self._clip_file(clip)],
                 view=self,
             )
-        except discord.HTTPException:
-            log.warning("Failed to update the Libretro screen.", exc_info=True)
+        except discord.HTTPException as error:
+            # The game itself is fine, so say so rather than leaving the
+            # controls looking broken. The traceback goes to the log: this is
+            # how an invalid button emoji shows up in production.
+            log.exception(
+                "Failed to update the Libretro screen in channel %s.", self.channel_id
+            )
+            await self._whisper(
+                interaction,
+                "Discord would not accept the new clip "
+                f"(HTTP {getattr(error, 'status', '?')}). The game is safe "
+                "and was saved; try another press.",
+            )
 
     async def _recover(self, interaction: discord.Interaction, reason: str) -> None:
         """Put the controls back after a failed press and explain why."""
@@ -615,7 +651,12 @@ class RetroView(discord.ui.View):
                 view=self,
             )
         except discord.HTTPException:
-            log.warning("Failed to replay the Libretro clip.", exc_info=True)
+            log.exception(
+                "Failed to replay the Libretro clip in channel %s.", self.channel_id
+            )
+            await self._whisper(
+                interaction, "Discord would not accept that clip again."
+            )
 
     async def _stop(self, interaction: discord.Interaction) -> None:
         if self.closed:
