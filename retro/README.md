@@ -61,6 +61,7 @@ can start it by name:
 - `[p]retroset autodownload [true|false]` (owner) controls whether missing cores are fetched automatically when the cog loads. On by default.
 - `[p]retroset core <path>` (owner) points the cog at a libretro core that is already on the machine. The console is read from the filename, so keep the buildbot name (`snes9x_libretro.so`).
 - `[p]retroset game add|remove|list` (owner) manages the games anyone can start by name.
+- `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below.
 - `[p]retroset bios add|list|remove` (owner) manages BIOS files for cores that need one. See below.
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
 - `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows.
@@ -110,6 +111,72 @@ controller: the Genesis gets **A B C** (and **X Y Z** and **Mode**), the Atari
 **VI** and **Run**, and the Neo Geo Pocket's **A** and **B** are the right way
 round rather than swapped.
 
+## Core options
+
+Every libretro core has its own settings — the console region, sound quality,
+the colour palette a Game Boy game is tinted with. Gambatte has 32 of them,
+FCEUmm 44, Genesis Plus GX 62. `[p]retroset coreoptions` reads and changes
+them, and the changes are applied every time that core loads a game.
+
+```
+[p]retroset coreoptions                                        list the cores
+[p]retroset coreoptions gambatte                               list its options
+[p]retroset coreoptions gambatte gb_colorization               explain one
+[p]retroset coreoptions gambatte gb_colorization GBC           set it
+[p]retroset coreoptions gambatte gb_colorization reset         put the default back
+```
+
+A listing looks like this, paginated with arrows when it does not fit in one
+message:
+
+```
+**`gambatte`** — Game Boy
+32 option(s), read from the core itself.
+
+**gb_colorization** = `GBC` **(changed)**
+  `gambatte_gb_colorization` • `disabled`, `auto`, `GBC`, `SGB`, `internal`, `custom`
+**gbc_color_correction** = `GBC only` *(default)*
+  `gambatte_gbc_color_correction` • `disabled`, `GBC only`, `always`
+```
+
+**Keys** may be given with or without the core's prefix, so
+`gambatte_gb_colorization` and `gb_colorization` both work, as does any
+unambiguous ending of a key (`colorization` alone is refused, because Gambatte
+has two options ending that way, and the two are listed for you). Prefixes are
+not guessed: FCEUmm names its options `fceumm_region` but the Neo Geo Pocket
+core names its one option `ngp_language`, not `mednafen_ngp_language`.
+
+**`reset`** is the value that clears an override and puts the core's own
+default back. It is not `default` or `none`, because some cores use those as
+real values.
+
+**Values** are checked against what the core says it accepts, and an invalid
+one is refused with the list of valid ones:
+
+```
+[p]retroset coreoptions fceumm region Mars
+→ `Mars` is not something the `fceumm` core accepts for `fceumm_region`.
+  Valid values: `Auto`, `NTSC`, `PAL`, `Dendy`. Use `reset` to put the
+  default (`Auto`) back.
+```
+
+**Reading a core's options can mean loading it**, and only one core may be
+loaded at a time, so a game that is running is saved and put to sleep first —
+exactly as starting a game in another channel would. Everything discovered is
+remembered, so later listings are instant.
+
+Most cores declare their options before any game is loaded, so asking is
+enough. **Some do not**: FCEUmm declares *nothing* until a ROM is in, and then
+declares 44. When that happens the cog says so rather than pretending the core
+has no options, and the options become listable the moment somebody plays a
+NES game — every session that starts adds what its core reports to what is
+already known. A setting made before then is stored unchecked, with a warning:
+libretro validates every key and value against the core's own list and
+silently uses its default for anything it does not recognise, so a typo wastes
+your time but cannot break a game.
+
+`[p]retroset settings` lists whatever is currently overridden.
+
 ## Saving and sleeping
 
 The cog never throws a game away. Progress is written to a save state
@@ -137,6 +204,29 @@ about 25ms, so nobody notices.
 Starting a *different* game in a channel banks the current game's progress and
 switches. Starting the same one again just resumes it. Each game a channel
 plays keeps its own save, so you can switch back and forth.
+
+### Battery saves, as insurance
+
+A save state is a snapshot of the whole machine, and it is only ever loadable
+by the same build of the same core: **update a core and every save state it
+wrote stops fitting**, which would strand a sleeping game. So the cartridge's
+own battery save — its SRAM, the thing an original cart kept your file in — is
+written alongside the state, on exactly the same schedule, as a `.srm` file
+that any emulator can read.
+
+When a game wakes up, the save state is preferred: it brings back the precise
+moment, mid-jump if that is where you were. If the state is missing or the
+core has since been updated and rejects it, the game is booted fresh with the
+battery save poured back in, and the channel is told:
+
+> This game's save state could not be used (the emulator core was updated), so
+> it started from the title screen — but your in-game save survived. Load it
+> from the game's own menu to carry on.
+
+Plenty of cartridges have no battery at all — nestest, dmg-acid2, most
+puzzle games. That is normal, not a failure: nothing is written, no empty file
+is left behind, and if a save state is ever lost for one of those the channel
+is told the game simply started over.
 
 ## Playing
 

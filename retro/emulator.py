@@ -29,7 +29,11 @@ __all__ = [
     "MAX_CLIP_SECONDS",
     "CLIP_FORMATS",
     "DEFAULT_CLIP_FORMAT",
+    "MAX_SRAM_SIZE",
+    "RETRO_MEMORY_SAVE_RAM",
     "clip_extension",
+    "describe_definitions",
+    "probe_core_options",
 ]
 
 log = logging.getLogger("red.robloach.retro.emulator")
@@ -99,10 +103,183 @@ DEFAULT_CLIP_FORMAT = "WEBP"
 # here have small palettes, so this is very nearly lossless for them.
 GIF_COLORS = 64
 
+# RETRO_MEMORY_SAVE_RAM, i.e. the cartridge's battery-backed save memory. It is
+# 0 in libretro.h and has been since libretro existed, but it is spelled out
+# here so the SRAM code reads as something other than a magic number.
+RETRO_MEMORY_SAVE_RAM = 0
+
+# A sanity ceiling for a battery save. The largest cartridge SRAM any of these
+# consoles ever shipped is 128 KiB (µCity's Game Boy Color cart reports exactly
+# that), so anything past a megabyte is a core reporting nonsense and is not
+# worth writing to disk on every few button presses.
+MAX_SRAM_SIZE = 1024 * 1024
+
 
 def clip_extension(clip_format: str = DEFAULT_CLIP_FORMAT) -> str:
     """``"WEBP"`` -> ``".webp"``."""
     return f".{str(clip_format).lower()}"
+
+
+# -- Core options -------------------------------------------------------------
+#
+# libretro cores expose their own settings (region, sound quality, palette,
+# ...) through RETRO_ENVIRONMENT_SET_CORE_OPTIONS and friends. Keys, values and
+# labels all cross the boundary as C strings, so everything libretro.py hands
+# back here is ``bytes``; the cog deals in text and in JSON-serializable dicts,
+# so the two conversions live here rather than being repeated at every call
+# site.
+
+
+def _text(value) -> str:
+    """Whatever libretro.py handed us, as a plain string."""
+    if value is None:
+        return ""
+    if isinstance(value, memoryview):
+        value = bytes(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def _encode_options(options) -> typing.Dict[bytes, bytes]:
+    """``{"gambatte_gb_colorization": "GBC"}`` -> ``{b"...": b"..."}``."""
+    encoded: typing.Dict[bytes, bytes] = {}
+    for key, value in dict(options or {}).items():
+        key = key if isinstance(key, bytes) else str(key).encode("utf-8")
+        value = value if isinstance(value, bytes) else str(value).encode("utf-8")
+        if key and value:
+            encoded[key] = value
+    return encoded
+
+
+def describe_definitions(definitions) -> typing.Dict[str, dict]:
+    """
+    Turn libretro.py's option definitions into plain, storable dictionaries.
+
+    The input is whatever ``OptionDriver.definitions`` returns: a mapping of
+    ``bytes`` key to ``retro_core_option_v2_definition``. The output is all
+    text and all JSON-serializable, so the cog can keep it in Config and list
+    a core's options without loading that core again::
+
+        {"gambatte_gb_colorization": {
+            "desc": "GB Colorization",
+            "info": "Enables colorization of Game Boy games.",
+            "default": "disabled",
+            "values": [["disabled", "disabled"], ["auto", "Auto"], ...],
+        }}
+
+    ``values`` is a list of ``[value, label]`` pairs: the value is what the
+    core is actually given, the label is what RetroArch would show. A
+    definition's value array is fixed-length and NULL-padded, so the empty
+    trailing entries are dropped here rather than everywhere downstream.
+    """
+    described: typing.Dict[str, dict] = {}
+    for raw_key, definition in dict(definitions or {}).items():
+        key = _text(raw_key) or _text(getattr(definition, "key", ""))
+        if not key:
+            continue
+        values: typing.List[typing.List[str]] = []
+        for entry in getattr(definition, "values", ()) or ():
+            value = _text(getattr(entry, "value", None))
+            if not value:
+                # The NULL padding at the end of the array.
+                continue
+            label = _text(getattr(entry, "label", None)) or value
+            values.append([value, label])
+        described[key] = {
+            "desc": _text(getattr(definition, "desc", None)),
+            "info": _text(getattr(definition, "info", None)),
+            "default": _text(getattr(definition, "default_value", None)),
+            "values": values,
+        }
+    return described
+
+
+def probe_core_options(core_path, options=None) -> typing.Dict[str, dict]:
+    """
+    Read a core's option definitions without loading a game.
+
+    Most cores register their options from ``retro_set_environment``, which
+    runs before any content exists: Gambatte declares all 32 of its settings
+    that way, as do snes9x (43) and Genesis Plus GX (62). Some do not --
+    FCEUmm registers nothing at all until a ROM is loaded, and then declares
+    44 -- so an empty result means "ask again once a game is running", never
+    "this core has no options".
+
+    This deliberately drives ``Core`` directly rather than going through
+    ``libretro.defaults(...).build()``, because the builder insists on
+    content: with none, and with a core that does not advertise no-content
+    support, it raises ``ValueError("No content provided and core did not
+    register support for no-content mode")``.
+
+    Blocking C code, like everything else here: run it in a worker thread, and
+    only while no other core is loaded (a libretro core is a shared object
+    with process-global state).
+    """
+    try:
+        from libretro import ArrayAudioDriver, ArrayVideoDriver, Core, JoypadState
+        from libretro.drivers.environment.composite import CompositeEnvironmentDriver
+        from libretro.drivers.input.iterable import IterableInputDriver
+        from libretro.drivers.options.dict import DictOptionDriver
+    except Exception as exc:
+        raise EmulatorError(
+            f"This libretro.py cannot be asked for a core's options: {exc}"
+        ) from exc
+
+    core_path = Path(core_path).resolve()
+    if not core_path.is_file():
+        raise EmulatorError(f"Libretro core not found: {core_path}")
+
+    def _input_generator():
+        while True:
+            yield JoypadState()
+
+    option_driver = DictOptionDriver(
+        version=2,
+        categories_supported=True,
+        variables=_encode_options(options),
+    )
+    drivers = {
+        "audio": ArrayAudioDriver(),
+        "video": ArrayVideoDriver(),
+        "input": IterableInputDriver(_input_generator),
+        "options": option_driver,
+        "log": _make_log_driver(),
+    }
+    # A driver slot that is present but None is rejected, so drop the ones we
+    # could not build. The constructor itself changed shape between releases:
+    # libretro.py 0.6.x takes one positional dict of drivers, 0.7+ takes them
+    # as keyword arguments. Passing a dict to the newer one would silently
+    # bind it to `audio` and fail with a confusing TypeError, so try the
+    # keyword form first and fall back.
+    drivers = {name: driver for name, driver in drivers.items() if driver is not None}
+    try:
+        environment = CompositeEnvironmentDriver(**drivers)
+    except TypeError:
+        environment = CompositeEnvironmentDriver(drivers)
+
+    core = None
+    initialised = False
+    try:
+        core = Core(str(core_path))
+        core.set_environment(environment.environment)
+        core.init()
+        initialised = True
+        return describe_definitions(option_driver.definitions)
+    except EmulatorError:
+        raise
+    except Exception as exc:
+        log.warning("Could not read the options of the core %s", core_path, exc_info=True)
+        raise EmulatorError(f"The core's options could not be read: {exc}") from exc
+    finally:
+        # Always unload: leaving a half-initialised core in the process is
+        # exactly the state MAX_LIVE_EMULATORS exists to prevent.
+        if core is not None and initialised:
+            try:
+                core.deinit()
+            except Exception:
+                log.warning("The core %s did not deinitialise cleanly.", core_path, exc_info=True)
+        del core
 
 
 class EmulatorError(RuntimeError):
@@ -122,14 +299,26 @@ class RetroEmulator:
         png_bytes = emulator.screenshot()
         clip_bytes = emulator.record(presses=[("a", 0, 12)])
         state = emulator.save_state()
+        sram = emulator.save_sram()   # None if the cart has no battery
         emulator.stop()
+
+    ``options`` is a mapping of libretro core option keys to values (for
+    example ``{"gambatte_gb_colorization": "GBC"}``) seeded before the core
+    initialises; see :func:`probe_core_options` for reading what a core
+    offers.
     """
 
-    def __init__(self, core_path, rom_path, system_dir=None) -> None:
+    def __init__(self, core_path, rom_path, system_dir=None, options=None) -> None:
         # Resolve to an absolute path: dlopen() does not search the working
         # directory for bare filenames like "gambatte_libretro.so".
         self.core_path = Path(core_path).resolve()
         self.rom_path = Path(rom_path)
+        # Core options to seed before the core initialises, as text. A core
+        # only reads most of its options once, at startup, so these have to be
+        # in place before retro_init() rather than poked in afterwards.
+        self.options: typing.Dict[str, str] = {
+            _text(key): _text(value) for key, value in dict(options or {}).items()
+        }
         # Where the core should look for BIOS/firmware files, i.e. what it is
         # told when it asks RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY. None means
         # the core is given no system directory at all, which is fine for a
@@ -185,6 +374,7 @@ class RetroEmulator:
             while True:
                 yield self._current_joypad()
 
+        encoded_options = _encode_options(self.options)
         try:
             builder_defaults = getattr(libretro, "defaults", None)
             if builder_defaults is not None:
@@ -201,6 +391,14 @@ class RetroEmulator:
                     builder = builder.with_paths(path_driver)
                 if log_driver is not None and hasattr(builder, "with_log"):
                     builder = builder.with_log(log_driver)
+                if encoded_options and hasattr(builder, "with_options"):
+                    # Seeds a DictOptionDriver with these values, which it
+                    # keeps when the core registers its own definitions. An
+                    # unknown key, or a value the core does not offer, is
+                    # ignored and the core sees its own default instead -- so
+                    # a setting left over from an older build of a core can
+                    # never stop a game from starting.
+                    builder = builder.with_options(encoded_options)
                 session = builder.build()
             else:
                 # libretro.py >= 0.7: Session constructor API.
@@ -209,11 +407,26 @@ class RetroEmulator:
                     kwargs["path"] = path_driver
                 if log_driver is not None:
                     kwargs["log"] = log_driver
-                session = libretro.Session(
-                    str(self.core_path),
-                    str(self.rom_path),
-                    **kwargs,
-                )
+                if encoded_options:
+                    kwargs["options"] = encoded_options
+                try:
+                    session = libretro.Session(
+                        str(self.core_path), str(self.rom_path), **kwargs
+                    )
+                except TypeError:
+                    # A libretro.py whose Session takes no options= argument.
+                    # The game matters more than the setting, so start it
+                    # anyway and say why the setting did nothing.
+                    if "options" not in kwargs:
+                        raise
+                    log.warning(
+                        "This libretro.py does not accept core options at "
+                        "startup, so %s of them were ignored.",
+                        len(kwargs.pop("options")),
+                    )
+                    session = libretro.Session(
+                        str(self.core_path), str(self.rom_path), **kwargs
+                    )
             session.__enter__()
         except Exception as exc:
             self._log_start_failure(exc)
@@ -546,6 +759,162 @@ class RetroEmulator:
             raise EmulatorError(f"The save state could not be loaded: {exc}") from exc
         self.advance(1)
 
+    # -- Core options -------------------------------------------------------
+
+    @property
+    def _option_driver(self):
+        """The running session's option driver, or None if it has none."""
+        if self._session is None:
+            return None
+        try:
+            return self._session.options
+        except Exception:
+            return None
+
+    def option_definitions(self) -> typing.Dict[str, dict]:
+        """
+        Everything this core has told us about its own settings, as text.
+
+        See :func:`describe_definitions` for the shape. Empty if the core has
+        registered nothing (or this libretro.py exposes no option driver),
+        which is not the same as the core having no options.
+        """
+        driver = self._option_driver
+        if driver is None:
+            return {}
+        try:
+            return describe_definitions(driver.definitions)
+        except Exception:
+            log.debug("Could not read the core's option definitions.", exc_info=True)
+            return {}
+
+    def option_value(self, key: str) -> typing.Optional[str]:
+        """The value the core would read for ``key`` right now, or None."""
+        driver = self._option_driver
+        if driver is None:
+            return None
+        try:
+            return _text(driver.variables[_text(key).encode("utf-8")])
+        except Exception:
+            return None
+
+    def set_option(self, key: str, value: str) -> bool:
+        """
+        Change a setting on the running core.
+
+        Writing to the option driver raises the "variables have changed" flag,
+        which the core notices the next time it polls. Cores differ in how much
+        of that they honour mid-game -- a palette usually changes at once, a
+        region setting usually waits for a restart -- so the caller should
+        treat a True here as "the core has been told", not "the picture
+        changed".
+        """
+        driver = self._option_driver
+        if driver is None:
+            return False
+        try:
+            driver.variables[_text(key).encode("utf-8")] = _text(value).encode("utf-8")
+        except Exception:
+            log.warning("Could not set the core option %s.", key, exc_info=True)
+            return False
+        return True
+
+    # -- Battery saves (SRAM) -----------------------------------------------
+    #
+    # A save state is a snapshot of the whole machine and is only loadable by
+    # the exact build of the core that wrote it: update the core and every
+    # state on disk becomes a size mismatch (see load_state). SRAM is the
+    # opposite -- it is the cartridge's own battery-backed memory, the same
+    # bytes an original cart would hold, in a format that does not change --
+    # so it is kept alongside the state as insurance. The state restores the
+    # exact moment; the SRAM restores the player's in-game save.
+
+    def _save_ram(self) -> typing.Optional[memoryview]:
+        """A writable view of the cartridge's battery memory, or None."""
+        if not self.started:
+            return None
+        try:
+            memory = self._session.core.get_memory(RETRO_MEMORY_SAVE_RAM)
+        except Exception:
+            log.debug("This core does not expose its save RAM.", exc_info=True)
+            return None
+        if memory is None:
+            return None
+        try:
+            size = len(memory)
+        except Exception:
+            return None
+        # A cartridge with no battery reports either a NULL pointer (None
+        # above) or a zero-length region; both are normal, not errors.
+        if size <= 0:
+            return None
+        if size > MAX_SRAM_SIZE:
+            log.warning(
+                "The core %s reports %s bytes of save RAM, which is past the "
+                "%s byte ceiling; ignoring it.",
+                self.core_path.name,
+                size,
+                MAX_SRAM_SIZE,
+            )
+            return None
+        return memory
+
+    def save_sram(self) -> typing.Optional[bytes]:
+        """
+        The cartridge's battery save, or None if this game has none.
+
+        None is the normal answer for a cart with no battery (a NES test ROM,
+        most Game Boy puzzle games): it means "nothing to keep", not "this
+        failed". Never raises.
+        """
+        memory = self._save_ram()
+        if memory is None:
+            return None
+        try:
+            return bytes(memory)
+        except Exception:
+            log.warning("Could not read the save RAM.", exc_info=True)
+            return None
+
+    def load_sram(self, data: bytes) -> bool:
+        """
+        Write a battery save back into the running game.
+
+        Must be called *after* the game is loaded, because the core only
+        allocates its save memory once it knows what cartridge it is holding.
+        Returns False when there is nothing to restore into, or when the blob
+        does not fit the region the core reports -- neither is worth raising
+        over, since the fallback is simply a fresh save file.
+        """
+        if not data:
+            return False
+        memory = self._save_ram()
+        if memory is None:
+            return False
+        size = len(memory)
+        if len(data) != size:
+            # A different revision of the same game, or a cart whose save size
+            # depends on a core option. Restoring a prefix would hand the game
+            # a half-written save file, which is worse than a clean one.
+            log.warning(
+                "Not restoring %s bytes of save RAM into a %s byte region.",
+                len(data),
+                size,
+            )
+            return False
+        try:
+            memory[:] = bytes(data)
+        except Exception:
+            log.warning("Could not restore the save RAM.", exc_info=True)
+            return False
+        return True
+
+    @property
+    def sram_size(self) -> int:
+        """How many bytes of battery save this game has, 0 if it has none."""
+        memory = self._save_ram()
+        return 0 if memory is None else len(memory)
+
     # -- Video --------------------------------------------------------------
 
     @staticmethod
@@ -867,6 +1236,9 @@ def _main() -> int:
     with RetroEmulator(sys.argv[1], sys.argv[2], system_dir=system_dir) as emulator:
         if system_dir:
             print(f"system directory: {emulator.system_directory}")
+        # 0 for a cartridge with no battery, which is normal; see save_sram().
+        print(f"save ram: {emulator.sram_size} bytes")
+        print(f"core options: {len(emulator.option_definitions())}")
         if len(sys.argv) > 4:
             frames = int(sys.argv[4])
         elif clip_format:

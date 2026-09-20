@@ -228,6 +228,13 @@ class RetroView(discord.ui.View):
         # Set when this session is replaced or the cog goes away, so an old
         # message's buttons can never bring its emulator back.
         self.closed: bool = False
+        # A one-off sentence to show with the next clip, then forget. Used
+        # when waking a session tells the player something they need to know
+        # -- that the save state was rejected after a core update and the game
+        # came back from its battery save instead, for instance. It rides on
+        # the next embed rather than being a second message, so it lands with
+        # the clip it explains.
+        self.notice: typing.Optional[str] = None
 
         self.message: typing.Optional[discord.Message] = None
         self.lock: asyncio.Lock = asyncio.Lock()
@@ -397,6 +404,10 @@ class RetroView(discord.ui.View):
         """
         embed = discord.Embed(title=self.game_name, colour=await self._embed_colour())
         embed.set_author(name=self.system.name)
+        if footer is None:
+            # A pending one-off notice outranks the standing footer, and is
+            # cleared as it is shown so it appears exactly once.
+            footer, self.notice = self.notice, None
         if footer is None:
             footer = (
                 "Anyone can press the buttons. The game sleeps after "

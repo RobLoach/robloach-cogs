@@ -154,6 +154,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+      - name: Install the emulator dependencies
+        run: pip install "libretro.py"
       - name: Every recommended core exists on the buildbot
         run: |
           python - <<'EOF'
@@ -161,12 +163,15 @@ jobs:
           import io
           import urllib.request
           import zipfile
+          from pathlib import Path
 
           spec = importlib.util.spec_from_file_location("systems", "retro/systems.py")
           S = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(S)
 
           BASE = "https://buildbot.libretro.com/nightly/linux/x86_64/latest"
+          cores = Path("cores")
+          cores.mkdir(exist_ok=True)
           total = 0
           for core in S.CORES:
               name = f"{core}_libretro.so"
@@ -175,9 +180,58 @@ jobs:
               with zipfile.ZipFile(io.BytesIO(payload)) as archive:
                   member = next(e for e in archive.namelist() if e.endswith(name))
                   size = archive.getinfo(member).file_size
+                  # Kept for the core-option check below, which needs the real
+                  # shared objects rather than just their sizes.
+                  (cores / name).write_bytes(archive.read(member))
               total += len(payload)
               print(f"OK {core:<20} {len(payload) // 1024:>5} KiB zip -> {size // 1024:>6} KiB core")
           print(f"{len(S.CORES)} cores, {total // 1024} KiB of downloads")
+          EOF
+
+      - name: No core uses "reset" as a real option value
+        # `[p]retroset coreoptions <core> <key> reset` puts a core's default
+        # back, so the sentinel must not also be something a core accepts.
+        # "default" and "none" are both out already (mednafen_wswan offers the
+        # first, snes9x and genesis_plus_gx the second); this catches a core
+        # update that would make "reset" ambiguous too.
+        run: |
+          python - <<'EOF'
+          import importlib.util
+          from pathlib import Path
+
+          def load(name, path):
+              spec = importlib.util.spec_from_file_location(name, path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          S = load("systems", "retro/systems.py")
+          E = load("emulator", "retro/emulator.py")
+          # RetroCog cannot be imported here (it needs Red), so the sentinel is
+          # repeated; the red-import job asserts OPTION_RESET is still "reset".
+          SENTINEL = "reset"
+
+          total = 0
+          for core in sorted(S.CORES):
+              path = Path("cores") / f"{core}_libretro.so"
+              definitions = E.probe_core_options(path)
+              values = {
+                  value
+                  for option in definitions.values()
+                  for value, _ in option["values"]
+              }
+              clash = [
+                  key for key, option in definitions.items()
+                  if any(value.lower() == SENTINEL for value, _ in option["values"])
+              ]
+              assert not clash, f"{core} uses {SENTINEL!r} as a value of {clash}"
+              total += len(definitions)
+              print(f"OK {core:<20} {len(definitions):>3} options, "
+                    f"{len(values):>3} distinct values, no {SENTINEL!r}")
+          # FCEUmm declares nothing until a ROM is loaded, so a zero here is
+          # expected for it and is not a failure; the others must say something.
+          assert total > 150, f"only {total} options across {len(S.CORES)} cores"
+          print(f"{total} core options readable with no ROM at all")
           EOF
 
   emulator-smoke:
@@ -201,6 +255,11 @@ jobs:
           unzip gambatte_libretro.so.zip
       - name: Download the dmg-acid2 test ROM
         run: curl -fsSLO https://github.com/mattcurrie/dmg-acid2/releases/download/v1.0/dmg-acid2.gb
+      - name: Download the uCity ROM
+        # A free, MIT-licensed Game Boy Color city builder whose cartridge has
+        # a 128 KiB battery save -- which is what the SRAM checks below need,
+        # since dmg-acid2's cart has none.
+        run: curl -fsSLO https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc
       - name: Render a still frame
         run: python retro/emulator.py ./gambatte_libretro.so dmg-acid2.gb out.png 120
       - name: The core is given our system (BIOS) directory
@@ -251,6 +310,157 @@ jobs:
           print(f"OK: {len(data)} byte animated WebP, {clip.n_frames} frames, loop=1")
           EOF
 
+      - name: A core's options can be read without a ROM
+        # Most cores declare their options from retro_set_environment, before
+        # any content exists, so `[p]retroset coreoptions` can read them by
+        # loading the core on its own. This is the low-level Core path, not
+        # the session builder: the builder refuses to run without content.
+        run: |
+          python - <<'EOF'
+          import importlib.util
+
+          spec = importlib.util.spec_from_file_location("emulator", "retro/emulator.py")
+          E = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(E)
+
+          definitions = E.probe_core_options("./gambatte_libretro.so")
+          assert len(definitions) >= 30, f"expected ~32 options, got {len(definitions)}"
+          assert all(isinstance(k, str) for k in definitions), "keys must be text"
+
+          option = definitions["gambatte_gb_colorization"]
+          assert option["desc"] == "GB Colorization", option["desc"]
+          assert option["default"] == "disabled", option["default"]
+          values = [value for value, _ in option["values"]]
+          # libretro pads the value array with NULLs; none of that may leak.
+          assert all(values), values
+          for wanted in ("disabled", "auto", "GBC", "SGB"):
+              assert wanted in values, (wanted, values)
+          assert option["info"], "the option should carry its help text"
+          print(f"OK: {len(definitions)} options read from the core with no ROM")
+          print(f"OK: gambatte_gb_colorization = {option['default']} of {values}")
+          EOF
+
+      - name: A core option changes what the core actually draws
+        # dmg-acid2 is a plain Game Boy ROM, so Gambatte's colorization option
+        # is the difference between the four Game Boy greys and a palette. If
+        # the option never reached the core, all three would be identical.
+        run: |
+          python - <<'EOF'
+          import hashlib
+          import importlib.util
+          import io
+
+          from PIL import Image
+
+          spec = importlib.util.spec_from_file_location("emulator", "retro/emulator.py")
+          E = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(E)
+
+          shots = {}
+          for wanted in ("disabled", "GBC", "SGB"):
+              emulator = E.RetroEmulator(
+                  "./gambatte_libretro.so", "dmg-acid2.gb",
+                  options={"gambatte_gb_colorization": wanted},
+              )
+              emulator.start()
+              emulator.advance(emulator.frames_for_seconds(4))
+              png = emulator.screenshot()
+              image = Image.open(io.BytesIO(png)).convert("RGB")
+              seen = emulator.option_value("gambatte_gb_colorization")
+              assert seen == wanted, (wanted, seen)
+              shots[wanted] = (len(image.getcolors(1 << 24)),
+                               hashlib.sha256(png).hexdigest())
+              emulator.stop()
+              print(f"OK {wanted:<9} {shots[wanted][0]} colours "
+                    f"{shots[wanted][1][:12]}")
+
+          assert shots["disabled"][0] == 4, shots["disabled"]
+          assert shots["GBC"][0] > 4, shots["GBC"]
+          assert len({digest for _, digest in shots.values()}) == 3, shots
+
+          # A key or value the core does not know must not stop a game: the
+          # option driver validates and hands the core its own default.
+          emulator = E.RetroEmulator(
+              "./gambatte_libretro.so", "dmg-acid2.gb",
+              options={"gambatte_not_a_real_option": "x",
+                       "gambatte_gb_colorization": "not-a-real-value"},
+          )
+          emulator.start()
+          emulator.advance(60)
+          assert emulator.started and emulator.screenshot()
+          assert emulator.set_option("gambatte_gb_colorization", "SGB")
+          emulator.stop()
+          print("OK: an unusable core option degrades to the default")
+          EOF
+
+      - name: Battery saves (SRAM) round-trip, and survive a core update
+        # A save state is only loadable by the build of the core that wrote
+        # it, so updating a core invalidates every one on disk. The
+        # cartridge's battery save is not, which is why the cog keeps both.
+        run: |
+          python - <<'EOF'
+          import importlib.util
+
+          spec = importlib.util.spec_from_file_location("emulator", "retro/emulator.py")
+          E = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(E)
+
+          CORE = "./gambatte_libretro.so"
+
+          # A cartridge with no battery must be silent, not an error.
+          plain = E.RetroEmulator(CORE, "dmg-acid2.gb")
+          plain.start()
+          plain.advance(60)
+          assert plain.sram_size == 0, plain.sram_size
+          assert plain.save_sram() is None, "no battery means None, not b''"
+          assert plain.load_sram(b"x" * 16) is False
+          plain.stop()
+          print("OK: dmg-acid2 has no battery, and says so quietly")
+
+          # uCity's cartridge has one.
+          first = E.RetroEmulator(CORE, "ucity.gbc")
+          first.start()
+          first.advance(first.frames_for_seconds(3))
+          size = first.sram_size
+          assert size == 131072, f"expected 128 KiB of SRAM, got {size}"
+          marker = (bytes(range(256)) * (size // 256 + 1))[:size]
+          assert first.load_sram(marker) is True
+          assert first.save_sram() == marker
+          assert first.load_sram(b"\0" * 100) is False, "a wrong size must be refused"
+          assert first.load_sram(b"") is False
+          first.advance(120)
+          kept = first.save_sram()
+          state = first.save_state()
+          first.stop()
+          print(f"OK: {size} bytes of battery save, written and read back")
+
+          # The fallback the whole feature exists for: a save state the core
+          # will not take (faked by truncating it, which is the same failure
+          # a core update produces) still leaves the battery save usable.
+          after = E.RetroEmulator(CORE, "ucity.gbc")
+          after.start()
+          rejected = None
+          try:
+              after.load_state(state[: len(state) // 2])
+          except E.EmulatorError as error:
+              rejected = str(error)
+          assert rejected and "expects" in rejected, rejected
+          assert after.save_sram() != kept, "a fresh boot should not have it yet"
+          assert after.load_sram(kept) is True
+          after.advance(120)
+          assert after.save_sram() == kept, "the in-game save must survive"
+          after.stop()
+          print(f"OK: a rejected save state ({rejected.split(';')[0]}) still "
+                "leaves the battery save restorable")
+
+          # And a matching state still loads, so the fallback is a fallback.
+          exact = E.RetroEmulator(CORE, "ucity.gbc")
+          exact.start()
+          exact.load_state(state)
+          exact.stop()
+          print("OK: a matching save state still restores the exact moment")
+          EOF
+
   red-import:
     runs-on: ubuntu-latest
     steps:
@@ -262,6 +472,73 @@ jobs:
         run: pip install Red-DiscordBot
       - name: Import the cogs
         run: python -c "import retro.RetroCog, retro.RetroView, retro.systems, retro.archives"
+      - name: Core option key resolution and value fallback
+        # These decide what a typed-in option name means and what the core
+        # will really read, so they are checked directly rather than through
+        # Discord. Needs Red, because they are methods on the cog.
+        run: |
+          python - <<'EOF'
+          from retro.RetroCog import OPTION_RESET, RetroCog
+
+          resolve = RetroCog._resolve_option_key
+          definitions = {
+              "gambatte_gb_colorization": {"default": "disabled",
+                                           "values": [["disabled", "disabled"],
+                                                      ["auto", "Auto"],
+                                                      ["GBC", "GBC"]]},
+              "gambatte_gbc_colorization": {"default": "off", "values": [["off", "Off"]]},
+              "gambatte_gbc_color_correction": {"default": "GBC only",
+                                                "values": [["GBC only", "GBC only"]]},
+              "gambatte_mix_frames": {"default": "disabled",
+                                      "values": [["disabled", "disabled"]]},
+              "gambatte_gb_mix_frames": {"default": "disabled",
+                                         "values": [["disabled", "disabled"]]},
+          }
+          for typed, expected in [
+              ("gambatte_gb_colorization", "gambatte_gb_colorization"),  # exact
+              ("gb_colorization", "gambatte_gb_colorization"),           # <core>_<key>
+              ("GB_COLORIZATION", "gambatte_gb_colorization"),           # case
+              ("`gb_colorization`", "gambatte_gb_colorization"),         # backticks
+              ("color_correction", "gambatte_gbc_color_correction"),     # unique suffix
+              ("mix_frames", "gambatte_mix_frames"),  # exact <core>_<key> beats suffix
+          ]:
+              key, error = resolve("gambatte", definitions, typed, "!")
+              assert key == expected and error is None, (typed, key, error)
+              print(f"OK {typed!r:<28} -> {key}")
+
+          # Two options end in `_colorization` and neither is
+          # `gambatte_colorization`, so this must be refused, not guessed.
+          key, error = resolve("gambatte", definitions, "colorization", "!")
+          assert key is None and error and "matches 2" in error, (key, error)
+          assert "gb_colorization" in error and "gbc_colorization" in error, error
+          print(f"OK ambiguity refused: {error}")
+
+          key, error = resolve("gambatte", definitions, "nonsense", "!")
+          assert key is None and "no option called" in error, (key, error)
+          # mednafen_ngp names its option `ngp_language`, so a prefix is never
+          # assumed when nothing is known about the core.
+          key, error = resolve("mednafen_ngp", {}, "language", "!")
+          assert key is None and error is None, (key, error)
+          print("OK an unknown core prefix is not guessed")
+
+          # What the core will really read, which is not always what is stored:
+          # libretro falls back to the default for a value it does not offer.
+          colorization = definitions["gambatte_gb_colorization"]
+          assert RetroCog._option_default(colorization) == "disabled"
+          assert RetroCog._effective_value(colorization, None) == "disabled"
+          assert RetroCog._effective_value(colorization, "GBC") == "GBC"
+          assert RetroCog._effective_value(colorization, "rainbow") == "disabled"
+          # A definition with no declared default uses its first value.
+          assert RetroCog._option_default({"default": "", "values": [["a", "A"]]}) == "a"
+          assert RetroCog._short_key("gambatte", "gambatte_gb_colorization") == "gb_colorization"
+          assert RetroCog._short_key("fceumm", "ngp_language") == "ngp_language"
+          print("OK effective values fall back exactly as libretro does")
+
+          # The sentinel must not collide with a real value; see the cores job.
+          assert OPTION_RESET == "reset", OPTION_RESET
+          assert OPTION_RESET not in ("default", "none", "off", "disabled")
+          print(f"OK the reset sentinel is {OPTION_RESET!r}")
+          EOF
       - name: Nothing is imported that info.json does not declare
         # The cog must run on nothing but what Red ships plus what
         # info.json["requirements"] installs. Red does NOT ship Pillow, so it
