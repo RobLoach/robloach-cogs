@@ -45,7 +45,7 @@ jobs:
       - name: Download the dmg-acid2 test ROM
         run: curl -fsSLO https://github.com/mattcurrie/dmg-acid2/releases/download/v1.0/dmg-acid2.gb
       - name: Run the emulator
-        run: python pyboy/emulator.py gambatte_libretro.so dmg-acid2.gb out.png 120
+        run: python pyboy/emulator.py ./gambatte_libretro.so dmg-acid2.gb out.png 120
       - name: Check the screenshot
         run: |
           python - <<'EOF'

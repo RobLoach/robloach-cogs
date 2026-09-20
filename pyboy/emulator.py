@@ -46,7 +46,9 @@ class GameBoyEmulator:
     """
 
     def __init__(self, core_path, rom_path) -> None:
-        self.core_path = Path(core_path)
+        # Resolve to an absolute path: dlopen() does not search the working
+        # directory for bare filenames like "gambatte_libretro.so".
+        self.core_path = Path(core_path).resolve()
         self.rom_path = Path(rom_path)
         self._pressed: frozenset = frozenset()
         self._session = None
