@@ -7,6 +7,7 @@ import sys
 import typing
 import zipfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -113,14 +114,32 @@ class PyBoyCog(commands.Cog):
                         if (resp.content_length or 0) > MAX_ROM_SIZE:
                             await ctx.send("That file is too big to be a Game Boy ROM.")
                             return None
-                        data = await resp.content.read(MAX_ROM_SIZE + 1)
+                        # read(n) only returns the next chunk, so loop until
+                        # the body ends or the size cap is exceeded.
+                        chunks = []
+                        total = 0
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            chunks.append(chunk)
+                            total += len(chunk)
+                            if total > MAX_ROM_SIZE:
+                                break
+                        data = b"".join(chunks)
             except aiohttp.ClientError as error:
                 await ctx.send(f"Downloading the ROM failed: {error}")
                 return None
             if len(data) > MAX_ROM_SIZE:
                 await ctx.send("That file is too big to be a Game Boy ROM.")
                 return None
-            filename = Path(str(resp.url.path)).name or "rom.gb"
+            # Redirects (e.g. GitHub release assets) often end at a URL whose
+            # path has no real filename, so prefer the Content-Disposition
+            # header, then the URL the user actually gave us.
+            filename = ""
+            if resp.content_disposition is not None:
+                filename = resp.content_disposition.filename or ""
+            if not filename:
+                filename = Path(urlparse(url).path).name
+            if not filename:
+                filename = Path(str(resp.url.path)).name or "rom.gb"
             return filename, data
 
         await ctx.send(
