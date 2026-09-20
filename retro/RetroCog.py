@@ -122,6 +122,11 @@ class RetroCog(commands.Cog):
         self.bot = bot
         self.config: Config = Config.get_conf(
             self,
+            # The sum of the bytes of "robloach-cogs/pyboy", the name this cog
+            # was born under. It is what Red keys every stored setting, saved
+            # game and hibernated session by, so it is frozen for good: a new
+            # number would silently hand every existing install an empty
+            # configuration. Same reasoning as CUSTOM_ID_PREFIX in RetroView.
             identifier=114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121,
             force_registration=True
         )
@@ -736,9 +741,8 @@ class RetroCog(commands.Cog):
             # emulator.stop() the machine state is gone for good.
             await self._write_state(view, emulator)
             await asyncio.to_thread(emulator.stop)
-        # The Stop button goes away with the emulator; everything else stays
-        # enabled so the next press can wake the session back up.
-        view._sync_children()
+        # The controls stay enabled so the next press can wake the session
+        # back up; nothing about the buttons changes when a game sleeps.
         await self._save_record(view)
         if reason is not None:
             await view.refresh(reason)
@@ -825,7 +829,6 @@ class RetroCog(commands.Cog):
                 "restored" if outcome == "sram" else "not available",
             )
         view.emulator = emulator
-        view._sync_children()
         await self._learn_options(view.core, emulator)
 
     @staticmethod
@@ -1039,8 +1042,8 @@ class RetroCog(commands.Cog):
         """Turn a Discord rejection into something worth reading."""
         if isinstance(error, discord.Forbidden):
             return (
-                "Discord would not let me post that here. I need the **Embed "
-                "Links** and **Attach Files** permissions in this channel."
+                "Discord would not let me post that here. I need the **Attach "
+                "Files** permission in this channel to post a clip."
             )
         code = getattr(error, "code", 0) or 0
         if code == 50035:
@@ -1480,10 +1483,9 @@ class RetroCog(commands.Cog):
                 return
         view.last_clip = clip
         view.touch()
-        view._sync_children()
         try:
             view.message = await ctx.send(
-                embed=await view._make_embed(),
+                view._content(),
                 file=view._clip_file(clip),
                 view=view,
                 reference=ctx.message.to_reference(fail_if_not_exists=False),
@@ -1531,7 +1533,10 @@ class RetroCog(commands.Cog):
 
     @commands.max_concurrency(1, commands.BucketType.channel)
     @commands.guild_only()
-    @commands.bot_has_permissions(embed_links=True, attach_files=True)
+    # Only Attach Files: the game is a clip and a row of buttons, with no
+    # embed anywhere in the play loop. (`[p]retroset settings` still uses one,
+    # and asks for Embed Links itself.)
+    @commands.bot_has_permissions(attach_files=True)
     @commands.command()
     async def retro(self, ctx: commands.Context, *, game: typing.Optional[str] = None) -> None:
         """
@@ -1766,6 +1771,7 @@ class RetroCog(commands.Cog):
 
         The game is saved and the emulator is freed, but the controls stay
         live: pressing any button picks the game up again where it left off.
+        This is the only way to stop a game; there is no Stop button.
 
         Only the person who started the game, members with the Manage
         Messages permission, and the bot owner can stop it.
@@ -2346,7 +2352,7 @@ class RetroCog(commands.Cog):
         Every button press posts an animated clip of what happened next.
         Longer clips show more of the game but take longer to record and
         upload. The value is clamped between 1 and 15 seconds and applies to
-        clips recorded afterwards. The default is 5 seconds.
+        clips recorded afterwards. The default is 4 seconds.
 
         **Examples:**
         - `[p]retroset cliplength 8`
@@ -2366,15 +2372,16 @@ class RetroCog(commands.Cog):
         Set how long a button is held down when someone presses it.
 
         Too short and a game polling its controller a few times a second
-        misses the press entirely; too long and one tap walks through two
-        menu entries. Directions are held twice as long as this, because
-        movement needs sustained input to actually go anywhere.
+        misses the press entirely; too long and one press does the job twice
+        — a Game Boy walk cycle is 16 frames, so holding a direction past
+        about 270ms walks two tiles instead of one. Every button, directions
+        included, is held for this long.
 
         The value is clamped between 50 and 2000 milliseconds. The default is
-        200.
+        160.
 
         **Examples:**
-        - `[p]retroset hold 300`
+        - `[p]retroset hold 200`
 
         **Arguments:**
         - `<milliseconds>` - How long a button stays down (50-2000).
@@ -2384,8 +2391,8 @@ class RetroCog(commands.Cog):
         for view in self.sessions.values():
             view.hold_ms = milliseconds
         await ctx.send(
-            f"Buttons are now held for {milliseconds}ms, and directions for "
-            f"{milliseconds * 2}ms."
+            f"Every button, directions included, is now held for "
+            f"{milliseconds}ms."
         )
 
     @retroset.group(name="game")
@@ -2817,7 +2824,7 @@ class RetroCog(commands.Cog):
         hold_ms = await self.config.hold_ms()
         embed.add_field(
             name="Button hold",
-            value=f"{hold_ms}ms per press, {hold_ms * 2}ms for directions",
+            value=f"{hold_ms}ms per press, directions included",
             inline=False,
         )
         games = await self.config.games()

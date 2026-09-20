@@ -2,7 +2,7 @@
     "author": [
         "Rob Loach"
     ],
-    "install_msg": "Retro installed. Load it with `[p]load retro` and the emulator cores (about 5 MiB, no BIOS files needed) download themselves in the background — `[p]retroset settings` shows the progress, or run `[p]retroset download` to do it now. Then play: attach a ROM or `.zip` to `[p]retro`, or try `[p]retro https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc`. Free homebrew games for every supported console are at https://retrobrews.github.io/ . Save games players can start by name with `[p]retroset game add <name> <url>`.",
+    "install_msg": "Retro installed. Load it with `[p]load retro`, then attach a ROM to `[p]retro` and play. The emulator cores download themselves in the background.",
     "name": "Retro",
     "short": "Play retro console games in Discord",
     "description": "Play retro console games together in Discord. Start a game by name, URL, or an attached ROM or .zip (homebrew, or one you have the rights to) and control it with buttons under the screen. Eleven consoles are supported, from the Atari 2600 to the Super Nintendo, picked automatically from the file extension, each with its own controller layout. Every press posts an animated clip of the next few seconds. Games save automatically and pick up where they left off, even after the bot restarts: a save state restores the exact moment, and the cartridge's own battery save is kept beside it so an in-game save survives even an emulator core update. Cores download themselves, their own settings can be read and changed with [p]retroset coreoptions, and the bot owner can supply their own BIOS files for cores that need one. Emulated through libretro.",

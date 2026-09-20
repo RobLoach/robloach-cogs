@@ -33,16 +33,30 @@ jobs:
 
           RETROPAD = {"b", "y", "select", "start", "up", "down", "left", "right",
                       "a", "x", "l", "r", "l2", "r2", "l3", "r3"}
+          # systems.System.rows is the whole controller -- d-pad, face buttons
+          # and layout spacers -- and the view appends Wait/repeat/Replay to
+          # it. validate_layouts() enforces Discord's 5x5x25 budget and runs at
+          # import time; this asserts it covered every console.
+          assert S.validate_layouts() == tuple(x.key for x in S.SYSTEMS)
           seen = {}
           for system in S.SYSTEMS:
               fields = system.fields
               assert set(fields) <= RETROPAD, (system.key, set(fields) - RETROPAD)
               assert len(set(fields)) == len(fields), f"{system.key} repeats a button"
               assert system.confirm in fields, f"{system.key} has no confirm button"
-              # Row 0 is the d-pad and the row after the console's own rows is
-              # Wait/repeat/Replay/Stop, so Discord's 5x5 grid allows 3 here.
-              assert len(system.rows) <= 3, f"{system.key} needs too many rows"
-              assert all(len(row) <= 5 for row in system.rows), f"{system.key} row too wide"
+              rows = system.rows
+              used = len(rows) + (0 if len(rows[-1]) + S.CONTROL_BUTTONS <= 5 else 1)
+              assert used <= 5, f"{system.key} needs {used} action rows"
+              assert all(len(row) <= 5 for row in rows), f"{system.key} row too wide"
+              assert sum(len(r) for r in rows) + S.CONTROL_BUTTONS <= 25, system.key
+              # The d-pad reads as a cross: a spacer, then Up; then Left Down Right.
+              assert rows[0][0] is S.SPACER and rows[0][1] is S.UP, system.key
+              assert rows[1][:3] == (S.LEFT, S.DOWN, S.RIGHT), system.key
+              # Every cell needs a label or an emoji, spacers included, or
+              # Discord refuses the whole message.
+              for row in rows:
+                  for cell in row:
+                      assert cell.label or cell.emoji, (system.key, cell)
               for extension in system.extensions:
                   assert extension not in S.AMBIGUOUS_EXTENSIONS, extension
                   assert extension not in seen, f".{extension}: {seen[extension]} vs {system.key}"
@@ -51,6 +65,13 @@ jobs:
           assert S.system_for_extension("nes").core == "fceumm"
           assert S.system_for_extension("bin") is None
           assert S.core_name_from_filename("/x/snes9x_libretro.so") == "snes9x"
+          # The d-pad is emoji only on every console: four arrows, no words.
+          for button in S.DPAD:
+              assert button.emoji and not button.label, button
+          for system in S.SYSTEMS:
+              print(f"OK {system.key:<10} "
+                    + " | ".join(" ".join(b.emoji or b.label for b in r)
+                                 for r in system.rows))
           print(f"OK: {len(S.SYSTEMS)} consoles, {len(S.CORES)} cores, {len(seen)} extensions")
           EOF
 
@@ -80,6 +101,11 @@ jobs:
               needs = S.EMOJI_CODEPOINTS[ord(base)]
               assert needs == value.endswith(S.VARIATION_SELECTOR_16), value
               print(f"OK {' '.join(f'U+{ord(c):04X}' for c in value):<16} {value}")
+
+          # The Stop button is gone, and its U+23F9 with it.
+          assert not hasattr(S, "STOP_EMOJI"), "STOP_EMOJI should have been removed"
+          assert 0x23F9 not in S.EMOJI_CODEPOINTS, "the stop emoji is unused now"
+          assert len(emoji) == 6, f"expected 4 arrows + Wait + Replay, got {emoji}"
 
           # The character that broke production must still be refused, and so
           # must anything new that has not been reviewed.
@@ -310,6 +336,67 @@ jobs:
           print(f"OK: {len(data)} byte animated WebP, {clip.n_frames} frames, loop=1")
           EOF
 
+      - name: The clip plays at the speed the game ran at
+        # Animated WebP stores each frame's duration in milliseconds, so a
+        # 15 fps clip off a 59.73 fps core is 67ms a frame and the whole thing
+        # plays in the time it took to emulate. (GIF stores centiseconds and
+        # cannot be exact; it is a fallback that is never chosen automatically.)
+        run: |
+          python - <<'EOF'
+          import importlib.util
+          import struct
+
+          spec = importlib.util.spec_from_file_location("emulator", "retro/emulator.py")
+          E = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(E)
+
+          def anmf(data):
+              assert data[:4] == b"RIFF" and data[8:12] == b"WEBP", data[:12]
+              off, durations = 12, []
+              while off + 8 <= len(data):
+                  fourcc = data[off:off + 4]
+                  size = struct.unpack("<I", data[off + 4:off + 8])[0]
+                  if fourcc == b"ANMF":
+                      durations.append(
+                          int.from_bytes(data[off + 20:off + 23], "little")
+                      )
+                  off += 8 + size + (size & 1)
+              return durations
+
+          assert E.CLIP_SECONDS == 4, E.CLIP_SECONDS
+          # uCity rather than dmg-acid2: a screen where nothing whatsoever
+          # moves is collapsed by libwebp into a single still frame with no
+          # animation chunks at all, which is correct but has no timing to
+          # check.
+          emulator = E.RetroEmulator("./gambatte_libretro.so", "ucity.gbc")
+          emulator.start()
+          emulator.advance(emulator.frames_for_seconds(3))
+          frames = emulator.frames_for_seconds(E.CLIP_SECONDS)
+          data = emulator.record(frames)
+          durations = anmf(data)
+          step = max(1, round(emulator.fps / E.CLIP_FPS))
+          emulated = 1000 * frames / emulator.fps
+          played = sum(durations)
+          assert durations, "no animation frames at all"
+          # libwebp merges runs of identical frames and sums their durations,
+          # so the total is the contract, not the per-frame value.
+          assert abs(played - emulated) / emulated < 0.01, (played, emulated)
+          assert len(durations) <= -(-frames // step), (len(durations), frames, step)
+          # Milliseconds, not centiseconds: a 15 fps clip is 67ms a frame.
+          assert durations[0] == round(1000 * step / emulator.fps), durations[0]
+          # A press scheduled at frame 0 is down before the first captured
+          # frame, so a clip never opens on the picture from before the press.
+          emulator.advance(60)
+          state = emulator.save_state()
+          quiet = emulator.record(frames)
+          emulator.load_state(state)
+          pressed = emulator.record(frames, presses=[("start", 0, 10)])
+          assert quiet != pressed, "the press never reached the clip"
+          emulator.stop()
+          print(f"OK: {len(durations)} frames, {played}ms played vs "
+                f"{emulated:.0f}ms emulated ({len(data) // 1024} KiB)")
+          EOF
+
       - name: A core's options can be read without a ROM
         # Most cores declare their options from retro_set_environment, before
         # any content exists, so `[p]retroset coreoptions` can read them by
@@ -472,6 +559,115 @@ jobs:
         run: pip install Red-DiscordBot
       - name: Import the cogs
         run: python -c "import retro.RetroCog, retro.RetroView, retro.systems, retro.archives"
+      - name: Every console's controls are a payload Discord will accept
+        # A component Discord refuses is a 400 on the send, which takes out the
+        # whole command -- that is exactly how an invalid button emoji broke
+        # this cog in production. So the real view is built for every console
+        # and the dict discord.py would put on the wire is inspected.
+        run: |
+          python - <<'EOF'
+          import discord
+
+          from retro import RetroView as V
+          from retro import systems as S
+
+          class FakeBot:
+              def get_channel(self, _id):
+                  return None
+
+          class FakeCog:
+              bot = FakeBot()
+
+          print(f"discord.py {discord.__version__}")
+          for system in S.SYSTEMS:
+              view = V.RetroView(
+                  FakeCog(), game_name="T", slug="t",
+                  rom_filename=f"t.{system.extensions[0]}",
+                  channel_id=1, system=system,
+              )
+              rows = view.to_components()
+              assert len(rows) <= 5, (system.key, len(rows))
+              buttons = []
+              for row in rows:
+                  assert row["type"] == 1, row
+                  assert 1 <= len(row["components"]) <= 5, (system.key, row)
+                  buttons.extend(row["components"])
+              assert len(buttons) <= 25, (system.key, len(buttons))
+
+              ids = []
+              for button in buttons:
+                  assert button["type"] == 2, button
+                  label, emoji = button.get("label"), button.get("emoji")
+                  # Discord refuses a button with neither, and refuses an
+                  # empty or whitespace-only label.
+                  assert label or emoji, (system.key, button)
+                  if label is not None:
+                      assert 1 <= len(label) <= 80, (system.key, repr(label))
+                      assert label.strip(), (system.key, repr(label))
+                  if emoji is not None:
+                      problem = S.emoji_problem(emoji["name"])
+                      assert problem is None, (system.key, problem)
+                  custom_id = button["custom_id"]
+                  assert 1 <= len(custom_id) <= 100, (system.key, custom_id)
+                  assert custom_id.startswith("libretro:"), custom_id
+                  ids.append(custom_id)
+                  if ":spacer:" in custom_id:
+                      assert button["disabled"], ("a spacer must be inert", button)
+
+              assert len(set(ids)) == len(ids), (system.key, ids)
+              assert view.is_persistent(), system.key
+              # The Stop button was removed; [p]retrostop is the way to stop.
+              assert not any(i.endswith(":stop") for i in ids), ids
+              # Existing messages route clicks by these exact strings.
+              for button in system.buttons:
+                  assert f"libretro:press:{button.field}" in ids, (system.key, button)
+              shape = " | ".join(
+                  " ".join((c.get("emoji") or {}).get("name") or c["label"]
+                           for c in r["components"])
+                  for r in rows
+              )
+              print(f"OK {system.key:<10} {len(buttons):>2} components, "
+                    f"{len(rows)} rows  {shape}")
+
+          # A click whose custom_id this view no longer has (an old message's
+          # Stop button) must be dropped, not raised.
+          store = discord.ui.view.ViewStore(None)
+          class Msg: id = 1
+          class Inter: message = Msg()
+          store.dispatch_view(2, "libretro:stop", Inter())
+          print("OK a click on a removed button is discarded silently")
+          EOF
+      - name: Playing needs no Embed Links permission
+        # The clip is a plain attachment and the controls are buttons, so the
+        # play loop must not ask for Embed Links. One owner-only command does.
+        run: |
+          python - <<'EOF'
+          from retro.RetroCog import RetroCog
+
+          play = {name for name, on in RetroCog.retro.requires.bot_perms if on}
+          assert play == {"attach_files"}, play
+          settings = {n for n, on in RetroCog.retroset_settings.requires.bot_perms if on}
+          assert settings == {"embed_links"}, settings
+          print(f"OK [p]retro needs {sorted(play)}")
+          print(f"OK [p]retroset settings needs {sorted(settings)}")
+          EOF
+      - name: The hold and clip defaults
+        run: |
+          python - <<'EOF'
+          from retro.RetroView import DEFAULT_HOLD_MS, MAX_HOLD_MS, MIN_HOLD_MS
+          import retro.RetroView as V
+          from retro.emulator import CLIP_SECONDS, MAX_CLIP_SECONDS, MIN_CLIP_SECONDS
+
+          assert CLIP_SECONDS == 4, CLIP_SECONDS
+          assert (MIN_CLIP_SECONDS, MAX_CLIP_SECONDS) == (1, 15)
+          assert DEFAULT_HOLD_MS == 160, DEFAULT_HOLD_MS
+          assert (MIN_HOLD_MS, MAX_HOLD_MS) == (50, 2000)
+          # Directions are no longer held longer than anything else: a Game Boy
+          # walk cycle is 16 frames (~270ms), so a longer hold walks two tiles.
+          assert not hasattr(V, "DPAD_HOLD_MULTIPLIER")
+          assert round(59.727 * DEFAULT_HOLD_MS / 1000) < 16
+          print(f"OK {CLIP_SECONDS}s clips, {DEFAULT_HOLD_MS}ms on every button")
+          EOF
       - name: Core option key resolution and value fallback
         # These decide what a typed-in option name means and what the core
         # will really read, so they are checked directly rather than through

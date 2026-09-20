@@ -17,35 +17,50 @@ from .emulator import (
     clip_extension,
 )
 from .systems import (
-    DPAD,
+    CONTROL_BUTTONS,
+    MAX_ACTION_ROWS,
+    MAX_BUTTONS_PER_ROW,
+    MAX_COMPONENTS,
+    MAX_LAYOUT_ROWS,
     REPLAY_EMOJI,
-    STOP_EMOJI,
     SYSTEMS,
     WAIT_EMOJI,
     System,
+    is_spacer,
     system_by_key,
     system_for_extension,
 )
 
 log = logging.getLogger("red.robloach.retro")
 
-# How long a button is held down at the start of a clip, in milliseconds.
-# The old 8 frames (~133ms) was short enough that games polling input a few
-# times a second could miss it entirely. 200ms is comfortably longer than one
-# poll on every console here without being long enough to double-trigger a
-# menu.
-DEFAULT_HOLD_MS = 200
+# How long a button is held down at the start of a clip, in milliseconds, for
+# every button including the directions.
+#
+# Measured against Pokemon Red under Gambatte (59.73 fps), with the player
+# already facing the way they were pushed and two clear tiles ahead:
+#
+#     hold    frames   tiles walked
+#     400ms       24        2          <- the old d-pad hold
+#     300ms       18        2
+#     250ms       15        1
+#     160ms       10        1
+#     100ms        6        1
+#
+# A Game Boy walk cycle is 16 frames, so any hold that outlasts it starts a
+# second step and the character crosses two tiles for one button press. 160ms
+# is ten frames: long enough that a game polling its controller a few times a
+# second cannot miss it (the old 8-frame, ~133ms hold could), and short enough
+# that one press is always one step and one menu entry.
+DEFAULT_HOLD_MS = 160
 MIN_HOLD_MS = 50
 MAX_HOLD_MS = 2000
 
-# A direction is held this many times longer than a face button. Pressing "up"
-# is a request to *travel*, and 200ms of walking covers well under a tile in
-# most games, so a player would need a dozen round trips to cross a room. A
-# face button is the opposite: holding it longer only risks a second menu
-# selection.
-DPAD_HOLD_MULTIPLIER = 2
-DPAD_FIELDS = frozenset(button.field for button in DPAD)
-
+# Directions used to be held twice as long as a face button, on the theory
+# that moving needs sustained input. On the consoles here it does not: the
+# game commits to a whole tile as soon as the step begins, so the only thing
+# the extra hold bought was a second step nobody asked for. There is no
+# direction multiplier any more, and no set of fields that needs one.
+#
 # The repeat button taps the console's confirm button this many times, spaced
 # this far apart, so text boxes and menus take one round trip instead of
 # three. The taps all land in the first second or so, leaving the rest of the
@@ -67,20 +82,23 @@ SAVE_STATE_EVERY_PRESSES = 3
 # Every button needs a custom_id that survives a restart, because that is how
 # Discord routes a click back to a persistent view. They are scoped per
 # message by bot.add_view(view, message_id=...), so fixed ids are fine.
+#
+# The prefix is deliberately still "libretro" and must stay that way. It is
+# baked into the custom_id of every button on every message this cog has ever
+# posted, and Discord routes a click by that exact string; renaming it to
+# "retro" would orphan every live game in every channel. The cog's name is
+# cosmetic, this is not.
 CUSTOM_ID_PREFIX = "libretro"
 
-# Discord allows five action rows of five components each. The row budget is:
+# The controller grid comes from systems.py (see the row plan there); this
+# view adds the three control buttons -- Wait, confirm x3, Replay -- to the
+# last row if they fit and to a row of their own if they do not.
 #
-#   row 0            the d-pad                        (4 buttons, every console)
-#   rows 1..3        the console's own buttons        (systems.System.rows)
-#   row after those  Wait / repeat / Replay / Stop    (4 buttons)
-#
-# The worst case is the SNES and the six-button Genesis, which use two rows of
-# their own: 4 + 4 + 5 + 4 = 17 buttons over four rows, leaving one row spare.
-# systems.py must therefore never declare more than three rows per console.
-MAX_SYSTEM_ROWS = 3
-MAX_BUTTONS_PER_ROW = 5
-
+# The Stop button that used to sit here is gone: `[p]retrostop` is the way to
+# put a game to sleep. A message posted before it was removed still has the
+# button drawn on it until its next press redraws the row, and a click on that
+# stale button resolves to a custom_id this view no longer has -- which
+# discord.py's ViewStore.dispatch_view drops silently rather than raising.
 _STYLES = {
     "primary": discord.ButtonStyle.primary,
     "secondary": discord.ButtonStyle.secondary,
@@ -152,18 +170,25 @@ class _ReplayButton(discord.ui.Button):
         await self.view._replay(interaction)
 
 
-class _StopButton(discord.ui.Button):
-    def __init__(self, row: int) -> None:
-        super().__init__(
-            label="Stop",
-            emoji=STOP_EMOJI,
-            style=discord.ButtonStyle.danger,
-            row=row,
-            custom_id=f"{CUSTOM_ID_PREFIX}:stop",
-        )
+class _SpacerButton(discord.ui.Button):
+    """
+    A disabled button that holds a column open in the controller grid.
 
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await self.view._stop(interaction)
+    Discord has no empty grid cell, so the only way to indent a row is to put
+    something inert in front of it. This is permanently disabled, so it is
+    never clickable and never re-enabled by _set_disabled(); it still carries
+    an explicit custom_id, because a persistent view requires every child to
+    have one (discord.ui.Item.is_persistent).
+    """
+
+    def __init__(self, label: str, row: int, column: int) -> None:
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.secondary,
+            row=row,
+            disabled=True,
+            custom_id=f"{CUSTOM_ID_PREFIX}:spacer:{row}:{column}",
+        )
 
 
 class RetroView(discord.ui.View):
@@ -171,13 +196,18 @@ class RetroView(discord.ui.View):
     An interactive game controller, laid out for whichever console is running.
 
     The view *is* the session: it outlives the emulator. When the emulator is
-    freed (idle timeout, Stop, cog unload, bot restart) the session
+    freed (idle timeout, `[p]retrostop`, cog unload, bot restart) the session
     hibernates, the controls stay enabled, and the next press transparently
     boots the core again from the cached ROM plus the last save state.
 
-    Anyone in the channel can press the buttons (it's a social feature);
-    only the person who started the game, moderators, and the bot owner can
-    stop the session.
+    Anyone in the channel can press the buttons (it's a social feature); only
+    the person who started the game, moderators, and the bot owner can stop
+    the session, which is what `[p]retrostop` is for.
+
+    The message carries the clip and nothing else. There is no status card:
+    the buttons say what they do, and the only text that ever appears is the
+    occasional sentence that has to be said (the game went to sleep, a save
+    state could not be restored, an emulator error).
     """
 
     def __init__(
@@ -232,45 +262,64 @@ class RetroView(discord.ui.View):
         # when waking a session tells the player something they need to know
         # -- that the save state was rejected after a core update and the game
         # came back from its battery save instead, for instance. It rides on
-        # the next embed rather than being a second message, so it lands with
-        # the clip it explains.
+        # the next message edit rather than being a second message, so it
+        # lands with the clip it explains, and is cleared as it is shown.
         self.notice: typing.Optional[str] = None
 
         self.message: typing.Optional[discord.Message] = None
         self.lock: asyncio.Lock = asyncio.Lock()
-        self._colour: typing.Optional[discord.Colour] = None
-        self.stop_item: typing.Optional[_StopButton] = None
         self._build_controls()
 
     # -- Layout -------------------------------------------------------------
 
     def _build_controls(self) -> None:
-        """Lay out this console's buttons; see the row budget comment above."""
+        """
+        Lay this console's controller out; see the row plan in systems.py.
+
+        The console's own grid comes first, spacers and all, and the three
+        control buttons go on the end of the last row if they fit there and on
+        a row of their own if they do not.
+        """
         rows = self.system.rows
-        if len(rows) > MAX_SYSTEM_ROWS:
+        if len(rows) > MAX_LAYOUT_ROWS:
             raise ValueError(
-                f"{self.system.name} declares {len(rows)} button rows; "
-                f"at most {MAX_SYSTEM_ROWS} fit alongside the d-pad and controls."
+                f"{self.system.name} declares {len(rows)} controller rows; "
+                f"at most {MAX_LAYOUT_ROWS} fit alongside the controls."
             )
-        for spec in DPAD:
-            self.add_item(_GameButton(spec, row=0))
-        for index, row in enumerate(rows, start=1):
+        for index, row in enumerate(rows):
             if len(row) > MAX_BUTTONS_PER_ROW:
                 raise ValueError(
-                    f"{self.system.name} row {index} has {len(row)} buttons; "
-                    f"Discord allows {MAX_BUTTONS_PER_ROW}."
+                    f"{self.system.name} row {index} has {len(row)} "
+                    f"components; Discord allows {MAX_BUTTONS_PER_ROW}."
                 )
-            for spec in row:
-                self.add_item(_GameButton(spec, row=index))
+            for column, spec in enumerate(row):
+                if is_spacer(spec):
+                    self.add_item(_SpacerButton(spec.label, index, column))
+                else:
+                    self.add_item(_GameButton(spec, row=index))
 
-        control_row = len(rows) + 1
+        # Wait / confirm x3 / Replay. They share the last row when there is
+        # space, which is how Start and Select end up beside them.
+        last = len(rows) - 1
+        if len(rows[last]) + CONTROL_BUTTONS <= MAX_BUTTONS_PER_ROW:
+            control_row = last
+        else:
+            control_row = len(rows)
+        if control_row >= MAX_ACTION_ROWS:
+            raise ValueError(
+                f"{self.system.name} leaves no room for the Wait/Replay row; "
+                f"Discord allows {MAX_ACTION_ROWS} rows."
+            )
         self.add_item(_WaitButton(control_row))
         confirm = self.system.button(self.system.confirm)
         if confirm is not None:
             self.add_item(_RepeatButton(confirm, control_row))
         self.add_item(_ReplayButton(control_row))
-        self.stop_item = _StopButton(control_row)
-        self._sync_children()
+        if len(self.children) > MAX_COMPONENTS:
+            raise ValueError(
+                f"{self.system.name} needs {len(self.children)} components; "
+                f"Discord allows {MAX_COMPONENTS}."
+            )
 
     # -- Session records ----------------------------------------------------
 
@@ -359,65 +408,44 @@ class RetroView(discord.ui.View):
         safe = re.sub(r"[^A-Za-z0-9_-]+", "-", game_name).strip("-")[:48]
         return f"{safe or 'screen'}{clip_extension(clip_format)}"
 
-    def _sync_children(self) -> None:
-        """
-        Show the Stop button only while the emulator is live.
-
-        A hibernated session is already stopped, so offering Stop would be
-        confusing. The button carries an explicit ``row``, so removing and
-        re-adding it puts it back in the same place.
-        """
-        if self.stop_item is None:
-            return
-        present = self.stop_item in self.children
-        if self.live and not present:
-            self.add_item(self.stop_item)
-        elif not self.live and present:
-            self.remove_item(self.stop_item)
-
     def _set_disabled(self, disabled: bool) -> None:
+        """Grey the controls out, or bring them back. Spacers stay inert."""
         for child in self.children:
+            if isinstance(child, _SpacerButton):
+                continue
             if hasattr(child, "disabled"):
                 child.disabled = disabled
 
     # -- Messages -----------------------------------------------------------
 
-    async def _embed_colour(self) -> discord.Colour:
-        if self._colour is None:
-            channel = self.cog.bot.get_channel(self.channel_id)
-            try:
-                self._colour = await self.cog.bot.get_embed_colour(channel)
-            except Exception:
-                # No channel in cache (e.g. straight after a restart), or the
-                # bot lost access; the colour is cosmetic either way.
-                self._colour = discord.Colour.default()
-        return self._colour
-
-    async def _make_embed(self, footer: typing.Optional[str] = None) -> discord.Embed:
+    def _content(self, message: typing.Optional[str] = None) -> typing.Optional[str]:
         """
-        The status card that sits with the clip.
+        The text to put on the message with the clip, which is usually none.
 
-        It deliberately does *not* set an image: Discord only animates an
-        animated WebP when it is a plain attachment, and an embed's image is
-        shown as a still frame. So the clip rides along as its own attachment
-        and this embed carries nothing but text.
+        The clip and the buttons are the whole interface: a card repeating the
+        console's name over a picture of that console is noise. Text appears
+        only when there is something to say -- ``message`` from the caller
+        (the game went to sleep, the emulator failed), or a pending one-off
+        notice, which is cleared as it is shown so it appears exactly once.
+
+        Returning None is meaningful rather than lazy: discord.py sends an
+        explicit null for it, which *clears* whatever the message said before,
+        so yesterday's "asleep" line does not linger over today's clip.
         """
-        embed = discord.Embed(title=self.game_name, colour=await self._embed_colour())
-        embed.set_author(name=self.system.name)
-        if footer is None:
-            # A pending one-off notice outranks the standing footer, and is
-            # cleared as it is shown so it appears exactly once.
-            footer, self.notice = self.notice, None
-        if footer is None:
-            footer = (
-                "Anyone can press the buttons. The game sleeps after "
-                f"{self.timeout_minutes} minutes without input and wakes up "
-                "on the next press."
-            )
-        embed.set_footer(text=footer)
-        return embed
+        if message is not None:
+            return message
+        notice, self.notice = self.notice, None
+        return notice
 
     def _clip_file(self, data: bytes) -> discord.File:
+        """
+        The clip, as a plain attachment.
+
+        It has to be one: Discord only animates an animated WebP when it is
+        attached directly. Put the same bytes in an embed's image and it is
+        shown as a single still frame, which is why the message has never
+        carried the clip inside an embed (and now carries no embed at all).
+        """
         return discord.File(io.BytesIO(data), filename=self.screen_filename)
 
     async def resolve_message(self) -> typing.Optional[discord.Message]:
@@ -440,7 +468,7 @@ class RetroView(discord.ui.View):
             return None
         return self.message
 
-    async def refresh(self, footer: typing.Optional[str] = None) -> None:
+    async def refresh(self, note: typing.Optional[str] = None) -> None:
         """
         Re-edit the message with the current controls, keeping the last clip.
 
@@ -451,7 +479,7 @@ class RetroView(discord.ui.View):
         if message is None:
             return
         try:
-            await message.edit(embed=await self._make_embed(footer), view=self)
+            await message.edit(content=self._content(note), view=self)
         except discord.HTTPException:
             # The message may have been deleted, or the bot may have lost
             # access to the channel; the session state is still correct.
@@ -462,14 +490,12 @@ class RetroView(discord.ui.View):
     async def start(self, ctx: commands.Context, emulator: RetroEmulator) -> discord.Message:
         """Boot the emulator and post the first clip with the controls."""
         self.starter_id = ctx.author.id
-        self._colour = await ctx.embed_colour()
         clip = await asyncio.to_thread(self._boot, emulator)
         self.emulator = emulator
         self.last_clip = clip
         self.touch()
-        self._sync_children()
         self.message = await ctx.send(
-            embed=await self._make_embed(),
+            self._content(),
             file=self._clip_file(clip),
             view=self,
             reference=ctx.message.to_reference(fail_if_not_exists=False),
@@ -490,13 +516,15 @@ class RetroView(discord.ui.View):
     def _schedule(
         self, emulator: RetroEmulator, field: typing.Optional[str], repeat: int
     ) -> typing.List[tuple]:
-        """Work out when, and for how long, to hold a button during a clip."""
+        """
+        Work out when, and for how long, to hold a button during a clip.
+
+        Every button, direction or not, is held for exactly ``hold_ms``; see
+        DEFAULT_HOLD_MS for why the directions no longer get a multiplier.
+        """
         if field is None:
             return []
-        hold_ms = self.hold_ms
-        if field in DPAD_FIELDS:
-            hold_ms *= DPAD_HOLD_MULTIPLIER
-        hold = emulator.frames_for_ms(hold_ms)
+        hold = emulator.frames_for_ms(self.hold_ms)
         gap = emulator.frames_for_ms(REPEAT_GAP_MS)
         return [(field, tap * (hold + gap), hold) for tap in range(max(1, repeat))]
 
@@ -567,9 +595,10 @@ class RetroView(discord.ui.View):
 
         Emulating and encoding a clip takes a second or two, which feels
         broken with no feedback. Editing the message in the interaction
-        *response* is instant, and doubles as the "Resuming..." indicator for
-        a hibernated session. ``attachments`` is not touched, so this costs
-        no upload and the current clip stays put.
+        *response* is instant, and doubles as the "Resuming..." line for a
+        hibernated session, which has a core to load and a save state to
+        restore before it can even start emulating. ``attachments`` is not
+        touched, so this costs no upload and the current clip stays put.
         """
         if self.message is None and interaction.message is not None:
             # After a restart the view is rebuilt from Config and has never
@@ -577,10 +606,10 @@ class RetroView(discord.ui.View):
             self.message = interaction.message
             self.message_id = interaction.message.id
         self._set_disabled(True)
-        footer = "Resuming where you left off..." if resuming else None
+        note = "Resuming where you left off\N{HORIZONTAL ELLIPSIS}" if resuming else None
         try:
             await interaction.response.edit_message(
-                embed=await self._make_embed(footer), view=self
+                content=self._content(note), view=self
             )
         except discord.HTTPException:
             log.warning("Could not disable the Libretro controls.", exc_info=True)
@@ -604,13 +633,13 @@ class RetroView(discord.ui.View):
     async def _show(self, interaction: discord.Interaction, clip: bytes) -> None:
         """Re-enable the controls and swap in the new clip, in one edit."""
         self._set_disabled(False)
-        self._sync_children()
         try:
             # edit_original_response targets the same component message that
             # response.edit_message just updated. attachments= replaces the
-            # message's files; omitting it would keep the previous clip.
+            # message's files; omitting it would keep the previous clip, and
+            # content=None clears whatever was said before it.
             self.message = await interaction.edit_original_response(
-                embed=await self._make_embed(),
+                content=self._content(),
                 attachments=[self._clip_file(clip)],
                 view=self,
             )
@@ -631,10 +660,9 @@ class RetroView(discord.ui.View):
     async def _recover(self, interaction: discord.Interaction, reason: str) -> None:
         """Put the controls back after a failed press and explain why."""
         self._set_disabled(False)
-        self._sync_children()
         try:
             await interaction.edit_original_response(
-                embed=await self._make_embed(reason), view=self
+                content=self._content(reason), view=self
             )
         except discord.HTTPException:
             log.warning("Failed to report a Libretro failure.", exc_info=True)
@@ -657,7 +685,7 @@ class RetroView(discord.ui.View):
         # play through exactly once, so this is the only way to see it twice.
         try:
             await interaction.response.edit_message(
-                embed=await self._make_embed(),
+                content=self._content(),
                 attachments=[self._clip_file(self.last_clip)],
                 view=self,
             )
@@ -669,30 +697,13 @@ class RetroView(discord.ui.View):
                 interaction, "Discord would not accept that clip again."
             )
 
-    async def _stop(self, interaction: discord.Interaction) -> None:
-        if self.closed:
-            await self._silent_ack(interaction)
-            return
-        if not await self.can_stop(interaction.user):
-            await interaction.response.send_message(
-                "Only the person who started the game, moderators, or the "
-                "bot owner can stop it.",
-                ephemeral=True,
-            )
-            return
-        await self._silent_ack(interaction)
-        if self.message is None and interaction.message is not None:
-            self.message = interaction.message
-            self.message_id = interaction.message.id
-        async with self.lock:
-            await self.cog.hibernate(
-                self,
-                f"Stopped by {interaction.user.display_name}. "
-                "Press a button to pick up where you left off.",
-            )
-
     async def can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
-        """Whether this user may stop the session."""
+        """
+        Whether this user may stop the session with `[p]retrostop`.
+
+        Anyone in the channel can play; ending someone else's game is the one
+        thing that is not open to everybody.
+        """
         if user.id == self.starter_id:
             return True
         if await self.cog.bot.is_owner(user):

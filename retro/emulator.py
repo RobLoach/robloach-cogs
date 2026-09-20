@@ -76,7 +76,14 @@ DEFAULT_FPS = 60.0
 # How many seconds of play one clip shows, and how many frames per second the
 # clip itself is encoded at. Sampling every 4th emulated frame is enough to
 # read the action and keeps the clip a quarter of the size.
-CLIP_SECONDS = 5
+#
+# On the timing: animated WebP stores each frame's duration in *milliseconds*,
+# so 15 fps against a 59.73 fps core is 4 emulated frames per clip frame and
+# exactly 67ms per frame -- a 4 second clip measures 4.02s, which is 0.5% slow
+# and invisible. (GIF is the format that stores centiseconds; see _encode.)
+# 20 fps would land on a round 50ms and match the emulated time exactly, at
+# about 39% more bytes and 32% more encoding time, so 15 stays the default.
+CLIP_SECONDS = 4
 CLIP_FPS = 15
 
 # Bounds for the configurable clip length.
@@ -1010,11 +1017,17 @@ class RetroEmulator:
         triples, scheduled against the frames *of this recording*, so the clip
         shows the game reacting to the input rather than only its end state.
         Overlapping entries are fine: they are simply held at the same time.
+        A press scheduled at frame 0 goes down *before* the first emulated
+        frame of the clip, so the first picture the player sees is already the
+        game responding.
 
         Roughly every ``core_fps / fps``-th emulated frame is captured, so the
-        default five seconds at 15 fps is a 75 frame clip. Identical
+        default four seconds at 15 fps is a 60 frame clip. Identical
         consecutive frames cost almost nothing, so a game sitting on a static
         screen produces a handful of kilobytes.
+
+        Note that this is the *only* thing that advances the emulation: the
+        console is frozen between one clip and the next.
         """
         self._require_started()
         clip_format = str(clip_format).upper()
@@ -1098,8 +1111,12 @@ class RetroEmulator:
             else:
                 # GIF durations are stored in centiseconds, so round to 10ms
                 # here instead of letting the encoder truncate and play the
-                # clip too fast. No loop= argument on purpose: Pillow only
-                # writes the looping extension when one is given.
+                # clip too fast. This is the one place the clip's timing is
+                # not exact: 67ms a frame becomes 70ms, so a GIF plays about
+                # 4.5% slower than the game did. WebP has millisecond frame
+                # durations and does not need this. No loop= argument on
+                # purpose: Pillow only writes the looping extension when one
+                # is given.
                 #
                 # optimize=True made these GIFs 16-40% *bigger* (the frames
                 # are already palette images), as well as slower.

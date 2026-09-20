@@ -1,9 +1,10 @@
 # Discord Red: Retro Cog
 
 Play retro console games together in Discord. Attach a ROM and control the game
-with buttons under the screen. Every press posts a short animated clip of the
-next few seconds of gameplay, so you see the game react instead of a still
-frame. Anyone in the channel can play, making it a fun social feature.
+with a controller built out of Discord buttons. Every press posts a short
+animated clip of the next few seconds of gameplay, so you see the game react
+instead of a still frame. Anyone in the channel can play, making it a fun
+social feature.
 
 Eleven consoles are supported out of the box, from the Atari 2600 to the Super
 Nintendo. Emulation is provided by
@@ -56,7 +57,7 @@ can start it by name:
 ## Commands
 
 - `[p]retro [name|url]` starts a game from a saved name, a URL, or a ROM attached to the message. `.zip` files are unpacked for you. With no arguments it brings back the game already going in the channel.
-- `[p]retrostop` saves the game and puts it to sleep. The controls keep working.
+- `[p]retrostop` saves the game and puts it to sleep. The controls keep working — pressing any button wakes it up again. There is no Stop button under the screen; this command is how a game is stopped.
 - `[p]retroset download` (owner) downloads every supported core for your platform from the [libretro buildbot](https://buildbot.libretro.com). `[p]retroset download <core>` fetches or refreshes just one.
 - `[p]retroset autodownload [true|false]` (owner) controls whether missing cores are fetched automatically when the cog loads. On by default.
 - `[p]retroset core <path>` (owner) points the cog at a libretro core that is already on the machine. The console is read from the filename, so keep the buildbot name (`snes9x_libretro.so`).
@@ -64,8 +65,8 @@ can start it by name:
 - `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below.
 - `[p]retroset bios add|list|remove` (owner) manages BIOS files for cores that need one. See below.
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
-- `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows.
-- `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it.
+- `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 4.
+- `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it. The default is 160.
 - `[p]retroset settings` (owner) shows the current configuration, including the system directory and any BIOS files in it.
 
 ## Attaching a ROM
@@ -110,6 +111,34 @@ controller: the Genesis gets **A B C** (and **X Y Z** and **Mode**), the Atari
 2600 gets **Fire**, **Select** and **Reset**, the PC Engine gets **I** through
 **VI** and **Run**, and the Neo Geo Pocket's **A** and **B** are the right way
 round rather than swapped.
+
+## The controller
+
+The buttons are laid out like the console's own pad rather than as a list: the
+d-pad is a cross on the left, the face buttons sit to its right, and Start and
+Select share the bottom row with **Wait**, **×3** and **Replay**. A Game Boy
+looks like this, where `·` is a greyed-out spacer that holds the column open:
+
+```
+·  ⬆️
+⬅️  ⬇️  ➡️   B  A
+Start  Select   ⏩ Wait   A ×3   🔁 Replay
+```
+
+Consoles with more buttons grow upwards and sideways into the same shape — the
+Game Boy Advance and Virtual Boy put **L** and **R** on the top row where the
+shoulder buttons really are, the Super Nintendo adds a **Y X / B A** block, and
+the six-button Genesis and PC Engine keep their real two-by-three face cluster:
+
+```
+·  ⬆️   X  Y  Z
+⬅️  ⬇️  ➡️
+·  ·   A  B  C
+Mode  Start   ⏩ Wait   B ×3   🔁 Replay
+```
+
+Discord allows five rows of five components, and the widest layout (the Super
+Nintendo) uses four rows and nineteen buttons, so there is room to spare.
 
 ## Core options
 
@@ -189,11 +218,10 @@ nothing plays it), and everything a core prints goes to the
 `red.robloach.retro.core` logger at DEBUG rather than onto the bot's console.
 
 A game goes to sleep after 10 minutes without input (configurable with
-`[p]retroset timeout`), when someone presses Stop, or when the bot shuts down.
-Sleeping frees the emulator but keeps the controls live: the next button press
-wakes the game up exactly where it was, even if the bot has restarted in
-between. The Stop button only appears while a game is awake, since a sleeping
-one is already stopped.
+`[p]retroset timeout`), when somebody runs `[p]retrostop`, or when the bot shuts
+down. Sleeping frees the emulator but keeps the controls live: the next button
+press wakes the game up exactly where it was, even if the bot has restarted in
+between.
 
 One game runs at a time across the whole bot. A libretro core is a shared
 library with global state, so two emulators running at once would corrupt each
@@ -230,18 +258,38 @@ is told the game simply started over.
 
 ## Playing
 
-Each press records the next five seconds (configurable with
+Each press records the next four seconds (configurable with
 `[p]retroset cliplength`) and posts them as a lossless animated WebP. The clip
 plays through once and stops rather than looping forever, so a busy channel
 isn't full of flickering images — press **Replay** to watch the last clip again.
 The controls grey out the moment you press a button and come back when the new
 clip is ready, so you can tell the bot heard you.
 
-A button is held down for 200ms at the start of the clip, which is long enough
-that no game misses it. Directions are held twice as long, because moving needs
-sustained input to actually go anywhere. Both are tuned with
-`[p]retroset hold`. The **×3** button taps the console's confirm button three
-times in one clip, so text boxes and menus take one round trip instead of three.
+Nothing but the clip is posted: no status card, no caption. The buttons say what
+they do. A line of text only appears when there is something to say, such as the
+game having gone to sleep or a save state that could not be restored, and it is
+cleared again by the next press.
+
+**The game only runs while a clip is being recorded.** Between one press and the
+next the console is frozen mid-frame — it is not ticking away in the background,
+so nothing can happen to you while nobody is looking, and a game left overnight
+is exactly where you left it. That is also why a clip always starts the instant
+the button goes down.
+
+A button is held down for 160ms at the start of the clip, directions included.
+That is long enough that no game polling its controller a few times a second can
+miss it, and short enough that one press is one action: a Game Boy walk cycle is
+16 frames (about 270ms), so a longer hold starts a *second* step and the
+character crosses two tiles for one press. Tune it with `[p]retroset hold`. The
+**×3** button taps the console's confirm button three times in one clip, so text
+boxes and menus take one round trip instead of three.
+
+## Permissions
+
+Playing needs only **Attach Files** (plus the usual Read Messages / Send
+Messages) — the clip is a plain attachment and the controls are buttons, so no
+embed is involved. **Embed Links** is used by one owner-only command,
+`[p]retroset settings`.
 
 ## BIOS files
 
