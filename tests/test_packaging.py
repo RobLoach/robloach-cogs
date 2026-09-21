@@ -21,6 +21,12 @@ DECLARED = {"libretro.py": "libretro", "pillow": "PIL"}
 #: Provided by Red-DiscordBot itself, so the cog may import them undeclared.
 FROM_RED = {"redbot", "discord", "aiohttp"}
 
+#: The cog's own modules. Normally they are imported relatively (which the
+#: scanner below already skips), but `python retro/emulator.py` runs with no
+#: package at all and `retro/` as sys.path[0], so that one path imports its
+#: sibling by bare name. See the fallback import at the top of emulator.py.
+SIBLING_MODULES = {path.stem for path in (REPO_ROOT / "retro").glob("*.py")}
+
 
 @pytest.mark.parametrize("path", INFO_FILES, ids=lambda p: str(p.relative_to(REPO_ROOT)))
 def test_every_info_json_is_valid_json(path):
@@ -53,7 +59,12 @@ def imported_names():
 
 
 def test_nothing_is_imported_that_info_json_does_not_declare():
-    allowed = set(sys.stdlib_module_names) | FROM_RED | set(DECLARED.values())
+    allowed = (
+        set(sys.stdlib_module_names)
+        | FROM_RED
+        | set(DECLARED.values())
+        | SIBLING_MODULES
+    )
     undeclared = {k: sorted(v) for k, v in imported_names().items() if k not in allowed}
     assert not undeclared, f"undeclared imports: {undeclared}"
 
@@ -120,12 +131,24 @@ def test_pytest_markers_are_registered():
 COG_README = (REPO_ROOT / "retro" / "README.md").read_text()
 COG_INFO = json.loads((REPO_ROOT / "retro" / "info.json").read_text())
 COG_SOURCE = (REPO_ROOT / "retro" / "Retro.py").read_text()
+MIGRATION_SOURCE = (REPO_ROOT / "retro" / "migration.py").read_text()
 
 
 def test_the_cog_module_is_named_after_its_class():
     assert (REPO_ROOT / "retro" / "Retro.py").is_file()
     assert not (REPO_ROOT / "retro" / "RetroCog.py").exists()
-    assert "class Retro(commands.Cog)" in COG_SOURCE
+    # The class is assembled from mixins (see retro/abc.py), so the bases are
+    # several -- but it is still exactly one class, still called Retro, and
+    # still a commands.Cog, which is what Red keys the Config namespace and
+    # the data directory off. Asserted on the parsed source rather than on a
+    # substring, so reordering the mixins cannot break it.
+    declaration = next(
+        node
+        for node in ast.parse(COG_SOURCE).body
+        if isinstance(node, ast.ClassDef) and node.name == "Retro"
+    )
+    bases = [ast.unparse(base) for base in declaration.bases]
+    assert "commands.Cog" in bases, bases
     init = (REPO_ROOT / "retro" / "__init__.py").read_text()
     assert "from .Retro import Retro" in init
     assert "RetroCog" not in init
@@ -212,4 +235,7 @@ def test_the_load_bearing_constants_are_still_in_the_source():
         REPO_ROOT / "retro" / "RetroView.py"
     ).read_text()
     assert "114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121" in COG_SOURCE
-    assert 'LEGACY_COG_NAME = "RetroCog"' in COG_SOURCE
+    # The old cog name lives with the migration that is keyed on it, and is
+    # re-exported from Retro.py so `retro.Retro.LEGACY_COG_NAME` still works.
+    assert 'LEGACY_COG_NAME = "RetroCog"' in MIGRATION_SOURCE
+    assert "LEGACY_COG_NAME" in COG_SOURCE

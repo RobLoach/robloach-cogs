@@ -9,7 +9,18 @@ that needs the real metadata is marked ``redbot``.
 import types
 
 
-class Cog:
+class CogMeta(type):
+    """Red re-exports discord.py's CogMeta; the cog needs it to exist.
+
+    The real one collects a cog's commands out of the whole MRO, which is
+    what lets `Retro` be assembled from mixins. Nothing here collects
+    anything -- the tests reach a command through the class attribute the
+    decorator left behind -- but `retro/abc.py` derives its metaclass from
+    this and `ABCMeta`, so it has to be a metaclass rather than a name.
+    """
+
+
+class Cog(metaclass=CogMeta):
     pass
 
 

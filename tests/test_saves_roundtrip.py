@@ -42,7 +42,7 @@ def real(retro, monkeypatch, gambatte, ucity):
     """
     from retro.emulator import RetroEmulator
 
-    monkeypatch.setattr(retro.cogmod, "RetroEmulator", RetroEmulator)
+    retro.patch("RetroEmulator", RetroEmulator, monkeypatch)
     # A real core at a real path, recorded the way the downloader records it.
     monkeypatch.setattr(retro.cog, "_core_path", _fixed_path(gambatte))
     retro.rom_bytes = open(ucity, "rb").read()

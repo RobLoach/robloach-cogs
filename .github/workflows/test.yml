@@ -28,8 +28,8 @@ jobs:
   #
   # requirements-dev.txt installs libretro.py here even though no core is
   # loaded, which is what lets tests/test_frame_grab.py run: it drives a real
-  # ArrayVideoDriver with synthetic frames and asserts the cog's fast frame
-  # grab is byte-identical to libretro.py's own screenshot(). The fast grab
+  # ArrayVideoDriver with synthetic frames and asserts retro/clips.py's fast
+  # frame grab is byte-identical to libretro.py's own screenshot(). The fast grab
   # reads private attributes, so a libretro.py release that renames or
   # relays them has to fail *here*, in seconds, rather than silently making
   # every clip a hundred times slower to record. That is also why the
@@ -72,13 +72,24 @@ jobs:
         # retro.RetroCog before the class was renamed to Retro.
         # `retro.Retro` is the cog class re-exported by retro/__init__.py, so
         # the module of the same name is imported through importlib.
+        #
+        # Every module is listed, mixins included: the cog class is assembled
+        # from retro/storage.py, retro/cores.py, retro/saves.py and
+        # retro/migration.py (see retro/abc.py), and a mixin that will not
+        # import is a cog that will not load.
         run: |
           python -c "
           import importlib, retro
-          for name in ('retro.Retro', 'retro.RetroView', 'retro.systems', 'retro.archives'):
+          for name in (
+              'retro.Retro', 'retro.abc', 'retro.storage', 'retro.cores',
+              'retro.saves', 'retro.migration', 'retro.RetroView',
+              'retro.emulator', 'retro.clips', 'retro.systems',
+              'retro.archives', 'retro.net',
+          ):
               importlib.import_module(name)
           assert retro.Retro.__name__ == 'Retro', retro.Retro.__name__
           print('cog class:', retro.Retro.__name__)
+          print('commands:', len(retro.Retro.__cog_commands__))
           "
       - name: Run the fast tests against the real Red
         run: pytest -m "not emulator and not network" --durations=10

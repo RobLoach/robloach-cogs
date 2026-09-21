@@ -15,7 +15,7 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` included), the shared restore chain, the clip arithmetic (`press_plan`, `input_budget`: plain functions of a frame rate, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
+| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` included), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget` and `retro/clips.py`: plain functions of a frame rate or of a framebuffer, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
 | `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
@@ -24,10 +24,41 @@ has to be `-n`, i.e. separate processes: one libretro core may be loaded per
 process. The fast suite is *slower* under `-n`, so it is left serial.
 
 `-m redbot` marks the few tests that need the real Red-DiscordBot (command
-permission metadata, and the two `Config`/`cog_data_path` escape hatches the
-data migration rests on). Everything else runs against `tests/stubs/redbot`,
-which is used automatically when Red is not installed -- Red is a large
-dependency and a controller layout does not need a database.
+permission metadata, the assembled cog's `__cog_commands__`, and the two
+`Config`/`cog_data_path` escape hatches the data migration rests on).
+Everything else runs against `tests/stubs/redbot`, which is used
+automatically when Red is not installed -- Red is a large dependency and a
+controller layout does not need a database.
+
+## The cog is several modules and one class
+
+`Retro` is a cog class assembled from mixins, which is how Red's own
+multi-file cogs are built: `retro/storage.py` (paths, atomic writes, the
+disk budget), `retro/cores.py` (installing cores, and their own options),
+`retro/saves.py` (the `[p]retrosaves` group) and `retro/migration.py` (the
+one-off `RetroCog` -> `Retro` move), wired together by `retro/abc.py`. The
+clip arithmetic and the animation encoder live in `retro/clips.py`, which
+imports no libretro at all, with `retro/emulator.py` re-exporting every name
+so nothing downstream had to change.
+
+Two consequences for the tests:
+
+* **`retro.patch(name, value, monkeypatch)`, never `monkeypatch.setattr` on
+  one module.** A module looks its globals up in its own namespace, so a
+  fake installed on `retro.Retro` alone stops intercepting the moment the
+  code that uses it lives in a mixin -- and the fixture keeps passing while
+  testing nothing, which this repository has shipped twice. `RetroEnv.patch`
+  installs the fake on every module in `fakes.COG_MODULES` that binds the
+  name and *raises* if none of them do. `tests/test_mixins.py` proves no
+  namespace is left holding the real thing.
+* **Constants are re-exported from `retro.Retro`.** `retro.cogmod.<NAME>`
+  still means what it always did, because a read of an immutable value does
+  not care where it was defined. Anything *patched*, though, has to be
+  patched where the code looks it up -- which is what `retro.patch` is for.
+
+`tests/test_mixins.py` also pins the command surface and the Config keys:
+both are already on other people's disks, so a command or a settings key
+that a refactor quietly drops is their data gone.
 
 ## Getting the cores and ROMs
 
@@ -55,9 +86,12 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
 
 ## Adding a test
 
-* Put it where it belongs: `test_systems.py` and `test_archives.py` import
-  nothing but the standard library (they load the module under test
-  directly, via `tests/loader.py`); `test_view.py` and `test_cog_*.py` use
+* Put it where it belongs: `test_systems.py`, `test_archives.py` and
+  `test_frame_grab.py` import nothing but the standard library plus what the
+  module under test needs (they load it directly, via `tests/loader.py`,
+  which puts it in a synthetic package so a relative import of a sibling
+  still resolves without running `retro/__init__.py`); `test_view.py` and
+  `test_cog_*.py` use
   the `retro` fixture, which is a real `Retro` wired to the fakes in
   `tests/fakes.py`; `test_migration.py` and `test_resume.py` use the same
   fixture for the data migration and the Resume button; `test_restore.py`

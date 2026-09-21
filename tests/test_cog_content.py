@@ -68,14 +68,14 @@ def buildbot(retro, monkeypatch):
             served.append(core)
             return FakeResponse(core)
 
-    monkeypatch.setattr(
-        retro.cogmod,
+    retro.patch(
         "aiohttp",
         types.SimpleNamespace(
             ClientSession=lambda **kw: FakeSession(),
             ClientTimeout=lambda **kw: None,
             ClientError=Exception,
         ),
+        monkeypatch,
     )
 
     # Core downloads go through the SSRF guard, so that is what has to be
@@ -649,7 +649,7 @@ async def test_a_zip_with_nothing_usable_says_so(retro, bios):
 
 
 async def test_a_bios_zip_that_unpacks_too_large_is_refused(retro, bios, monkeypatch):
-    monkeypatch.setattr(retro.cogmod, "MAX_BIOS_TOTAL_SIZE", 1024)
+    retro.patch("MAX_BIOS_TOTAL_SIZE", 1024, monkeypatch)
     pack = zip_of([(f"f{i}.bin", b"\x01" * 512) for i in range(4)])
     ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "big.zip")])
     await bios.add(retro.cog, ctx, None, None)
@@ -658,7 +658,7 @@ async def test_a_bios_zip_that_unpacks_too_large_is_refused(retro, bios, monkeyp
 
 
 async def test_too_many_files_in_a_bios_zip_is_refused(retro, bios, monkeypatch):
-    monkeypatch.setattr(retro.cogmod, "MAX_BIOS_FILES", 3)
+    retro.patch("MAX_BIOS_FILES", 3, monkeypatch)
     pack = zip_of([(f"f{i}.bin", b"\x01" * 8) for i in range(6)])
     ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "lots.zip")])
     await bios.add(retro.cog, ctx, None, None)
@@ -667,7 +667,7 @@ async def test_too_many_files_in_a_bios_zip_is_refused(retro, bios, monkeypatch)
 
 
 async def test_a_file_in_a_zip_over_the_per_file_limit_is_skipped(retro, bios, monkeypatch):
-    monkeypatch.setattr(retro.cogmod, "MAX_BIOS_SIZE", 256)
+    retro.patch("MAX_BIOS_SIZE", 256, monkeypatch)
     pack = zip_of([("huge.bin", b"\x01" * 4096), ("small_bios.bin", b"\x02" * 64)])
     ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "mixed.zip")])
     await bios.add(retro.cog, ctx, None, None)
@@ -768,14 +768,14 @@ def auto(retro, monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-    monkeypatch.setattr(
-        retro.cogmod,
+    retro.patch(
         "aiohttp",
         types.SimpleNamespace(
             ClientSession=lambda **kw: NullSession(),
             ClientTimeout=lambda **kw: None,
             ClientError=Exception,
         ),
+        monkeypatch,
     )
     cog._download_core = fake_download
     return cog, attempted

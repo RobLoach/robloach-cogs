@@ -107,7 +107,7 @@ async def test_the_probe_puts_a_running_game_to_sleep_first(retro, options, monk
         )
         return dict(GAMBATTE_DEFS) if "gambatte" in Path(core_path).name else {}
 
-    monkeypatch.setattr(retro.cogmod, "probe_core_options", fake_probe)
+    retro.patch("probe_core_options", fake_probe, monkeypatch)
 
     ctx = retro.context(channel)
     await options(retro.cog, ctx, core="gambatte")
@@ -118,8 +118,8 @@ async def test_the_probe_puts_a_running_game_to_sleep_first(retro, options, monk
 
 
 async def test_the_listing_shows_keys_values_defaults_and_provenance(retro, options, monkeypatch):
-    monkeypatch.setattr(
-        retro.cogmod, "probe_core_options", lambda path, opts=None: dict(GAMBATTE_DEFS)
+    retro.patch(
+        "probe_core_options", lambda path, opts=None: dict(GAMBATTE_DEFS), monkeypatch
     )
     ctx = retro.context(retro.channel(9703))
     await options(retro.cog, ctx, core="gambatte")
@@ -134,10 +134,10 @@ async def test_the_listing_shows_keys_values_defaults_and_provenance(retro, opti
 
 async def test_a_running_game_answers_for_its_own_core_with_no_probe(retro, options, monkeypatch):
     probed = []
-    monkeypatch.setattr(
-        retro.cogmod,
+    retro.patch(
         "probe_core_options",
         lambda path, opts=None: probed.append(path) or {},
+        monkeypatch,
     )
     FakeEmulator.definitions_by_core = {"gambatte": GAMBATTE_DEFS}
     channel = retro.channel(9704)
@@ -152,10 +152,10 @@ async def test_a_running_game_answers_for_its_own_core_with_no_probe(retro, opti
 
 async def test_a_cached_listing_needs_no_probe_at_all(retro, options, monkeypatch):
     probed = []
-    monkeypatch.setattr(
-        retro.cogmod,
+    retro.patch(
         "probe_core_options",
         lambda path, opts=None: (probed.append(path), dict(GAMBATTE_DEFS))[1],
+        monkeypatch,
     )
     await options(retro.cog, retro.context(retro.channel(9705)), core="gambatte")
     assert probed, "the first listing reads the core"
@@ -166,8 +166,8 @@ async def test_a_cached_listing_needs_no_probe_at_all(retro, options, monkeypatc
 
 
 async def test_one_option_is_shown_in_full(retro, options, monkeypatch):
-    monkeypatch.setattr(
-        retro.cogmod, "probe_core_options", lambda path, opts=None: dict(GAMBATTE_DEFS)
+    retro.patch(
+        "probe_core_options", lambda path, opts=None: dict(GAMBATTE_DEFS), monkeypatch
     )
     ctx = retro.context(retro.channel(9707))
     await options(retro.cog, ctx, core="gambatte", key="gb_colorization")
@@ -263,8 +263,8 @@ def test_the_reset_sentinel_is_not_something_a_core_would_offer(retro):
 @pytest.fixture
 async def gambatte_known(retro, options, monkeypatch):
     """The command, with gambatte's options already cached."""
-    monkeypatch.setattr(
-        retro.cogmod, "probe_core_options", lambda path, opts=None: dict(GAMBATTE_DEFS)
+    retro.patch(
+        "probe_core_options", lambda path, opts=None: dict(GAMBATTE_DEFS), monkeypatch
     )
     await options(retro.cog, retro.context(retro.channel(9710)), core="gambatte")
     return options
@@ -325,7 +325,7 @@ async def test_reset_puts_the_core_s_default_back_and_is_idempotent(retro, gamba
 
 
 async def test_a_silent_core_is_not_called_optionless(retro, options, monkeypatch):
-    monkeypatch.setattr(retro.cogmod, "probe_core_options", lambda path, opts=None: {})
+    retro.patch("probe_core_options", lambda path, opts=None: {}, monkeypatch)
     ctx = retro.context(retro.channel(9720))
     await options(retro.cog, ctx, core="fceumm")
     said = ctx.said()
@@ -334,7 +334,7 @@ async def test_a_silent_core_is_not_called_optionless(retro, options, monkeypatc
 
 
 async def test_setting_an_unverifiable_option_is_allowed_but_flagged(retro, options, monkeypatch):
-    monkeypatch.setattr(retro.cogmod, "probe_core_options", lambda path, opts=None: {})
+    retro.patch("probe_core_options", lambda path, opts=None: {}, monkeypatch)
     ctx = retro.context(retro.channel(9721))
     await options(retro.cog, ctx, core="fceumm", key="fceumm_region", value="PAL")
     said = ctx.said()
@@ -375,7 +375,7 @@ async def test_a_stale_override_is_shown_as_the_default_the_core_will_use(retro,
 
 
 async def test_the_settings_embed_summarises_the_overrides(retro, options, monkeypatch):
-    monkeypatch.setattr(retro.cogmod, "probe_core_options", lambda path, opts=None: {})
+    retro.patch("probe_core_options", lambda path, opts=None: {}, monkeypatch)
     ctx = retro.context(retro.channel(9724))
     await options(retro.cog, ctx, core="fceumm", key="fceumm_region", value="PAL")
 

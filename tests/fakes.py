@@ -683,6 +683,25 @@ def zip_of(entries):
 
 # -- The environment a cog test runs in ---------------------------------------
 
+#: The modules `Retro` is assembled from: the cog module itself plus every
+#: mixin it inherits (see retro/abc.py). `RetroEnv.patch` replaces a name on
+#: all of the ones that bind it, because each of them resolves its globals in
+#: its own namespace.
+#:
+#: Deliberately not retro.emulator, retro.clips, retro.RetroView, retro.net,
+#: retro.systems or retro.archives: those are collaborators rather than parts
+#: of the cog class, tests patch them by name where they mean to (`netmod`,
+#: `viewmod`), and standing a fake in for `retro.emulator.RetroEmulator`
+#: would replace the real class for everybody -- including the tests that
+#: deliberately put it back.
+COG_MODULES = (
+    "retro.Retro",
+    "retro.storage",
+    "retro.cores",
+    "retro.saves",
+    "retro.migration",
+)
+
 
 class RetroEnv:
     """A Retro wired to the fakes above, with the helpers tests need."""
@@ -694,10 +713,24 @@ class RetroEnv:
         self.viewmod = sys.modules["retro.RetroView"]
         self.sysmod = sys.modules["retro.systems"]
         self.netmod = sys.modules["retro.net"]
+        # The modules the cog class is assembled from, so a test can reach a
+        # helper where it now lives. Patching is done through self.patch()
+        # rather than against one of these by hand; see COG_MODULES.
+        self.storagemod = sys.modules["retro.storage"]
+        self.coresmod = sys.modules["retro.cores"]
+        self.savesmod = sys.modules["retro.saves"]
+        self.migrationmod = sys.modules["retro.migration"]
         # The emulator module itself, for the clip arithmetic and its bounds.
         # FakeEmulator stands in for the *class*, not for the constants and
         # the plain functions around it, which are the real ones under test.
         self.emumod = sys.modules["retro.emulator"]
+        self.clipsmod = sys.modules["retro.clips"]
+        #: name -> the modules self.patch() replaced it on, so a test can
+        #: assert that a fake is installed everywhere it has to be.
+        self.patched = {}
+        #: name -> what it was replaced with, for the same reason.
+        self.fakes = {}
+        self._monkeypatch = monkeypatch
         # Laid out the way Red lays it out: one folder per cog *class name*
         # under a shared root. That is what makes the RetroCog -> Retro data
         # move a real move in these tests rather than a no-op.
@@ -717,23 +750,55 @@ class RetroEnv:
         FakeEmulator.reset()
         FakeConfirm.reset()
         self.configs = FakeConfigFactory()
-        monkeypatch.setattr(self.cogmod, "cog_data_path", self._cog_data_path)
-        monkeypatch.setattr(
-            self.cogmod,
-            "Config",
-            types.SimpleNamespace(get_conf=self.configs.get_conf),
-        )
-        monkeypatch.setattr(self.cogmod, "RetroEmulator", FakeEmulator)
-        monkeypatch.setattr(self.cogmod, "SimpleMenu", FakeMenu)
-        monkeypatch.setattr(self.cogmod, "ConfirmView", FakeConfirm)
+        #: Every cog_data_path() call the cog made, so a test can prove the
+        #: fake was reached rather than merely installed.
+        self.data_path_calls = []
+        self.patch("cog_data_path", self._cog_data_path)
+        self.patch("Config", types.SimpleNamespace(get_conf=self.configs.get_conf))
+        self.patch("RetroEmulator", FakeEmulator)
+        self.patch("SimpleMenu", FakeMenu)
+        self.patch("ConfirmView", FakeConfirm)
 
         self.cog, self.bot = self.make_cog()
+
+    # -- patching
+    def patch(self, name, value, monkeypatch=None):
+        """
+        Install ``value`` as ``name`` on **every** cog module that binds it.
+
+        The cog is one class assembled from several modules, and a module
+        looks a global up in its own namespace. So a fake installed on
+        ``retro.Retro`` alone stops intercepting the moment the code that
+        uses the name lives in a mixin -- and a fixture that keeps passing
+        while testing nothing is the exact bug this repository has already
+        shipped twice. Patching everywhere the name is bound is what makes
+        that impossible to get wrong by moving code.
+
+        Raises if nothing binds the name at all, since patching it would
+        then intercept nothing and say nothing about it.
+        """
+        monkeypatch = monkeypatch or self._monkeypatch
+        where = []
+        for module_name in COG_MODULES:
+            module = sys.modules[module_name]
+            if name in vars(module):
+                monkeypatch.setattr(module, name, value)
+                where.append(module_name)
+        if not where:
+            raise AssertionError(
+                f"no module in {COG_MODULES} binds {name!r}, so patching it "
+                "would intercept nothing. Has it moved or been removed?"
+            )
+        self.patched[name] = tuple(where)
+        self.fakes[name] = value
+        return tuple(where)
 
     def _cog_data_path(self, cog_instance=None, raw_name=None):
         """Red's cog_data_path: <root>/<class name>, created on the way out."""
         name = raw_name or (
             type(cog_instance).__name__ if cog_instance is not None else "Retro"
         )
+        self.data_path_calls.append(name)
         path = self.cogs_root / name
         path.mkdir(parents=True, exist_ok=True)
         return path
