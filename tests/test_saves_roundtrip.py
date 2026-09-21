@@ -270,9 +270,18 @@ def machine(emulator):
 
 
 def last_picture(clip):
-    """A hash of the final frame of a clip, i.e. what stays on the message."""
+    """A hash of the final frame of a clip, i.e. what stays on the message.
+
+    A clip plays through once and holds its last frame, so this really is
+    the picture the channel is left looking at. The clip itself is read back
+    off the edit that carried it (``interaction.clip()`` for a button,
+    ``retro.shown_clip(view)`` for a command that edits the message): a
+    session keeps no copy of its footage, so the message is where it lives
+    and is also what a player sees.
+    """
     from PIL import Image
 
+    assert isinstance(clip, bytes) and clip, "no clip reached the message"
     animation = Image.open(io.BytesIO(clip))
     animation.seek(animation.n_frames - 1)
     return hashlib.sha1(animation.convert("RGB").tobytes()).hexdigest()
@@ -301,7 +310,7 @@ async def test_undo_puts_a_real_core_and_its_picture_back(real, city):
     await view._press(interaction, "start")
     pressed_state = emulator.save_state()
     pressed_machine = machine(emulator)
-    pressed_picture = last_picture(view.last_clip)
+    pressed_picture = last_picture(interaction.clip())
     assert differing_bytes(pressed_state, before) > 100, "the press moved the game on"
 
     # The undo point is the state the press began from, compressed.
@@ -315,7 +324,7 @@ async def test_undo_puts_a_real_core_and_its_picture_back(real, city):
     await real.control(view, "undo").callback(undoing)
     undone_state = emulator.save_state()
     undone_machine = machine(emulator)
-    undone_clip = view.last_clip
+    undone_clip = undoing.clip()
 
     # The reference: the same state, the same core, one clip of no input.
     emulator.load_state(before)
@@ -434,12 +443,16 @@ async def test_retroreset_reboots_a_real_core_through_the_cog(real, city):
     saved = in_game_save()
     assert emulator.load_sram(saved) is True
     for field in ("start", "a", "down"):
-        await view._press(real.interaction(view, message=view.message), field)
+        # A press edits the *interaction*, so the clip it posted is read back
+        # from there; `[p]retroreset` edits the message itself, which is what
+        # `shown_clip` reads below.
+        playing = real.interaction(view, message=view.message)
+        await view._press(playing, field)
     await cog._write_state(view)
     assert state_path.is_file()
     on_disk_before = state_path.read_bytes()
     played_wram, _ = machine(emulator)
-    played_picture = last_picture(view.last_clip)
+    played_picture = last_picture(playing.clip())
     assert differing_bytes(played_wram, booted_wram) > 0, "the play moved nothing"
 
     await command(real, "retroreset")(cog, ctx)
@@ -453,7 +466,7 @@ async def test_retroreset_reboots_a_real_core_through_the_cog(real, city):
 
     # 2. The picture the channel is left looking at is the game booting, not
     #    the game that was thrown away.
-    assert last_picture(view.last_clip) != played_picture
+    assert last_picture(real.shown_clip(view)) != played_picture
 
     # 3. The player's own in-game save is untouched: a real console's reset
     #    never wiped one, and neither does this.

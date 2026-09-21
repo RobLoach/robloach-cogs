@@ -21,7 +21,22 @@ class CogMeta(type):
 
 
 class Cog(metaclass=CogMeta):
-    pass
+    @classmethod
+    def listener(cls, name=None):
+        """Mark a coroutine as a Discord event handler.
+
+        The real decorator records the event name so discord.py can wire the
+        method up when the cog is added to the bot. Nothing here wires
+        anything: the tests call a listener directly, exactly as they call a
+        command's callback, so all this has to do is leave the function
+        alone. ``tests/test_mixins.py`` pins the set of listeners against
+        the real Red.
+        """
+
+        def decorator(func):
+            return func
+
+        return decorator
 
 
 class Context:

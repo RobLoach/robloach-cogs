@@ -180,9 +180,11 @@ def test_no_documentation_still_offers_retroset_core():
 def test_the_readme_says_the_replay_button_is_gone_and_what_it_saved():
     # The docs may explain that it was removed -- that is where the 8 MiB a
     # session no longer holds is written down -- but must not present it as
-    # something to press.
+    # something to press. The clip that replaced the buffer has since gone
+    # too (nothing read it), so what the README now states is that a session
+    # holds no footage at all.
     assert "Replay** shows the last" not in COG_README
-    assert "session keeps one clip" in COG_README
+    assert "session keeps no footage at all" in COG_README
     assert "8 MiB" in COG_README
     for line in COG_README.splitlines():
         assert "🔁" not in line, line
@@ -252,6 +254,85 @@ def test_the_readme_explains_the_live_session_rule():
 def test_the_readme_says_who_may_destroy_a_save():
     assert "Manage Messages" in COG_README
     assert "open to the channel" in COG_README
+
+
+def test_the_readme_explains_what_the_cog_forgets_and_what_it_keeps():
+    """The one place a reader could lose progress by misunderstanding.
+
+    A session or Resume record is a pointer and is deleted automatically; a
+    save state and a battery save are the player's progress and are not. The
+    docs have to draw that line, name all four things that drop a record,
+    and say which way the deleted-channel decision went.
+    """
+    assert "### What the cog forgets, and what it never does" in COG_README
+    for phrase in (
+        "dropping a record loses the button and nothing else",
+        "the cached ROM it named was pruned",
+        "the channel or thread was deleted",
+        "the bot left the server",
+        "can no longer see the channel",
+        "saves for a deleted channel are deliberately kept",
+        # The hazard worth writing down: Red loads cogs before logging in.
+        "before logging in",
+    ):
+        assert phrase in COG_README, phrase
+
+
+def test_the_documented_core_download_size_is_not_the_unpacked_one():
+    """Two figures, and neither the docs nor the help may quote only one.
+
+    The buildbot's zips for the seven cores are about 4.5 MiB and the shared
+    objects they unpack to are about 31 MiB (genesis_plus_gx alone is 12).
+    Only the second one counts against `[p]retroset diskbudget`, and every
+    place that quoted 4.5 MiB for the disk was out by a factor of seven.
+    """
+    for where, text in (
+        ("retro/README.md", COG_README),
+        ("retro/Retro.py", COG_SOURCE),
+        ("retro/storage.py", (REPO_ROOT / "retro" / "storage.py").read_text()),
+    ):
+        assert "4.5 MiB" in text, where
+        assert "31 MiB" in text, where
+
+
+def test_the_readme_documents_every_command_the_cog_publishes():
+    """A command nobody wrote down is a command nobody finds.
+
+    `[p]retroset diskbudget` and `[p]retroset allowprivateurls` were both
+    missing from the list for a while, and the second of those is the one
+    that turns a security guard off.
+    """
+    listed = {
+        line.split("`")[1].split(" ")[0]
+        for line in COG_README.splitlines()
+        if line.startswith("- `[p]retro")
+    }
+    for command in ("[p]retrosaves", "[p]retroset", "[p]retro"):
+        assert command in listed or any(c.startswith(command) for c in listed)
+    for command in (
+        "[p]retroset allowprivateurls",
+        "[p]retroset diskbudget",
+        "[p]retrosaves rollback",
+    ):
+        assert f"- `{command}" in COG_README, command
+
+
+def test_the_readme_documents_the_url_guard_the_cog_points_at():
+    """`[p]retroset game add` refers the owner to it by name.
+
+    The reply used to say "see the SSRF note in the README" when the README
+    had no such note anywhere in it.
+    """
+    assert "## ROM URLs" in COG_README
+    assert "**ROM URLs** in the " in COG_SOURCE, "the reply points nowhere"
+    for phrase in ("169.254.169.254", "redirect hop is checked", "the same sentence"):
+        assert phrase in COG_README, phrase
+
+
+def test_the_readme_says_what_a_corrupt_rom_does():
+    assert "## Corrupt and unplayable ROMs" in COG_README
+    assert "the emulator is freed and no half-started session is left behind" in COG_README
+    assert "test_malformed_roms.py" in COG_README
 
 
 def test_the_readme_describes_the_single_restore_chain():

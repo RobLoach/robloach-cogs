@@ -22,9 +22,10 @@ env:
 
 jobs:
   # Lint plus the whole fast suite: tables, layouts, archives, the cog
-  # driven against fakes, and the property tests. No cores, no ROMs, no
-  # network -- this is the job that should fail first when something is
-  # wrong, and it takes well under a minute.
+  # driven against fakes, what it holds on to (memory *and* Config records),
+  # and the property tests. No cores, no ROMs, no network -- this is the job
+  # that should fail first when something is wrong, and it takes well under a
+  # minute.
   #
   # requirements-dev.txt installs libretro.py here even though no core is
   # loaded, which is what lets tests/test_frame_grab.py run: it drives a real
@@ -84,21 +85,24 @@ jobs:
               'retro.Retro', 'retro.abc', 'retro.storage', 'retro.cores',
               'retro.saves', 'retro.migration', 'retro.RetroView',
               'retro.emulator', 'retro.clips', 'retro.systems',
-              'retro.archives', 'retro.net',
+              'retro.archives', 'retro.net', 'retro.version',
           ):
               importlib.import_module(name)
           assert retro.Retro.__name__ == 'Retro', retro.Retro.__name__
           print('cog class:', retro.Retro.__name__)
           print('commands:', len(retro.Retro.__cog_commands__))
+          print('listeners:', sorted(n for n, _ in retro.Retro.__cog_listeners__))
+          print('version:', retro.version.VERSION)
           "
       - name: Run the fast tests against the real Red
         run: pytest -m "not emulator and not network" --durations=10
 
-  # The slow half: real libretro cores driving real ROMs, plus the one place
+  # The slow half: real libretro cores driving real ROMs, plus the two places
   # the cog itself is driven against a real core -- exporting µCity's 128 KiB
-  # battery save, wiping it and importing it back. The cores and the
-  # freely-distributable ROMs are cached between runs, so an unchanged core
-  # list costs one cache restore instead of ~40 MiB of downloads.
+  # battery save, wiping it and importing it back, and handing `[p]retro` a
+  # deliberately corrupted cartridge that no core will take. The cores and
+  # the freely-distributable ROMs are cached between runs, so an unchanged
+  # core list costs one cache restore instead of ~40 MiB of downloads.
   emulator:
     runs-on: ubuntu-latest
     strategy:
@@ -116,9 +120,10 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - name: Install the emulator dependencies
         # discord.py, but deliberately not Red: most of the emulator tests
-        # exercise retro/emulator.py on its own, but the save export/import
-        # round trip (tests/test_saves_roundtrip.py) drives the real cog
-        # against a real core, and tests/stubs stands in for Red.
+        # exercise retro/emulator.py on its own, while the save export/import
+        # round trip (tests/test_saves_roundtrip.py) and the corrupted-ROM
+        # tests (tests/test_malformed_roms.py) drive the real cog against a
+        # real core, and tests/stubs stands in for Red.
         run: pip install "libretro.py" pillow "discord.py" pytest pytest-asyncio pytest-xdist
       - name: Restore the cached cores and ROMs
         uses: actions/cache@v4

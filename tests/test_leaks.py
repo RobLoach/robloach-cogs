@@ -13,7 +13,8 @@ Three kinds of proof are used:
 * ``weakref`` plus ``gc.collect()``, for "is this object really released";
 * adding up the bytes every reachable session is holding, which used to be
   where the megabytes actually were (a replay buffer of up to 8 MiB apiece,
-  before the Replay button was removed) and is now one clip each.
+  before the Replay button was removed, and one clip each after that) and is
+  now nothing at all.
 
 Nothing here needs a real core or the network. The one thing it does need is
 the *real* discord.py view store, because the leak that motivated this file
@@ -22,6 +23,7 @@ lives inside it: see test_a_retired_view_is_released_by_discord_py below.
 
 import asyncio
 import gc
+import types
 import weakref
 
 import pytest
@@ -32,6 +34,8 @@ pytest.importorskip("discord", reason="the leak tests need discord.py")
 
 import discord  # noqa: E402
 from discord.ui.view import ViewStore  # noqa: E402
+
+from .fakes import footage_bytes  # noqa: E402
 
 C = load_standalone("retro_clips_for_leaks", "clips.py")
 
@@ -287,19 +291,23 @@ async def test_forgetting_a_retired_record_releases_its_view(retro, store):
     assert not alive, f"{len(alive)} of 8 forgotten Resume buttons are still reachable"
 
 
-# -- 2. The clip a session holds -----------------------------------------------
+# -- 2. The footage a session holds --------------------------------------------
 #
 # This section used to be about the replay buffer, which was the one thing in
 # a session big enough to matter: up to MAX_REPLAY_BYTES -- 8 MiB -- of
 # footage apiece, bounded by a count cap, a byte cap and a seconds cap that
 # all had to be enforced as clips arrived. Removing the Replay button removed
-# all of it. What a session holds now is the single clip that is on its
-# message, so the tests are the same shape against a much smaller number:
-# one clip, and none at all once the session is discarded.
+# all of it, leaving the single clip that was on the message
+# (`RetroView.last_clip`); nothing read that either, so it has gone too and
+# the number these tests are about is now zero.
+#
+# `fakes.footage_bytes` is deliberately attribute-agnostic -- every
+# bytes-like thing a view holds, bar the compressed undo history -- because
+# the thing being guarded against is a clip coming back under a new name.
 
 
-async def test_a_session_holds_one_clip_however_long_it_is_played(retro):
-    """No container to grow: the newest clip replaces the last one.
+async def test_a_session_holds_no_footage_however_long_it_is_played(retro):
+    """No container to grow, and no clip either: it is built and let go of.
 
     The buffer this replaces kept fifteen seconds of footage, which at the
     0.2s clip floor was 76 clips (MAX_REPLAY_CLIPS) and needed a byte cap of
@@ -311,33 +319,39 @@ async def test_a_session_holds_one_clip_however_long_it_is_played(retro):
 
     held, clips = [], []
     for _ in range(60):
-        await view._press(retro.interaction(view, message=view.message), "a")
-        held.append(len(view.last_clip or b""))
-        clips.append(view.last_clip)
+        interaction = retro.interaction(view, message=view.message)
+        await view._press(interaction, "a")
+        clips.append(interaction.clip())
+        held.append(footage_bytes(view))
 
     # Sixty clips recorded, all of them different, and the session is holding
-    # exactly the last one: no growth at all across the sixty presses.
+    # none of them at any point along the way.
     assert len(set(clips)) == 60, "the fake produced the same clip twice"
-    assert view.last_clip == clips[-1]
-    assert max(held) < 64 * 1024, max(held)
+    assert all(isinstance(clip, bytes) and clip for clip in clips)
+    assert held == [0] * 60, held
     assert not hasattr(view, "clips"), "the replay buffer came back"
+    assert not hasattr(view, "last_clip"), "the per-session clip came back"
 
 
-async def test_a_discarded_session_does_not_keep_its_clip(retro, store):
+async def test_a_discarded_session_holds_no_footage_either(retro, store):
     """
-    Freeing it where the session is discarded means that even if something
-    else does hold the view (a stale reference in a traceback, say) the clip
-    is not what is held. It was 8 MiB of footage before Replay was removed,
-    which is what made a retained view expensive.
+    The same statement at the other end of a session's life.
+
+    It used to need saying twice, because the clip was held until
+    ``_release_view`` dropped it: even if something else kept the view (a
+    stale reference in a traceback, say) the expensive part had to be gone.
+    Now there is nothing to drop, so what is checked is that retiring a
+    session leaves it holding neither footage nor undo history.
     """
     await retro.install_cores("gambatte")
     view, ctx, _ = await retro.posted_game(9642, "clipdrop")
     for _ in range(4):
         await view._press(retro.interaction(view, message=view.message), "a")
-    assert view.last_clip
+    assert view.history, "nothing was played, so this proves nothing"
 
     await retro.cog._retire(view, "replaced")
-    assert view.last_clip is None, "a retired session kept its clip"
+    assert footage_bytes(view) == 0, "a retired session kept a clip"
+    assert not view.history and view.history_bytes == 0
 
 
 async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro, store):
@@ -345,10 +359,11 @@ async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro
     The bytes, counted rather than inferred.
 
     This plays thirty games across ten channels, presses buttons in each, and
-    adds up the clip bytes still reachable from the cog and from discord.py at
-    the end. With the views retained it grew with every game; now it is
-    bounded by the channels that still have a live session -- and by one clip
-    each rather than by MAX_REPLAY_BYTES each.
+    adds up the payload bytes still reachable from the cog and from discord.py
+    at the end. With the views retained it grew with every game, at up to
+    MAX_REPLAY_BYTES a session and then at one clip a session; the answer is
+    now zero throughout, and it is measured rather than assumed because a
+    clip is exactly the kind of thing that comes back by accident.
     """
     await retro.install_cores("gambatte")
 
@@ -361,7 +376,7 @@ async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro
             if id(view) in seen:
                 continue
             seen.add(id(view))
-            total += len(getattr(view, "last_clip", None) or b"")
+            total += footage_bytes(view)
         return total
 
     held = []
@@ -371,19 +386,15 @@ async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro
         view = await retro.start_game(ctx, name=f"footage{index}")
         retro.cog._register_view(view)
         for _ in range(8):
-            await view._press(retro.interaction(view, message=view.message), "a")
-        assert view.last_clip
+            interaction = retro.interaction(view, message=view.message)
+            await view._press(interaction, "a")
+            assert interaction.clip(), "no clip was posted, so this proves nothing"
         await retro.cog._retire(view, "replaced")
         retro.cog.sessions.pop(channel.id, None)
         held.append(footage())
         del view, ctx
 
-    assert held[-1] == 0, f"footage retained after every game was retired: {held}"
-    # One session's clip at most, which is a few kilobytes -- not the eight
-    # megabytes a single session's replay buffer was allowed to reach.
-    assert max(held) < 64 * 1024, (
-        f"more than one clip's worth of footage was held at once: {max(held)}"
-    )
+    assert held == [0] * 30, f"footage was retained: {held}"
 
 
 # -- 3. Module level containers ------------------------------------------------
@@ -629,6 +640,56 @@ async def test_a_cancelled_resume_still_frees_the_core(retro, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("when", ["load", "run"])
+async def test_a_rom_the_core_will_not_digest_leaves_nothing_behind(retro, when):
+    """A player's broken ROM must not cost the bot its one emulator slot.
+
+    The fast half of tests/test_malformed_roms.py, which does the same thing
+    with real cores and genuinely corrupted cartridges: here the fake is
+    simply made to fail the way a core does, at the two points it can --
+    refusing the content (``start``) and falling over while the first clip is
+    being recorded (``record``). Both land in ``_start_session``'s
+    EmulatorError branch and ``_abandon_session``.
+    """
+    await retro.install_cores("gambatte")
+    fake = retro.fakes["RetroEmulator"]
+    fake.reset_all()
+
+    def refuse_the_rom(self, *args, **kwargs):
+        raise retro.emumod.EmulatorError("The core could not load this ROM.")
+
+    def die_mid_run(self, *args, **kwargs):
+        # The case with something to clean up: the core is loaded by now.
+        assert self.started, "the core was not loaded, so this is the wrong case"
+        raise retro.emumod.EmulatorError("The core crashed while running: boom")
+
+    method, replacement = {
+        "load": ("start", refuse_the_rom),
+        "run": ("record", die_mid_run),
+    }[when]
+    original = getattr(fake, method)
+    setattr(fake, method, replacement)
+    try:
+        channel = retro.channel(9805)
+        ctx = retro.context(channel)
+        view = await retro.start_game(ctx, name="unplayable")
+    finally:
+        setattr(fake, method, original)
+
+    assert view is None, "a session survived a ROM that could not be started"
+    assert channel.id not in retro.cog.sessions
+    assert not await retro.cog.config.channel_from_id(channel.id).session()
+    assert "could not be started" in ctx.said(), ctx.said()
+    assert fake.instances, "no emulator was built, so nothing is proved"
+    assert not any(e.started for e in fake.instances), (
+        "a failed start left a libretro core loaded, and MAX_LIVE_EMULATORS is 1"
+    )
+
+    # And the next game plays, which is the consequence worth proving.
+    fine = await retro.start_game(retro.context(retro.channel(9806)), name="fine")
+    assert fine is not None and fine.live
+
+
 async def test_many_starts_and_stops_leave_no_emulator_running(retro):
     """The ordinary path, repeated, as a backstop for all of the above."""
     await retro.install_cores("gambatte")
@@ -686,10 +747,17 @@ def test_the_fast_frame_grab_does_not_alias_the_framebuffer():
 
 
 async def test_a_session_keeps_no_image_or_memoryview_after_a_clip(retro):
-    """Clips are held as bytes; nothing decoded survives the press."""
+    """A clip is uploaded as bytes; nothing decoded survives the press.
+
+    The picture goes out as an attachment and the Pillow images and the
+    framebuffer views it was built from are not kept anywhere -- neither on
+    the session nor on the emulator.
+    """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9820, "noimages")
-    await view._press(retro.interaction(view, message=view.message), "a")
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+    assert isinstance(interaction.clip(), bytes), "no clip was posted at all"
 
     held = {}
     for owner in (view, view.emulator):
@@ -701,7 +769,6 @@ async def test_a_session_keeps_no_image_or_memoryview_after_a_clip(retro):
             elif type(value).__module__.startswith("PIL"):
                 held[f"{type(owner).__name__}.{name}"] = type(value).__name__
     assert not held, held
-    assert isinstance(view.last_clip, bytes) and view.last_clip
 
 
 # -- 7. The core option definitions cache --------------------------------------
@@ -818,3 +885,313 @@ async def test_discord_py_still_has_no_public_way_to_unregister_a_view():
     assert store._views and store._synced_message_views
     registered.stop()
     assert removed == [registered], "stop() no longer calls ViewStore.remove_view"
+
+
+# -- 9. Session records in Config ----------------------------------------------
+#
+# The per-channel `session` record and the `retired` records behind a
+# channel's Resume buttons used to be written and never deleted: there was no
+# `session.clear()` anywhere in the cog and no channel or guild listeners, so
+# `_restore_sessions` rebuilt a RetroView for every channel that had *ever*
+# played, on every load, including channels that no longer existed and games
+# whose cached ROM had been pruned months earlier. Bounded per channel
+# (one session, MAX_RETIRED_PER_CHANNEL buttons) and unbounded in channels.
+#
+# Four things drop a record now, and every one of them keeps the saves:
+#
+#   * the cached ROM it pointed at was pruned, by either pruner;
+#   * the channel (or thread) was deleted;
+#   * the bot left the guild;
+#   * the bot can no longer see the channel, noticed by the sweep that runs
+#     once the bot is ready.
+#
+# The *semantics* are what make that safe, and they are asserted as hard as
+# the counting is: a record is only a "resume from this message" pointer,
+# while the `.state` and `.srm` (and the previous generation of each) are
+# keyed by channel and game. Dropping a record costs the button and nothing
+# else -- `[p]retro <name>` re-fetches the ROM and picks the progress back
+# up.
+
+
+def saves_of(retro, channel_id, slug):
+    """Which of a game's four save files are on disk, by name."""
+    return [p.name for p in retro.cog._save_paths(channel_id, slug) if p.is_file()]
+
+
+async def test_a_rom_pruned_by_the_disk_budget_takes_its_resume_button_with_it(retro):
+    """The pointer goes with the file; the progress does not.
+
+    This is the disk budget's prune, which deliberately deletes cached ROMs
+    and never a save. So the Resume button -- which can only apologise once
+    its ROM is gone -- is dropped, and all four save files stay exactly
+    where they are.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9900, "budgeted")
+    slug = view.slug
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog._write_state(view)
+    retro.cog._sram_path(channel.id, slug).write_bytes(b"battery")
+    # Rotate both, so the previous generation exists too.
+    await retro.cog._write_state(view)
+    retro.cog._write_atomic(retro.cog._sram_path(channel.id, slug), b"battery2", True)
+    before = saves_of(retro, channel.id, slug)
+    assert len(before) == 4, before
+
+    # Retire it, so its ROM is no longer protected by a live session, and
+    # then squeeze the budget until the ROM has to go.
+    await retro.cog._retire(view, "replaced")
+    retro.cog.sessions.pop(channel.id, None)
+    assert await retro.cog.config.channel_from_id(channel.id).retired()
+    rom = retro.cog._rom_path(view.rom_filename)
+    assert rom.is_file()
+
+    # A 1 MiB budget and a download that only fits once the 128 KiB ROM
+    # above has gone, so the prune really runs and is not merely refused.
+    await retro.cog.config.disk_budget_mb.set(1)
+    room, note = await retro.cog._make_room(950 * 1024)
+
+    assert not rom.is_file(), "the ROM was not pruned, so nothing is proved"
+    assert not await retro.cog.config.channel_from_id(channel.id).retired()
+    assert not retro.cog.retired, "the Resume button was left armed"
+    # And the player's progress is untouched, which is the whole point.
+    assert saves_of(retro, channel.id, slug) == before
+    assert room and "Nothing anyone had saved was touched" in note, note
+
+
+async def test_starting_a_forgotten_game_again_still_picks_up_its_save(retro):
+    """Why dropping the record is allowed to be automatic.
+
+    A save state and a battery save are keyed by channel *and* game, never
+    by message, so the pointer is the only thing a forgotten record costs:
+    `[p]retro <name>` re-fetches the ROM and restores exactly as it always
+    did.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9901, "comeback")
+    for _ in range(3):
+        await view._press(retro.interaction(view, message=view.message), "a")
+    assert retro.cog._state_path(channel.id, view.slug).is_file()
+    played = view.emulator.frame
+
+    # Forget everything the channel could be resumed *from*, and throw the
+    # cached ROM away as a prune would.
+    await retro.cog._forget_channel(channel.id, "a test said so")
+    retro.cog._rom_path(view.rom_filename).unlink()
+    assert not await retro.cog.config.all_channels()
+    assert not retro.cog.sessions and not retro.cog.retired
+
+    again = await retro.start_game(retro.context(channel), name="comeback")
+    assert again is not None and again.live
+    assert again.boot_outcome == "state", "the save state was not picked up"
+    assert again.emulator.loaded_from == played
+
+
+async def test_a_deleted_channel_is_forgotten_and_keeps_its_saves(retro):
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9902, "deletedchan")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog._write_state(view)
+    retro.cog._sram_path(channel.id, view.slug).write_bytes(b"battery")
+    saved = saves_of(retro, channel.id, view.slug)
+    assert len(saved) == 2, saved
+
+    await retro.cog.on_guild_channel_delete(channel)
+
+    assert channel.id not in retro.cog.sessions
+    assert not await retro.cog.config.all_channels(), "the Config row survived"
+    assert view.closed and view.is_finished(), "the view was not released"
+    # Kept, deliberately: they are small, the disk budget prunes ROMs rather
+    # than saves, and an archived thread is indistinguishable from a deleted
+    # channel here. See the note above Retro._channel_is_gone.
+    assert saves_of(retro, channel.id, view.slug) == saved
+
+
+async def test_deleting_a_channel_that_never_played_writes_nothing(retro):
+    """The common case, and it must cost nothing.
+
+    ``on_guild_channel_delete`` fires for every channel and category in
+    every server the bot is in, and almost none of them have ever played a
+    game. A listener that wrote to Config (and logged) for each of them
+    would be worse than the leak it replaced.
+    """
+    await retro.install_cores("gambatte")
+    played, _, busy = await retro.posted_game(9904, "played")
+    quiet = retro.channel(9905)
+
+    await retro.cog.on_guild_channel_delete(quiet)
+
+    # (`FakeConfig.channel_from_id` creates its dict on read, which Red's does
+    # not, so the statement is about the *rows* -- what `all_channels()`
+    # answers and therefore what `_restore_sessions` would walk on load.)
+    assert quiet.id not in await retro.cog.config.all_channels()
+    # ...and the channel that *is* playing was not touched by it.
+    assert retro.cog.sessions.get(busy.id) is played
+    assert await retro.cog.config.channel_from_id(busy.id).session()
+
+
+async def test_a_deleted_thread_is_forgotten_the_same_way(retro):
+    """A thread is a channel a game can be played in, with its own event."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9903, "deletedthread")
+    await retro.cog.on_thread_delete(channel)
+    assert channel.id not in retro.cog.sessions
+    assert not await retro.cog.config.all_channels()
+
+
+async def test_leaving_a_guild_forgets_every_channel_it_had(retro):
+    await retro.install_cores("gambatte")
+    guild = types.SimpleNamespace(id=777)
+    mine, theirs = [], []
+    for index in range(4):
+        view, _, channel = await retro.posted_game(9910 + index, f"ours{index}")
+        mine.append((view, channel))
+        await retro.cog._retire(view, "replaced")
+        retro.cog.sessions.pop(channel.id, None)
+    # A channel in another guild, which must be left completely alone.
+    other = retro.channel(9950)
+    elsewhere = await retro.start_game(
+        retro.context(other, guild_id=888), name="elsewhere"
+    )
+    theirs.append((elsewhere, other))
+
+    await retro.cog.on_guild_remove(guild)
+
+    rows = await retro.cog.config.all_channels()
+    assert set(rows) == {other.id}, rows
+    assert set(retro.cog.sessions) == {other.id}
+    assert not retro.cog.retired, "the departed guild's Resume buttons are still armed"
+    assert elsewhere is retro.cog.sessions[other.id] and not elsewhere.closed
+    for view, channel in mine:
+        assert view.closed and view.is_finished(), "a view was left live"
+        # The saves of a game the departed guild was playing are kept, exactly
+        # as they are for a deleted channel.
+        assert retro.cog._state_path(channel.id, view.slug).is_file(), view.slug
+
+
+async def test_a_record_whose_channel_is_gone_is_not_rebuilt_on_load(retro):
+    """Rather than arming a persistent view against a message nobody can see.
+
+    This is the case that made the records grow for ever: every load built a
+    RetroView for every channel that had ever played, deleted or not.
+    """
+    await retro.install_cores("gambatte")
+    alive, _, alive_channel = await retro.posted_game(9920, "stillhere")
+    gone, _, gone_channel = await retro.posted_game(9921, "longgone")
+    await retro.cog._retire(gone, "replaced")
+    retro.cog.sessions.pop(gone_channel.id, None)
+
+    cog2, bot2 = retro.make_cog()
+    cog2.config.channels.update(
+        {k: dict(v) for k, v in retro.cog.config.channels.items()}
+    )
+    # The restarted bot can see one of the two channels.
+    bot2.channels[alive_channel.id] = alive_channel
+
+    await cog2._restore_sessions()
+
+    assert set(cog2.sessions) == {alive_channel.id}
+    assert not [v for v in cog2.retired.values() if v.channel_id == gone_channel.id]
+    assert set(await cog2.config.all_channels()) == {alive_channel.id}
+    assert not bot2.added_views or all(
+        getattr(view, "channel_id", None) == alive_channel.id
+        for view, _ in bot2.added_views
+    )
+    await cog2.cog_unload()
+
+
+async def test_nothing_is_forgotten_while_the_bot_is_still_connecting(retro):
+    """The hazard in the whole idea, pinned.
+
+    Red loads its cogs *before* the bot connects, so during a startup load
+    ``bot.get_channel`` answers None for every channel that exists. Acting
+    on that would delete every record on every restart, so
+    ``_channel_is_gone`` answers False until the bot says it is ready.
+    """
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9930, "connecting")
+    await retro.cog.hibernate(view, None)
+
+    cog2, bot2 = retro.make_cog()
+    cog2.config.channels.update(
+        {k: dict(v) for k, v in retro.cog.config.channels.items()}
+    )
+    bot2.ready = False           # still logging in; the cache is empty
+    assert bot2.get_channel(channel.id) is None
+
+    await cog2._restore_sessions()
+    assert set(cog2.sessions) == {channel.id}, "a record was dropped too early"
+    assert set(await cog2.config.all_channels()) == {channel.id}
+
+    # Once it is connected and the channel really is not there, the sweep
+    # that runs after wait_until_red_ready() drops it.
+    bot2.ready = True
+    await cog2._forget_unreachable_sessions()
+    assert not cog2.sessions
+    assert not await cog2.config.all_channels()
+    await cog2.cog_unload()
+
+
+async def test_a_listener_that_hits_a_broken_config_cannot_break_the_cog(retro):
+    """discord.py does not await a listener, so a raise is an orphan error."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9940, "brokenconfig")
+
+    def explode(channel_id):
+        raise RuntimeError("Config is unavailable")
+
+    retro.cog.config.channel_from_id = explode
+
+    # None of the three may raise, and the in-memory half must still happen.
+    await retro.cog.on_guild_channel_delete(channel)
+    await retro.cog.on_thread_delete(channel)
+    await retro.cog.on_guild_remove(types.SimpleNamespace(id=777))
+    assert channel.id not in retro.cog.sessions
+    assert view.closed
+
+
+async def test_the_records_do_not_grow_with_the_channels_a_bot_has_seen(retro):
+    """The whole point, counted: N channels in, nothing left behind.
+
+    Twelve channels each play two games -- so each one ends with a session
+    record and a Resume button -- and then go away the two ways a channel
+    does: deleted while the bot is up (the listener) or simply invisible by
+    the time it next loads (the sweep). Both the Config rows and the two
+    in-memory dictionaries come back to zero, and not one save is deleted.
+    """
+    await retro.install_cores("gambatte")
+    channels, slugs = [], []
+    for index in range(12):
+        channel = retro.channel(9960 + index)
+        ctx = retro.context(channel)
+        first = await retro.start_game(ctx, name=f"first{index}")
+        await retro.cog._retire(first, "replaced")
+        retro.cog.sessions.pop(channel.id, None)
+        second = await retro.start_game(retro.context(channel), name=f"second{index}")
+        await retro.cog._write_state(second)
+        channels.append(channel)
+        slugs.append((channel.id, first.slug, second.slug))
+
+    rows = await retro.cog.config.all_channels()
+    assert len(rows) == 12
+    assert all(row["session"] and row["retired"] for row in rows.values())
+    assert len(retro.cog.sessions) == 12 and len(retro.cog.retired) == 12
+    grew = sum(len(row["retired"]) + 1 for row in rows.values())
+    assert grew == 24, grew
+
+    # Half are deleted while the bot is watching.
+    for channel in channels[:6]:
+        await retro.cog.on_guild_channel_delete(channel)
+    assert len(await retro.cog.config.all_channels()) == 6
+    assert len(retro.cog.sessions) == 6 and len(retro.cog.retired) == 6
+
+    # The other half quietly stop existing, and the sweep notices.
+    for channel in channels[6:]:
+        retro.bot.channels.pop(channel.id, None)
+    await retro.cog._forget_unreachable_sessions()
+
+    assert not await retro.cog.config.all_channels()
+    assert not retro.cog.sessions and not retro.cog.retired
+    # Twelve channels came and went and nobody's progress did.
+    for channel_id, _first_slug, second_slug in slugs:
+        assert retro.cog._state_path(channel_id, second_slug).is_file(), second_slug

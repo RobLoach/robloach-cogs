@@ -2,8 +2,8 @@
 
 ```bash
 pip install -r ../requirements-dev.txt
-pytest                      # the fast suite, which is the default: ~8s
-pytest -m emulator          # real cores and real ROMs: ~26s, or ~15s with -n 2
+pytest                      # the fast suite, which is the default: ~9s
+pytest -m emulator          # real cores and real ROMs: ~29s, or ~17s with -n 2
 pytest -m "not network"     # both of the above, i.e. everything this machine can run
 pytest -m network           # the buildbot check; also needs RETRO_TEST_NETWORK=1
 ```
@@ -25,11 +25,11 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, the per-console press line, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves`, `[p]retroreset` and the Undo button included), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; a few tests that read a clip's frames back want Pillow) |
-| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, resetting a core, save states, battery saves, core options, BIOS directory, and the save export/import round trip, the Undo round trip and the `[p]retroreset` round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
+| fast | console tables, button layouts, emoji, the per-console press line, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves`, `[p]retroreset` and the Undo button included), the session-record lifecycle (the channel and guild listeners, and bounded growth), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; a few tests that read a clip's frames back want Pillow) |
+| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, resetting a core, save states, battery saves, core options, BIOS directory, deliberately corrupted ROMs (`test_malformed_roms.py`), and the save export/import round trip, the Undo round trip and the `[p]retroreset` round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` and `test_malformed_roms.py` also want `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
-`pytest -m emulator -n 2` roughly halves the slow half (26s to 15s here). It
+`pytest -m emulator -n 2` roughly halves the slow half (29s to 17s here). It
 has to be `-n`, i.e. separate processes: one libretro core may be loaded per
 process. The fast suite is *slower* under `-n`, so it is left serial.
 
@@ -41,7 +41,8 @@ keeps it: `test_a_clip_plays_for_as_long_as_it_emulated` runs at every clip
 length up to four seconds. Don't shorten that one.
 
 `-m redbot` marks the few tests that need the real Red-DiscordBot (command
-permission metadata, the assembled cog's `__cog_commands__`, and the two
+permission metadata, the assembled cog's `__cog_commands__`, the set of
+Discord events it really registers a listener for, and the two
 `Config`/`cog_data_path` escape hatches the data migration rests on).
 Everything else runs against `tests/stubs/redbot`, which is used
 automatically when Red is not installed -- Red is a large dependency and a
@@ -73,9 +74,11 @@ Two consequences for the tests:
   not care where it was defined. Anything *patched*, though, has to be
   patched where the code looks it up -- which is what `retro.patch` is for.
 
-`tests/test_mixins.py` also pins the command surface and the Config keys:
-both are already on other people's disks, so a command or a settings key
-that a refactor quietly drops is their data gone.
+`tests/test_mixins.py` also pins the command surface, the Config keys and
+the listeners. The first two are already on other people's disks, so a
+command or a settings key that a refactor quietly drops is their data gone;
+the listeners are pinned because losing one is *invisible* -- nothing fails,
+the records they exist to delete simply start accumulating for ever again.
 
 ## What a button press is allowed to do to the message
 
@@ -138,17 +141,53 @@ except `View.stop()` -- there is no `bot.remove_view`. So every game a
 channel plays used to leave a whole `RetroView` reachable for the life of the
 process -- and in those days each one held a replay buffer of up to 8 MiB,
 which is what made it worth chasing. `Retro._release_view` is the fix and
-these tests are the proof; they fail if it is taken out. Section 2 of that
-file is now "one clip per session, and none after it is discarded", which is
-the same shape against a much smaller number.
+these tests are the proof; they fail if it is taken out.
 
-Two conventions in there worth knowing:
+Two of its nine sections are worth knowing about by name:
+
+* **section 2, the footage a session holds**, which is now zero. The replay
+  buffer went with the Replay button and the single `last_clip` that
+  replaced it went too (nothing in the cog read it: `_show` is handed the
+  clip it posts). So the assertions use `fakes.footage_bytes(view)` -- every
+  bytes-like attribute except the compressed undo history -- rather than
+  naming an attribute, because the thing being guarded against is a clip
+  coming back under a new name.
+* **section 9, the session records in Config**, which is about the growth
+  that was not in memory at all: the per-channel `session` and `retired`
+  records were written and never deleted, so a bot rebuilt a `RetroView`
+  for every channel that had *ever* played, on every load. It covers the
+  listeners, the load-time skip, the after-ready sweep and the "N channels
+  in, nothing left behind" count -- and, just as hard, the semantics that
+  make dropping a record safe: a record is a pointer, the saves are not, and
+  the saves are kept.
+
+Three conventions in there worth knowing:
 
 * the fake bot is given a **real** `discord.ui.view.ViewStore`, because a
   fake of the container under test can only ever agree with itself;
 * `drop_the_test_doubles(env)` clears what `tests/fakes.py` recorded before
   the `weakref` check, because `FakeMessage` keeps the kwargs it was sent
-  with (view included) and a real `discord.Message` does not.
+  with (view included) and a real `discord.Message` does not;
+* `FakeBot.ready` is False for the tests about what the cog may conclude
+  from an empty channel cache. Red loads its cogs *before* the bot connects,
+  so `bot.get_channel` answering None is not evidence of anything until
+  `wait_until_red_ready()` has returned -- acting on it earlier would delete
+  every record on every restart.
+
+## Where the clip on a message is
+
+A session holds no footage, so a test that wants to see the picture a player
+is looking at reads it off the edit that carried it:
+
+* `interaction.clip()` for a button press, which edits the *interaction*
+  (`FakeInteraction.snapshot` keeps the attachment's bytes under `"clip"`);
+* `retro.shown_clip(view)` for the paths that edit the message itself --
+  `[p]retroreset` through `RetroView.show_clip`, and the first clip of a
+  game, which arrives as the `file=` of the send.
+
+That is closer to what the feature promises than an attribute was, which is
+why the real-core Undo and `[p]retroreset` comparisons in
+`test_saves_roundtrip.py` go through it.
 
 ## Getting the cores and ROMs
 
@@ -188,12 +227,25 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
   fixture for the data migration and the Resume button; `test_restore.py`
   holds the two callers of the save state -> battery save -> cold boot chain
   against each other; `test_emulator.py` is for things that need a real core,
-  and `test_saves_roundtrip.py` for the two places the cog *and* a real core
-  are needed at once (it puts `RetroEmulator` back over the fake): the save
-  export/import round trip, and Undo. `test_packaging.py` covers the cog as
-  Red's Downloader sees it, `retro/version.py` included -- that module loads
-  standalone too, so the version can be checked with neither Red nor
-  `discord.py` installed.
+  and `test_saves_roundtrip.py` for the places the cog *and* a real core are
+  needed at once (it puts `RetroEmulator` back over the fake): the save
+  export/import round trip, and Undo. `test_malformed_roms.py` does the same
+  for deliberately corrupted cartridges, at both levels -- the emulator on
+  its own, and `[p]retro` with a ROM no core will take. `test_packaging.py`
+  covers the cog as Red's Downloader sees it, `retro/version.py` included --
+  that module loads standalone too, so the version can be checked with
+  neither Red nor `discord.py` installed.
+* **A corrupted ROM is a regression test, not a fuzzer.** Everything in
+  `test_malformed_roms.py` is seeded, so a failure is reproducible, and the
+  sixteen runs it makes cost about 1.5s in total. What it asserts for every
+  one of them is the invariant -- a clean run or an `EmulatorError`, inside
+  a time budget so a hang fails rather than hanging the suite, and never a
+  loaded core left behind -- rather than that any particular seed breaks any
+  particular core. Two tests *are* about a specific failure mode, and they
+  say so in their names: without one of those, nothing would exercise the
+  wrapping in `RetroEmulator.advance` at all. The measured hit rates per
+  core are in that file's docstring; if a core update moves them,
+  re-measure the seeds rather than deleting the test.
 * **Comparing two save states is not a byte comparison.** Gambatte's state
   carries a four-byte `time` field that a cartridge with no real-time clock
   never initialises, so two states serialized from an identical machine come

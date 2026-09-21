@@ -30,14 +30,20 @@ MAX_CACHED_GAMES_PER_CHANNEL = 5
 
 # -- The disk budget -----------------------------------------------------------
 #
-# Everything this cog stores lives under one directory: the cores (about 4.5 MiB
-# for the lot), the cached ROMs (up to 32 MiB each, five per channel), the save
-# states and battery saves with one previous generation each, and any BIOS
-# files the owner has installed. The per-channel ROM cache bounds one channel;
-# nothing bounded the total, so a bot in fifty channels had no ceiling at all.
+# Everything this cog stores lives under one directory: the cores, the cached
+# ROMs (up to 32 MiB each, five per channel), the save states and battery
+# saves with one previous generation each, and any BIOS files the owner has
+# installed. The per-channel ROM cache bounds one channel; nothing bounded the
+# total, so a bot in fifty channels had no ceiling at all.
 #
-# 1 GiB is the default: a hundred times the cores, room for something like a
-# hundred ordinary cartridges with their saves, and small enough that a VPS
+# The cores are the fixed cost and they are bigger on disk than the download
+# suggests: the seven of them are about 4.5 MiB of zips from the buildbot and
+# 31 MiB unpacked (measured on linux/x86_64, 2026-09; genesis_plus_gx alone is
+# 12 MiB). That is what this budget has to account for, so it is the unpacked
+# figure quoted here and in `[p]retroset download`.
+#
+# 1 GiB is the default: about thirty times the cores, room for something like
+# a hundred ordinary cartridges with their saves, and small enough that a VPS
 # with a 20 GB disk cannot be filled by a Discord channel. The owner can
 # change it, and 0 means "no limit" for somebody who would rather watch it
 # themselves.
@@ -293,7 +299,9 @@ class StorageMixin(MixinMeta):
                 return f"{size:,.1f} {unit}"
         return f"{size:,.1f} GiB"  # pragma: no cover - the loop always returns
 
-    def _prune_cached_games(self, channel_id: int, keep_slug: str) -> None:
+    def _prune_cached_games(
+        self, channel_id: int, keep_slug: str
+    ) -> typing.List[str]:
         """
         Drop the oldest cached ROM+save sets for a channel.
 
@@ -307,11 +315,18 @@ class StorageMixin(MixinMeta):
         previous generations) with it, so no battery save outlives the ROM it
         belongs to. The *disk budget* below is the other, separate limit, and
         it deliberately never touches a save -- see _prune_roms_for_budget.
+
+        Returns the ROM filenames that were deleted, so the caller can drop
+        the session and Resume-button records that pointed at them; see
+        ``Retro._forget_pruned_roms``. A record whose cached ROM has gone can
+        only apologise when it is clicked, and it would otherwise sit in
+        Config for the life of the install.
         """
+        deleted: typing.List[str] = []
         try:
             roms = list(self._roms_dir().glob(f"{channel_id}-*"))
         except OSError:
-            return
+            return deleted
         entries = []
         for path in roms:
             # The leftovers of an interrupted _write_atomic are not games.
@@ -336,10 +351,12 @@ class StorageMixin(MixinMeta):
                 continue
             try:
                 path.unlink(missing_ok=True)
+                deleted.append(path.name)
                 for save in self._save_paths(channel_id, slug):
                     save.unlink(missing_ok=True)
             except OSError:
                 log.warning("Could not prune the cached ROM %s", path, exc_info=True)
+        return deleted
 
     # -- The disk budget ----------------------------------------------------
     #
@@ -488,6 +505,14 @@ class StorageMixin(MixinMeta):
                 freed,
                 budget // (1024 * 1024),
             )
+            # The saves for those games stay exactly where they are -- that is
+            # this pruner's whole rule -- but the session and Resume-button
+            # *pointers* at the deleted files do not: a button that can only
+            # apologise is not worth a Config entry for the life of the
+            # install. Starting the game again by name re-downloads the ROM
+            # and picks the saves straight back up. See
+            # ``Retro._forget_pruned_roms``.
+            await self._forget_pruned_roms(deleted)
         if total - freed + incoming <= budget:
             if not deleted:
                 return True, ""

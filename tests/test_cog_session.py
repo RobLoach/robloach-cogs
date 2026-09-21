@@ -7,6 +7,7 @@ tests/fakes.py. Nothing here needs a libretro core.
 import asyncio
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -16,7 +17,7 @@ import types  # noqa: E402
 
 import discord  # noqa: E402
 
-from .fakes import NES_BYTES, ROM_BYTES, FakeUser  # noqa: E402
+from .fakes import NES_BYTES, ROM_BYTES, FakeUser, footage_bytes  # noqa: E402
 
 # -- Defaults -----------------------------------------------------------------
 
@@ -575,12 +576,23 @@ async def test_a_press_no_longer_greys_the_controls_out(retro):
     assert not retro.control(view, "undo").disabled
 
 
-async def test_the_clip_on_the_message_is_kept_as_bytes(retro):
+async def test_the_clip_put_on_the_message_is_a_real_animation(retro):
+    """Read off the edit, which is the only place the clip exists.
+
+    The session used to keep a copy in ``last_clip``; nothing in the cog
+    read it (``_show`` is handed the clip as an argument), so it is gone and
+    the message is the statement.
+    """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9003, "cached")
-    await view._press(retro.interaction(view, message=view.message), "a")
-    assert isinstance(view.last_clip, bytes) and view.last_clip
-    assert view.last_clip[:4] == b"RIFF" and view.last_clip[8:12] == b"WEBP"
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+
+    clip = interaction.clip()
+    assert isinstance(clip, bytes) and clip
+    assert clip[:4] == b"RIFF" and clip[8:12] == b"WEBP"
+    assert not hasattr(view, "last_clip"), "the session kept a copy of the clip"
+    assert not hasattr(view, "remember_clip")
 
 
 async def test_a_save_state_is_written_every_third_press(retro):
@@ -816,23 +828,41 @@ def test_the_replay_button_and_its_buffer_are_gone(retro):
         assert not hasattr(retro.emumod, name), name
         assert name not in retro.emumod.__all__, name
     assert not hasattr(retro.sysmod, "REPLAY_EMOJI")
+    # The single clip that replaced the buffer is gone too. Nothing read it:
+    # `_show` is handed the clip it is about to post, so keeping a copy on
+    # the session was bookkeeping and a test hook and nothing else.
+    assert not hasattr(retro.viewmod.RetroView, "remember_clip")
+    for module in (retro.viewmod, retro.cogmod):
+        source = Path(module.__file__).read_text()
+        # The comments may say it was removed and why; nothing may set it.
+        assert "self.last_clip =" not in source, module.__name__
+        assert "view.last_clip =" not in source, module.__name__
 
 
-async def test_a_session_holds_one_clip_and_not_a_buffer_of_them(retro):
+async def test_a_session_holds_no_footage_at_all(retro):
+    """Not a buffer of clips, and not one clip either.
+
+    The replay buffer went with the Replay button, and the single
+    ``last_clip`` that replaced it went too: nothing read it. So a press
+    builds a clip, uploads it and drops it, and twenty presses leave the
+    session holding no bytes of picture whatsoever.
+    """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9027, "oneclip")
-    assert not hasattr(view, "clips"), "the replay buffer is gone"
-    assert not hasattr(view, "buffered_seconds")
-    assert not hasattr(view, "_trim_clips")
+    for gone in ("clips", "buffered_seconds", "_trim_clips", "last_clip", "remember_clip"):
+        assert not hasattr(view, gone), gone
 
-    sizes = []
+    posted = []
     for _ in range(20):
-        await view._press(retro.interaction(view, message=view.message), "a")
-        assert isinstance(view.last_clip, bytes) and view.last_clip
-        sizes.append(len(view.last_clip))
-    # Twenty presses, and what is held is still one clip's worth: the thing
-    # that used to grow to fifteen seconds of footage per session.
-    assert max(sizes) < 64 * 1024, max(sizes)
+        interaction = retro.interaction(view, message=view.message)
+        await view._press(interaction, "a")
+        clip = interaction.clip()
+        assert isinstance(clip, bytes) and clip
+        posted.append(clip)
+    assert len(set(posted)) == 20, "the fake produced the same clip twice"
+    # Twenty clips posted, and the session is not holding one of them: no
+    # attribute on it is anything like a clip's worth of bytes.
+    assert footage_bytes(view) == 0, vars(view).keys()
 
 
 # -- Undo ---------------------------------------------------------------------
@@ -1053,21 +1083,22 @@ async def test_the_undo_s_own_clip_replaces_the_undone_press_s_on_the_message(re
     to drop the undone press's footage from the replay buffer as well, so a
     stitched replay could not show somebody walking into a room they were not
     in. The buffer is gone, so the whole of it is "the clip on the message is
-    the one the undo just recorded" -- and the assertion is the interaction
-    log rather than the attribute, because the message is what a player sees.
+    the one the undo just recorded" -- and the assertion is on the edits
+    themselves, because the message is where the clip lives and what a
+    player sees. There is no attribute left to read it off.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9210, "undoclip")
     await view._press(retro.interaction(view, message=view.message), "a")
     pressed = retro.interaction(view, message=view.message)
     await view._press(pressed, "right")
-    pressed_clip = view.last_clip
+    pressed_clip = pressed.clip()
     assert isinstance(pressed_clip, bytes) and pressed_clip
 
     undoing = await undo(retro, view)
 
-    assert view.last_clip != pressed_clip, "a fresh clip was recorded"
-    assert isinstance(view.last_clip, bytes) and view.last_clip
+    assert undoing.clip() != pressed_clip, "a fresh clip was recorded"
+    assert isinstance(undoing.clip(), bytes) and undoing.clip()
     # And it is the clip that went out: one edit, one attachment, the undo
     # line above it.
     assert undoing.kinds() == ["response.defer", "edit_original_response"]
@@ -1148,7 +1179,7 @@ async def test_a_retired_session_lets_go_of_its_undo_history(retro):
     await retro.cog._retire(view, "Replaced.")
 
     assert not view.history and view.history_bytes == 0
-    assert view.last_clip is None, "and it let go of the clip it was holding"
+    assert footage_bytes(view) == 0, "and it is holding no picture either"
 
 
 async def test_a_core_that_cannot_save_states_costs_undo_and_nothing_else(retro):
@@ -1279,7 +1310,11 @@ async def test_a_session_is_restored_from_config_after_a_restart(retro):
     assert any(mid == view.message_id for _, mid in bot2.added_views)
     assert restored.slug == view.slug and restored.system.key == view.system.key
     assert restored.hold_ms == await cog2.config.hold_ms()
-    assert restored.last_clip is None, "clips live in memory only"
+    # Nothing about the picture survives: a restored session has no clip of
+    # its own (it never did, and now no session has one at all) and an empty
+    # undo history, so Undo comes back greyed out.
+    assert footage_bytes(restored) == 0
+    assert not restored.can_undo and retro.control(restored, "undo").disabled
 
     restored.message = view.message
     await restored._press(retro.interaction(restored, message=view.message), "a")
@@ -1487,11 +1522,11 @@ async def test_retroreset_puts_the_boot_clip_on_the_game_s_message(retro):
     await retro.install_cores("gambatte")
     view, ctx, _ = await retro.posted_game(9091, "resetclip")
     await view._press(retro.interaction(view, message=view.message), "a")
-    before = view.last_clip
+    before = retro.shown_clip(view)
 
     await reset_command(retro)(retro.cog, ctx)
 
-    assert view.last_clip != before, "a fresh clip was recorded"
+    assert retro.shown_clip(view) != before, "a fresh clip was recorded"
     # One edit of the game's own message, carrying the clip and the line that
     # says what happened -- the same shape a press makes.
     edit = view.message.edits[-1]

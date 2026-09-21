@@ -39,6 +39,12 @@ class MixinMeta(ABC):
     emulator_lock: asyncio.Lock
     #: The per-channel half of the start rate limit.
     start_buckets: typing.Any
+    #: Drops the session and Resume-button records that pointed at a cached
+    #: ROM which has just been deleted, keeping the saves. Implemented on the
+    #: cog itself (retro/Retro.py) and called by the disk budget after it
+    #: prunes (retro/storage.py), which is the one place a mixin reaches back
+    #: into the cog for something that is not storage.
+    _forget_pruned_roms: typing.Callable[..., typing.Awaitable[None]]
 
 
 class CompositeMetaClass(commands.CogMeta, ABCMeta):

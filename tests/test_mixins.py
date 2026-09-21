@@ -20,6 +20,7 @@ that are load-bearing enough to be asserted rather than assumed:
   fakes are reached rather than merely installed.
 """
 
+import inspect
 import sys
 
 import pytest
@@ -117,6 +118,17 @@ GLOBAL_KEYS = {
 }
 CHANNEL_KEYS = {"retired", "session"}
 
+#: The Discord events the cog listens for. Pinned because a listener that
+#: silently stops being registered is invisible: nothing fails, the records
+#: it was there to delete simply accumulate for ever again. Each one drops
+#: the *pointers* a channel could be resumed from and keeps every save; see
+#: the note above ``Retro._channel_is_gone``.
+LISTENERS = {
+    "on_guild_channel_delete",
+    "on_guild_remove",
+    "on_thread_delete",
+}
+
 
 @pytest.mark.redbot
 def test_the_command_surface_is_exactly_what_it_was(retro):
@@ -135,6 +147,27 @@ def test_every_subcommand_is_attached_to_its_group(retro):
         head, _, tail = name.rpartition(" ")
         if head:
             assert by_name[name].parent is by_name[head], name
+
+
+def test_every_listener_exists_and_is_a_coroutine(retro):
+    for name in LISTENERS:
+        method = getattr(type(retro.cog), name, None)
+        assert method is not None, name
+        assert inspect.iscoroutinefunction(method), name
+
+
+@pytest.mark.redbot
+def test_the_listeners_are_exactly_what_they_were(retro):
+    """And that Red really registers them, which the stub cannot show.
+
+    ``tests/stubs``' ``Cog.listener`` is a passthrough -- the tests call a
+    listener directly, as they call a command's callback -- so this is the
+    only place the decorator's actual effect is checked.
+    """
+    registered = {name for name, _ in retro.cog.get_listeners()}
+    assert registered == LISTENERS
+    for name, method in retro.cog.get_listeners():
+        assert method.__self__ is retro.cog, name
 
 
 def test_the_config_schema_is_exactly_what_it_was(retro):

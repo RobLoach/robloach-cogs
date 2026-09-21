@@ -28,9 +28,10 @@ Install and load the cog:
 [p]load retro
 ```
 
-The emulator cores (about 4.5 MiB for all eight consoles, none of which need a
-BIOS) start downloading in the background as soon as the cog loads. To do it
-now, or to check on it:
+The seven emulator cores that cover all eight consoles — about 4.5 MiB to
+download, 31 MiB once unpacked, none of them needing a BIOS — start
+downloading in the background as soon as the cog loads. To do it now, or to
+check on it:
 
 ```
 [p]retroset download
@@ -76,12 +77,15 @@ can start it by name:
 - `[p]retrosaves export <game>` posts a game's battery save as a file to keep. `export state <game>` or `export both <game>` sends the save state too.
 - `[p]retrosaves import <game>` installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real core first.
 - `[p]retrosaves reset <game>` drops the save state, so the game restarts from the last in-game save.
+- `[p]retrosaves rollback <game>` (aliased `undo`) goes back to the previous save-state generation — the durable, on-disk version of the **Undo** button.
 - `[p]retrosaves delete <game>` wipes both halves of a game's save, after asking.
 - `[p]retroset download` (owner) downloads every supported core for your platform from the [libretro buildbot](https://buildbot.libretro.com). `[p]retroset download <core>` fetches or refreshes just one.
 - `[p]retroset autodownload [true|false]` (owner) controls whether missing cores are fetched automatically when the cog loads. On by default.
 - `[p]retroset game add|remove|list` (owner) manages the games anyone can start by name.
 - `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below.
 - `[p]retroset bios add|list|remove` (owner) manages BIOS files for cores that need one. See below.
+- `[p]retroset diskbudget [megabytes]` (owner, aliased `disk`/`budget`) caps what the whole cog may use on disk, and with no argument reports what is using it. The default is 1024 MiB; `0` is no limit. **No save is ever deleted to make room** — cached ROMs are, oldest first.
+- `[p]retroset allowprivateurls [true|false]` (owner) lets ROM URLs point inside your own network. Off, and best left off: see [ROM URLs](#rom-urls).
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
 - `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 1 second; anything from 0.2 to 15 works, fractions included (`0.8` is a real answer).
 - `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it. The default is 160. It is a ceiling: a clip too short to show the button coming back up holds it for less.
@@ -103,7 +107,10 @@ password-protected archive gets a plain explanation rather than a stack trace.
 ## Consoles
 
 The console is chosen from the ROM's file extension. Every core is BIOS-free —
-nothing but the ROM is needed — and the whole set is about 4.5 MiB.
+nothing but the ROM is needed. Seven cores cover the eight consoles
+(`genesis_plus_gx` runs two of them): about 4.5 MiB of zips from the
+buildbot, 31 MiB unpacked, which is the figure that counts against
+`[p]retroset diskbudget`.
 
 | Console | Core | File extensions |
 | --- | --- | --- |
@@ -291,9 +298,45 @@ Pressing it starts that game again in that channel, right on that message: the
 game it replaces is saved and retired in turn (and gets a Resume button of its
 own), anything live elsewhere is hibernated first, and the save state comes
 back. It keeps working after a bot restart, because what it needs is stored
-rather than held in memory. A channel keeps the five most recent of them; if
-the ROM cache for one has since been pruned, the button says so instead of
-failing, and the game's save is still there for `[p]retro <name>` to pick up.
+rather than held in memory. A channel keeps one per cached game — five at the
+very most — and a button whose cached ROM has been cleaned up is forgotten
+along with it, rather than left there to apologise when somebody clicks it.
+
+### What the cog forgets, and what it never does
+
+Two kinds of thing are stored per channel, and the difference between them is
+the whole of this section:
+
+| | what it is | when it goes |
+| --- | --- | --- |
+| the **session** and **Resume** records | a pointer: *this message, in this channel, was playing this game* | by itself, as soon as it cannot resume anything |
+| the **save state** and **battery save** | the player's progress, keyed by channel **and game** | only when somebody asks (`[p]retrosaves delete`), or when the per-channel game cap drops that game entirely |
+
+Because progress is keyed by channel and game rather than by message,
+**dropping a record loses the button and nothing else**. Starting the game
+again by name re-downloads the ROM and restores from the save exactly as it
+always did, so the cog does it automatically in four cases:
+
+* **the cached ROM it named was pruned**, by the disk budget or by the
+  per-channel cap of five games. A Resume button without its ROM can only
+  apologise;
+* **the channel or thread was deleted**;
+* **the bot left the server** (or was thrown out of it);
+* **the bot can no longer see the channel at all**, which is the same thing
+  noticed a restart later. Nothing is judged until the bot is actually
+  connected, because Red loads its cogs before logging in and at that moment
+  every channel that exists looks deleted.
+
+Before this, nothing was ever deleted: a bot rebuilt a session for every
+channel that had *ever* played, on every load, for the life of the install.
+
+**The saves for a deleted channel are deliberately kept.** They are small
+next to a cached ROM, the disk budget already prunes ROMs (and never a save),
+and from inside the bot an archived thread, a channel it has briefly lost
+sight of and a channel that was really deleted look identical — deleting
+somebody's progress on that evidence is not a trade worth making. The
+opposite mistake costs a few hundred kilobytes, which `[p]retroset diskbudget`
+counts and reports under *saves*.
 
 ### Battery saves, as insurance
 
@@ -453,28 +496,33 @@ A clip in which nothing moved at all — a title screen, a menu, a game waiting
 for you — is written as a single still frame of a few hundred bytes, which is
 exactly as informative and much likelier at a second than it was at four.
 
-**A session keeps one clip: the one on its message.** There used to be a
-**Replay** button that stitched the last fifteen seconds of play back into
-one animation, and with it a per-session buffer of recent clips bounded at
-**8 MiB**. Both are gone. It was not worth its keep — most people pressed it
-once — and it was the single largest thing a channel's session held on to.
-Measured on the real cores, fifteen seconds of play at the default clip
-length, buffer against the one clip that replaces it:
+**A session keeps no footage at all.** The clip a press records is encoded,
+uploaded as the message's attachment, and dropped. There is nowhere else it
+lives, which is why the message is the only place to look for it.
 
-| Console | Buffer (15 × 1s) | One clip |
-| --- | --- | --- |
-| Game Boy (µCity) | 13.5 KiB | 0.7 KiB |
-| NES (nestest) | 21.8 KiB | 1.4 KiB |
-| Super Nintendo | 153.9 KiB | 12.4 KiB |
-| Genesis | 111.2 KiB | 2.0 KiB |
+That took two goes. There used to be a **Replay** button that stitched the
+last fifteen seconds of play back into one animation, and with it a
+per-session buffer of recent clips bounded at **8 MiB**; removing the button
+removed the buffer and left a single clip per session behind, and nothing
+read *that* either — the one edit a press makes is handed the clip it is
+about to post. So it has gone too. Measured on the real cores, fifteen
+seconds of play at the default clip length:
 
-At the 0.2s clip floor the buffer held 76 clips, 36.1 KiB of them, against
-0.5 KiB now. The *press* is no faster for it in any way anybody can feel: the
-bookkeeping the buffer needed on every press — copy, append, three caps to
-re-check, a button label to rewrite — measured 6.1 µs against a press that
-spends 37 ms recording a clip, so about 0.015% of it. What was really saved is
-the memory, the 0.18–0.40 s of decoding and re-encoding a Replay click cost,
-and a component on every console's controls.
+| Console | Buffer (15 × 1s) | One clip | Now |
+| --- | --- | --- | --- |
+| Game Boy (µCity) | 13.5 KiB | 0.7 KiB | 0 |
+| NES (nestest) | 21.8 KiB | 1.4 KiB | 0 |
+| Super Nintendo | 153.9 KiB | 12.4 KiB | 0 |
+| Genesis | 111.2 KiB | 2.0 KiB | 0 |
+
+At the 0.2s clip floor the buffer held 76 clips, 36.1 KiB of them. The
+*press* is no faster for any of it in a way anybody can feel: the bookkeeping
+the buffer needed on every press — copy, append, three caps to re-check, a
+button label to rewrite — measured 6.1 µs against a press that spends 37 ms
+recording a clip, so about 0.015% of it. What was really saved is the memory,
+the 0.18–0.40 s of decoding and re-encoding a Replay click cost, and a
+component on every console's controls. The only thing a session holds now is
+its **Undo** history, which is capped in both directions (see below).
 
 **Which button was pressed is written on the message.** Every press replaces
 the one line above the clip with its own name — `Pressed A.`, `Pressed ⬅️.`,
@@ -676,8 +724,11 @@ now answer the question itself:
 [p]retroset version
 ```
 
-> **Version** `1.0.0`
-> **Commit** `e41aedb0a8e6` on `master`
+which answers with the four lines below (the hashes and times are of course
+whatever your install really is):
+
+> **Version** `1.1.0`
+> **Commit** `2cdc38c1f0a2` on `master`
 > **Loaded code** `5fe2e0c2125f`, newest file 2026-09-21 10:00:28
 > **Loaded at** 2026-09-21 10:00:32
 
@@ -723,6 +774,67 @@ Among the people in a channel, playing and looking at saves are open to
 everybody; destroying progress is not. `[p]retrostop`, `[p]retroreset`,
 `[p]retrosaves reset`, `[p]retrosaves delete` and `[p]retrosaves import` all
 want the person who started the game, **Manage Messages**, or the bot owner.
+
+## ROM URLs
+
+`[p]retro <url>` makes the bot fetch a URL **a channel member chose**, from
+wherever the bot is running. That is a server-side request forgery (SSRF)
+waiting to happen, so every byte the cog fetches on somebody else's word goes
+through one guard (`retro/net.py`):
+
+* the scheme must be `http` or `https`;
+* the hostname is resolved, and **every** address it resolves to must be a
+  public one. Loopback, private, link-local, unique-local, multicast and
+  reserved ranges are all refused — so nobody can aim the bot at
+  `http://localhost:8080`, the Docker bridge, your router, or a cloud
+  metadata service at `169.254.169.254`, which on most providers hands out
+  credentials to anything that asks;
+* the connection is made to the address that was just checked, and every
+  redirect hop is checked again.
+
+A refusal, a connection that is declined and a request that times out all
+come back as **the same sentence**, deliberately: "refused" versus "timed
+out" is exactly the difference a port scanner is looking for. The real reason
+goes to the bot's log instead.
+
+`[p]retroset allowprivateurls true` turns the guard off, and turning it off
+removes the protection **for everybody** — any member who can run `[p]retro`
+can then use the bot to probe your network. It exists for a bot you run at
+home with a ROM library on your own LAN; the command says so at length before
+you use it, and `[p]retroset settings` shows a warning while it is on. If the
+library is reachable from the internet at all, prefer `[p]retroset game add`
+with the guard left on.
+
+`[p]retroset game add` checks its URL against the same guard while you are
+still looking at the command, rather than letting a player discover next week
+that it can never be fetched — and because that one is the owner, it says
+exactly why.
+
+## Corrupt and unplayable ROMs
+
+A ROM that is not what it claims to be is an ordinary event: a truncated
+download, a URL that served an HTML page, a ROM hack that was patched wrong.
+None of it can take the bot down.
+
+The obvious cases are refused before any core sees the file — something that
+starts with `<` is a web page, anything under 1 KiB is a failed download, and
+an extension no console claims is answered with the table above. Past that it
+is up to the core, and both of its failure modes end in one plain sentence in
+the channel:
+
+* **the core refuses the cartridge** (a scrambled header, a `.gb` that is
+  really something else) — *The game could not be started: the core could not
+  load this ROM…*;
+* **the core accepts it and then falls over** running code that is not a
+  game, which is what a corrupted ROM body does about half the time.
+
+Either way the emulator is freed and no half-started session is left behind,
+which matters beyond the one game: the bot runs **one** core at a time, so a
+core leaked by a failed start would stop every channel playing anything until
+the cog was reloaded. `tests/test_malformed_roms.py` drives seeded corrupted
+cartridges through both levels — the emulator on its own and `[p]retro` —
+and the measurements are in that file's docstring. No hang and no native
+crash has ever come out of it.
 
 ## BIOS files
 

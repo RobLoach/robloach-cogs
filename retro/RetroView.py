@@ -191,9 +191,10 @@ UNDO_DEPTH = 8
 # it is over the cap on its own: an Undo button that cannot undo the press
 # somebody has just made would be worse than the memory.
 #
-# This is now the *only* bound on anything a session holds, beyond the one
-# clip that is on the message. It used to be a quarter of the 8 MiB replay
-# buffer that sat beside it.
+# This is now the *only* bound on anything a session holds: the undo history
+# is the only thing left that a session keeps at all. It used to be a quarter
+# of the 8 MiB replay buffer beside it, and then sat next to the single clip
+# that was on the message (`last_clip`, which nothing read and which is gone).
 MAX_UNDO_BYTES = 2 * 1024 * 1024
 
 # Every button needs a custom_id that survives a restart, because that is how
@@ -640,17 +641,18 @@ class RetroView(discord.ui.View):
 
         # The live emulator, or None while hibernated.
         self.emulator: typing.Optional[RetroEmulator] = None
-        # The clip that is on the message right now, or None before the first
-        # one (and after a restart, since this is memory only).
-        #
-        # One clip, not a buffer of them. A session used to keep its last
-        # fifteen seconds of footage -- up to MAX_REPLAY_BYTES, i.e. 8 MiB --
-        # so the Replay button could stitch it back together; that button is
-        # gone and so is the buffer. What is left is the single attachment the
-        # single edit a press makes has already uploaded, a few tens of
-        # kilobytes, which is what the tests read to check the picture the
-        # channel is left looking at.
-        self.last_clip: typing.Optional[bytes] = None
+
+        # No attribute here holds a clip, and that is deliberate. A session
+        # used to keep its last fifteen seconds of footage -- up to
+        # MAX_REPLAY_BYTES, i.e. 8 MiB -- so the Replay button could stitch it
+        # back together, and after that button went it still kept the single
+        # clip that was on the message (`last_clip`, with a `remember_clip()`
+        # to set it). Nothing read either: `_show` is handed the clip it is
+        # about to post, as an argument. So a clip is now built, uploaded and
+        # dropped inside one press, and the picture the channel is looking at
+        # is read back off the message -- which is where it actually lives,
+        # and what a player sees.
+
         # The machine states the last few presses started from, oldest first,
         # each one zlib-compressed. This is what the Undo button pops. Memory
         # only, and *cheap* to lose, because the authoritative save state is
@@ -863,17 +865,6 @@ class RetroView(discord.ui.View):
         return len(self.press_plan(REPEAT_TAPS))
 
     # -- The clip on the message --------------------------------------------
-
-    def remember_clip(self, data: typing.Optional[bytes]) -> None:
-        """
-        Record which clip is on the message now.
-
-        One clip, kept because it is the picture the channel is left looking
-        at and therefore the thing a test can hold the emulator to; see
-        :attr:`last_clip` for what used to be here instead. Empty or ``None``
-        means "nothing on the message", which is a restored session's state.
-        """
-        self.last_clip = bytes(data) if data else None
 
     def press_note(
         self, field: typing.Optional[str], repeat: int = 1
@@ -1212,7 +1203,6 @@ class RetroView(discord.ui.View):
         its own reply to fall back on, and a message that has been deleted is
         not a reason for the reset itself to look like it failed.
         """
-        self.remember_clip(clip)
         message = await self.resolve_message()
         if message is None:
             return False
@@ -1263,7 +1253,6 @@ class RetroView(discord.ui.View):
         # written before the message goes out, so the first thing anybody
         # sees is already correct.
         self._update_repeat_label()
-        self.remember_clip(clip)
         self.touch()
         if on_booted is not None:
             on_booted(self)
@@ -1367,7 +1356,6 @@ class RetroView(discord.ui.View):
                 log.exception("Unexpected emulator failure in channel %s", self.channel_id)
                 await self._recover(interaction, "The emulator hit an unexpected error.")
                 return
-            self.remember_clip(clip)
             self.touch()
             # The press names itself on the message, on the very same edit
             # that carries the clip (see :meth:`press_note`). The resume line
@@ -1549,10 +1537,10 @@ class RetroView(discord.ui.View):
                 log.exception("Unexpected undo failure in channel %s", self.channel_id)
                 await self._recover(interaction, "The emulator hit an unexpected error.")
                 return
-            # This clip replaces the undone press's on the message, so what
-            # the channel is left looking at is where the game actually is.
-            self.remember_clip(clip)
             self.touch()
+            # The edit below replaces the undone press's clip with this one,
+            # so what the channel is left looking at is where the game
+            # actually is.
             # UNDONE_NOTE rather than a press line: nothing was pressed, and
             # "Undid the last press." is the sentence every other line here
             # was written to match.

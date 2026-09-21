@@ -391,19 +391,35 @@ async def test_a_retired_view_is_persistent(retro, retired):
 
 
 async def test_only_so_many_resume_buttons_are_kept_per_channel(retro):
+    """Two bounds, and the tighter of the two is the cached ROM.
+
+    ``MAX_RETIRED_PER_CHANNEL`` is the ceiling on the records themselves,
+    but a record is only worth keeping while the ROM it names is still on
+    disk: the per-channel game cap prunes the oldest cached ROMs, and the
+    Resume buttons that pointed at them are dropped with them (see
+    ``Retro._forget_pruned_roms``). So a channel that works through games
+    keeps one record per *cached* game that is not the one playing, which is
+    one fewer than the record cap.
+    """
     await retro.install_cores("gambatte")
     channel = retro.channel(9660)
     ctx = retro.context(channel)
     limit = retro.cogmod.MAX_RETIRED_PER_CHANNEL
+    cached = retro.cogmod.MAX_CACHED_GAMES_PER_CHANNEL
 
     for index in range(limit + 3):
         retro.serve(f"game{index}.gbc", ROM_BYTES)
         await play(retro, ctx, f"https://example.com/game{index}.gbc")
 
     stored = (await retro.cog.config.all_channels())[channel.id]["retired"]
-    assert len(stored) == limit
+    assert len(stored) == cached - 1 <= limit, stored
     # The oldest are the ones that went.
     assert "game0" not in " ".join(r["game_name"] for r in stored.values())
+    # And every record that is left can really bring its game back: its ROM
+    # is still cached, so clicking it does not have to apologise.
+    for record in stored.values():
+        assert retro.cog._rom_path(record["rom_filename"]).is_file(), record
+    assert len(retro.cog.retired) == len(stored), "the views followed the records"
 
 
 async def test_an_unreadable_retired_record_is_ignored_not_fatal(retro):

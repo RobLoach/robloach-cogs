@@ -16,6 +16,7 @@ three things a unit test cannot have are faked:
 Importing this module needs discord.py, and ``redbot`` (real or stubbed).
 """
 
+import collections
 import io
 import sys
 import types
@@ -284,6 +285,16 @@ class FakeScope:
         self.store = store
         self.defaults = defaults or {}
 
+    async def clear(self):
+        """Throw the whole scope away, as Red's ``Group.clear()`` does.
+
+        Red deletes the row rather than writing the defaults back, so a
+        cleared channel stops appearing in ``all_channels()`` altogether --
+        which is the property the cog's record lifecycle depends on. See
+        :meth:`FakeConfig.all_channels`.
+        """
+        self.store.clear()
+
     def __getattr__(self, name):
         if name in ("store", "defaults"):
             raise AttributeError(name)
@@ -344,8 +355,17 @@ class FakeConfig:
         )
 
     async def all_channels(self):
+        """Every channel that has something stored, with defaults merged.
+
+        A channel with nothing stored is deliberately absent, which is what
+        Red answers: there is no row for a channel that has never been
+        written to, or whose scope has been cleared. Without that, a test
+        could never tell "forgotten" from "written back as the defaults".
+        """
         out = {}
         for channel_id, data in self.channels.items():
+            if not data:
+                continue
             merged = dict(self._channel_defaults)
             merged.update(data)
             out[channel_id] = merged
@@ -452,9 +472,21 @@ class FakeBot:
     def __init__(self):
         self.added_views = []
         self.channels = {}
+        self.guilds = []
+        #: Whether the channel cache is worth reading. Red loads its cogs
+        #: *before* the bot connects, so this really is False for part of a
+        #: cog's life and the cog must not mistake an empty cache for a pile
+        #: of deleted channels; see ``Retro._channel_is_gone``.
+        self.ready = True
 
     async def is_owner(self, user):
         return user.id == 1
+
+    def is_ready(self):
+        return self.ready
+
+    def get_guild(self, gid):
+        return next((g for g in self.guilds if getattr(g, "id", None) == gid), None)
 
     def get_channel(self, cid):
         return self.channels.get(cid)
@@ -505,6 +537,72 @@ def pressable(viewmod, view):
     ]
 
 
+def file_bytes(upload):
+    """What a ``discord.File`` would upload, without consuming it.
+
+    The real HTTP layer reads the payload once and the fake never reads it
+    at all, so the position is put back: a test may look at the same edit
+    twice, and `ctx.uploaded()` reads the very same objects.
+    """
+    payload = getattr(upload, "fp", None)
+    if payload is None:
+        return None
+    position = payload.tell()
+    payload.seek(0)
+    data = payload.read()
+    payload.seek(position)
+    return data
+
+
+def clip_bytes(files):
+    """The bytes of the first attachment a send or an edit carried, or None.
+
+    This is how the tests read the clip that is on a message now. A session
+    holds no footage of its own -- there was a `RetroView.last_clip` once,
+    and before that a whole replay buffer -- so the message is the only
+    place the picture a player is looking at exists.
+    """
+    for upload in files or ():
+        data = file_bytes(upload)
+        if data:
+            return data
+    return None
+
+
+#: Attributes that legitimately hold bytes which are not a picture: the undo
+#: history is compressed save states, bounded by MAX_UNDO_BYTES and measured
+#: on its own terms by the tests that are about it.
+NOT_FOOTAGE = ("history", "_history_bytes")
+
+
+def _payload_size(value):
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    if isinstance(value, (list, tuple, set, frozenset, collections.deque)):
+        return sum(_payload_size(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_payload_size(item) for item in value.values())
+    return 0
+
+
+def footage_bytes(owner):
+    """How many bytes of picture an object is holding in its own attributes.
+
+    Deliberately attribute-*agnostic*, because the thing being guarded
+    against is a clip coming back under a new name: `RetroView` held a
+    replay buffer once (up to 8 MiB) and a single `last_clip` after that,
+    and the statement now is that it holds neither -- which only stays
+    checked if the measurement does not name what it is looking for. See
+    NOT_FOOTAGE for the one exception.
+    """
+    total = 0
+    for name, value in vars(owner).items():
+        if name in NOT_FOOTAGE:
+            continue
+        total += _payload_size(value)
+    return total
+
+
 def snapshot(viewmod, kwargs, view):
     """What an edit would have put on the wire, in a comparable shape."""
     files = kwargs.get("attachments") or []
@@ -512,6 +610,9 @@ def snapshot(viewmod, kwargs, view):
         "has_attachments": "attachments" in kwargs,
         "n_attachments": len(files),
         "filenames": [getattr(f, "filename", None) for f in files],
+        # The clip itself, so a test can compare the picture the channel is
+        # left looking at without the session having to keep a copy for it.
+        "clip": clip_bytes(files),
         "all_disabled": all(getattr(c, "disabled", False) for c in pressable(viewmod, view)),
         "any_disabled": any(getattr(c, "disabled", False) for c in pressable(viewmod, view)),
         "labels": [getattr(c, "label", None) or getattr(c, "custom_id", None) for c in view.children],
@@ -603,6 +704,13 @@ class FakeInteraction:
 
     def kinds(self):
         return [kind for kind, _ in self.log]
+
+    def clip(self):
+        """The clip the newest edit through this interaction carried."""
+        for _, data in reversed(self.log):
+            if data.get("clip"):
+                return data["clip"]
+        return None
 
 
 class FakeContext:
@@ -886,6 +994,25 @@ class RetroEnv:
 
     def interaction(self, view, **kwargs):
         return FakeInteraction(self.viewmod, view, **kwargs)
+
+    def shown_clip(self, view):
+        """The clip on this session's own message, as a player would see it.
+
+        The newest attachment a *message* edit carried, falling back to the
+        file the message was sent with. A button press edits the interaction
+        rather than the message, so for one of those the answer is
+        ``interaction.clip()``; this is for the paths that edit the message
+        directly (`[p]retroreset` through ``RetroView.show_clip``) and for
+        the first clip of a game.
+        """
+        message = getattr(view, "message", None)
+        if message is None:
+            return None
+        for edit in reversed(list(getattr(message, "edits", None) or ())):
+            data = clip_bytes(edit.get("attachments"))
+            if data:
+                return data
+        return clip_bytes([(getattr(message, "kwargs", None) or {}).get("file")])
 
     def button(self, view, custom_id):
         return next(c for c in view.children if c.custom_id == custom_id)

@@ -18,9 +18,10 @@ built. Each one is a separate concern with its own module:
   namespace, which will never need to change again.
 
 What is left here is the cog itself: its Config schema, the session
-lifecycle (start, hibernate, wake, retire, resume), talking to Discord
-without letting an HTTP failure surface as a traceback, the rate limits, and
-the `[p]retro`, `[p]retrostop`, `[p]retroreset` and `[p]retroset` commands.
+lifecycle (start, hibernate, wake, retire, resume, forget), talking to
+Discord without letting an HTTP failure surface as a traceback, the rate
+limits, and the `[p]retro`, `[p]retrostop`, `[p]retroreset` and `[p]retroset`
+commands.
 
 Constants that moved into those modules are re-exported at the bottom of
 this one, so `retro.Retro.<NAME>` keeps meaning what it always did.
@@ -221,8 +222,11 @@ BIOS_COOLDOWN_SECONDS = 60.0
 OPTION_MENU_TIMEOUT = 180.0
 
 # How many retired messages one channel keeps a working Resume button on.
-# Matches MAX_CACHED_GAMES_PER_CHANNEL, because a Resume button for a game
-# whose ROM has been pruned can only apologise.
+# Matches MAX_CACHED_GAMES_PER_CHANNEL because a Resume button is only worth
+# keeping while the ROM it names is still cached: in practice the *cache* is
+# the tighter of the two bounds, since pruning a ROM now drops the records
+# that pointed at it (see _forget_pruned_roms), so a busy channel settles at
+# one record per cached game that is not the one playing.
 MAX_RETIRED_PER_CHANNEL = MAX_CACHED_GAMES_PER_CHANNEL
 
 # Firmware sets are distributed as a zip of several files, sometimes with a
@@ -283,6 +287,13 @@ DEFAULT_GLOBALS: typing.Dict[str, typing.Any] = {
 }
 
 #: The per-channel settings and their defaults.
+#:
+#: Both of these are *pointers* -- "this message, in this channel, was playing
+#: this game" -- and neither holds any of the player's progress: that is the
+#: ``.state`` and ``.srm`` on disk, keyed by channel and game rather than by
+#: message. So both are deleted automatically once they can no longer do their
+#: job, and the saves are kept when they are. See the "Forgetting a channel"
+#: section below for the four things that drop one and why that is safe.
 DEFAULT_CHANNEL: typing.Dict[str, typing.Any] = {
     # A session outlives its emulator, so the record of one lives here and is
     # reloaded when the cog (or the whole bot) starts again.
@@ -407,6 +418,12 @@ class Retro(
     # from -- and it is used for exactly one decision: whether somebody may
     # stop or destroy a game they did not start (see RetroView.can_stop and
     # _may_manage_saves).
+    #
+    # Both of those records are also deleted on their own once they cannot do
+    # their job -- a deleted channel, a guild the bot has left, a cached ROM
+    # that has been pruned -- which takes the stored id with them. See the
+    # "Forgetting a channel" section below; this API is the way to have it
+    # removed sooner.
     #
     # Nothing else here is end user data. A save state, a battery save and a
     # cached ROM belong to the *channel*: several people play one game, the
@@ -543,9 +560,17 @@ class Retro(
                 "",
                 *lines,
                 "",
-                "The clip a game is currently showing is held in memory only, "
-                "as are the save states the Undo button steps back through, "
-                "and both are lost whenever the bot restarts.",
+                "The clip on a game's message is an attachment on that "
+                "message and is not kept anywhere else. The save states the "
+                "Undo button steps back through are held in memory only and "
+                "are lost whenever the bot restarts.",
+                "",
+                "The record that lets a game be resumed from its message is "
+                "deleted by itself once it can no longer do that -- when the "
+                "channel is deleted, when the bot leaves the server, or when "
+                "the cached ROM it names is cleaned up. That removes your id "
+                "along with it. The game's saves are kept, because they "
+                "belong to the channel rather than to anybody.",
             ]
         )
         return {"retro.txt": io.BytesIO(text.encode("utf-8"))}
@@ -557,7 +582,15 @@ class Retro(
         timeout_minutes = await self.config.session_timeout_minutes()
         clip_seconds = await self.config.clip_seconds()
         hold_ms = await self.config.hold_ms()
+        forget: typing.List[int] = []
         for channel_id, data in (await self.config.all_channels()).items():
+            if self._channel_is_gone(channel_id):
+                # A channel this bot can no longer see. Building a view for it
+                # would register a persistent view against a message nobody
+                # can reach, on every single load, for ever. Only the pointer
+                # is dropped; see _forget_channel.
+                forget.append(int(channel_id))
+                continue
             record = data.get("session")
             if record:
                 record.setdefault("channel_id", channel_id)
@@ -601,6 +634,10 @@ class Retro(
                         channel_id,
                         key,
                     )
+        for channel_id in forget:
+            await self._forget_channel(
+                channel_id, "the bot can no longer see that channel"
+            )
         if self.sessions or self.retired:
             log.info(
                 "Restored %s hibernated Libretro session(s) and %s Resume "
@@ -638,8 +675,15 @@ class Retro(
 
         Bounded per channel for the same reason the ROM cache is: a channel
         that works through a pile of games would otherwise accumulate a
-        Config entry per message forever, and a Resume button whose ROM has
-        been pruned can only apologise anyway.
+        Config entry per message forever.
+
+        This cap is the *ceiling*, not the usual bound. The cached ROM is
+        tighter: pruning one drops the records that pointed at it
+        (_forget_pruned_roms), so a channel normally holds a record per
+        cached game rather than MAX_RETIRED_PER_CHANNEL of them. The cap is
+        still here because the two limits are separate -- a ROM can be
+        deleted by hand, and a store written by another version of the cog
+        must not be able to grow without one.
         """
         channel_id = int(record.get("channel_id") or 0)
         message_id = record.get("message_id")
@@ -713,6 +757,286 @@ class Retro(
                 view.alive = False
                 self._release_view(view)
 
+    # -- Forgetting a channel -----------------------------------------------
+    #
+    # A session record and the records behind a channel's Resume buttons are
+    # *pointers*: "this message, in this channel, was playing this game".
+    # Dropping one costs the ability to resume from that message and nothing
+    # else, because the two things that hold the player's progress -- the
+    # ``.state`` and the ``.srm``, with one previous generation each -- are
+    # keyed by channel *and* game rather than by message. Starting the game
+    # again by name re-fetches the ROM and restores from them (see
+    # _saved_progress, which every start goes through), so the game comes
+    # back exactly where it was; only the button is gone.
+    #
+    # That is what makes the four things below safe to do automatically:
+    #
+    #   * a cached ROM was pruned, by the disk budget or the per-channel game
+    #     cap, so the record points at a file that is no longer there
+    #     (_forget_pruned_roms);
+    #   * the channel was deleted, or a thread was (the listeners below);
+    #   * the bot was removed from the guild (ditto);
+    #   * the bot can no longer see the channel at all, which is the same
+    #     thing noticed a restart later (_forget_unreachable_sessions).
+    #
+    # Without them a record was never deleted: there was no `session.clear()`
+    # anywhere in the cog and no listeners, so every channel that had *ever*
+    # played had a RetroView rebuilt for it on every load, for the life of
+    # the install. Bounded per channel, unbounded in channels.
+    #
+    # **The saves on disk are deliberately kept**, even for a channel or a
+    # guild that is gone. They are small next to a ROM, the disk budget
+    # already prunes ROMs (and never saves -- see _prune_roms_for_budget),
+    # and the cases are not distinguishable from the outside anyway: an
+    # archived thread, a channel the bot has temporarily lost sight of and a
+    # channel that was really deleted all look identical here. Deleting
+    # somebody's progress on that evidence is not a trade worth making, and
+    # the opposite mistake costs a few hundred kilobytes that `[p]retroset
+    # diskbudget` reports and `[p]retrosaves delete` can clear.
+
+    def _channel_is_gone(self, channel_id: int) -> bool:
+        """
+        Whether the bot is in a position to say this channel does not exist.
+
+        Deliberately conservative, because being wrong here deletes a
+        record: it answers False whenever the answer is *unknown*. In
+        particular Red loads its cogs before the bot connects, so during a
+        startup load the channel cache is empty and every channel would
+        otherwise look deleted. ``wait_until_red_ready`` is what makes the
+        cache trustworthy, so nothing is judged until it has returned --
+        see the sweep in _hibernation_loop, which is where a record left
+        alone at load time is reconsidered.
+        """
+        try:
+            if not self.bot.is_ready():
+                return False
+            return self.bot.get_channel(int(channel_id)) is None
+        except Exception:
+            # A bot object that cannot answer must never cost a record.
+            log.debug("Could not check whether a channel still exists.", exc_info=True)
+            return False
+
+    def _drop_session_view(self, channel_id: int) -> None:
+        """Take a channel's live view out of service. Keeps nothing."""
+        view = self.sessions.pop(int(channel_id), None)
+        if view is None:
+            return
+        view.closed = True
+        self._release_view(view)
+
+    def _drop_retired_views(self, channel_id: int) -> None:
+        """Take every Resume button of one channel out of service."""
+        for message_id, view in list(self.retired.items()):
+            if int(getattr(view, "channel_id", 0) or 0) != int(channel_id):
+                continue
+            self.retired.pop(message_id, None)
+            view.alive = False
+            self._release_view(view)
+
+    async def _forget_channel(self, channel_id: int, why: str) -> None:
+        """
+        Forget everything a channel could be resumed from. Keeps its saves.
+
+        A channel that has nothing stored is left completely alone, which is
+        the overwhelmingly common case for the listeners: most channels a bot
+        can see have never played anything, and a deletion should not cost a
+        Config write and a log line each.
+
+        Never raises: every caller is a Discord event handler or the cog
+        load, and neither may be broken by a Config write that failed.
+        """
+        channel_id = int(channel_id)
+        held = channel_id in self.sessions or any(
+            int(getattr(view, "channel_id", 0) or 0) == channel_id
+            for view in self.retired.values()
+        )
+        scope = None
+        stored = True
+        try:
+            scope = self.config.channel_from_id(channel_id)
+            stored = bool(await scope.session()) or bool(await scope.retired())
+        except Exception:
+            # Unknown, so act: leaving a record behind is the failure mode
+            # this whole section exists to stop. The in-memory half below
+            # happens either way, because it cannot fail.
+            log.exception("Could not read channel %s's Retro records.", channel_id)
+        if not stored and not held:
+            return
+        self._drop_session_view(channel_id)
+        self._drop_retired_views(channel_id)
+        if scope is None:
+            return
+        try:
+            # The whole per-channel scope, so neither the session nor the
+            # retired records are left behind. Red removes the row outright,
+            # which is what stops all_channels() growing with channels the
+            # bot has not been able to see for months.
+            await scope.clear()
+        except Exception:
+            log.exception(
+                "Could not forget the Retro records for channel %s.", channel_id
+            )
+            return
+        log.info(
+            "Forgot channel %s's Retro session and Resume buttons (%s). "
+            "Its save states and battery saves were kept.",
+            channel_id,
+            why,
+        )
+
+    async def _forget_guild(self, guild_id: int, why: str) -> None:
+        """Forget every channel of one guild. Keeps every save."""
+        guild_id = int(guild_id)
+        channels: typing.Set[int] = set()
+        try:
+            stored = await self.config.all_channels()
+        except Exception:
+            log.exception("Could not read the Retro channels to forget a guild.")
+            stored = {}
+        for channel_id, data in (stored or {}).items():
+            records = [(data or {}).get("session")]
+            records.extend(((data or {}).get("retired") or {}).values())
+            for record in records:
+                if record and int((record or {}).get("guild_id") or 0) == guild_id:
+                    channels.add(int(channel_id))
+                    break
+        # A record written before guild_id was stored has none, so the live
+        # views are consulted as well rather than only the stored records.
+        for view in list(self.sessions.values()):
+            if int(getattr(view, "guild_id", 0) or 0) == guild_id:
+                channels.add(int(view.channel_id))
+        for view in list(self.retired.values()):
+            record = getattr(view, "record", None) or {}
+            if int(record.get("guild_id") or 0) == guild_id:
+                channels.add(int(getattr(view, "channel_id", 0) or 0))
+        for channel_id in sorted(channels):
+            if channel_id:
+                await self._forget_channel(channel_id, why)
+
+    async def _forget_pruned_roms(self, filenames: typing.Iterable[str]) -> None:
+        """
+        Drop the records that pointed at a cached ROM that has just gone.
+
+        Both pruners end up here: the per-channel game cap
+        (``_prune_cached_games``) and the disk budget
+        (``_prune_roms_for_budget``). A Resume button whose ROM has been
+        cleaned up can only apologise when it is clicked, and a session
+        record for one is a view rebuilt on every load for a game that
+        cannot come back from it -- so the pointer goes with the file.
+
+        The saves stay exactly where they are. For a budget prune that is
+        the whole point: `[p]retro <name>` re-downloads the ROM and picks
+        the progress straight back up. Never raises.
+        """
+        gone = {str(name) for name in filenames if name}
+        if not gone:
+            return
+        try:
+            stored = await self.config.all_channels()
+        except Exception:
+            log.exception("Could not read the Retro channels after pruning a ROM.")
+            return
+        for channel_id, data in (stored or {}).items():
+            channel_id = int(channel_id)
+            session = (data or {}).get("session") or {}
+            if session and str(session.get("rom_filename") or "") in gone:
+                await self._forget_session(
+                    channel_id, "its cached ROM was pruned"
+                )
+            stale = [
+                key
+                for key, record in ((data or {}).get("retired") or {}).items()
+                if str((record or {}).get("rom_filename") or "") in gone
+            ]
+            for key in stale:
+                try:
+                    await self._forget_retired(channel_id, int(key))
+                except (TypeError, ValueError):
+                    log.debug("Ignoring an unreadable retired key %r.", key)
+
+    async def _forget_session(self, channel_id: int, why: str) -> None:
+        """Drop one channel's session pointer. Keeps its saves. Never raises."""
+        channel_id = int(channel_id)
+        self._drop_session_view(channel_id)
+        try:
+            await self.config.channel_from_id(channel_id).session.clear()
+        except Exception:
+            log.exception(
+                "Could not forget channel %s's Retro session record.", channel_id
+            )
+            return
+        log.info(
+            "Forgot channel %s's Retro session (%s); its saves were kept.",
+            channel_id,
+            why,
+        )
+
+    async def _forget_unreachable_sessions(self) -> None:
+        """
+        Drop the records of channels the bot cannot see, once it is ready.
+
+        The counterpart to the check in _restore_sessions, which runs before
+        the bot has connected on a cold start and therefore has to keep
+        everything. Run once from the hibernation loop, after
+        ``wait_until_red_ready``. Never raises.
+        """
+        try:
+            stored = await self.config.all_channels()
+        except Exception:
+            log.exception("Could not read the Retro channels to sweep them.")
+            return
+        for channel_id in list(stored or {}):
+            if self._channel_is_gone(channel_id):
+                await self._forget_channel(
+                    channel_id, "the bot can no longer see that channel"
+                )
+
+    # -- Discord's own events ------------------------------------------------
+    #
+    # Each one is wrapped in its own try/except and logs rather than raises:
+    # discord.py dispatches a listener as a task it does not await, so an
+    # exception in here would surface as an unhandled task error and (on
+    # Red) a traceback in the owner's console for something nobody can act
+    # on. Forgetting a record is also never urgent -- the sweep above picks
+    # up whatever a failed listener missed on the next load.
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel) -> None:
+        """A text channel was deleted: nothing here can be resumed from it."""
+        try:
+            await self._forget_channel(
+                getattr(channel, "id", 0), "the channel was deleted"
+            )
+        except Exception:
+            log.exception("Failed to forget a deleted channel's Retro records.")
+
+    @commands.Cog.listener()
+    async def on_thread_delete(self, thread) -> None:
+        """
+        The same for a thread, which is a channel a game can be played in.
+
+        Discord only sends this for a thread that is actually deleted. A
+        thread that is merely *archived* stays in Config until the sweep
+        notices the bot can no longer see it, which costs the Resume button
+        and nothing else.
+        """
+        try:
+            await self._forget_channel(
+                getattr(thread, "id", 0), "the thread was deleted"
+            )
+        except Exception:
+            log.exception("Failed to forget a deleted thread's Retro records.")
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild) -> None:
+        """The bot left (or was thrown out of) a server."""
+        try:
+            await self._forget_guild(
+                getattr(guild, "id", 0), "the bot is no longer in that server"
+            )
+        except Exception:
+            log.exception("Failed to forget a departed guild's Retro records.")
+
     def _register_view(self, view: RetroView) -> None:
         """
         Teach the bot to route this message's button clicks to this view.
@@ -745,20 +1069,21 @@ class Retro(
 
         So without this, a channel that plays twenty games leaves twenty
         RetroViews reachable for the life of the process, each one holding a
-        clip and a stack of save states. Marking them ``closed`` (which is
-        still done, and still what answers a click that arrives in the gap)
-        stops them acting; it does not let go of them.
+        stack of save states. Marking them ``closed`` (which is still done,
+        and still what answers a click that arrives in the gap) stops them
+        acting; it does not let go of them.
 
-        The clip on the message and the undo history are dropped here as well
-        as handed over, because they are the expensive part: a stray
-        reference to the view from somewhere unexpected should cost a few
-        kilobytes of object, not a clip and a stack of save states. (It used
-        to be worth far more than that: a session kept up to MAX_REPLAY_BYTES
-        -- eight megabytes -- of footage for the Replay button, and this is
-        where that was let go of.) Emptying the history costs nothing either
-        way: this is only called for a view the cog has finished with, whose
-        game is either retired or gone, so there is nothing anybody could
-        still want to undo.
+        The undo history is dropped here as well as handed over, because it
+        is the expensive part: a stray reference to the view from somewhere
+        unexpected should cost a few kilobytes of object rather than a stack
+        of save states. (It used to be worth far more than that: a session
+        kept up to MAX_REPLAY_BYTES -- eight megabytes -- of footage for the
+        Replay button, and then one clip after that button went; a session
+        holds no footage at all now, so there is nothing of that left to
+        release.) Emptying the history costs nothing either way: this is only
+        called for a view the cog has finished with, whose game is either
+        retired or gone, so there is nothing anybody could still want to
+        undo.
 
         Call this *before* registering a replacement view on the same
         message: remove_view unconditionally drops that message id from
@@ -767,8 +1092,6 @@ class Retro(
 
         Never raises: it is on every discard path, including cog_unload.
         """
-        if hasattr(view, "last_clip"):
-            view.last_clip = None
         forget = getattr(view, "forget_history", None)
         if forget is not None:
             try:
@@ -976,10 +1299,13 @@ class Retro(
 
         rom_path = self._rom_path(record.get("rom_filename") or "")
         if rom_path is None or not rom_path.is_file():
-            # The cache is bounded, so a game a channel has not touched in a
-            # while really can be gone. Say so; the save state is very
-            # probably still there, so starting it again by name will pick it
-            # back up (see _start_session).
+            # Rare now rather than routine: pruning a cached ROM drops the
+            # records that pointed at it, so a Resume button whose ROM has
+            # gone normally goes with it (_forget_pruned_roms). This is the
+            # gap -- a ROM deleted by hand, or a Config write that failed on
+            # the way. Say so; the save state is very probably still there,
+            # so starting the game again by name will pick it back up (see
+            # _start_session).
             await self._whisper_interaction(
                 interaction,
                 f"The cached ROM for **{game_name}** has been cleaned up, so "
@@ -1075,7 +1401,6 @@ class Retro(
         # button's label can be written from its real frame rate, and this is
         # the last chance before the message goes back out.
         view._update_repeat_label()
-        view.remember_clip(clip)
         view.touch()
         self._settle_boot(view, progress, notice)
         await self._forget_retired(channel_id, message_id)
@@ -1495,6 +1820,15 @@ class Retro(
             await self.bot.wait_until_red_ready()
         except Exception:
             pass
+        # Only now is the channel cache worth reading: Red loads its cogs
+        # before the bot connects, so _restore_sessions had to keep every
+        # record it could not judge. This is where one belonging to a channel
+        # that has since gone is dropped. Once, not on every pass -- a
+        # channel that disappears while the bot is up has a listener for it.
+        try:
+            await self._forget_unreachable_sessions()
+        except Exception:
+            log.exception("Could not sweep the Retro session records.")
         while True:
             try:
                 await asyncio.sleep(IDLE_CHECK_SECONDS)
@@ -1907,7 +2241,6 @@ class Retro(
             except EmulatorError as error:
                 await self._safe_send(ctx, f"The game could not be resumed: {error}")
                 return
-        view.remember_clip(clip)
         view.touch()
         try:
             view.message = await ctx.send(
@@ -2207,7 +2540,11 @@ class Retro(
                 "disk space.",
             )
             return
-        self._prune_cached_games(ctx.channel.id, slug)
+        # The oldest of this channel's cached games fall off the end here, and
+        # the records that pointed at them go with them.
+        await self._forget_pruned_roms(
+            self._prune_cached_games(ctx.channel.id, slug)
+        )
 
         core_path = await self._core_path(system.core)
         if core_path is None:
@@ -2469,8 +2806,10 @@ class Retro(
         dropped in by hand is picked up too, as long as it keeps its buildbot
         filename (`snes9x_libretro.so`, `gambatte_libretro.dll`).
 
-        The whole set is about 4.5 MiB. None of these cores need a BIOS file.
-        For one that does, see `[p]retroset bios`.
+        The whole set is about 4.5 MiB to download and about 31 MiB once
+        unpacked, which is what counts against `[p]retroset diskbudget`. None
+        of these cores need a BIOS file. For one that does, see
+        `[p]retroset bios`.
 
         **Examples:**
         - `[p]retroset download`
@@ -2783,8 +3122,8 @@ class Retro(
         if refusal is not None:
             await ctx.send(
                 f"That URL will not be fetched: {refusal}. The bot refuses to "
-                "make requests to its own network (see the SSRF note in the "
-                "README). If this really is a ROM library on your LAN, "
+                "make requests to its own network (see **ROM URLs** in the "
+                "cog's README). If this really is a ROM library on your LAN, "
                 f"`{ctx.clean_prefix}retroset allowprivateurls true` turns the "
                 "guard off \N{EM DASH} read what that command says first."
             )
