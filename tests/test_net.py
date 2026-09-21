@@ -18,6 +18,10 @@ import pytest
 
 from .loader import load_standalone
 
+# retro/net.py needs aiohttp (Red ships it, a bare checkout may not), so the
+# whole module stands down rather than failing collection.
+pytest.importorskip("aiohttp", reason="the URL guard needs aiohttp")
+
 net = load_standalone("retro_net_standalone", "net.py")
 
 

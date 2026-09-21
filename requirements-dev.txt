@@ -13,6 +13,10 @@ ruff>=0.6
 pytest-xdist>=3.0
 
 # What the cog itself needs, so a dev environment can run the whole suite:
+# aiohttp is listed explicitly even though discord.py pulls it in: the URL
+# guard's tests stand down without it, and security tests must not be able
+# to skip themselves quietly.
+aiohttp
 libretro.py
 pillow
 discord.py
