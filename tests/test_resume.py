@@ -238,6 +238,23 @@ async def test_resume_restarts_the_game_from_its_save_state(retro, retired):
     assert not interaction.log[-1][1]["all_disabled"]
 
 
+async def test_a_resumed_game_labels_its_repeat_button_from_the_real_core(
+    retro, retired
+):
+    """The label counts the taps the clip length fits, so it needs the fps."""
+    await retro.cog.config.clip_seconds.set(0.2)
+    retired.old.clip_seconds = 0.2
+    interaction = retro.interaction(retired.view, message=retired.old.message)
+    await retired.view.children[0].callback(interaction)
+
+    back = retro.cog.sessions[retired.channel.id]
+    button = retro.control(back, "repeat")
+    # A fifth of a second fits one tap, which is what the confirm button
+    # already does -- and the message went out saying so, not "A x3".
+    assert button.label == "A x1" and button.disabled
+    assert back.repeat_taps == 1
+
+
 async def test_resume_hibernates_whatever_else_was_live(retro, retired):
     assert retired.current.live
     interaction = retro.interaction(retired.view, message=retired.old.message)

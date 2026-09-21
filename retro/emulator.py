@@ -13,6 +13,7 @@ Session constructor API of libretro.py >= 0.7.
 
 import io
 import logging
+import math
 import re
 import typing
 from pathlib import Path
@@ -27,6 +28,8 @@ __all__ = [
     "CLIP_FPS",
     "MIN_CLIP_SECONDS",
     "MAX_CLIP_SECONDS",
+    "MIN_CLIP_FRAMES",
+    "MIN_AFTERMATH_FRAMES",
     "REPLAY_SECONDS",
     "MAX_REPLAY_FRAMES",
     "MAX_REPLAY_CLIPS",
@@ -35,11 +38,18 @@ __all__ = [
     "DEFAULT_CLIP_FORMAT",
     "MAX_SRAM_SIZE",
     "RETRO_MEMORY_SAVE_RAM",
+    "capture_step",
+    "clamp_clip_seconds",
     "clip_extension",
+    "clip_frame_count",
     "concatenate_clips",
     "decode_clip",
     "describe_definitions",
+    "describe_seconds",
     "encode_animation",
+    "format_seconds",
+    "frame_count",
+    "input_budget",
     "probe_core_options",
 ]
 
@@ -84,18 +94,51 @@ DEFAULT_FPS = 60.0
 # clip itself is encoded at. Sampling every 4th emulated frame is enough to
 # read the action and keeps the clip a quarter of the size.
 #
+# One second is the default because a turn is a round trip: press, wait for
+# the clip to encode and upload, look at it, press again. Four seconds of
+# footage made every one of those round trips four times as long to watch and
+# to record, and almost all of it was the game sitting still after the press
+# had already played out. A second shows the press land and its result, which
+# is what the next press is decided from.
+#
 # On the timing: animated WebP stores each frame's duration in *milliseconds*,
 # so 15 fps against a 59.73 fps core is 4 emulated frames per clip frame and
-# exactly 67ms per frame -- a 4 second clip measures 4.02s, which is 0.5% slow
-# and invisible. (GIF is the format that stores centiseconds; see _encode.)
-# 20 fps would land on a round 50ms and match the emulated time exactly, at
-# about 39% more bytes and 32% more encoding time, so 15 stays the default.
-CLIP_SECONDS = 4
+# exactly 67ms per frame -- a 1 second clip is 60 emulated frames, 15 pictures
+# and measures 1.005s, which is 0.5% slow and invisible. (GIF is the format
+# that stores centiseconds; see _encode.) 20 fps would land on a round 50ms
+# and match the emulated time exactly, at about 39% more bytes and 32% more
+# encoding time, so 15 stays the default.
+CLIP_SECONDS = 1.0
 CLIP_FPS = 15
 
-# Bounds for the configurable clip length.
-MIN_CLIP_SECONDS = 1
-MAX_CLIP_SECONDS = 15
+# Bounds for the configurable clip length, which is a float: 0.8 is a real
+# answer, and at these lengths the difference between 0.8 and 1 is a fifth of
+# the turn.
+#
+# The floor is 0.2s rather than something smaller because of what a clip is
+# made of. At 59.73 fps it is 12 emulated frames: three pictures at CLIP_FPS,
+# so still an animation, and an input budget of 8 frames (see input_budget)
+# which is ~134ms of button hold -- above the ~100ms where a game polling its
+# controller a few times a second can miss a press entirely. Halve it again
+# and the clip is two pictures and the hold is four frames, i.e. a press that
+# may not register at all and a "clip" nobody can read.
+MIN_CLIP_SECONDS = 0.2
+MAX_CLIP_SECONDS = 15.0
+
+# The fewest emulated frames a clip may be, whatever it was asked for. At
+# CLIP_FPS against a 60 fps core one picture is four frames, so six frames is
+# two pictures -- the least that is still an animation -- and leaves room for
+# a press plus the aftermath frame below. MIN_CLIP_SECONDS is well clear of
+# it on every console here (0.2s is 10 frames even on a 50 fps PAL core), so
+# this is a floor for a core that reports a strange frame rate and for direct
+# callers of record(), not something the settings can reach.
+MIN_CLIP_FRAMES = 6
+
+# How many emulated frames at the end of a clip are kept clear of input, so
+# the last picture shows the game *after* the press rather than still under
+# it. Counted in captured frames by input_budget(), which is what makes it
+# one visible picture rather than one invisible frame.
+MIN_AFTERMATH_FRAMES = 1
 
 # How much footage the Replay button stitches back together, and the hard
 # frame cap that bounds how long doing so can possibly take.
@@ -114,14 +157,43 @@ MAX_CLIP_SECONDS = 15
 # which no real game does; they are there to show the ceiling. 300 frames is
 # 20 seconds at CLIP_FPS and keeps even that ceiling inside single digits,
 # while 15 seconds of real footage costs well under two.
+#
+# 300 frames is also more than fifteen seconds needs at *any* clip length,
+# which is what makes the seconds the binding cap rather than the frames: a
+# clip contributes CLIP_FPS pictures per second of footage however it is
+# sliced, so fifteen seconds is about 225 pictures whether that is four 4s
+# clips, fifteen 1s clips or seventy-five 0.2s ones.
 REPLAY_SECONDS = 15
 MAX_REPLAY_FRAMES = 300
 
 # How many clips one session keeps in memory to replay, and how many bytes of
-# them. The buffer is memory-only and per session, so it is deliberately small:
-# a Game Boy clip is 1-170 KiB and a busy SNES one about 50 KiB, so the byte
-# cap is only a backstop against a pathological game.
-MAX_REPLAY_CLIPS = 8
+# them.
+#
+# The count used to be 8, which was fine when a clip was four seconds and
+# became the cap that bit first when the default became one: eight one-second
+# clips are eight seconds, so Replay could never reach the fifteen it
+# promised. It is derived from the two numbers that decide it instead --
+# enough clips to cover REPLAY_SECONDS at the shortest clip length allowed,
+# plus the one that straddles the fifteen-second edge (concatenate_clips
+# trims that one frame by frame) -- so it cannot fall behind either again.
+#
+# Clip count is not what bounds the memory: bytes track *footage* far more
+# than the number of files it arrived in, because a short clip holds
+# proportionally fewer pictures. Measured on a Raspberry Pi 5, fifteen
+# seconds of Pokemon Red in the overworld:
+#
+#     clip length   clips   buffer   stitched   stitch time
+#     4s                5   18.5 KiB   7.8 KiB       0.15s
+#     1s               16   30.7 KiB  12.9 KiB       0.22s
+#     0.8s             20   35.0 KiB  12.1 KiB       0.20s
+#     0.2s             76   80.8 KiB  25.2 KiB       0.40s
+#
+# So the shortest clips cost about four times the bytes of the longest for
+# the same footage (each file repeats a keyframe), which is 81 KiB against a
+# cap of 8 MiB. The cap stays where it is as a backstop against a
+# pathological game, two orders of magnitude clear of anything measured, and
+# MAX_REPLAY_FRAMES is still what bounds the encode time.
+MAX_REPLAY_CLIPS = int(math.ceil(REPLAY_SECONDS / MIN_CLIP_SECONDS)) + 1
 MAX_REPLAY_BYTES = 8 * 1024 * 1024
 
 # Frames taller than this are shown at 1x; anything smaller is doubled. The
@@ -159,6 +231,106 @@ MAX_SRAM_SIZE = 1024 * 1024
 def clip_extension(clip_format: str = DEFAULT_CLIP_FORMAT) -> str:
     """``"WEBP"`` -> ``".webp"``."""
     return f".{str(clip_format).lower()}"
+
+
+# -- Clip arithmetic ----------------------------------------------------------
+#
+# Seconds in, frames out. These are plain functions of a frame rate rather
+# than methods so the view can lay a press schedule out before a core has
+# been loaded (to label the repeat button, which has to say how many taps it
+# will really do) and so the arithmetic can be tested without one. The
+# RetroEmulator methods below are thin wrappers that pass the core's own fps.
+
+
+def frame_count(fps: float, seconds: float) -> int:
+    """How many emulated frames last roughly this long, at least one."""
+    return max(1, round(float(fps) * float(seconds)))
+
+
+def clip_frame_count(fps: float, seconds: float) -> int:
+    """
+    How many emulated frames one clip of this length covers.
+
+    Never fewer than MIN_CLIP_FRAMES, so a clip is always an animation with
+    room for a press in it.
+    """
+    return max(MIN_CLIP_FRAMES, frame_count(fps, seconds))
+
+
+def capture_step(fps: float, clip_fps: int = CLIP_FPS) -> int:
+    """
+    How many emulated frames one picture of the clip covers.
+
+    4 for a 15 fps clip off a 59.73 fps Game Boy. Only every ``step``-th
+    emulated frame is captured, which is what makes the clip a quarter of the
+    size for no loss of readability.
+    """
+    rate = max(1, min(round(float(fps)), int(clip_fps)))
+    return max(1, round(float(fps) / rate))
+
+
+def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
+    """
+    The last frame of a clip that a button may still be released on.
+
+    Everything scheduled into a clip has to be *up* by this frame, because
+    the picture captured on it is the last one the clip has and a clip whose
+    last picture is still mid-press does not show the player what their press
+    did. Only every ``capture_step``-th frame is captured, so this is the
+    last captured frame (less MIN_AFTERMATH_FRAMES - 1 further pictures),
+    not simply ``frames - 1``: releasing a button on frame 59 of a 60 frame
+    clip would never be seen, since the last picture was taken on frame 56.
+
+    At four seconds this is 236 of 239 frames and no schedule ever came near
+    it. At a fifth of a second it is 8 of 12, and it is what stops a 400ms
+    hold, or the repeat button's three taps, from running off the end of the
+    recording.
+    """
+    frames = max(1, int(frames))
+    step = capture_step(fps, clip_fps)
+    reserved = max(1, int(MIN_AFTERMATH_FRAMES)) - 1
+    return max(1, ((frames - 1) // step - reserved) * step)
+
+
+def clamp_clip_seconds(value: typing.Any) -> float:
+    """
+    Whatever was configured, as a clip length this cog will actually record.
+
+    Every path that reads a clip length goes through here: the setting is a
+    float now, but an installation that set `[p]retroset cliplength 4` before
+    it was has a plain ``int`` in Config (which is a perfectly good float),
+    and a hand-edited settings file can hold anything at all. Rounding to
+    hundredths keeps the number something that can be printed back without
+    trailing noise, and 10ms is well under one frame of any console here.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return float(CLIP_SECONDS)
+    if not math.isfinite(seconds):
+        return float(CLIP_SECONDS)
+    return float(min(MAX_CLIP_SECONDS, max(MIN_CLIP_SECONDS, round(seconds, 2))))
+
+
+def format_seconds(seconds: float, places: int = 2) -> str:
+    """
+    A clip length as short as it can honestly be written.
+
+    ``1.0`` -> ``"1"``, ``0.8`` -> ``"0.8"``, ``0.25`` -> ``"0.25"``. Nobody
+    wants to read "1.0 seconds" for the default. ``places=1`` is for the
+    Replay button, whose figure is an approximation of a buffer anyway and
+    which must not turn 3.0135 seconds of footage into "3.01s".
+    """
+    value = round(float(seconds), max(0, int(places)))
+    if value == int(value):
+        return str(int(value))
+    return f"{value:g}"
+
+
+def describe_seconds(seconds: float, places: int = 2) -> str:
+    """``1.0`` -> ``"1 second"``, ``0.8`` -> ``"0.8 seconds"``."""
+    text = format_seconds(seconds, places)
+    return f"{text} second" if text == "1" else f"{text} seconds"
 
 
 # -- Core options -------------------------------------------------------------
@@ -698,10 +870,22 @@ class RetroEmulator:
 
     def frames_for_ms(self, milliseconds: float) -> int:
         """How many emulated frames last roughly this long, at least one."""
-        return max(1, round(self.fps * float(milliseconds) / 1000.0))
+        return frame_count(self.fps, float(milliseconds) / 1000.0)
 
     def frames_for_seconds(self, seconds: float) -> int:
-        return max(1, round(self.fps * float(seconds)))
+        return frame_count(self.fps, seconds)
+
+    def clip_frames(self, seconds: float = CLIP_SECONDS) -> int:
+        """How many emulated frames a clip of this length covers here."""
+        return clip_frame_count(self.fps, seconds)
+
+    def capture_step(self, clip_fps: int = CLIP_FPS) -> int:
+        """How many emulated frames one picture of a clip covers here."""
+        return capture_step(self.fps, clip_fps)
+
+    def input_budget(self, frames: int, clip_fps: int = CLIP_FPS) -> int:
+        """The last frame of a clip a button may still be released on."""
+        return input_budget(self.fps, frames, clip_fps)
 
     # -- Input and emulation ------------------------------------------------
 
@@ -1056,9 +1240,17 @@ class RetroEmulator:
         game responding.
 
         Roughly every ``core_fps / fps``-th emulated frame is captured, so the
-        default four seconds at 15 fps is a 60 frame clip. Identical
-        consecutive frames cost almost nothing, so a game sitting on a static
-        screen produces a handful of kilobytes.
+        default one second (60 emulated Game Boy frames) at 15 fps is a 15
+        picture clip. Identical consecutive frames cost almost nothing -- the
+        encoder merges them and adds their durations together -- so a game
+        sitting on a static screen produces a handful of kilobytes, and a
+        short clip of one can legitimately come back out as a single frame
+        holding the whole clip's duration.
+
+        A press is fitted to the recording by the caller (see
+        :func:`input_budget` and ``RetroView.press_plan``); what happens here
+        is only the final safety clamp, which keeps a press inside the clip
+        but does not promise the release will be *seen*.
 
         Note that this is the *only* thing that advances the emulation: the
         console is frozen between one clip and the next.
@@ -1071,11 +1263,9 @@ class RetroEmulator:
             )
         core_fps = self.fps
         if frames is None:
-            frames = self.frames_for_seconds(CLIP_SECONDS)
+            frames = self.clip_frames(CLIP_SECONDS)
         frames = max(1, int(frames))
-        fps = max(1, min(round(core_fps), int(fps)))
-        step = max(1, round(core_fps / fps))
-        duration_ms = max(1, round(1000 * step / core_fps))
+        step = capture_step(core_fps, fps)
 
         # frame index -> buttons that go down / come up on that frame.
         down: dict = {}
@@ -1099,6 +1289,13 @@ class RetroEmulator:
         # rendered anything yet.
         size = None
         held: set = set()
+        # One duration per captured picture rather than one for the clip.
+        # They are all ``step`` frames long except possibly the last, which
+        # covers however many emulated frames were left: a 0.5 second Game
+        # Boy clip is 30 frames, which is seven whole pictures and an eighth
+        # covering two frames. Giving that last one a full 67ms made the clip
+        # play 7% longer than the half second it emulated.
+        durations: typing.List[int] = []
         try:
             for index in range(frames):
                 if index in up:
@@ -1111,15 +1308,17 @@ class RetroEmulator:
                     if size is None:
                         size = self.output_size(scale=scale)
                     images.append(self._frame_image(size, colors=colors))
+                    covered = min(step, frames - index)
+                    durations.append(max(1, round(1000 * covered / core_fps)))
         finally:
             self._pressed = frozenset()
 
         if not images:
             raise EmulatorError("No video frames were captured.")
-        return self._encode(images, duration_ms, clip_format)
+        return self._encode(images, durations, clip_format)
 
     @staticmethod
-    def _encode(images, duration_ms: int, clip_format: str) -> bytes:
+    def _encode(images, duration_ms, clip_format: str) -> bytes:
         """Turn a list of same-sized Pillow images into one animation."""
         return encode_animation(images, duration_ms, clip_format)
 
@@ -1204,7 +1403,9 @@ def encode_animation(images, duration_ms, clip_format: str = DEFAULT_CLIP_FORMAT
     return buffer.getvalue()
 
 
-def decode_clip(data: bytes) -> typing.Tuple[list, typing.List[int]]:
+def decode_clip(
+    data: bytes, fallback_ms: typing.Optional[float] = None
+) -> typing.Tuple[list, typing.List[int]]:
     """
     Read one encoded clip back into ``(frames, per-frame durations in ms)``.
 
@@ -1213,8 +1414,19 @@ def decode_clip(data: bytes) -> typing.Tuple[list, typing.List[int]]:
     went in as sixty 67ms frames comes back out as two frames of 67ms and
     3948ms, and re-encoding it with a flat 67ms would play it forty times too
     fast.
+
+    ``fallback_ms`` is for the one case where the file records no duration at
+    all. A clip in which *every* picture is identical -- a title screen, a
+    menu, a game waiting for input, all of which are far likelier now a clip
+    is one second rather than four -- collapses to a single image, and libwebp
+    then writes a plain still WebP with no animation chunks in it. That is a
+    perfectly good clip and Discord shows it, but nothing in the file says it
+    stood for a second of play, so a caller that knows how long the clip was
+    meant to be should say so; otherwise such a frame counts as 1ms and the
+    Replay button under-reports how much footage it stitched.
     """
     Image = _pillow()
+    default = max(1, round(float(fallback_ms))) if fallback_ms else 1
     try:
         image = Image.open(io.BytesIO(bytes(data)))
         frames = []
@@ -1222,7 +1434,8 @@ def decode_clip(data: bytes) -> typing.Tuple[list, typing.List[int]]:
         for index in range(max(1, int(getattr(image, "n_frames", 1)))):
             image.seek(index)
             frames.append(image.convert("RGB"))
-            durations.append(max(1, int(image.info.get("duration") or 1)))
+            recorded = image.info.get("duration")
+            durations.append(max(1, int(recorded)) if recorded else default)
     except EmulatorError:
         raise
     except Exception as exc:
@@ -1235,6 +1448,7 @@ def decode_clip(data: bytes) -> typing.Tuple[list, typing.List[int]]:
 def concatenate_clips(
     clips: typing.Sequence[bytes],
     *,
+    seconds: "typing.Optional[typing.Sequence[float]]" = None,
     max_seconds: float = REPLAY_SECONDS,
     max_frames: int = MAX_REPLAY_FRAMES,
     clip_format: str = DEFAULT_CLIP_FORMAT,
@@ -1248,6 +1462,13 @@ def concatenate_clips(
     however much of the run-up fits; the oldest footage is what gets dropped.
     Trimming is per *frame*, not per clip, so a single clip longer than the
     budget still works.
+
+    ``seconds`` is how long each clip was meant to be, in the same order,
+    which the session knows and the files do not always say: a clip in which
+    nothing moved is written as a single still image with no timing in it at
+    all (see :func:`decode_clip`). Without it such a clip counts as one
+    millisecond of footage, and a replay of a menu screen reports having
+    stitched nothing.
 
     Returns ``(encoded bytes, seconds covered)``.
 
@@ -1274,11 +1495,17 @@ def concatenate_clips(
     total_ms = 0
     size = None
     failures = 0
-    for data in reversed(list(clips)):
+    # Nominal lengths, newest first like the loop below, padded with None so
+    # a caller that passes none (or too few) still works.
+    lengths = list(reversed(list(seconds or ())))
+    for position, data in enumerate(reversed(list(clips))):
         if total_ms >= budget_ms or len(frames) >= max_frames:
             break
+        nominal = lengths[position] if position < len(lengths) else None
         try:
-            clip_frames, clip_durations = decode_clip(data)
+            clip_frames, clip_durations = decode_clip(
+                data, None if nominal is None else float(nominal) * 1000.0
+            )
         except EmulatorError:
             # One unreadable clip in the buffer should cost that clip, not the
             # replay. Stop here rather than skipping it: the frames are a
@@ -1443,7 +1670,7 @@ def _main() -> int:
         if len(sys.argv) > 4:
             frames = int(sys.argv[4])
         elif clip_format:
-            frames = emulator.frames_for_seconds(CLIP_SECONDS)
+            frames = emulator.clip_frames(CLIP_SECONDS)
         else:
             frames = 120
         if clip_format:

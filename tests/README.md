@@ -3,7 +3,7 @@
 ```bash
 pip install -r ../requirements-dev.txt
 pytest                      # everything the machine can run
-pytest -m "not emulator"    # the fast half: about a second
+pytest -m "not emulator"    # the fast half: a few seconds
 pytest -m emulator          # real cores and real ROMs: about a minute
 ```
 
@@ -15,11 +15,11 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` included), the shared restore chain, property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
-| `-m emulator` | real libretro cores: clips, timing, stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
+| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` included), the shared restore chain, the clip arithmetic (`press_plan`, `input_budget`: plain functions of a frame rate, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
+| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
-`pytest -m emulator -n 2` halves the slow half (about 75s to 39s here). It
+`pytest -m emulator -n 2` halves the slow half (about 64s to 34s here). It
 has to be `-n`, i.e. separate processes: one libretro core may be loaded per
 process. The fast suite is *slower* under `-n`, so it is left serial.
 

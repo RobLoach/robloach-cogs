@@ -104,7 +104,7 @@ def test_a_console_boots_and_records_a_playable_clip(
     assert 0.5 < emulator.aspect_ratio < 3.0, emulator.aspect_ratio
 
     emulator.advance(emulator.frames_for_seconds(2))
-    frames = emulator.frames_for_seconds(E.CLIP_SECONDS)
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
     clip = emulator.record(frames, presses=[(button, 0, emulator.frames_for_ms(200))])
 
     assert clip[:4] == b"RIFF" and clip[8:12] == b"WEBP", clip[:12]
@@ -138,10 +138,30 @@ def test_frames_are_counted_from_the_core_s_own_frame_rate(emu, gambatte, ucity)
     assert emulator.frames_for_ms(400) == 24
     assert emulator.frames_for_ms(0) == 1, "a hold is never zero frames"
     assert emulator.frames_for_seconds(4) == 239
-    assert E.CLIP_SECONDS == 4
+    assert E.CLIP_SECONDS == 1.0
     # The default hold has to stay under a Game Boy walk cycle (16 frames) or
     # one press walks two tiles; see the Pokemon test below.
     assert emulator.frames_for_ms(160) < 16
+
+
+@pytest.mark.parametrize("seconds", [0.2, 0.5, 0.8, 1.0, 4.0])
+def test_a_fractional_clip_length_is_a_real_number_of_frames(
+    emu, gambatte, ucity, seconds
+):
+    """Clip lengths are floats now, and the frames come from the real fps."""
+    emulator = emu(gambatte, ucity)
+    frames = emulator.clip_frames(seconds)
+    assert frames == max(E.MIN_CLIP_FRAMES, round(emulator.fps * seconds))
+    assert frames >= E.MIN_CLIP_FRAMES, "a clip is never empty"
+    assert emulator.fps != 60, "the frame count must come from the core"
+
+    step = emulator.capture_step()
+    budget = emulator.input_budget(frames)
+    # Input has to be released on a frame that is actually photographed, and
+    # at least one picture of the clip has to be left over to show it.
+    assert budget % step == 0
+    assert 1 <= budget <= frames - 1
+    assert -(-frames // step) >= 2, "two pictures is the least that animates"
 
 
 def test_a_longer_hold_really_does_reach_the_core(emu, gambatte, ucity):
@@ -199,17 +219,24 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
     poke._pressed = frozenset()
     poke.advance(150)
     ready = poke.save_state()
-    clip = poke.frames_for_seconds(E.CLIP_SECONDS)
+    # The default clip is one second now, not four, so this is measured
+    # inside the clip the cog really records -- a hold that walks one tile is
+    # no use if the step does not finish before the clip does.
+    clip = poke.clip_frames(E.CLIP_SECONDS)
+    assert clip == 60, f"a one second Game Boy clip is 60 frames, not {clip}"
 
-    def tiles(hold_ms):
+    def tiles(hold_ms, frames=None):
+        frames = clip if frames is None else frames
         poke.load_state(ready)
         start = coords()
-        hold = poke.frames_for_ms(hold_ms)
-        # Exactly what RetroEmulator.record() does with a press at frame 0.
+        # Exactly what the cog schedules: the hold is capped at the last
+        # frame of the clip that is still photographed, so what is measured
+        # here is what a player would actually see.
+        hold = min(poke.frames_for_ms(hold_ms), poke.input_budget(frames))
         poke._pressed = frozenset({"left"})
         poke.advance(hold)
         poke._pressed = frozenset()
-        poke.advance(max(0, clip - hold))
+        poke.advance(max(0, frames - hold))
         end = coords()
         return abs(end[0] - start[0]) + abs(end[1] - start[1])
 
@@ -219,34 +246,105 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
     assert walked[200] == 1, walked
     assert all(walked[ms] == 1 for ms in (250, 200, 160, 150, 100)), walked
 
+    # One second is enough aftermath to *see* the step complete: the tile has
+    # changed by the last frame the clip photographs, not merely by the end of
+    # the emulation. A Game Boy walk cycle is 16 frames and the hold is 10, so
+    # the step lands around frame 26 of 60 and the clip shows the rest.
+    assert tiles(160, poke.input_budget(clip)) == 1, "the step finishes inside the clip"
+
+    # The shortest clip the settings allow still registers the press: the
+    # hold is cut to the 8 frames a 12 frame clip can show being released,
+    # which is ~134ms and still over the ~100ms a game needs to see a press.
+    # A walk cycle is 16 frames and the clip is 12, so the tile it walks to
+    # is credited during the *next* clip -- the press is not lost, it lands a
+    # clip later, which is the honest cost of a 0.2 second clip.
+    short = poke.clip_frames(E.MIN_CLIP_SECONDS)
+    assert tiles(160, short) == 0, "unexpectedly quick: recheck the comment above"
+    assert tiles(160, short * 2) == 1, "a 0.2s clip lost the press altogether"
+
 
 # -- 3. Clip timing: what the player actually sees ----------------------------
 
 
-def test_a_four_second_clip_plays_in_four_seconds(emu, gambatte, ucity):
+@pytest.mark.parametrize("seconds", [0.2, 0.5, 0.8, 1.0, 4.0])
+def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
+    """Playback time tracks emulated time at every clip length, whole or not."""
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    frames = emulator.frames_for_seconds(E.CLIP_SECONDS)
+    frames = emulator.clip_frames(seconds)
     data = emulator.record(frames)
     durations, loop = anmf(data)
-    step = max(1, round(emulator.fps / E.CLIP_FPS))
+    step = emulator.capture_step()
 
     assert durations, "no animation frames at all"
-    assert len(set(durations)) == 1, set(durations)
     # WebP stores milliseconds; a 15 fps clip off a 59.73 fps core is 67ms a
     # frame. GIF stores centiseconds and cannot be exact, which is why it is
     # only ever a fallback.
-    assert durations[0] == round(1000 * step / emulator.fps)
+    frame_ms = round(1000 * step / emulator.fps)
+    captured = -(-frames // step)
+    assert loop == 1, "the clip plays through exactly once"
+    # The encoder merges runs of identical frames and adds their durations
+    # together, so a clip of a static screen legitimately comes back with
+    # fewer frames than were captured -- never more, and never a zero-length
+    # one, and always the same total length.
+    assert 1 <= len(durations) <= captured
+    assert all(duration > 0 for duration in durations)
+    if len(durations) == captured:
+        # Every picture is a whole step of emulation except possibly the
+        # last, which gets only the frames that were left: 30 frames is
+        # seven 67ms pictures and an eighth worth 33ms, and calling that one
+        # 67ms too played a half-second clip 7% slow.
+        assert set(durations[:-1]) <= {frame_ms}, set(durations)
+        assert 0 < durations[-1] <= frame_ms, durations[-1]
+        assert durations[-1] == round(1000 * (frames - step * (captured - 1)) / emulator.fps)
     emulated = 1000 * frames / emulator.fps
     assert abs(sum(durations) - emulated) / emulated < 0.01, (sum(durations), emulated)
-    assert loop == 1, "the clip plays through exactly once"
-    assert len(durations) == -(-frames // step)
+    # Every picture of the clip is worth having: a fifth of a second is three
+    # of them, not one.
+    assert captured >= 2 and len(data) > 0
+
+
+def test_a_static_screen_collapses_to_a_still_that_is_still_a_clip(
+    emu, image, gambatte, ucity
+):
+    """A short clip of a screen where nothing moves really is one frame.
+
+    libwebp merges identical consecutive frames, and when *every* captured
+    picture is the same it writes a plain still WebP with no animation chunks
+    in it at all. That is fine -- Discord shows it, and it costs a few dozen
+    bytes -- but it means the file no longer says how long the clip was, which
+    is what decode_clip's fallback and concatenate_clips' `seconds` exist for.
+    Far more likely at a one second clip than it was at four.
+    """
+    emulator = emu(gambatte, ucity)
+    # Frame 1 of a cold boot: the screen is blank and stays blank.
+    frames = emulator.clip_frames(0.2)
+    data = emulator.record(frames)
+    picture = image.open(io.BytesIO(data))
+
+    assert data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+    assert getattr(picture, "n_frames", 1) == 1, "uCity's boot is not static"
+    assert anmf(data)[0] == [], "a still has no frame timings to read"
+    assert 0 < len(data) < 4096, len(data)
+
+    # Nothing divides by zero, and no frame is left with no duration at all.
+    decoded, decoded_durations = E.decode_clip(data)
+    assert len(decoded) == 1 and decoded_durations == [1]
+    _, told = E.decode_clip(data, 200)
+    assert told == [200], "a caller that knows the length can say so"
+
+    # And it still stitches, with the session's own lengths standing in for
+    # the timing the file does not have.
+    stitched, covered = E.concatenate_clips([data, data])
+    assert len(stitched) > 0 and covered == pytest.approx(0.002)
+    stitched, covered = E.concatenate_clips([data, data], seconds=[0.2, 0.2])
+    assert len(stitched) > 0 and covered == pytest.approx(0.4)
 
 
 def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gambatte, ucity):
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    frames = emulator.frames_for_seconds(E.CLIP_SECONDS)
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
     before = hashlib.sha1(
         image.open(io.BytesIO(emulator.screenshot())).convert("RGB").tobytes()
     ).hexdigest()[:10]
@@ -260,7 +358,7 @@ def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gam
 def test_a_resumed_clip_picks_up_where_the_last_one_left_off(emu, image, gambatte, ucity):
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    frames = emulator.frames_for_seconds(E.CLIP_SECONDS)
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
     state = emulator.save_state()
     # load_state deliberately runs one frame, so a restored session is at
     # T+1; the session it is compared against is put there too, and the two
@@ -341,7 +439,7 @@ def test_webp_is_smaller_than_gif_on_a_busy_picture(assets, emu, image):
     for clip_format in ("WEBP", "GIF"):
         emulator = emu(core, str(rom))
         emulator.advance(emulator.frames_for_seconds(3))
-        count = emulator.frames_for_seconds(E.CLIP_SECONDS)
+        count = emulator.clip_frames(E.CLIP_SECONDS)
         data = emulator.record(
             count, presses=[(b, 0, count) for b in held], clip_format=clip_format
         )

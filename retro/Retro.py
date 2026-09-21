@@ -22,6 +22,7 @@ from redbot.core.utils.views import ConfirmView, SimpleMenu
 from . import archives
 from .emulator import (
     CLIP_SECONDS,
+    DEFAULT_FPS,
     MAX_CLIP_SECONDS,
     MAX_SRAM_SIZE,
     MIN_CLIP_SECONDS,
@@ -29,6 +30,9 @@ from .emulator import (
     REPLAY_SECONDS,
     EmulatorError,
     RetroEmulator,
+    clamp_clip_seconds,
+    describe_seconds,
+    format_seconds,
     probe_core_options,
 )
 from .RetroView import (
@@ -36,9 +40,11 @@ from .RetroView import (
     DEFAULT_TIMEOUT_MINUTES,
     MAX_HOLD_MS,
     MIN_HOLD_MS,
+    REPEAT_TAPS,
     SAVE_STATE_EVERY_PRESSES,
     RetiredView,
     RetroView,
+    press_plan,
     restore_into,
 )
 from .systems import (
@@ -1547,6 +1553,10 @@ class Retro(commands.Cog):
         self.sessions[channel_id] = view
 
         view.emulator = emulator
+        # Same reason as RetroView.start(): with a core in hand the repeat
+        # button's label can be written from its real frame rate, and this is
+        # the last chance before the message goes back out.
+        view._update_repeat_label()
         view.last_clip = clip
         view.touch()
         self._settle_boot(view, state, notice)
@@ -4513,27 +4523,76 @@ class Retro(commands.Cog):
             "Pressing a button wakes them up again."
         )
 
+    @staticmethod
+    def _describe_press_fit(clip_seconds: float, hold_ms: int) -> str:
+        """
+        What a clip this short does to the input scheduled inside it.
+
+        Said by both `[p]retroset cliplength` and `[p]retroset hold`, because
+        the two settings constrain each other: a clip has to have room to
+        show the button come back up, so a short one is a ceiling on the hold
+        and on how many taps the repeat button can fit. Saying nothing would
+        leave an owner who set a 400ms hold and a 0.2 second clip wondering
+        why presses feel shorter than they asked for.
+
+        Worked out at DEFAULT_FPS rather than a live core's rate, because
+        this is about a setting rather than about one session, and every
+        console here is within half a percent of it. See
+        :func:`RetroView.press_plan`, which is what actually decides.
+        """
+        plan = press_plan(DEFAULT_FPS, clip_seconds, hold_ms, REPEAT_TAPS)
+        held_ms = round(1000 * plan[0][1] / DEFAULT_FPS)
+        taps = len(plan)
+        notes = []
+        if held_ms < hold_ms - 5:
+            notes.append(
+                f"A press is held for about {held_ms}ms rather than the "
+                f"{hold_ms}ms configured, so the clip can still show the "
+                "button coming back up."
+            )
+        if taps < 2:
+            notes.append(
+                "The repeat button is greyed out at this length: only one "
+                "tap fits, which is what the confirm button already does."
+            )
+        elif taps < REPEAT_TAPS:
+            notes.append(
+                f"The repeat button taps {taps} times rather than {REPEAT_TAPS}."
+            )
+        return " ".join(notes)
+
     @retroset.command(name="cliplength", aliases=["clip"])
-    async def retroset_cliplength(self, ctx: commands.Context, seconds: int) -> None:
+    async def retroset_cliplength(self, ctx: commands.Context, seconds: float) -> None:
         """
         Set how many seconds of play each clip shows.
 
         Every button press posts an animated clip of what happened next.
-        Longer clips show more of the game but take longer to record and
-        upload. The value is clamped between 1 and 15 seconds and applies to
-        clips recorded afterwards. The default is 4 seconds.
+        Longer clips show more of the game; shorter ones make a turn — press,
+        watch, press again — quicker, which is what most of these games want.
+        Fractions are allowed, so `0.8` is a real answer.
+
+        The value is clamped between 0.2 and 15 seconds and applies to clips
+        recorded afterwards. The default is 1 second.
+
+        A very short clip is also a ceiling on the input inside it: a button
+        is never held past the point where the clip can still show it coming
+        back up, and the repeat button taps as many times as fit.
 
         **Examples:**
-        - `[p]retroset cliplength 8`
+        - `[p]retroset cliplength 0.8`
+        - `[p]retroset cliplength 4`
 
         **Arguments:**
-        - `<seconds>` - Seconds of play per clip (1-15).
+        - `<seconds>` - Seconds of play per clip (0.2-15, fractions allowed).
         """
-        seconds = max(MIN_CLIP_SECONDS, min(MAX_CLIP_SECONDS, seconds))
+        seconds = clamp_clip_seconds(seconds)
         await self.config.clip_seconds.set(seconds)
         for view in self.sessions.values():
             view.clip_seconds = seconds
-        await ctx.send(f"Clips now show {seconds} seconds of play.")
+        fit = self._describe_press_fit(seconds, await self.config.hold_ms())
+        await ctx.send(
+            f"Clips now show {describe_seconds(seconds)} of play.{' ' + fit if fit else ''}"
+        )
 
     @retroset.command(name="hold")
     async def retroset_hold(self, ctx: commands.Context, milliseconds: int) -> None:
@@ -4547,7 +4606,9 @@ class Retro(commands.Cog):
         included, is held for this long.
 
         The value is clamped between 50 and 2000 milliseconds. The default is
-        160.
+        160. It is a ceiling rather than a promise: a hold longer than the
+        clip can show being released is cut down to fit (see
+        `[p]retroset cliplength`).
 
         **Examples:**
         - `[p]retroset hold 200`
@@ -4559,9 +4620,12 @@ class Retro(commands.Cog):
         await self.config.hold_ms.set(milliseconds)
         for view in self.sessions.values():
             view.hold_ms = milliseconds
+        fit = self._describe_press_fit(
+            clamp_clip_seconds(await self.config.clip_seconds()), milliseconds
+        )
         await ctx.send(
             f"Every button, directions included, is now held for "
-            f"{milliseconds}ms."
+            f"{milliseconds}ms.{' ' + fit if fit else ''}"
         )
 
     @retroset.group(name="game")
@@ -5152,20 +5216,23 @@ class Retro(commands.Cog):
             ),
             inline=False,
         )
-        clip_seconds = await self.config.clip_seconds()
+        clip_seconds = clamp_clip_seconds(await self.config.clip_seconds())
         embed.add_field(
             name="Clip length",
             value=(
-                f"{clip_seconds} seconds of play per button press. Replay "
-                f"stitches the last {REPLAY_SECONDS} seconds back together "
-                "from clips kept in memory, so a restart empties it."
+                f"{describe_seconds(clip_seconds)} of play per button press "
+                f"({format_seconds(MIN_CLIP_SECONDS)}-"
+                f"{format_seconds(MAX_CLIP_SECONDS)}, fractions allowed). "
+                f"Replay stitches the last {REPLAY_SECONDS} seconds back "
+                "together from clips kept in memory, so a restart empties it."
             ),
             inline=False,
         )
         hold_ms = await self.config.hold_ms()
+        fit = self._describe_press_fit(clip_seconds, hold_ms)
         embed.add_field(
             name="Button hold",
-            value=f"{hold_ms}ms per press, directions included",
+            value=f"{hold_ms}ms per press, directions included{'. ' + fit if fit else ''}",
             inline=False,
         )
         games = await self.config.games()

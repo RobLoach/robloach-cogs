@@ -13,14 +13,20 @@ from redbot.core import commands
 from .emulator import (
     CLIP_SECONDS,
     DEFAULT_CLIP_FORMAT,
+    DEFAULT_FPS,
     MAX_REPLAY_BYTES,
     MAX_REPLAY_CLIPS,
     MAX_REPLAY_FRAMES,
     REPLAY_SECONDS,
     EmulatorError,
     RetroEmulator,
+    clamp_clip_seconds,
     clip_extension,
+    clip_frame_count,
     concatenate_clips,
+    format_seconds,
+    frame_count,
+    input_budget,
 )
 from .systems import (
     CONTROL_BUTTONS,
@@ -58,6 +64,9 @@ log = logging.getLogger("red.robloach.retro")
 # is ten frames: long enough that a game polling its controller a few times a
 # second cannot miss it (the old 8-frame, ~133ms hold could), and short enough
 # that one press is always one step and one menu entry.
+#
+# It is a ceiling, not a promise: a clip has to have room to show the button
+# come back up, so on a short clip the hold is cut to fit. See press_plan.
 DEFAULT_HOLD_MS = 160
 MIN_HOLD_MS = 50
 MAX_HOLD_MS = 2000
@@ -70,13 +79,32 @@ MAX_HOLD_MS = 2000
 #
 # The repeat button taps the console's confirm button this many times, spaced
 # this far apart, so text boxes and menus take one round trip instead of
-# three. The taps all land in the first second or so, leaving the rest of the
-# clip to show where they got you.
+# three.
+#
+# 3 x 160ms held with 250ms between them is 1.4 seconds of schedule, which
+# was nothing inside a four second clip and does not fit inside a one second
+# one at all -- the third tap would have been shoved onto the clip's last
+# frame and the player would have seen two taps and a twitch. So the spacing
+# is squeezed down to MIN_REPEAT_GAP_MS to make the taps fit (three taps
+# closer together are still three taps), and only when even that will not fit
+# is a tap dropped; the button then says how many it really does. See
+# press_plan.
+#
+# The floor on the spacing is what a game needs to see the button come back
+# up between taps: five frames at 59.73 fps, comfortably more than the one or
+# two frames a per-frame input poll needs and still tight enough to fit three
+# taps into a one second clip.
 REPEAT_TAPS = 3
 REPEAT_GAP_MS = 250
+MIN_REPEAT_GAP_MS = 80
 
 # Seconds of emulation to run before the first clip, so the console's boot
 # logo is out of the way. Converted to frames with the core's real frame rate.
+#
+# Deliberately not tied to the clip length: how long a Game Boy takes to get
+# past its logo has nothing to do with how much of the game a press shows, so
+# a one second clip still gets three seconds of boot. It is skipped entirely
+# when a save state comes back, since that is already past the title screen.
 BOOT_SECONDS = 3
 
 DEFAULT_TIMEOUT_MINUTES = 10
@@ -112,6 +140,58 @@ _STYLES = {
     "success": discord.ButtonStyle.success,
     "danger": discord.ButtonStyle.danger,
 }
+
+
+def press_plan(
+    fps: float,
+    clip_seconds: float,
+    hold_ms: float = DEFAULT_HOLD_MS,
+    taps: int = 1,
+) -> typing.List[typing.Tuple[int, int]]:
+    """
+    When to hold a button, and for how long, inside one clip.
+
+    Returns ``(start frame, hold frames)`` pairs measured against the frames
+    of the clip itself, which is exactly what ``RetroEmulator.record`` takes.
+    A plain press is one pair starting at frame 0; the repeat button asks for
+    ``REPEAT_TAPS`` of them.
+
+    Everything it returns is released by :func:`input_budget`, i.e. by the
+    last frame of the clip that is actually captured, so the clip's final
+    picture always shows the game *after* the input. That is the whole reason
+    this is not two lines: a clip used to be four seconds, where a 160ms hold
+    and three taps 250ms apart fitted with two seconds to spare, and at a
+    fifth of a second neither fits at all.
+
+    Two things give, in this order:
+
+    * **the spacing**, down to MIN_REPEAT_GAP_MS. Three taps 117ms apart are
+      still three taps, and this is what keeps the repeat button useful at
+      0.8-1s clips.
+    * **the number of taps**, one at a time, when even the floor will not
+      fit. Two taps is a worthwhile repeat button; one is just the confirm
+      button, and the view greys it out rather than pretending (see
+      :meth:`RetroView._update_repeat_label`).
+
+    The hold itself is clamped last-ditch: it can never be longer than the
+    budget, so a 0.2s clip (12 frames, budget 8) with a 400ms hold holds the
+    button for 8 frames -- about 134ms -- and shows one picture of the
+    release. The configured hold is a ceiling, not a promise, and
+    `[p]retroset hold` says so when the clip is too short to honour it.
+    """
+    frames = clip_frame_count(fps, clip_seconds)
+    budget = input_budget(fps, frames)
+    hold = max(1, min(frame_count(fps, float(hold_ms) / 1000.0), budget))
+    gap = frame_count(fps, REPEAT_GAP_MS / 1000.0)
+    floor = min(gap, frame_count(fps, MIN_REPEAT_GAP_MS / 1000.0))
+    taps = max(1, int(taps))
+    while taps > 1:
+        room = budget - taps * hold
+        if room >= floor * (taps - 1):
+            gap = min(gap, room // (taps - 1))
+            break
+        taps -= 1
+    return [(tap * (hold + gap), hold) for tap in range(taps)]
 
 
 def restore_into(
@@ -197,18 +277,31 @@ class _WaitButton(discord.ui.Button):
 
 
 class _RepeatButton(discord.ui.Button):
-    """Tap the console's confirm button several times in one clip."""
+    """
+    Tap the console's confirm button several times in one clip.
 
-    def __init__(self, spec, row: int) -> None:
+    The label counts the taps the clip length can actually fit rather than
+    always claiming three: a short clip has no room for three 160ms presses
+    250ms apart, and a button that says "A x3" while doing two is a lie. It
+    is rewritten whenever the controls are redrawn, so changing
+    `[p]retroset cliplength` mid-game corrects it (see
+    :meth:`RetroView._update_repeat_label`). The custom_id never changes, so
+    Discord keeps routing clicks to it.
+    """
+
+    def __init__(self, spec, row: int, taps: int = REPEAT_TAPS) -> None:
         super().__init__(
-            label=f"{spec.label} x{REPEAT_TAPS}",
+            label=f"{spec.label} x{max(1, int(taps))}",
             style=discord.ButtonStyle.primary,
             row=row,
             custom_id=f"{CUSTOM_ID_PREFIX}:repeat",
         )
         self.field: str = spec.field
+        self.name: str = spec.label
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        # REPEAT_TAPS is what is *asked* for; press_plan decides how many of
+        # them fit, and the label above says which it was.
         await self.view._press(interaction, self.field, repeat=REPEAT_TAPS)
 
 
@@ -367,7 +460,7 @@ class RetroView(discord.ui.View):
         source: str = "",
         message_id: typing.Optional[int] = None,
         timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
-        clip_seconds: int = CLIP_SECONDS,
+        clip_seconds: float = CLIP_SECONDS,
         hold_ms: int = DEFAULT_HOLD_MS,
         clip_format: str = DEFAULT_CLIP_FORMAT,
     ) -> None:
@@ -387,7 +480,10 @@ class RetroView(discord.ui.View):
         self.source: str = source
         self.message_id: typing.Optional[int] = message_id
         self.timeout_minutes: int = timeout_minutes
-        self.clip_seconds: int = clip_seconds
+        # Fractional, and clamped on the way in: the setting is a float now,
+        # an installation that set it before it was has an int in Config, and
+        # neither must be able to ask for a clip of no frames at all.
+        self.clip_seconds: float = clamp_clip_seconds(clip_seconds)
         self.hold_ms: int = hold_ms
         self.clip_format: str = clip_format
         self.screen_filename: str = self._screen_filename(game_name, clip_format)
@@ -423,6 +519,7 @@ class RetroView(discord.ui.View):
         self.lock: asyncio.Lock = asyncio.Lock()
         self._build_controls()
         self._update_replay_label()
+        self._update_repeat_label()
 
     # -- Layout -------------------------------------------------------------
 
@@ -467,7 +564,11 @@ class RetroView(discord.ui.View):
         self.add_item(_WaitButton(control_row))
         confirm = self.system.button(self.system.confirm)
         if confirm is not None:
-            self.add_item(_RepeatButton(confirm, control_row))
+            # Built with the taps this clip length can fit, so a session
+            # started on a short clip never shows a promise it cannot keep.
+            # CONTROL_BUTTONS still reserves room for three controls either
+            # way, so the layout does not move when it is greyed out.
+            self.add_item(_RepeatButton(confirm, control_row, self.repeat_taps))
         self.add_item(_ReplayButton(control_row))
         if len(self.children) > MAX_COMPONENTS:
             raise ValueError(
@@ -502,7 +603,7 @@ class RetroView(discord.ui.View):
         cog: commands.Cog,
         record: dict,
         timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
-        clip_seconds: int = CLIP_SECONDS,
+        clip_seconds: float = CLIP_SECONDS,
         hold_ms: int = DEFAULT_HOLD_MS,
     ) -> "RetroView":
         """Rebuild a hibernated session from Config after a restart."""
@@ -556,6 +657,47 @@ class RetroView(discord.ui.View):
     def touch(self) -> None:
         self.last_active = time.time()
 
+    # -- Timing -------------------------------------------------------------
+
+    @property
+    def fps(self) -> float:
+        """
+        The frame rate this session's clips are laid out against.
+
+        The live core's own rate, which is the only honest answer (59.73 on a
+        Game Boy, 60.10 on a NES, 50 on a PAL machine), falling back to
+        DEFAULT_FPS while the session is hibernated. The fallback is only
+        ever used for labelling -- how many taps the repeat button will do --
+        and the two answers differ by less than half a percent, which is far
+        too little to change a tap count; the label is written again from the
+        real rate as soon as the core is up.
+        """
+        emulator = self.emulator
+        return DEFAULT_FPS if emulator is None else emulator.fps
+
+    def clip_frames(self, emulator: typing.Optional[RetroEmulator] = None) -> int:
+        """How many emulated frames one clip covers on this console."""
+        fps = self.fps if emulator is None else emulator.fps
+        return clip_frame_count(fps, self.clip_seconds)
+
+    def press_plan(
+        self, taps: int = 1, emulator: typing.Optional[RetroEmulator] = None
+    ) -> typing.List[typing.Tuple[int, int]]:
+        """This session's ``(start, hold)`` frames; see :func:`press_plan`."""
+        fps = self.fps if emulator is None else emulator.fps
+        return press_plan(fps, self.clip_seconds, self.hold_ms, taps)
+
+    @property
+    def repeat_taps(self) -> int:
+        """
+        How many taps the repeat button really does at this clip length.
+
+        Three when there is room for three, fewer when there is not, and one
+        -- meaning "no more than the confirm button itself" -- on a clip too
+        short for even two, which is when the button is greyed out.
+        """
+        return len(self.press_plan(REPEAT_TAPS))
+
     # -- The replay buffer --------------------------------------------------
 
     @property
@@ -588,10 +730,12 @@ class RetroView(discord.ui.View):
         """
         Drop the oldest clips until the buffer fits all three of its bounds.
 
-        Seconds is the bound that normally applies; the count and the byte cap
-        are backstops, for a one-second clip length (which would otherwise
-        buffer fifteen clips) and for a game that somehow encodes enormous
-        ones. The clip that straddles the fifteen-second edge is kept, because
+        Seconds is the bound that is meant to apply, and now does at every
+        clip length: MAX_REPLAY_CLIPS is derived from REPLAY_SECONDS and the
+        shortest clip allowed, so the count cannot cut the replay short the
+        way a flat eight clips did once a clip became one second. The byte
+        cap is a backstop for a game that somehow encodes enormous ones. The
+        clip that straddles the fifteen-second edge is kept, because
         :func:`concatenate_clips` trims it frame by frame.
         """
         while len(self.clips) > MAX_REPLAY_CLIPS:
@@ -618,6 +762,10 @@ class RetroView(discord.ui.View):
         it says how many seconds it will show, since that is the thing the
         player cannot otherwise know. The custom_id never changes, so none of
         this affects how Discord routes a click.
+
+        The figure is written to one decimal place rather than rounded to a
+        whole second: two 0.2s clips are 0.4 seconds of footage, and
+        ``round()`` made that button say "Replay 0s".
         """
         button = next(
             (child for child in self.children if isinstance(child, _ReplayButton)), None
@@ -631,8 +779,33 @@ class RetroView(discord.ui.View):
             button.label = "Replay"
             button.disabled = False
         else:
-            button.label = f"Replay {round(self.buffered_seconds)}s"
+            button.label = f"Replay {format_seconds(self.buffered_seconds, 1)}s"
             button.disabled = False
+
+    def _update_repeat_label(self) -> None:
+        """
+        Make the repeat button say how many taps it will really do.
+
+        Three taps need about 1.4 seconds of clip; :func:`press_plan` squeezes
+        the spacing to fit a shorter one and then drops taps, so the label has
+        to follow it rather than stating REPEAT_TAPS for ever. At one tap the
+        button does nothing the console's own confirm button does not, so it
+        is greyed out instead -- the same treatment Replay gets when there is
+        nothing to replay, and for the same reason: better a dead button than
+        a lying one. The layout never moves, because systems.py reserves room
+        for three controls whether or not this one is usable.
+        """
+        button = next(
+            (child for child in self.children if isinstance(child, _RepeatButton)), None
+        )
+        if button is None:
+            return
+        taps = self.repeat_taps
+        button.label = f"{button.name} x{taps}"
+        # Both ways round: a session built while hibernated laid the button
+        # out against DEFAULT_FPS, and a 50 fps PAL core can fit a tap that
+        # the fallback said would not fit (and vice versa).
+        button.disabled = taps < 2
 
     @staticmethod
     def _screen_filename(game_name: str, clip_format: str = DEFAULT_CLIP_FORMAT) -> str:
@@ -648,9 +821,13 @@ class RetroView(discord.ui.View):
             if hasattr(child, "disabled"):
                 child.disabled = disabled
         if not disabled:
-            # Replay is the one control that can have nothing to do; it comes
-            # back only if there is something in the buffer.
+            # Replay and the repeat button are the two controls that can have
+            # nothing to do: Replay comes back only if there is something in
+            # the buffer, and the repeat button only if the clip is long
+            # enough to fit more than one tap. This runs on every redraw, so
+            # changing the clip length mid-game corrects both.
             self._update_replay_label()
+            self._update_repeat_label()
 
     # -- Messages -----------------------------------------------------------
 
@@ -749,6 +926,11 @@ class RetroView(discord.ui.View):
         self.starter_id = ctx.author.id
         clip = await asyncio.to_thread(self._boot, emulator, state, sram)
         self.emulator = emulator
+        # Now that there is a core, the repeat button's label can be written
+        # from its real frame rate rather than DEFAULT_FPS -- and it is
+        # written before the message goes out, so the first thing anybody
+        # sees is already correct.
+        self._update_repeat_label()
         self.last_clip = clip
         self.touch()
         if on_booted is not None:
@@ -761,10 +943,6 @@ class RetroView(discord.ui.View):
         )
         self.message_id = self.message.id
         return self.message
-
-    def clip_frames(self, emulator: RetroEmulator) -> int:
-        """How many emulated frames one clip covers on this console."""
-        return emulator.frames_for_seconds(self.clip_seconds)
 
     def _boot(
         self,
@@ -789,14 +967,17 @@ class RetroView(discord.ui.View):
         """
         Work out when, and for how long, to hold a button during a clip.
 
-        Every button, direction or not, is held for exactly ``hold_ms``; see
-        DEFAULT_HOLD_MS for why the directions no longer get a multiplier.
+        Every button, direction or not, is held for the same ``hold_ms``; see
+        DEFAULT_HOLD_MS for why the directions no longer get a multiplier,
+        and :func:`press_plan` for how the schedule is made to fit inside the
+        clip it is going to be recorded into. ``field`` of None is the Wait
+        button: no input at all.
         """
         if field is None:
             return []
-        hold = emulator.frames_for_ms(self.hold_ms)
-        gap = emulator.frames_for_ms(REPEAT_GAP_MS)
-        return [(field, tap * (hold + gap), hold) for tap in range(max(1, repeat))]
+        return [
+            (field, start, hold) for start, hold in self.press_plan(repeat, emulator)
+        ]
 
     def _record(
         self, emulator: RetroEmulator, field: typing.Optional[str], repeat: int = 1
@@ -981,11 +1162,15 @@ class RetroView(discord.ui.View):
 
         async with self.lock:
             clips = [data for data, _ in self.clips]
+            # The clips' own nominal lengths go with them: a clip in which
+            # nothing moved carries no timing of its own, and the session is
+            # the only thing that knows it stood for a second of play.
+            lengths = [seconds for _, seconds in self.clips]
             self._set_disabled(True)
             try:
                 await interaction.response.edit_message(
                     content=self._content(
-                        f"Putting the last {round(self.buffered_seconds)} "
+                        f"Putting the last {format_seconds(self.buffered_seconds, 1)} "
                         "seconds together\N{HORIZONTAL ELLIPSIS}"
                     ),
                     view=self,
@@ -996,6 +1181,7 @@ class RetroView(discord.ui.View):
                 clip, seconds = await asyncio.to_thread(
                     concatenate_clips,
                     clips,
+                    seconds=lengths,
                     max_seconds=REPLAY_SECONDS,
                     max_frames=MAX_REPLAY_FRAMES,
                     clip_format=self.clip_format,
@@ -1014,7 +1200,7 @@ class RetroView(discord.ui.View):
             note = (
                 None
                 if not seconds
-                else f"The last {round(seconds)} seconds, replayed."
+                else f"The last {format_seconds(seconds, 1)} seconds, replayed."
             )
             try:
                 self.message = await interaction.edit_original_response(

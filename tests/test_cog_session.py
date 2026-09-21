@@ -24,8 +24,8 @@ from .fakes import NES_BYTES, ROM_BYTES, FakeUser  # noqa: E402
 async def test_the_clip_and_hold_defaults_reach_a_new_install(retro):
     from retro.emulator import CLIP_SECONDS
 
-    assert CLIP_SECONDS == 4
-    assert await retro.cog.config.clip_seconds() == 4
+    assert CLIP_SECONDS == 1.0
+    assert await retro.cog.config.clip_seconds() == 1.0
     assert await retro.cog.config.hold_ms() == retro.viewmod.DEFAULT_HOLD_MS == 160
 
 
@@ -38,6 +38,29 @@ async def test_an_already_configured_value_survives_a_new_default(retro):
     assert view.hold_ms == 420
 
 
+async def test_an_integer_clip_length_in_config_still_loads_as_a_float(retro):
+    """Nobody who set `[p]retroset cliplength 4` before it was a float."""
+    await retro.cog.config.clip_seconds.set(7)  # an int, as it was written
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(8049, "legacy")
+    assert view.clip_seconds == 7.0 and isinstance(view.clip_seconds, float)
+    assert view.clip_frames(view.emulator) == view.emulator.frames_for_seconds(7)
+
+
+async def test_a_nonsense_clip_length_in_config_cannot_make_an_empty_clip(retro):
+    from retro.emulator import CLIP_SECONDS
+
+    await retro.cog.config.clip_seconds.set(0)
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(8048, "zeroed")
+    assert view.clip_seconds == 0.2, "clamped on the way into the session"
+    assert view.clip_frames(view.emulator) >= retro.emumod.MIN_CLIP_FRAMES
+    assert view.press_plan(1)[0][1] >= 1, "and there is still a press in it"
+
+    view.clip_seconds = retro.emumod.clamp_clip_seconds("nonsense")
+    assert view.clip_seconds == CLIP_SECONDS
+
+
 async def test_retroset_cliplength_reports_and_clamps(retro):
     channel = retro.channel(8051)
     ctx = retro.context(channel)
@@ -46,10 +69,59 @@ async def test_retroset_cliplength_reports_and_clamps(retro):
     await cliplength(retro.cog, ctx, 4)
     assert await retro.cog.config.clip_seconds() == 4
     assert "4 seconds" in ctx.sent[-1]
+
+    # Fractions are the point of the change, and the reply says the number
+    # back the way it was typed rather than as "0.8000000000000001 seconds".
+    await cliplength(retro.cog, ctx, 0.8)
+    assert await retro.cog.config.clip_seconds() == 0.8
+    assert "0.8 seconds" in ctx.sent[-1]
+
+    # ...and the default does not read "1.0 seconds".
+    await cliplength(retro.cog, ctx, 1)
+    assert await retro.cog.config.clip_seconds() == 1.0
+    assert "1 second of play" in ctx.sent[-1], ctx.sent[-1]
+
     await cliplength(retro.cog, ctx, 0)
-    assert await retro.cog.config.clip_seconds() == 1
+    assert await retro.cog.config.clip_seconds() == retro.emumod.MIN_CLIP_SECONDS == 0.2
     await cliplength(retro.cog, ctx, 9999)
-    assert await retro.cog.config.clip_seconds() == 15
+    assert await retro.cog.config.clip_seconds() == retro.emumod.MAX_CLIP_SECONDS == 15.0
+
+
+async def test_retroset_cliplength_says_what_a_short_clip_does_to_a_press(retro):
+    """The knock-ons are surfaced rather than left to be discovered."""
+    ctx = retro.context(retro.channel(8053))
+    cliplength = retro.cogmod.Retro.retroset_cliplength.callback
+
+    await cliplength(retro.cog, ctx, 1)
+    assert "held for about" not in ctx.sent[-1], "a 160ms hold fits in a second"
+    assert "repeat button" not in ctx.sent[-1], "and so do three taps"
+
+    await cliplength(retro.cog, ctx, 0.5)
+    assert "repeat button taps 2 times" in ctx.sent[-1], ctx.sent[-1]
+
+    await cliplength(retro.cog, ctx, 0.2)
+    assert "held for about 133ms" in ctx.sent[-1], ctx.sent[-1]
+    assert "greyed out" in ctx.sent[-1], ctx.sent[-1]
+
+
+async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro):
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(8054, "relength")
+    cliplength = retro.cogmod.Retro.retroset_cliplength.callback
+    repeat = retro.control(view, "repeat")
+    assert repeat.label == "A x3" and not repeat.disabled
+
+    await cliplength(retro.cog, ctx, 0.2)
+    assert view.clip_seconds == 0.2
+    # The next press redraws the controls, and the repeat button stops
+    # claiming three taps it can no longer do.
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert repeat.label == "A x1" and repeat.disabled
+    assert view.clip_frames(view.emulator) == 12
+
+    await cliplength(retro.cog, ctx, 4)
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert repeat.label == "A x3" and not repeat.disabled
 
 
 async def test_nothing_of_the_stop_button_is_left_in_the_view(retro):
@@ -284,7 +356,28 @@ async def test_repeat_schedules_three_spread_out_taps_inside_the_clip(retro, hel
     taps = view._schedule(emulator, "a", retro.viewmod.REPEAT_TAPS)
     assert len(taps) == retro.viewmod.REPEAT_TAPS
     assert [t[1] for t in taps] == sorted({t[1] for t in taps})
-    assert max(t[1] + t[2] for t in taps) < emulator.frames_for_seconds(view.clip_seconds)
+    # All of it is released by the last frame the clip actually photographs,
+    # so the final picture shows where the taps got you. At a one second clip
+    # this is the bound that bites: three 160ms taps 250ms apart is 1.4s.
+    frames = view.clip_frames(emulator)
+    assert max(t[1] + t[2] for t in taps) <= emulator.input_budget(frames) < frames
+
+
+async def test_a_schedule_never_outlasts_a_short_clip(retro, held):
+    view, _, _ = held
+    emulator = view.emulator
+    for seconds in (0.2, 0.25, 0.5, 0.8, 1.0, 4.0, 15.0):
+        view.clip_seconds = seconds
+        frames = view.clip_frames(emulator)
+        budget = emulator.input_budget(frames)
+        for repeat in (1, retro.viewmod.REPEAT_TAPS):
+            taps = view._schedule(emulator, "a", repeat)
+            assert taps, f"{seconds}s left no press at all"
+            assert max(t[1] + t[2] for t in taps) <= budget, (seconds, repeat, taps)
+            # ...and the emulator is handed a schedule it does not have to
+            # clamp, which is what used to shove a tap onto the last frame.
+            view.run_press("a", repeat)
+            assert emulator.last_presses == taps
 
 
 async def test_a_press_reaches_the_emulator_as_a_webp_clip_schedule(retro, held):
@@ -517,17 +610,72 @@ async def test_replay_stitches_the_last_few_clips_into_one(retro):
     assert len(view.clips) == 3
 
 
+async def test_a_clip_in_which_nothing_moved_still_counts_as_a_clip(retro):
+    """libwebp writes a still image when every picture is identical.
+
+    Which is far likelier at a one second clip than at four: a title screen,
+    a menu or a game waiting for input produces one frame with no timing in
+    it at all, and the buffer's own record of how long it was is the only
+    thing that can say otherwise.
+    """
+    pytest.importorskip("PIL", reason="this needs Pillow to encode anything")
+    from PIL import Image
+
+    from retro.emulator import concatenate_clips, decode_clip, encode_animation
+
+    still = encode_animation([Image.new("RGB", (8, 8))] * 3, 1000)
+    frames, durations = decode_clip(still)
+    assert len(frames) == 1 and durations == [1], "not a still after all"
+    assert decode_clip(still, 1000)[1] == [1000]
+
+    assert concatenate_clips([still, still])[1] == pytest.approx(0.002)
+    assert concatenate_clips([still, still], seconds=[1.0, 1.0])[1] == pytest.approx(2.0)
+
+    # ...and the session really does hand its lengths over, so Replay says
+    # "the last 3 seconds" rather than "the last 0".
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9027, "frozen")
+    view.clips.clear()
+    for _ in range(3):
+        view.remember_clip(still)
+    interaction = retro.interaction(view, message=view.message)
+    await retro.control(view, "replay").callback(interaction)
+    assert "The last 3 seconds, replayed." == interaction.log[-1][1]["content"]
+
+
 async def test_a_stitched_replay_is_bounded_by_seconds(retro):
     pytest.importorskip("PIL", reason="stitching clips back together needs Pillow")
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9023, "bounded")
-    for _ in range(10):
+    for _ in range(25):
         await view._press(retro.interaction(view, message=view.message), "a")
 
-    # Four-second clips, fifteen seconds of replay: four clips, never eleven.
-    assert view.buffered_seconds <= retro.viewmod.REPLAY_SECONDS
-    assert len(view.clips) <= retro.cogmod.REPLAY_SECONDS / view.clip_seconds + 1
+    # One-second clips, fifteen seconds of replay: fifteen clips, never
+    # twenty-six -- and never the eight the old clip cap allowed, which is
+    # what made a fifteen-second Replay unreachable at this clip length.
+    assert view.buffered_seconds == retro.viewmod.REPLAY_SECONDS == 15
+    assert len(view.clips) == 15
+    assert len(view.clips) <= retro.viewmod.MAX_REPLAY_CLIPS
     assert sum(len(data) for data, _ in view.clips) <= retro.viewmod.MAX_REPLAY_BYTES
+
+
+async def test_the_clip_count_cap_can_never_cut_the_replay_short(retro):
+    """The cap that used to bite first: 8 clips of 1s is 8 seconds, not 15."""
+    E = retro.emumod
+    assert E.MAX_REPLAY_CLIPS >= E.REPLAY_SECONDS / E.MIN_CLIP_SECONDS
+    # Enough pictures for fifteen seconds at any clip length, too: a clip
+    # contributes CLIP_FPS pictures per second however it is sliced.
+    assert E.MAX_REPLAY_FRAMES >= E.REPLAY_SECONDS * E.CLIP_FPS
+
+    await retro.install_cores("gambatte")
+    for seconds, presses in ((0.2, 80), (0.8, 25), (1.0, 20), (4.0, 6)):
+        view, _, _ = await retro.posted_game(9030 + int(seconds * 10), f"cap{seconds}")
+        view.clip_seconds = seconds
+        view.clips.clear()
+        for _ in range(presses):
+            await view._press(retro.interaction(view, message=view.message), "a")
+        assert view.buffered_seconds == pytest.approx(E.REPLAY_SECONDS), seconds
+        assert len(view.clips) <= E.MAX_REPLAY_CLIPS
 
 
 async def test_the_replay_button_says_how_much_it_will_replay(retro):
@@ -538,8 +686,15 @@ async def test_the_replay_button_says_how_much_it_will_replay(retro):
     assert not button.disabled
 
     await view._press(retro.interaction(view, message=view.message), "a")
-    assert button.label == f"Replay {round(view.buffered_seconds)}s"
+    assert button.label == "Replay 2s", "two one-second clips"
     assert not button.disabled
+
+    # A fifth of a second a clip: round() made this button say "Replay 0s".
+    view.clips.clear()
+    view.clip_seconds = 0.2
+    for _ in range(2):
+        await view._press(retro.interaction(view, message=view.message), "a")
+    assert button.label == "Replay 0.4s", button.label
 
 
 async def test_the_replay_button_is_dead_and_says_so_with_an_empty_buffer(retro):

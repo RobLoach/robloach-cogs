@@ -260,6 +260,22 @@ async def test_the_settings_embed_describes_the_whole_install(retro):
     assert any("System directory" in name for name in names)
     assert any("Automatic core" in name for name in names)
     assert "awake at once" in values, "the one-at-a-time rule is explained"
+    # The clip length is a float, and the default must not read "1.0 seconds".
+    assert "1 second of play per button press" in values, values
+    assert "0.2-15, fractions allowed" in values, values
+    assert "160ms per press" in values
+
+
+async def test_the_settings_embed_says_what_a_short_clip_does_to_a_press(retro):
+    await retro.cog.config.clip_seconds.set(0.2)
+    ctx = retro.context(retro.channel(8602))
+    await retro.cogmod.Retro.retroset_settings.callback(retro.cog, ctx)
+
+    values = " ".join(field.value for field in ctx.sent[-1]["embed"].fields)
+    assert "0.2 seconds of play" in values, values
+    # The hold is a ceiling, and at a fifth of a second it is not honoured.
+    assert "held for about 133ms rather than the 160ms" in values, values
+    assert "repeat button is greyed out" in values, values
 
 
 # -- ROM size and content checks ----------------------------------------------

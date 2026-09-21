@@ -2,7 +2,7 @@
 
 Play retro console games together in Discord. Attach a ROM and control the game
 with a controller built out of Discord buttons. Every press posts a short
-animated clip of the next few seconds of gameplay, so you see the game react
+animated clip of the next second of gameplay, so you see the game react
 instead of a still frame. Anyone in the channel can play, making it a fun
 social feature.
 
@@ -82,8 +82,8 @@ can start it by name:
 - `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below.
 - `[p]retroset bios add|list|remove` (owner) manages BIOS files for cores that need one. See below.
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
-- `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 4.
-- `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it. The default is 160.
+- `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 1 second; anything from 0.2 to 15 works, fractions included (`0.8` is a real answer).
+- `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it. The default is 160. It is a ceiling: a clip too short to show the button coming back up holds it for less.
 - `[p]retroset settings` (owner) shows the current configuration, including the system directory and any BIOS files in it.
 
 ## Attaching a ROM
@@ -374,18 +374,40 @@ same three who may `[p]retrostop` someone else's game.
 
 ## Playing
 
-Each press records the next four seconds (configurable with
-`[p]retroset cliplength`) and posts them as a lossless animated WebP. The clip
-plays through once and stops rather than looping forever, so a busy channel
-isn't full of flickering images.
+Each press records the next **second** of play (configurable with
+`[p]retroset cliplength`, 0.2–15 and fractional) and posts it as a lossless
+animated WebP. The clip plays through once and stops rather than looping
+forever, so a busy channel isn't full of flickering images.
+
+A second is the default because a turn is a round trip: press, wait for the
+clip, watch it, press again. It used to be four seconds, and three of those
+were usually the game sitting still after the press had already played out —
+while costing three times as long to record. Measured on a Raspberry Pi 5
+with Pokémon Red in the overworld: a one second clip is 60 emulated frames
+captured as 15 pictures (6–12 once identical ones are merged), 5–8 KiB and
+0.41–0.45 seconds of work; four seconds was 239 frames, 60 pictures and
+1.43–1.50 seconds. Playback matches emulated time either way — a one second
+clip plays for 1.005s and a 0.5 second one for 0.502s.
+
+A clip in which nothing moved at all — a title screen, a menu, a game waiting
+for you — is written as a single still frame of a few hundred bytes, which is
+exactly as informative and much likelier at a second than it was at four.
+Replay still counts it as the second of play it stood for.
 
 **Replay** shows the last **15 seconds**, not just the last clip. Each session
 keeps its most recent clips in memory, and pressing Replay decodes them and
 stitches them into one animation, oldest first, ending on the moment you just
-played. The button says how much it holds — `Replay 12s` — so it never promises
-more than it has. Measured on a Raspberry Pi 5, stitching 16 seconds of real
-Game Boy footage costs 0.4–1.3 seconds and about 40–130 KiB; the hard ceiling
-is 300 frames, which keeps even a pathological, fully-changing SNES picture
+played. The button says how much it holds — `Replay 12s`, or `Replay 0.4s` on
+very short clips — so it never promises more than it has. Fifteen seconds is
+reachable at every clip length now: the clip cap used to be eight, which at
+a one second clip meant Replay could only ever hold eight seconds of the
+fifteen it advertised. The buffer holds as many clips as fifteen seconds
+takes — 76 at the 0.2s floor, 16 at a second, 5 at four seconds — bounded by
+8 MiB of memory it has never come close to. Fifteen seconds of Game Boy play
+in the buffer is 31 KiB at a second a clip and 81 KiB at 0.2s, and stitching
+it costs 0.18–0.40 seconds and produces a 13–25 KiB animation. The hard
+ceiling is 300 frames, which is more pictures than fifteen seconds needs at
+any clip length and keeps even a pathological, fully-changing SNES picture
 under seven seconds.
 
 The buffer is **memory only**. That is a deliberate trade: clips are worthless
@@ -412,9 +434,25 @@ A button is held down for 160ms at the start of the clip, directions included.
 That is long enough that no game polling its controller a few times a second can
 miss it, and short enough that one press is one action: a Game Boy walk cycle is
 16 frames (about 270ms), so a longer hold starts a *second* step and the
-character crosses two tiles for one press. Tune it with `[p]retroset hold`. The
-**×3** button taps the console's confirm button three times in one clip, so text
-boxes and menus take one round trip instead of three.
+character crosses two tiles for one press. Tune it with `[p]retroset hold`. In
+Pokémon Red, one press of a direction at a one second clip walks exactly one
+tile and the step lands around frame 26 of 60, so the clip shows it finish.
+
+Everything scheduled into a clip has to be **released before the clip's last
+picture**, or the player never sees what their press did. That makes a short
+clip a ceiling on the input inside it, and the ceiling is announced when you
+set either value:
+
+* the **hold** is cut to fit. At the 0.2s floor a clip is 12 emulated frames
+  and the last one photographed is frame 8, so a 400ms hold becomes about
+  134ms — still well over the ~100ms a game needs to notice a press.
+* the **×3** button taps as many times as fit. Three 160ms taps 250ms apart
+  need 1.4 seconds, so the spacing is squeezed first (218ms at a one second
+  clip, 117ms at 0.8s — three taps closer together are still three taps) and
+  only then is a tap dropped: 0.5s does two, and below about 0.45s only one
+  would fit, which is what the confirm button already does, so the button
+  greys itself out and says `A ×1` rather than lying. Its label always counts
+  the taps it will really do.
 
 ## Permissions
 

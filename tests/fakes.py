@@ -24,7 +24,13 @@ from pathlib import Path
 
 import discord
 
-from retro.emulator import EmulatorError, encode_animation
+from retro.emulator import (
+    EmulatorError,
+    capture_step,
+    clip_frame_count,
+    encode_animation,
+    input_budget,
+)
 
 # A stand-in ROM: big enough to pass the cog's MIN_ROM_SIZE, not a zip, and
 # not an HTML error page. The cog never looks at a ROM's contents, and the
@@ -123,6 +129,18 @@ class FakeEmulator:
 
     def frames_for_ms(self, ms):
         return max(1, round(self.fps * ms / 1000.0))
+
+    # The clip arithmetic is shared rather than re-implemented: these three
+    # are pure functions of a frame rate in retro/emulator.py, and a fake
+    # copy of them would only ever prove itself right.
+    def clip_frames(self, seconds):
+        return clip_frame_count(self.fps, seconds)
+
+    def capture_step(self, clip_fps=15):
+        return capture_step(self.fps, clip_fps)
+
+    def input_budget(self, frames, clip_fps=15):
+        return input_budget(self.fps, frames, clip_fps)
 
     # -- emulation
     def advance(self, frames=1):
@@ -675,6 +693,10 @@ class RetroEnv:
         self.cogmod = sys.modules["retro.Retro"]
         self.viewmod = sys.modules["retro.RetroView"]
         self.sysmod = sys.modules["retro.systems"]
+        # The emulator module itself, for the clip arithmetic and its bounds.
+        # FakeEmulator stands in for the *class*, not for the constants and
+        # the plain functions around it, which are the real ones under test.
+        self.emumod = sys.modules["retro.emulator"]
         # Laid out the way Red lays it out: one folder per cog *class name*
         # under a shared root. That is what makes the RetroCog -> Retro data
         # move a real move in these tests rather than a no-op.
