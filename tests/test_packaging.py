@@ -161,7 +161,39 @@ def test_the_readme_describes_unpacking_a_whole_bios_zip():
     assert "dc/dc_boot.bin" in COG_README
 
 
-@pytest.mark.parametrize("phrase", ["Replay", "Resume", "detected automatically"])
+def test_the_readme_documents_the_save_commands():
+    assert "## Managing saves" in COG_README
+    for command in (
+        "[p]retrosaves export",
+        "[p]retrosaves import",
+        "[p]retrosaves reset",
+        "[p]retrosaves delete",
+    ):
+        assert command in COG_README, command
+
+
+def test_the_readme_distinguishes_resetting_from_deleting():
+    # The one thing somebody about to run these has to understand.
+    assert "restart from my last in-game save" in COG_README
+    assert "start this game completely fresh" in COG_README
+
+
+def test_the_readme_explains_the_live_session_rule():
+    assert "saved and put to sleep first" in COG_README
+
+
+def test_the_readme_says_who_may_destroy_a_save():
+    assert "Manage Messages" in COG_README
+    assert "open to the channel" in COG_README
+
+
+def test_the_readme_describes_the_single_restore_chain():
+    assert "One restore chain, two doors" in COG_README
+
+
+@pytest.mark.parametrize(
+    "phrase", ["Replay", "Resume", "detected automatically", "[p]retrosaves"]
+)
 def test_info_json_describes_the_new_behaviour(phrase):
     assert phrase in COG_INFO["description"], phrase
 
@@ -170,6 +202,8 @@ def test_the_end_user_data_statement_mentions_what_is_now_stored():
     statement = COG_INFO["end_user_data_statement"]
     assert "Resume" in statement
     assert "memory only" in statement
+    # Saves can now leave the bot as an attachment and arrive as one.
+    assert "export" in statement and "delete" in statement
 
 
 def test_the_load_bearing_constants_are_still_in_the_source():

@@ -71,6 +71,11 @@ can start it by name:
 
 - `[p]retro [name|url]` starts a game from a saved name, a URL, or a ROM attached to the message. `.zip` files are unpacked for you. With no arguments it brings back the game already going in the channel.
 - `[p]retrostop` saves the game and puts it to sleep. The controls keep working — pressing any button wakes it up again. There is no Stop button under the screen; this command is how a game is stopped.
+- `[p]retrosaves [game]` (aliased `saves`) lists what this channel has saved, or shows one game in detail. See [Managing saves](#managing-saves).
+- `[p]retrosaves export <game>` posts a game's battery save as a file to keep. `export state <game>` or `export both <game>` sends the save state too.
+- `[p]retrosaves import <game>` installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real core first.
+- `[p]retrosaves reset <game>` drops the save state, so the game restarts from the last in-game save.
+- `[p]retrosaves delete <game>` wipes both halves of a game's save, after asking.
 - `[p]retroset download` (owner) downloads every supported core for your platform from the [libretro buildbot](https://buildbot.libretro.com). `[p]retroset download <core>` fetches or refreshes just one.
 - `[p]retroset autodownload [true|false]` (owner) controls whether missing cores are fetched automatically when the cog loads. On by default.
 - `[p]retroset game add|remove|list` (owner) manages the games anyone can start by name.
@@ -288,6 +293,85 @@ puzzle games. That is normal, not a failure: nothing is written, no empty file
 is left behind, and if a save state is ever lost for one of those the channel
 is told the game simply started over.
 
+**One restore chain, two doors.** Starting a game and waking a sleeping one
+run the same function — save state, then battery save, then the beginning —
+and the same code decides what to say afterwards and throws away a state the
+core would not take. They used to be two copies kept in step by the tests; now
+they cannot drift apart, and the suite holds the two against each other for
+every outcome.
+
+## Managing saves
+
+`[p]retrosaves` (aliased `saves`) is a window onto exactly those files:
+nothing else is stored, and nothing is kept per user.
+
+```
+[p]retrosaves                          list this channel's saved games
+[p]retrosaves <game>                   one game in detail
+[p]retrosaves list
+[p]retrosaves info <game>
+[p]retrosaves export <game>            post the battery save as a file
+[p]retrosaves export state|both <game> send the save state too
+[p]retrosaves import <game>            install an attached save file
+[p]retrosaves reset <game>             drop the save state only
+[p]retrosaves delete <game>            wipe both halves, after asking
+```
+
+A listing looks like this, paginated with arrows when it does not fit:
+
+```
+**3 game(s)** in this channel, 2 with saved progress, 434.6 KiB in total.
+
+**µCity** — `ucity` • Game Boy • **playing now**
+  save state 178.3 KiB, 2 minutes ago • battery save 128.0 KiB, 2 minutes ago
+**Tobu Tobu Girl** — `tobu` • Game Boy • resumable
+  save state 178.3 KiB, 3 days ago
+```
+
+`info` adds the console and core, whether the cached ROM is still there, and —
+the part people actually want — what starting the game right now would do:
+from its save state, from the title screen with the in-game save in place, or
+from the very beginning.
+
+**`reset` and `delete` are different things, deliberately.** `reset` throws
+away the save state and keeps the cartridge's battery save, which is
+"restart from my last in-game save".
+`delete` wipes both, which is "start this game completely fresh": it takes the
+player's in-game save with it, and asks for a yes first. Neither touches the
+cached ROM, so the game still starts instantly afterwards.
+
+**Exporting** posts the `.srm` as a plain attachment, so a player can keep it
+or load it in another emulator. The save state is only sent when asked for,
+because it is several times larger and only ever loads on the same build of
+the same core. Anything over what the server accepts as an attachment is named
+and skipped rather than failing the command.
+
+**Importing** is checked hard before anything is written. The file has to be
+named like a save (`.srm`/`.sav`, or `.state`), be inside the size ceilings
+(1 MiB for a battery save, 16 MiB for a state), and then actually fit: the
+game is booted on the real core and the files are offered to it, so a battery
+save for the wrong cartridge comes back as
+
+> That battery save is 8.0 KiB (8,192 bytes) but **µCity** has 128.0 KiB
+> (131,072 bytes) of save memory.
+
+and a state from another emulator comes back as the core's own complaint,
+never a stack trace. Importing a battery save on its own also removes the
+existing save state, because a state is restored *before* SRAM is looked at
+and would otherwise be put back over the import.
+
+**A game that is being played right now is saved and put to sleep first.** A
+running emulator holds the authoritative copy of both saves and writes them
+out on its next automatic save, so deleting or replacing the files under it
+would be undone by the very next button press. Every command here that changes
+a file hibernates the session first and says that it did; its controls stay
+live, and the next press starts it from whatever the command left behind.
+
+**Who may do what.** Listing, `info` and `export` are open to the channel,
+like playing. `reset`, `delete` and `import` are limited to the person who
+started the game, anybody with **Manage Messages**, and the bot owner — the
+same three who may `[p]retrostop` someone else's game.
+
 ## Playing
 
 Each press records the next four seconds (configurable with
@@ -336,8 +420,14 @@ boxes and menus take one round trip instead of three.
 
 Playing needs only **Attach Files** (plus the usual Read Messages / Send
 Messages) — the clip is a plain attachment and the controls are buttons, so no
-embed is involved. **Embed Links** is used by one owner-only command,
-`[p]retroset settings`.
+embed is involved. `[p]retrosaves export` asks for the same **Attach Files**,
+because it posts the save file itself. **Embed Links** is used by one
+owner-only command, `[p]retroset settings`.
+
+Among the people in a channel, playing and looking at saves are open to
+everybody; destroying a save is not. `[p]retrostop`, `[p]retrosaves reset`,
+`[p]retrosaves delete` and `[p]retrosaves import` all want the person who
+started the game, **Manage Messages**, or the bot owner.
 
 ## BIOS files
 

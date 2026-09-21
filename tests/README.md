@@ -15,8 +15,8 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes, property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
-| `-m emulator` | real libretro cores: clips, timing, stitched replays, save states, battery saves, core options, BIOS directory | `libretro.py`, Pillow, cores and ROMs |
+| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` included), the shared restore chain, property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
+| `-m emulator` | real libretro cores: clips, timing, stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
 `pytest -m emulator -n 2` halves the slow half (about 75s to 39s here). It
@@ -60,8 +60,17 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
   directly, via `tests/loader.py`); `test_view.py` and `test_cog_*.py` use
   the `retro` fixture, which is a real `Retro` wired to the fakes in
   `tests/fakes.py`; `test_migration.py` and `test_resume.py` use the same
-  fixture for the data migration and the Resume button; `test_emulator.py` is
-  for things that need a real core.
+  fixture for the data migration and the Resume button; `test_restore.py`
+  holds the two callers of the save state -> battery save -> cold boot chain
+  against each other; `test_emulator.py` is for things that need a real core,
+  and `test_saves_roundtrip.py` for the one place the cog *and* a real core
+  are needed at once (it puts `RetroEmulator` back over the fake).
+* `FakeConfirm` answers Red's `ConfirmView` for the commands that ask before
+  destroying something: set `FakeConfirm.reset(answer=False)` to press No, and
+  read `FakeConfirm.asked` to prove the question was put at all. `FakeUser(...,
+  manage_messages=True)` is a moderator, user `1` is the bot owner, and
+  `ctx.uploaded()` gives `{filename: bytes}` for everything a command
+  attached.
 * The fakes lay the data directory out the way Red does -- one folder per cog
   *class name* under `tmp_path/cogs/` -- so `retro.data` is `.../cogs/Retro`
   and `retro.legacy_data` is `.../cogs/RetroCog`. `Config` is likewise handed

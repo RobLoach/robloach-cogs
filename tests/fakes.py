@@ -371,8 +371,12 @@ class FakeMessage:
 
 
 class FakePermissions:
-    def __init__(self, view_channel=True):
+    def __init__(self, view_channel=True, manage_messages=False):
         self.view_channel = view_channel
+        # What the cog reads to decide who may destroy a save. A real
+        # discord.Member always has this attribute and a plain User never
+        # does, which is exactly the question the cog asks.
+        self.manage_messages = manage_messages
 
 
 class FakeChannel:
@@ -397,9 +401,11 @@ class FakeChannel:
 
 
 class FakeUser:
-    def __init__(self, uid=42, name="Tester"):
+    def __init__(self, uid=42, name="Tester", manage_messages=False):
         self.id = uid
         self.display_name = name
+        #: Members have these; `manage_messages=True` is a moderator.
+        self.guild_permissions = FakePermissions(manage_messages=manage_messages)
 
 
 class FakeBot:
@@ -535,12 +541,23 @@ class FakeInteraction:
 
 
 class FakeContext:
-    def __init__(self, channel, author=None, attachments=(), guild_id=777):
+    def __init__(
+        self,
+        channel,
+        author=None,
+        attachments=(),
+        guild_id=777,
+        filesize_limit=8 * 1024 * 1024,
+    ):
         self.channel = channel
         self.author = author or FakeUser()
-        self.guild = types.SimpleNamespace(id=guild_id)
+        # filesize_limit is what the cog asks the guild for before attaching a
+        # save; Discord's floor for an unboosted server is 8 MiB.
+        self.guild = types.SimpleNamespace(id=guild_id, filesize_limit=filesize_limit)
         self.clean_prefix = "!"
         self.sent = []
+        #: Every discord.File this context has been asked to upload.
+        self.uploads = []
         self.message = types.SimpleNamespace(
             attachments=list(attachments), to_reference=lambda **kw: None
         )
@@ -548,8 +565,22 @@ class FakeContext:
     async def send(self, content=None, **kwargs):
         message = FakeMessage(self.channel, content=content, **kwargs)
         self.sent.append(content if content is not None else kwargs)
+        self.uploads.extend(kwargs.get("files") or ())
+        if kwargs.get("file") is not None:
+            self.uploads.append(kwargs["file"])
         self.channel.messages[message.id] = message
         return message
+
+    def uploaded(self):
+        """``{filename: bytes}`` for everything this context has uploaded."""
+        out = {}
+        for upload in self.uploads:
+            payload = upload.fp
+            position = payload.tell()
+            payload.seek(0)
+            out[upload.filename] = payload.read()
+            payload.seek(position)
+        return out
 
     async def embed_colour(self):
         return discord.Colour.blurple()
@@ -577,6 +608,37 @@ class FakeAttachment:
 
     async def read(self):
         return bytes(self._data)
+
+
+class FakeConfirm:
+    """Stands in for Red's ConfirmView, which needs a real Discord message.
+
+    Red's own view waits for somebody to press Yes or No; there is nobody
+    here, so the answer is whatever a test has set on the class. The question
+    itself goes out through ``ctx.send`` as usual, so tests read it from
+    ``ctx.said()`` exactly as they read any other reply.
+    """
+
+    #: What the next confirmation is answered with.
+    answer = True
+    #: How many times the cog has asked, so a test can prove it did.
+    asked = 0
+
+    def __init__(self, author=None, *, timeout=180.0, disable_buttons=False):
+        FakeConfirm.asked += 1
+        self.author = author
+        self.timeout = timeout
+        self.disable_buttons = disable_buttons
+        self.message = None
+        self.result = FakeConfirm.answer
+
+    @classmethod
+    def reset(cls, answer=True):
+        cls.answer = answer
+        cls.asked = 0
+
+    async def wait(self):
+        return True
 
 
 class FakeMenu:
@@ -630,6 +692,7 @@ class RetroEnv:
         (self.cores_dir / "nestopia_libretro.so").write_bytes(b"\x7fELF not ours")
 
         FakeEmulator.reset()
+        FakeConfirm.reset()
         self.configs = FakeConfigFactory()
         monkeypatch.setattr(self.cogmod, "cog_data_path", self._cog_data_path)
         monkeypatch.setattr(
@@ -639,6 +702,7 @@ class RetroEnv:
         )
         monkeypatch.setattr(self.cogmod, "RetroEmulator", FakeEmulator)
         monkeypatch.setattr(self.cogmod, "SimpleMenu", FakeMenu)
+        monkeypatch.setattr(self.cogmod, "ConfirmView", FakeConfirm)
 
         self.cog, self.bot = self.make_cog()
 

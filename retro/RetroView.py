@@ -114,6 +114,55 @@ _STYLES = {
 }
 
 
+def restore_into(
+    emulator: RetroEmulator,
+    state: typing.Optional[bytes] = None,
+    sram: typing.Optional[bytes] = None,
+    slug: str = "",
+) -> str:
+    """
+    Start a core and put back as much of a game as is restorable.
+
+    The one implementation of the save state -> battery save -> cold boot
+    chain. Both paths that bring a game up go through it: starting a game the
+    channel has played before (:meth:`RetroView._boot`) and waking a
+    hibernated session (``Retro._wake_locked``). They used to have a copy each
+    and were kept in step by the tests rather than by construction.
+
+    Returns what actually happened, which is what the cog reads to decide
+    whether to say anything and whether to throw the save state away:
+
+    * ``"state"`` - the exact moment came back;
+    * ``"sram"`` - the moment did not, but the cartridge's battery save did;
+    * ``"fresh"`` - there was nothing to restore, or none of it could be used.
+
+    Blocking, so callers run it in a worker thread.
+    """
+    emulator.start()
+    if state:
+        try:
+            emulator.load_state(state)
+            # Straight back to the exact moment, so none of the boot frames
+            # below are wanted: the game is already past its title screen.
+            return "state"
+        except EmulatorError as error:
+            # A state from a different build of the core, a truncated file, or
+            # -- the case the battery save exists for -- a state whose size no
+            # longer matches because the core was updated. That should cost
+            # the exact moment, not the session and not the player's own
+            # in-game save.
+            log.warning(
+                "Discarding an unusable Libretro save state for %s: %s", slug, error
+            )
+    # Cold boot. The core only allocates the cartridge's save memory once it
+    # has loaded the game, so the battery save goes in after start(), and the
+    # boot frames run afterwards so the game reaches its own title screen with
+    # the save already in place.
+    restored = bool(sram) and emulator.load_sram(sram)
+    emulator.advance(emulator.frames_for_seconds(BOOT_SECONDS))
+    return "sram" if restored else "fresh"
+
+
 class _GameButton(discord.ui.Button):
     """One console button. Clicking it emulates a press and posts a clip."""
 
@@ -728,30 +777,10 @@ class RetroView(discord.ui.View):
 
         Sets :attr:`boot_outcome` to what actually happened, which is what the
         cog reads to decide whether to say anything and whether to throw the
-        save state away. Runs in a worker thread.
+        save state away. The restoring itself is :func:`restore_into`, shared
+        with the wake path so the two cannot drift. Runs in a worker thread.
         """
-        emulator.start()
-        if state:
-            try:
-                emulator.load_state(state)
-                self.boot_outcome = "state"
-                return self._record(emulator, None)
-            except EmulatorError as error:
-                # A state from a different build of the core, or a truncated
-                # file. That should cost the exact moment, not the game and
-                # not the player's own in-game save.
-                log.warning(
-                    "Discarding an unusable Libretro save state for %s: %s",
-                    self.slug,
-                    error,
-                )
-        # Cold boot. The core only allocates the cartridge's save memory once
-        # it has loaded the game, so the battery save goes in after start(),
-        # and the boot frames run afterwards so the game reaches its own title
-        # screen with the save already in place.
-        restored = bool(sram) and emulator.load_sram(sram)
-        self.boot_outcome = "sram" if restored else "fresh"
-        emulator.advance(emulator.frames_for_seconds(BOOT_SECONDS))
+        self.boot_outcome = restore_into(emulator, state, sram, self.slug)
         return self._record(emulator, None)
 
     def _schedule(
