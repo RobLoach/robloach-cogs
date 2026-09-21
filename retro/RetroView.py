@@ -109,6 +109,13 @@ BOOT_SECONDS = 3
 
 DEFAULT_TIMEOUT_MINUTES = 10
 
+# What a press says when it had to wake the session up first. Past tense on
+# purpose: it is shown *with* the clip rather than before it, because a press
+# makes exactly one edit to the message now (see RetroView._ack_now), so by
+# the time anybody reads it the game is already back. Cleared by the next
+# press, like every other one-off line.
+RESUMED_NOTE = "Resumed where you left off\N{HORIZONTAL ELLIPSIS}"
+
 # Writing a save state costs a few milliseconds and a couple of hundred
 # kilobytes of disk, so it happens every few presses rather than every press.
 # A crash or a power cut therefore costs at most this many presses of play.
@@ -870,7 +877,16 @@ class RetroView(discord.ui.View):
         return f"{safe or 'screen'}{clip_extension(clip_format)}"
 
     def _set_disabled(self, disabled: bool) -> None:
-        """Grey the controls out, or bring them back. Spacers stay inert."""
+        """
+        Grey the controls out, or bring them back. Spacers stay inert.
+
+        ``True`` is only :meth:`retire` now: a press used to grey the controls
+        out for the second it took to emulate, and that cost an extra edit of
+        the message, which is what made the previous clip play again from the
+        beginning (see :meth:`_ack_now`). ``False`` is still called on every
+        redraw, because that is also where Replay and the repeat button are
+        made to say what they will really do.
+        """
         for child in self.children:
             if isinstance(child, _SpacerButton):
                 continue
@@ -1067,8 +1083,12 @@ class RetroView(discord.ui.View):
             await self._silent_ack(interaction)
             return
         async with self.lock:
+            # A hibernated session has a core to load and a save state to
+            # restore before it can emulate anything, which is the one delay
+            # worth explaining. It is said *with* the clip rather than before
+            # it, because a press only gets one edit now; see _ack_now.
             resuming = not self.live
-            await self._disable_now(interaction, resuming)
+            await self._ack_now(interaction)
             try:
                 clip = await self.cog.run_press(self, field, repeat)
             except EmulatorError as error:
@@ -1083,7 +1103,7 @@ class RetroView(discord.ui.View):
                 return
             self.last_clip = clip
             self.touch()
-            await self._show(interaction, clip)
+            await self._show(interaction, clip, RESUMED_NOTE if resuming else None)
 
     @staticmethod
     async def _silent_ack(interaction: discord.Interaction) -> None:
@@ -1093,30 +1113,46 @@ class RetroView(discord.ui.View):
         except discord.HTTPException:
             log.debug("Could not acknowledge a dropped Libretro press.", exc_info=True)
 
-    async def _disable_now(self, interaction: discord.Interaction, resuming: bool) -> None:
+    async def _ack_now(self, interaction: discord.Interaction) -> None:
         """
-        Respond to the click immediately by greying out the controls.
+        Acknowledge the click without changing the message in any way.
 
-        Emulating and encoding a clip takes a second or two, which feels
-        broken with no feedback. Editing the message in the interaction
-        *response* is instant, and doubles as the "Resuming..." line for a
-        hibernated session, which has a core to load and a save state to
-        restore before it can even start emulating. ``attachments`` is not
-        touched, so this costs no upload and the current clip stays put.
+        One press has to cause exactly **one** visible change, and that is
+        why this defers rather than editing.
+
+        A Discord client re-renders a message from scratch on *any* edit to
+        it, and re-rendering restarts the animation that is already attached.
+        Clips are encoded with ``loop=1`` (see encode_animation) so they play
+        through once and hold their last frame; editing the message to grey
+        the buttons out therefore played the *previous* clip again from frame
+        zero, and a second later the new clip replaced it. What that looks
+        like from the player's side is the game jumping backwards a few
+        frames every time they press a button -- which is exactly how it was
+        reported.
+
+        So the instant "your click landed" feedback the controls used to give
+        is gone, and it cannot come back: any component response that shows
+        something either edits this message (the rewind) or posts another one
+        (an ephemeral "still emulating" notice, which was removed for being
+        spam). ``defer()`` on a component interaction is a
+        DEFERRED_UPDATE_MESSAGE, which changes nothing on screen at all, and
+        ``edit_original_response`` below then makes the one edit that swaps
+        the clip in and redraws the buttons.
+
+        Overlapping clicks are unaffected: the lock in :meth:`_press` drops
+        them through :meth:`_silent_ack`, which is the same defer, so a second
+        presser never sees "interaction failed" and never sees a message
+        either.
         """
         if self.message is None and interaction.message is not None:
             # After a restart the view is rebuilt from Config and has never
             # seen its message; the interaction carries it.
             self.message = interaction.message
             self.message_id = interaction.message.id
-        self._set_disabled(True)
-        note = "Resuming where you left off\N{HORIZONTAL ELLIPSIS}" if resuming else None
         try:
-            await interaction.response.edit_message(
-                content=self._content(note), view=self
-            )
+            await interaction.response.defer()
         except discord.HTTPException:
-            log.warning("Could not disable the Libretro controls.", exc_info=True)
+            log.warning("Could not acknowledge the Libretro press.", exc_info=True)
 
     @staticmethod
     async def _whisper(interaction: discord.Interaction, message: str) -> None:
@@ -1134,16 +1170,34 @@ class RetroView(discord.ui.View):
         except Exception:
             log.debug("Could not deliver a Libretro failure notice.", exc_info=True)
 
-    async def _show(self, interaction: discord.Interaction, clip: bytes) -> None:
-        """Re-enable the controls and swap in the new clip, in one edit."""
+    async def _show(
+        self,
+        interaction: discord.Interaction,
+        clip: bytes,
+        note: typing.Optional[str] = None,
+    ) -> None:
+        """
+        Swap in the new clip and redraw the controls. The *only* edit a press
+        makes; see :meth:`_ack_now` for why there is not a second one.
+
+        ``note`` is a line the *press* wants said (that the game was asleep
+        and has come back). A pending :attr:`notice` beats it, because that is
+        something the wake itself discovered and has to report -- that the
+        save state was rejected after a core update, for instance -- and only
+        one of the two can be shown.
+        """
         self._set_disabled(False)
+        content = self._content()
+        if content is None:
+            content = note
         try:
-            # edit_original_response targets the same component message that
-            # response.edit_message just updated. attachments= replaces the
-            # message's files; omitting it would keep the previous clip, and
-            # content=None clears whatever was said before it.
+            # edit_original_response targets the message the component is on,
+            # which response.defer() acknowledged without touching.
+            # attachments= replaces the message's files; omitting it would
+            # keep the previous clip, and content=None clears whatever was
+            # said before it.
             self.message = await interaction.edit_original_response(
-                content=self._content(),
+                content=content,
                 attachments=[self._clip_file(clip)],
                 view=self,
             )
@@ -1182,8 +1236,11 @@ class RetroView(discord.ui.View):
         With one clip buffered that is all this does, and it stays a single
         instant edit. With more, the buffered clips are decoded and stitched
         into one animation covering the last REPLAY_SECONDS -- a second or so
-        of work on a real game, so the controls grey out while it happens the
-        same way they do for a press.
+        of work on a real game -- and that too is one edit and no more, for
+        exactly the reason a press is (see :meth:`_ack_now`): the edit that
+        used to grey the controls out while the stitching ran also made the
+        clip already on the message play again from its first frame, so
+        pressing Replay showed the old clip, then the stitched one.
         """
         if self.closed or self.lock.locked():
             await self._silent_ack(interaction)
@@ -1219,17 +1276,7 @@ class RetroView(discord.ui.View):
             # nothing moved carries no timing of its own, and the session is
             # the only thing that knows it stood for a second of play.
             lengths = [seconds for _, seconds in self.clips]
-            self._set_disabled(True)
-            try:
-                await interaction.response.edit_message(
-                    content=self._content(
-                        f"Putting the last {format_seconds(self.buffered_seconds, 1)} "
-                        "seconds together\N{HORIZONTAL ELLIPSIS}"
-                    ),
-                    view=self,
-                )
-            except discord.HTTPException:
-                log.warning("Could not grey out the controls to replay.", exc_info=True)
+            await self._ack_now(interaction)
             try:
                 clip, seconds = await asyncio.to_thread(
                     concatenate_clips,
@@ -1249,6 +1296,8 @@ class RetroView(discord.ui.View):
                     error,
                 )
                 clip, seconds = self.last_clip, 0.0
+            # Never disabled, so this is only here to redraw the two controls
+            # that can have nothing to do; see _set_disabled.
             self._set_disabled(False)
             note = (
                 None

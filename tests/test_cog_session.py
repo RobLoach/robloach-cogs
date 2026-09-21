@@ -444,7 +444,7 @@ async def test_a_press_edit_carries_one_clip_and_no_embed(retro):
     interaction = retro.interaction(view, message=view.message)
     await view._press(interaction, "a")
     for _, snap in interaction.log:
-        assert not snap["has_embed"], snap
+        assert not snap.get("has_embed"), snap
     final = interaction.log[-1][1]
     assert final["n_attachments"] == 1
     assert final["filenames"][0].endswith(".webp")
@@ -474,20 +474,95 @@ async def test_the_permission_error_names_attach_files(retro):
 # -- Pressing a button --------------------------------------------------------
 
 
-async def test_a_press_greys_the_controls_then_posts_exactly_one_clip(retro):
+async def test_a_press_makes_exactly_one_edit_to_the_message(retro):
+    """The fix for "the clip rewinds when I press a button".
+
+    A press used to edit the message twice: once immediately, to grey the
+    controls out, and once again with the new clip. The first edit changed no
+    attachment, but a Discord client re-renders a message on *any* edit, and
+    re-rendering restarts the clip that is already attached -- which, since
+    clips play through once and hold their last frame, played the previous
+    clip again from frame zero before the new one arrived. So the press is
+    acknowledged with a plain defer (which shows nothing) and makes one edit.
+    """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9002, "ucity")
     assert view.live
 
     interaction = retro.interaction(view, message=view.message)
     await view._press(interaction, "a")
-    assert interaction.kinds() == ["response.edit_message", "edit_original_response"]
-    first, second = interaction.log[0][1], interaction.log[1][1]
-    assert first["all_disabled"], "the immediate response greys everything out"
-    assert not first["has_attachments"], "and uploads nothing"
-    assert not second["any_disabled"], "the final edit brings them back"
-    assert second["has_attachments"] and second["n_attachments"] == 1
-    assert sum(1 for _, snap in interaction.log if snap.get("has_attachments")) == 1
+
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
+    edits = [snap for kind, snap in interaction.log if kind != "response.defer"]
+    assert len(edits) == 1, interaction.kinds()
+    only = edits[0]
+    assert only["has_attachments"] and only["n_attachments"] == 1
+    assert only["filenames"][0].endswith(".webp")
+    assert not only["any_disabled"], "the buttons end up enabled"
+    assert only["spacers_disabled"], "except the inert layout spacers"
+
+
+async def test_nothing_is_edited_while_the_press_is_being_emulated(retro):
+    """No intermediate edit, not even a content-only one.
+
+    The whole bug was an edit that did not touch the attachment and still
+    restarted it, so "the clip is only uploaded once" is not the assertion
+    that matters; "the message is only touched once" is.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9005, "midpress")
+    interaction = retro.interaction(view, message=view.message)
+
+    original = view.run_press
+    seen = []
+
+    def watched(field, repeat=1):
+        # What the message had been told by the time the emulator was asked.
+        seen.append(list(interaction.kinds()))
+        return original(field, repeat)
+
+    view.run_press = watched
+    try:
+        await view._press(interaction, "a")
+    finally:
+        view.run_press = original
+
+    assert seen == [["response.defer"]], seen
+    assert not any(
+        kind.endswith("edit_message") for kind in interaction.kinds()
+    ), interaction.kinds()
+
+
+async def test_a_press_no_longer_greys_the_controls_out(retro):
+    """The trade this cost, pinned so it cannot be reintroduced by accident.
+
+    Instant "your click landed" feedback and a clip that does not rewind
+    cannot both be had: any component response that shows something either
+    edits this message (the rewind) or posts a second one (an ephemeral
+    notice, removed earlier for being spam). The controls therefore stay
+    enabled throughout, and _set_disabled(True) is left for retirement only.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9006, "nogrey")
+    interaction = retro.interaction(view, message=view.message)
+
+    original = view.run_press
+    disabled_midway = []
+
+    def watched(field, repeat=1):
+        disabled_midway.append(
+            [c.custom_id for c in retro.playable(view) if c.disabled]
+        )
+        return original(field, repeat)
+
+    view.run_press = watched
+    try:
+        await view._press(interaction, "a")
+    finally:
+        view.run_press = original
+
+    assert disabled_midway == [[]], disabled_midway
+    assert not any(c.disabled for c in retro.playable(view))
 
 
 async def test_the_clip_is_cached_for_replay(retro):
@@ -545,15 +620,21 @@ async def test_two_simultaneous_presses_produce_exactly_one_clip(retro):
     finally:
         view.run_press = original
 
+    # The loser is deferred and says nothing at all; the winner defers too
+    # and then makes the one edit. Neither ever shows "interaction failed".
     kinds = sorted([tuple(first.kinds()), tuple(second.kinds())])
     assert kinds == [
         ("response.defer",),
-        ("response.edit_message", "edit_original_response"),
+        ("response.defer", "edit_original_response"),
     ]
     clips = sum(
         1 for i in (first, second) for _, snap in i.log if snap.get("has_attachments")
     )
     assert clips == 1
+    edits = sum(
+        1 for i in (first, second) for kind, _ in i.log if kind != "response.defer"
+    )
+    assert edits == 1, "two presses, one visible change"
 
 
 # -- Replay -------------------------------------------------------------------
@@ -586,10 +667,10 @@ async def test_replay_stitches_the_last_few_clips_into_one(retro):
     interaction = retro.interaction(view, message=view.message)
     await retro.control(view, "replay").callback(interaction)
 
-    kinds = interaction.kinds()
-    assert kinds[0] == "response.edit_message", "the controls grey out first"
-    assert interaction.log[0][1]["all_disabled"]
-    assert "seconds together" in (interaction.log[0][1]["content"] or "")
+    # Stitching takes a moment, and it used to grey the controls out while it
+    # ran -- an edit that replayed the clip already on the message from its
+    # first frame. Replay is one edit now, for the same reason a press is.
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
     final = interaction.log[-1][1]
     assert final["n_attachments"] == 1
     assert not final["any_disabled"]
@@ -773,6 +854,14 @@ async def test_the_idle_task_saves_and_frees_a_sleeping_session(retro):
 
 
 async def test_a_press_resumes_a_sleeping_session_and_says_so_once(retro):
+    """The resume line rides on the clip now, and is cleared by the next press.
+
+    It used to be shown by the immediate "controls greyed out" edit and
+    cleared by the edit that brought the clip -- but that first edit is what
+    made the previous clip rewind, so it is gone and the line moved onto the
+    one edit a press makes. Past tense, because by the time it is readable
+    the game really is back.
+    """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9031, "wakeup")
     await retro.cog.hibernate(view, None)
@@ -781,9 +870,39 @@ async def test_a_press_resumes_a_sleeping_session_and_says_so_once(retro):
     interaction = retro.interaction(view, message=view.message)
     await view._press(interaction, "a")
     assert view.live
-    assert "Resuming" in (interaction.log[0][1]["content"] or "")
-    assert not interaction.log[0][1]["has_embed"]
-    assert interaction.log[-1][1]["content"] is None, "the resume line is cleared with the clip"
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
+    landed = interaction.log[-1][1]
+    assert landed["content"] == retro.viewmod.RESUMED_NOTE
+    assert "Resumed" in landed["content"]
+    assert not landed["has_embed"]
+    assert landed["n_attachments"] == 1, "and the clip came with it"
+
+    # Said once: the next press clears it rather than repeating it.
+    again = retro.interaction(view, message=view.message)
+    await view._press(again, "a")
+    assert again.log[-1][1]["content"] is None
+
+
+async def test_a_wake_that_has_something_to_report_beats_the_resume_line(retro):
+    """Only one line fits, and the important one wins.
+
+    A save state rejected after a core update is something the player has to
+    be told; "resumed where you left off" is a courtesy. The wake sets
+    view.notice and that is what the single edit carries.
+    """
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9032, "wakenotice")
+    await retro.cog.hibernate(view, None)
+    # A state the fake core will refuse, which is what a core update looks
+    # like from load_state()'s point of view.
+    retro.cog._state_path(channel.id, view.slug).write_bytes(b"not a state")
+
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+    content = interaction.log[-1][1]["content"] or ""
+    assert "save state could not be used" in content, content
+    assert retro.viewmod.RESUMED_NOTE not in content
+    assert view.notice is None, "and it is not said twice"
 
 
 # -- Surviving a restart ------------------------------------------------------

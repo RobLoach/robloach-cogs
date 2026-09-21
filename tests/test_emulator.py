@@ -477,7 +477,8 @@ def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
     # frame. GIF stores centiseconds and cannot be exact, which is why it is
     # only ever a fallback.
     frame_ms = round(1000 * step / emulator.fps)
-    captured = -(-frames // step)
+    plan = E.capture_plan(frames, step)
+    captured = len(plan)
     assert loop == 1, "the clip plays through exactly once"
     # The encoder merges runs of identical frames and adds their durations
     # together, so a clip of a static screen legitimately comes back with
@@ -486,16 +487,19 @@ def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
     assert 1 <= len(durations) <= captured
     assert all(duration > 0 for duration in durations)
     if len(durations) == captured:
-        # Every picture is a whole step of emulation except possibly the
-        # last, which gets only the frames that were left: 30 frames is
-        # seven 67ms pictures and an eighth worth 33ms, and calling that one
-        # 67ms too played a half-second clip 7% slow.
-        assert set(durations[:-1]) <= {frame_ms}, set(durations)
+        # Every picture stands until the next one is taken, which is a whole
+        # step except in the tail: a 30 frame clip is seven 67ms pictures,
+        # then frame 29 for 33ms and the closing frame 30 for 17ms. Calling
+        # any of those a full 67ms played a half-second clip 7% slow.
+        expected = [
+            max(1, round(1000 * covered / emulator.fps)) for _, covered in plan
+        ]
+        assert durations == expected, (durations, expected)
+        assert set(durations[:-2]) <= {frame_ms} or captured <= 2, set(durations)
         assert 0 < durations[-1] <= frame_ms, durations[-1]
-        assert durations[-1] == round(1000 * (frames - step * (captured - 1)) / emulator.fps)
     emulated = 1000 * frames / emulator.fps
     assert abs(sum(durations) - emulated) / emulated < 0.01, (sum(durations), emulated)
-    # Every picture of the clip is worth having: a fifth of a second is three
+    # Every picture of the clip is worth having: a fifth of a second is four
     # of them, not one.
     assert captured >= 2 and len(data) > 0
 
@@ -549,6 +553,84 @@ def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gam
     hashes = frame_hashes(moved, image)
     assert hashes[0] != before
     assert hashes[0] != hashes[1], "the first two frames are duplicates"
+
+
+def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, gambatte, ucity):
+    """The other half of "seamless movement", proved against a real core.
+
+    A clip's pictures are every ``step``-th emulated frame *plus the last
+    one* (see capture_plan), so the picture a clip finishes on -- and holds,
+    since clips play through once -- is the exact state the next clip starts
+    from. Before the closing frame was photographed a 60 frame clip stopped
+    on frame 57 while 58, 59 and 60 were emulated and never shown, so the
+    still picture sitting in the channel between presses was three frames
+    behind the console.
+
+    So: record two consecutive clips, then rewind and emulate the same frames
+    one at a time to get a reference picture for each. The first clip's last
+    picture has to be reference frame N, and the second clip's first picture
+    reference frame N + 1 -- adjacent, neither repeated nor skipped.
+    """
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    size = emulator.output_size()
+    state = emulator.save_state()
+
+    # load_state runs a frame of its own, so both the recordings and the
+    # reference below start from the same place: the state plus one frame.
+    emulator.load_state(state)
+    first = E.decode_clip(emulator.record(frames))[0]
+    second = E.decode_clip(emulator.record(frames))[0]
+
+    emulator.load_state(state)
+    reference = []
+    for _ in range(frames + 1):
+        emulator.advance(1)
+        reference.append(emulator._frame_image(size).tobytes())
+
+    assert first[-1].tobytes() == reference[frames - 1], (
+        "the first clip does not end on its own last emulated frame"
+    )
+    assert second[0].tobytes() == reference[frames], (
+        "the second clip does not open on the very next emulated frame"
+    )
+    # And the two really are different pictures, or none of the above means
+    # anything: a static screen would satisfy it by accident.
+    assert reference[frames - 1] != reference[frames], "nothing moved at all"
+
+
+@pytest.mark.parametrize("key, core, rom_name, button", CASES, ids=[c[0] for c in CASES])
+def test_each_console_is_posted_at_the_size_that_was_measured(
+    assets, emu, image, key, core, rom_name, button
+):
+    """The per-console upscale, read back off the real cores.
+
+    The flat 2x doubled every console up to 256 lines tall, which on a NES or
+    a SNES cost 2-4x the encode for a picture Discord shrinks to the message
+    column anyway. See MIN_CLIP_WIDTH in retro/clips.py for the timings.
+    tests/test_clips.py holds the same table with no core at all.
+    """
+    expected = {"gb": (320, 288), "nes": (293, 224), "snes": (299, 224)}[key]
+    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
+    emulator.advance(emulator.frames_for_seconds(2))
+
+    frame_width, frame_height = emulator._frame_size()
+    assert emulator.output_size() == expected, (
+        f"{key} is {frame_width}x{frame_height} at {emulator.aspect_ratio:.4f}"
+    )
+    # Never a downscale: the aspect correction may repeat columns, but a
+    # NEAREST resize that shrinks would throw somebody's pixels away.
+    assert expected[0] >= frame_width and expected[1] >= frame_height
+    # ...and the clip really is posted at it.
+    clip = emulator.record(emulator.clip_frames(0.2))
+    assert image.open(io.BytesIO(clip)).size == expected
+    # scale=1 is still "the console's own resolution", which is what the
+    # screenshot hashes in this file rely on.
+    assert emulator.output_size(scale=1) == (
+        max(1, round(frame_height * emulator.aspect_ratio)),
+        frame_height,
+    )
 
 
 def test_a_resumed_clip_picks_up_where_the_last_one_left_off(emu, image, gambatte, ucity):

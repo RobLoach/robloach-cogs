@@ -34,6 +34,7 @@ try:
         FAST_RAW_MODES,
         FAST_ROTATIONS,
         GIF_COLORS,
+        MAX_CLIP_SCALE,
         MAX_CLIP_SECONDS,
         MAX_REPLAY_BYTES,
         MAX_REPLAY_CLIPS,
@@ -41,6 +42,7 @@ try:
         MIN_AFTERMATH_FRAMES,
         MIN_CLIP_FRAMES,
         MIN_CLIP_SECONDS,
+        MIN_CLIP_WIDTH,
         REPLAY_SECONDS,
         WEBP_METHOD,
         WEBP_MINIMIZE_SIZE,
@@ -48,10 +50,13 @@ try:
         _channel_expansion_table,
         _note_slow_frame_grab,
         _pillow,
+        capture_plan,
         capture_step,
         clamp_clip_seconds,
         clip_extension,
         clip_frame_count,
+        clip_scale,
+        clip_size,
         concatenate_clips,
         decode_clip,
         describe_seconds,
@@ -76,6 +81,7 @@ except ImportError:  # pragma: no cover - `python retro/emulator.py`, see _main
         FAST_RAW_MODES,
         FAST_ROTATIONS,
         GIF_COLORS,
+        MAX_CLIP_SCALE,
         MAX_CLIP_SECONDS,
         MAX_REPLAY_BYTES,
         MAX_REPLAY_CLIPS,
@@ -83,6 +89,7 @@ except ImportError:  # pragma: no cover - `python retro/emulator.py`, see _main
         MIN_AFTERMATH_FRAMES,
         MIN_CLIP_FRAMES,
         MIN_CLIP_SECONDS,
+        MIN_CLIP_WIDTH,
         REPLAY_SECONDS,
         WEBP_METHOD,
         WEBP_MINIMIZE_SIZE,
@@ -90,10 +97,13 @@ except ImportError:  # pragma: no cover - `python retro/emulator.py`, see _main
         _channel_expansion_table,
         _note_slow_frame_grab,
         _pillow,
+        capture_plan,
         capture_step,
         clamp_clip_seconds,
         clip_extension,
         clip_frame_count,
+        clip_scale,
+        clip_size,
         concatenate_clips,
         decode_clip,
         describe_seconds,
@@ -117,6 +127,8 @@ __all__ = [
     "MAX_CLIP_SECONDS",
     "MIN_CLIP_FRAMES",
     "MIN_AFTERMATH_FRAMES",
+    "MIN_CLIP_WIDTH",
+    "MAX_CLIP_SCALE",
     "REPLAY_SECONDS",
     "MAX_REPLAY_FRAMES",
     "MAX_REPLAY_CLIPS",
@@ -125,10 +137,13 @@ __all__ = [
     "DEFAULT_CLIP_FORMAT",
     "MAX_SRAM_SIZE",
     "RETRO_MEMORY_SAVE_RAM",
+    "capture_plan",
     "capture_step",
     "clamp_clip_seconds",
     "clip_extension",
     "clip_frame_count",
+    "clip_scale",
+    "clip_size",
     "concatenate_clips",
     "decode_clip",
     "describe_definitions",
@@ -192,11 +207,11 @@ MIN_ROM_SIZE = 1024
 # This is only the fallback for a core that reports nothing useful.
 DEFAULT_FPS = 60.0
 
-# Frames taller than this are shown at 1x; anything smaller is doubled. The
-# SNES switches to a 512x478 interlaced mode mid-game, and doubling *that*
-# would be a 1274x956 clip, so the cutoff keeps every console in the same
-# ballpark without a per-core table to maintain.
-DOUBLE_UP_TO_HEIGHT = 256
+# How big a frame is posted is decided by MIN_CLIP_WIDTH and clip_size() in
+# retro/clips.py, which carry the per-console measurements the rule was
+# chosen from. This used to be a DOUBLE_UP_TO_HEIGHT cutoff here: everything
+# up to 256 pixels tall was drawn at 2x, which doubled the TV consoles for no
+# visible gain and 2-4x the encode.
 
 # RETRO_MEMORY_SAVE_RAM, i.e. the cartridge's battery-backed save memory. It is
 # 0 in libretro.h and has been since libretro existed, but it is spelled out
@@ -1052,23 +1067,23 @@ class RetroEmulator:
         shot = self._screenshot()
         return shot.width, shot.height
 
-    def output_size(self, scale: int = 2) -> "tuple":
+    def output_size(self, scale: int = MAX_CLIP_SCALE) -> "tuple":
         """
         The size a frame should be shown at, in pixels.
 
-        The height is the console's own height doubled (unless the frame is
-        already large), and the width follows from the aspect ratio the core
-        reports, so a NES frame comes out 4:3-ish instead of tall and narrow.
-        A Game Boy's pixels are square, so 160x144 lands on exactly 320x288.
+        ``scale`` is a *ceiling* on how many times over the frame may be
+        drawn, not an instruction: :func:`clip_size` enlarges a frame only
+        while the picture would be narrower than a message column, so a Game
+        Boy's square pixels land on exactly 320x288 while a NES frame stays at
+        its own 224 lines and comes out 293x224 rather than tall and narrow.
+        ``scale=1`` therefore means "the console's own resolution", which is
+        what a caller wanting a native screenshot asks for.
         """
         self._require_started()
-        _, frame_height = self._frame_size()
-        factor = scale if frame_height <= DOUBLE_UP_TO_HEIGHT else 1
-        height = max(1, frame_height * max(1, factor))
-        width = max(1, round(height * self.aspect_ratio))
-        return width, height
+        frame_width, frame_height = self._frame_size()
+        return clip_size(frame_width, frame_height, self.aspect_ratio, scale)
 
-    def _frame_image(self, size=None, *, scale: int = 2, colors: int = 0):
+    def _frame_image(self, size=None, *, scale: int = MAX_CLIP_SCALE, colors: int = 0):
         """
         Grab the current screen as a Pillow image.
 
@@ -1093,9 +1108,9 @@ class RetroEmulator:
                 "RGBA", (shot.width, shot.height), bytes(shot.data), "raw", "RGBA", 0, 1
             ).convert("RGB")
         if colors:
-            # Quantizing before the resize is a quarter of the work at 2x,
-            # and a nearest-neighbor resize of a P-mode image keeps the
-            # palette indices intact.
+            # Quantizing before the resize is cheaper whenever the resize
+            # enlarges, and a nearest-neighbor resize of a P-mode image keeps
+            # the palette indices intact.
             image = image.quantize(colors=colors)
         if size is None:
             size = self.output_size(scale=scale)
@@ -1103,7 +1118,7 @@ class RetroEmulator:
             image = image.resize(tuple(size), Image.NEAREST)
         return image
 
-    def screenshot(self, scale: int = 2) -> bytes:
+    def screenshot(self, scale: int = MAX_CLIP_SCALE) -> bytes:
         """Return the current screen as PNG bytes."""
         self._require_started()
         buffer = io.BytesIO()
@@ -1114,7 +1129,7 @@ class RetroEmulator:
         self,
         frames: "int | None" = None,
         *,
-        scale: int = 2,
+        scale: int = MAX_CLIP_SCALE,
         fps: int = CLIP_FPS,
         presses: "typing.Iterable | None" = None,
         clip_format: str = DEFAULT_CLIP_FORMAT,
@@ -1130,8 +1145,10 @@ class RetroEmulator:
         frame of the clip, so the first picture the player sees is already the
         game responding.
 
-        Roughly every ``core_fps / fps``-th emulated frame is captured, so the
-        default one second (60 emulated Game Boy frames) at 15 fps is a 15
+        Every ``core_fps / fps``-th emulated frame is captured, plus the very
+        last one -- see :func:`capture_plan`, which is what makes one clip
+        carry on from the previous one with no frames lost in between. The
+        default one second (60 emulated Game Boy frames) at 15 fps is a 16
         picture clip. Identical consecutive frames cost almost nothing -- the
         encoder merges them and adds their durations together -- so a game
         sitting on a static screen produces a handful of kilobytes, and a
@@ -1180,12 +1197,12 @@ class RetroEmulator:
         # rendered anything yet.
         size = None
         held: set = set()
-        # One duration per captured picture rather than one for the clip.
-        # They are all ``step`` frames long except possibly the last, which
-        # covers however many emulated frames were left: a 0.5 second Game
-        # Boy clip is 30 frames, which is seven whole pictures and an eighth
-        # covering two frames. Giving that last one a full 67ms made the clip
-        # play 7% longer than the half second it emulated.
+        # One duration per captured picture rather than one for the clip, so
+        # the clip plays for exactly as long as it emulated: a picture stands
+        # until the next one is taken, which is ``step`` frames for all but
+        # the tail. Giving the shorter tail pictures a full 67ms each made a
+        # half second clip play 7% slow.
+        plan = dict(capture_plan(frames, step))
         durations: typing.List[int] = []
         try:
             for index in range(frames):
@@ -1195,11 +1212,11 @@ class RetroEmulator:
                     held |= down[index]
                 self._pressed = frozenset(held)
                 self.advance(1)
-                if index % step == 0:
+                covered = plan.get(index)
+                if covered is not None:
                     if size is None:
                         size = self.output_size(scale=scale)
                     images.append(self._frame_image(size, colors=colors))
-                    covered = min(step, frames - index)
                     durations.append(max(1, round(1000 * covered / core_fps)))
         finally:
             self._pressed = frozenset()

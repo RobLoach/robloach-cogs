@@ -381,12 +381,42 @@ forever, so a busy channel isn't full of flickering images.
 A second is the default because a turn is a round trip: press, wait for the
 clip, watch it, press again. It used to be four seconds, and three of those
 were usually the game sitting still after the press had already played out —
-while costing three times as long to record. Measured on a Raspberry Pi 5
-with Pokémon Red in the overworld: a one second clip is 60 emulated frames
-captured as 15 pictures (6–12 once identical ones are merged), 5–8 KiB and
-0.41–0.45 seconds of work; four seconds was 239 frames, 60 pictures and
-1.43–1.50 seconds. Playback matches emulated time either way — a one second
-clip plays for 1.005s and a 0.5 second one for 0.502s.
+while costing three times as long to record. A one second Game Boy clip is 60
+emulated frames captured as 16 pictures (fewer once identical ones are
+merged), a few kilobytes, and about 47ms of work on a Raspberry Pi 5;
+four seconds is 239 frames and 61 pictures. Playback matches emulated time
+either way — a one second clip plays for 1.004s and a 0.5 second one for
+0.502s.
+
+**One clip carries on exactly where the last one stopped.** A clip
+photographs every fourth emulated frame *and* its own final frame, so the
+picture it finishes on — the one left sitting in the channel, since a clip
+plays through once and holds its last frame — is the precise state the next
+press continues from. It used to stop on the last frame that happened to fall
+on the sampling cadence, three frames (about 50ms) before the end of what it
+had already emulated, so every press began with a small invisible jump.
+
+**Each console is posted at a size that suits it** rather than at a flat 2x.
+Discord scales an attached image down to the message column anyway, so
+doubling a TV console was work thrown away: a Game Boy frame is 160×144 and
+genuinely needs the double (320×288, as it always was), but a NES or SNES
+frame is already 256×224 and is posted at 293×224 and 299×224. Measured on a
+Raspberry Pi 5, one second of real motion, recording a whole clip end to end:
+
+| Console | Was | Now | Time | Bytes |
+| --- | --- | --- | --- | --- |
+| Game Boy | 320×288, 47ms | 320×288, 47ms | — | — |
+| Game Boy Advance | 480×320, 83ms | 480×320, 86ms | +3% | +19% (of 0.6 KiB) |
+| NES | 585×448, 169ms | 293×224, 75ms | −55% | −7% |
+| Super Nintendo | 597×448, 383ms | 299×224, 173ms | −55% | −21% |
+| Genesis | 585×448, 116ms | 293×224, 65ms | −44% | −23% |
+| Master System | 585×384, 61ms | 293×192, 34ms | −44% | −22% |
+
+The picture is still scaled with nearest-neighbour and still corrected for
+the console's own non-square pixels, so it is the same crisp, correctly
+proportioned pixel art — there is simply less of it to encode and upload. A
+console whose frame is wider than the corrected width (a Genesis in its
+320-pixel mode) is doubled instead, so nothing is ever *shrunk*.
 
 A clip in which nothing moved at all — a title screen, a menu, a game waiting
 for you — is written as a single still frame of a few hundred bytes, which is
@@ -415,13 +445,30 @@ storage by the number of channels for a button most people press once. So after
 a bot restart there is nothing to replay yet, and the button is greyed out and
 says so until the next press refills it.
 
-The controls grey out the moment you press a button and come back when the new
-clip is ready, so you can tell the bot heard you.
+**A press changes the message exactly once.** The controls used to grey
+themselves out the instant you clicked and come back with the new clip, which
+was two edits of one message — and a Discord client re-renders a message from
+scratch on *any* edit to it. Re-rendering restarts whatever animation is
+already attached, so that first edit played the **previous** clip again from
+its first frame, and a moment later the new clip replaced it. What that looked
+like from the outside was the game jumping backwards a few frames every time
+somebody pressed a button.
+
+So a press is now acknowledged silently and makes a single edit, which swaps
+the clip in and redraws the buttons together. The cost is real and there is no
+way round it: the instant "your click landed" feedback is gone, because
+anything that shows you something either edits this message (and rewinds the
+clip) or posts a second one (an ephemeral "still emulating" notice, which was
+tried and removed for being spam). Clicks that arrive while a press is being
+emulated are still swallowed silently — nobody ever sees *This interaction
+failed* — and pressing **Replay** on a stitched replay behaves the same way,
+for the same reason.
 
 Nothing but the clip is posted: no status card, no caption. The buttons say what
 they do. A line of text only appears when there is something to say, such as the
 game having gone to sleep or a save state that could not be restored, and it is
-cleared again by the next press.
+cleared again by the next press. Waking a sleeping game says *Resumed where you
+left off…* alongside the clip it came back with.
 
 **The game only runs while a clip is being recorded.** Between one press and the
 next the console is frozen mid-frame — it is not ticking away in the background,

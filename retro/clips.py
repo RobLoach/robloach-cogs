@@ -51,11 +51,25 @@ class EmulatorError(RuntimeError):
 #
 # On the timing: animated WebP stores each frame's duration in *milliseconds*,
 # so 15 fps against a 59.73 fps core is 4 emulated frames per clip frame and
-# exactly 67ms per frame -- a 1 second clip is 60 emulated frames, 15 pictures
-# and measures 1.005s, which is 0.5% slow and invisible. (GIF is the format
+# exactly 67ms per frame -- a 1 second clip is 60 emulated frames and 16
+# pictures (fifteen on the cadence plus the closing frame, see capture_plan)
+# and measures 1.004s, which is 0.4% slow and invisible. (GIF is the format
 # that stores centiseconds; see encode_animation.) 20 fps would land on a round 50ms
 # and match the emulated time exactly, at about 39% more bytes and 32% more
 # encoding time, so 15 stays the default.
+#
+# Lowering it was measured and rejected. Now that a frame is posted at the
+# console's own resolution (see MIN_CLIP_WIDTH) the encode is small enough
+# that dropping a third of the pictures buys very little, and it buys it by
+# making the animation visibly choppier. One second of real motion, best of
+# three on a Raspberry Pi 5, encode time and bytes:
+#
+#              15 fps (16 pics)   12 fps (13)     10 fps (11)
+#   NES         32.5ms / 1,682    24.0ms / 1,400  17.6ms / 1,202
+#   SNES        71.4ms / 26,934   55.6ms / 23,428 49.8ms / 20,956
+#
+# So 10 fps saves 15ms on a NES clip and 22ms on a SNES one, out of the 77ms
+# and 128ms a whole clip takes end to end. Not worth a third of the frames.
 CLIP_SECONDS = 1.0
 CLIP_FPS = 15
 
@@ -75,11 +89,13 @@ MAX_CLIP_SECONDS = 15.0
 
 # The fewest emulated frames a clip may be, whatever it was asked for. At
 # CLIP_FPS against a 60 fps core one picture is four frames, so six frames is
-# two pictures -- the least that is still an animation -- and leaves room for
-# a press plus the aftermath frame below. MIN_CLIP_SECONDS is well clear of
-# it on every console here (0.2s is 10 frames even on a 50 fps PAL core), so
-# this is a floor for a core that reports a strange frame rate and for direct
-# callers of record(), not something the settings can reach.
+# three pictures (frames 1, 5 and -- because the closing frame is always
+# photographed, see capture_plan -- 6), which is more than the least that is
+# still an animation, and leaves room for a press plus the aftermath frame
+# below. MIN_CLIP_SECONDS is well clear of it on every console here (0.2s is
+# 10 frames even on a 50 fps PAL core), so this is a floor for a core that
+# reports a strange frame rate and for direct callers of record(), not
+# something the settings can reach.
 MIN_CLIP_FRAMES = 6
 
 # How many emulated frames at the end of a clip are kept clear of input, so
@@ -213,6 +229,19 @@ DEFAULT_CLIP_FORMAT = "WEBP"
 # frames (the SNES row: 181ms against 342ms at 1s) and it pays 22% more bytes
 # for it on every clip from every console. method>=5 was measured earlier at
 # 20-370x the time for no measurable saving, and method=6 takes minutes.
+#
+# A per-console or per-frame-size method was measured once the frames got
+# smaller (see MIN_CLIP_WIDTH) and rejected: shrinking the picture took the
+# absolute cost of method=1 out of the range where the trade was interesting.
+# One second of real motion at the resolutions now posted:
+#
+#                        method=0            method=1
+#   NES     293x224   18.8ms /  6,362    31.0ms /  1,682
+#   SNES    299x224   69.4ms / 74,390   117.2ms / 39,780
+#
+# method=1 is 3.8x smaller on the NES for 12ms and 47% smaller on the SNES
+# for 48ms. It was the 195ms the 2x upscale cost that made method=0 look
+# attractive on a SNES clip, and that upscale is gone.
 #
 # quality is a no-op here and is left at 100 for clarity: in lossless mode
 # libwebp reads it as an effort dial, and dropping it to 75 or 50 produced
@@ -520,17 +549,72 @@ def capture_step(fps: float, clip_fps: int = CLIP_FPS) -> int:
     return max(1, round(float(fps) / rate))
 
 
+def capture_plan(
+    frames: int, step: int
+) -> typing.List[typing.Tuple[int, int]]:
+    """
+    Which emulated frames of a clip are photographed, and for how long each.
+
+    Returns ``[(frame index, emulated frames that picture stands for), ...]``,
+    oldest first, where the index is the 0-based frame of the recording --
+    exactly what ``RetroEmulator.record`` counts with. The picture taken on
+    index ``i`` shows the game after ``i + 1`` emulated frames, and stands
+    until the next picture is taken, so the durations always add up to
+    ``frames`` and the clip plays for as long as it emulated.
+
+    Two frames are always photographed, and between them is why clip
+    boundaries are seamless:
+
+    * **frame 0**, so a press scheduled at the start of the clip is already
+      landing in the first picture the player sees;
+    * **the last frame**, so the picture the clip finishes on -- and holds,
+      since clips are encoded with ``loop=1`` -- is the exact state the *next*
+      clip carries on from. Without it the clip stopped on the last frame that
+      happened to fall on the ``step`` cadence (frame 57 of a 60 frame Game
+      Boy clip) while frames 58, 59 and 60 were emulated but never shown, so
+      the still picture sitting in the channel between presses was three
+      frames behind the console.
+
+    Everything in between is on the regular ``step`` cadence, so the clip's
+    timing is uniform except for the tail: a 60 frame clip at ``step`` 4 is
+    fourteen 4-frame pictures, then a 3-frame one (frame 57) and a 1-frame one
+    (frame 60). The last picture is the one that gets held after playback, so
+    its short nominal duration costs nothing.
+
+    When the last frame is already on the cadence -- ``frames`` of
+    ``k * step + 1`` -- nothing is added and every picture but the last is a
+    whole step.
+    """
+    frames = max(1, int(frames))
+    step = max(1, int(step))
+    indices = list(range(0, frames, step))
+    if indices[-1] != frames - 1:
+        indices.append(frames - 1)
+    bounds = indices[1:] + [frames]
+    return [
+        (index, following - index)
+        for index, following in zip(indices, bounds, strict=True)
+    ]
+
+
 def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     """
     The last frame of a clip that a button may still be released on.
 
     Everything scheduled into a clip has to be *up* by this frame, because
-    the picture captured on it is the last one the clip has and a clip whose
-    last picture is still mid-press does not show the player what their press
-    did. Only every ``capture_step``-th frame is captured, so this is the
-    last captured frame (less MIN_AFTERMATH_FRAMES - 1 further pictures),
-    not simply ``frames - 1``: releasing a button on frame 59 of a 60 frame
-    clip would never be seen, since the last picture was taken on frame 56.
+    the picture captured on it is the last one the clip has that is worth a
+    whole step of playback, and a clip whose closing pictures are still
+    mid-press does not show the player what their press did. Only every
+    ``capture_step``-th frame is captured, so this is the last frame on that
+    cadence (less MIN_AFTERMATH_FRAMES - 1 further pictures), not simply
+    ``frames - 1``: releasing a button on frame 59 of a 60 frame clip would
+    only ever be seen in the closing picture, which is held rather than
+    played.
+
+    :func:`capture_plan` also photographs the clip's final frame, so there is
+    always *more* aftermath on screen than this reserves, never less -- the
+    closing picture is taken after the budget and therefore after the
+    release too.
 
     At four seconds this is 236 of 239 frames and no schedule ever came near
     it. At a fifth of a second it is 8 of 12, and it is what stops a 400ms
@@ -541,6 +625,142 @@ def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     step = capture_step(fps, clip_fps)
     reserved = max(1, int(MIN_AFTERMATH_FRAMES)) - 1
     return max(1, ((frames - 1) // step - reserved) * step)
+
+
+# -- How big the posted picture is -------------------------------------------
+#
+# A frame is drawn at a whole-number multiple of the console's own height and
+# the width follows from the aspect ratio the core reports, so a NES frame
+# comes out 4:3-ish instead of tall and narrow and the resize stays NEAREST
+# (pixel art must never be smoothed). The only question is the multiple, and
+# it used to be a flat 2 for anything up to 256 pixels tall.
+#
+# That was wasted work on every console bigger than a handheld. Discord scales
+# an attached image down to the message column, so a 597x448 SNES clip is
+# shrunk again in the client while costing ~4x the encode of a native-sized
+# one. Measured on a Raspberry Pi 5, one second of real motion per console,
+# best of three (a 1s clip is 60 emulated frames and 16 pictures):
+#
+#                     pixels     emulate   Pillow   encode    total    bytes
+#   Game Boy   1x    160x144      20.7ms    6.4ms    6.9ms   31.6ms    3,576
+#              2x    320x288      20.7ms    6.4ms   21.2ms   48.3ms    3,962
+#   NES        1x    293x224      41.1ms    3.7ms   32.5ms   77.2ms    1,682
+#              2x    585x448      41.1ms    8.9ms  124.9ms  174.9ms    1,920
+#   SNES       1x    299x224      47.6ms    9.1ms   71.4ms  128.1ms   26,934
+#              2x    597x448      47.6ms   16.6ms  201.5ms  265.7ms   33,482
+#   Genesis    1x    293x224      43.6ms    -        23.1ms       -   12,700
+#              2x    585x448      51.0ms    -        68.2ms       -   16,440
+#   Master Sys 1x    293x192      29.4ms    -         6.4ms       -    1,554
+#              2x    585x384      34.7ms    -        28.8ms       -    1,986
+#
+# So doubling a TV console costs 2.3-4x the encode and *more* bytes, for a
+# picture Discord shrinks anyway: dropping to 1x takes a NES clip from 175ms
+# to 77ms and a SNES clip from 266ms to 128ms, both roughly halved end to
+# end. The Game Boy is the opposite case and genuinely needs the double --
+# 160x144 is not readable on a phone -- and it costs 17ms there.
+#
+# Hence a rule in terms of the *posted* width rather than a per-core table:
+# double (and double again) only while the picture would be narrower than
+# MIN_CLIP_WIDTH, and never at all once it is as wide as the frame itself.
+#
+# MIN_CLIP_WIDTH has to sit in (240, 293] to say what the measurements say:
+# above 240 so the Game Boy (160 wide at 1x) and the Game Boy Advance (240)
+# still double, and at or below 293 so the NES does not. 280 is the middle of
+# that window. The consoles land at:
+#
+#   Game Boy        160x144 -> 320x288     (2x, unchanged, and pinned by a test)
+#   Game Boy Adv.   240x160 -> 480x320     (2x, unchanged)
+#   NES             256x224 -> 293x224     (1x, was 585x448)
+#   Super Nintendo  256x224 -> 299x224     (1x, was 597x448)
+#   ...in hi-res    512x448 -> 597x448     (1x, unchanged)
+#   Genesis         256x224 -> 293x224     (1x, was 585x448)
+#   Master System   256x192 -> 293x192     (1x, was 585x384)
+#
+# Every row above is a frame size and aspect ratio read off the real core.
+# Three cases follow from the same rule rather than from a measurement,
+# because no freely-redistributable ROM was to hand for them: a
+# 320-pixel-wide Genesis mode (320x224 at the 1.306 the core reports) doubles
+# to 585x448, and the Neo Geo Pocket (160x152) and PC Engine (256x232) should
+# land at roughly 320x304 and 303x232. Worth re-measuring the day somebody
+# plays one.
+#
+# 293-303 pixels is a little under the 320-400 a message column would ideally
+# be filled with, and there is nothing in between to pick: the next multiple
+# is 585, because the height multiple is a whole number and the width follows
+# from a fixed aspect ratio. Thirty pixels of width is not worth 100-200ms of
+# every button press, so the narrower one wins.
+#
+# One knock-on worth knowing about: the old cutoff happened to give a SNES
+# the same 597x448 in both its resolutions, and now lo-res is 299x224 and
+# hi-res 597x448. A game that switches mid-session therefore leaves clips of
+# two sizes in the replay buffer, which concatenate_clips already handles by
+# ending the replay at the change. Making them agree would mean either
+# doubling every SNES clip again or throwing away half the columns of a
+# hi-res one.
+#
+# The second condition -- never narrower than the frame -- is what stops the
+# aspect correction from *losing* pixels. A Genesis game in its 320-pixel
+# mode would be 293 wide at 1x, which with NEAREST means dropping 27 columns
+# of somebody's picture, so it doubles instead. Widening 256 to 293 only
+# repeats columns, which is the ordinary cost of a non-square pixel.
+#
+#: The narrowest a clip is posted at, before the frame's own width has a say.
+MIN_CLIP_WIDTH = 280
+
+#: The most a frame is ever enlarged. Nothing here reaches it -- the widest
+#: thing needing two is the Game Boy Advance -- so it is a backstop against a
+#: core reporting a tiny frame or a nonsense aspect ratio, which would
+#: otherwise have this multiplying until the width cleared MIN_CLIP_WIDTH.
+MAX_CLIP_SCALE = 2
+
+
+def clip_scale(
+    frame_width: int,
+    frame_height: int,
+    aspect: float,
+    max_scale: int = MAX_CLIP_SCALE,
+) -> int:
+    """
+    How many times over to draw a frame of this size, 1 or more.
+
+    The smallest whole number that makes the picture at least
+    MIN_CLIP_WIDTH wide *and* at least as wide as the frame itself, capped at
+    ``max_scale``. See the block above for the measurements behind both
+    conditions. ``max_scale`` of 1 means "native", which is what the
+    screenshot helpers in the tests ask for.
+    """
+    frame_width = max(1, int(frame_width))
+    frame_height = max(1, int(frame_height))
+    aspect = float(aspect) if float(aspect) > 0.0 else frame_width / frame_height
+    wanted = max(int(MIN_CLIP_WIDTH), frame_width)
+    scale = 1
+    while scale < max(1, int(max_scale)):
+        if max(1, round(frame_height * scale * aspect)) >= wanted:
+            break
+        scale += 1
+    return scale
+
+
+def clip_size(
+    frame_width: int,
+    frame_height: int,
+    aspect: float,
+    max_scale: int = MAX_CLIP_SCALE,
+) -> typing.Tuple[int, int]:
+    """
+    The size a frame of this shape should be posted at, in pixels.
+
+    The height is a whole multiple of the console's own (see
+    :func:`clip_scale`) and the width follows from the aspect ratio the core
+    reports, so a Game Boy's square pixels land on exactly 320x288 and a NES
+    frame is 4:3-ish rather than tall and narrow.
+    """
+    frame_width = max(1, int(frame_width))
+    frame_height = max(1, int(frame_height))
+    ratio = float(aspect) if float(aspect) > 0.0 else frame_width / frame_height
+    scale = clip_scale(frame_width, frame_height, ratio, max_scale)
+    height = max(1, frame_height * scale)
+    return max(1, round(height * ratio)), height
 
 
 def clamp_clip_seconds(value: typing.Any) -> float:

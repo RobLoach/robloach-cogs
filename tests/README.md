@@ -2,8 +2,8 @@
 
 ```bash
 pip install -r ../requirements-dev.txt
-pytest                      # the fast suite, which is the default: ~6s
-pytest -m emulator          # real cores and real ROMs: ~21s, or ~12s with -n 2
+pytest                      # the fast suite, which is the default: ~8s
+pytest -m emulator          # real cores and real ROMs: ~26s, or ~15s with -n 2
 pytest -m "not network"     # both of the above, i.e. everything this machine can run
 pytest -m network           # the buildbot check; also needs RETRO_TEST_NETWORK=1
 ```
@@ -25,11 +25,11 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` included), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget` and `retro/clips.py`: plain functions of a frame rate or of a framebuffer, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
-| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
+| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` included), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
+| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
-`pytest -m emulator -n 2` roughly halves the slow half (21s to 12s here). It
+`pytest -m emulator -n 2` roughly halves the slow half (26s to 15s here). It
 has to be `-n`, i.e. separate processes: one libretro core may be loaded per
 process. The fast suite is *slower* under `-n`, so it is left serial.
 
@@ -81,6 +81,31 @@ Two consequences for the tests:
 both are already on other people's disks, so a command or a settings key
 that a refactor quietly drops is their data gone.
 
+## What a button press is allowed to do to the message
+
+A press must cause **exactly one** edit of the Discord message, and
+`tests/test_cog_session.py` is where that is enforced -- the fakes record
+every interaction call, so the assertion is on the list of calls rather than
+on a screenshot:
+
+* `test_a_press_makes_exactly_one_edit_to_the_message` -- the call log is
+  `["response.defer", "edit_original_response"]` and nothing else, the one
+  edit carries the new `.webp`, and the buttons come out enabled;
+* `test_nothing_is_edited_while_the_press_is_being_emulated` -- checked from
+  inside a wrapped `run_press`, because the bug was an edit that changed *no
+  attachment* and still restarted the one already there, so "only one clip is
+  uploaded" was never the statement that mattered;
+* `test_a_press_no_longer_greys_the_controls_out` -- the trade, pinned, so an
+  intermediate "greyed out" edit cannot come back by accident.
+
+The matching statement for the *content* of a clip is
+`test_one_clip_carries_on_from_the_last_with_no_frames_lost` in
+`test_emulator.py`: it records two consecutive clips off a real Game Boy,
+then rewinds the save state and emulates the same frames one at a time, and
+requires the first clip's last picture and the second clip's first picture to
+be adjacent emulated frames. `tests/test_clips.py` makes the same statement
+about `capture_plan` at every clip length and frame rate, with no core.
+
 ## What the cog holds on to
 
 `tests/test_leaks.py` is the file for "after N of these have come and gone,
@@ -127,9 +152,10 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
 
 ## Adding a test
 
-* Put it where it belongs: `test_systems.py`, `test_archives.py` and
-  `test_frame_grab.py` import nothing but the standard library plus what the
-  module under test needs (they load it directly, via `tests/loader.py`,
+* Put it where it belongs: `test_systems.py`, `test_archives.py`,
+  `test_clips.py` and `test_frame_grab.py` import nothing but the standard
+  library plus what the module under test needs (they load it directly, via
+  `tests/loader.py`,
   which puts it in a synthetic package so a relative import of a sibling
   still resolves without running `retro/__init__.py`); `test_view.py` and
   `test_cog_*.py` use
