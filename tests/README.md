@@ -103,24 +103,64 @@ with an empty history is the one click that makes *no* edit at all: it
 answers privately, so the assertion there is `["response.send_message"]` and
 an untouched message.
 
-**Saying which button was pressed rides on that same edit.** Every press now
-writes one line of `content` -- `Pressed A.`, `Pressed ⬅️.`, `Waited.` --
-and the tests in the "Which button was pressed" section of
-`test_cog_session.py` check that it reaches the message, that a real notice
-and the resumed line still beat it, and that the next press replaces it. The
-per-console wording is a table over all eight consoles in `test_view.py`
-(`PRESS_LINES`), held against the `Button` entries in `retro/systems.py` --
-which is the point, since the RetroPad field a button maps to is frequently
-not what the console calls it (a Genesis `C` is RetroPad `a`).
+**Saying who pressed which button rides on that same edit.** Every action
+writes one line of `content` -- `Rob pressed A.`, `Rob pressed ⬅️.`,
+`Rob waited.`, `Rob undid the last press.`, `Rob reset the game.` -- and the
+tests in the "Who did it" section of `test_cog_session.py` check it three
+ways:
 
-Two controls are allowed to be greyed out at any moment, because each of them
-can have nothing to do: **×3** on a clip too short for two taps, and **Undo**
-with an empty history (which is every session's first moment, and every
-session's state after a restart). So `fakes.pressable()` -- and the
-`any_disabled`/`all_disabled` keys of the interaction snapshot -- leave those
-two out, while `fakes.playable()` keeps them for the tests that are about
-them. Without that split, "a press does not grey the controls out" quietly
-becomes "there was something to undo".
+* `test_every_action_says_who_did_it` is table-driven over `ATTRIBUTED`, one
+  row per action, each row saying how to perform it and what the message must
+  then read. A press, Wait and ×3 arrive as `interaction.user`;
+  `[p]retroreset` is a *command* and arrives as `ctx.author`, so its row goes
+  through the command and reads the edit off the message
+  (`fakes.RetroEnv.message_edit`) rather than off an interaction log;
+* `test_no_action_can_notify_anybody` re-runs the same table with a display
+  name of `@everyone **<@111…>**` and asserts *both* guards -- that no
+  mention syntax survives in the string, and that the edit carries an
+  `allowed_mentions` with `everyone`, `users`, `roles` and `replied_user` all
+  false. The snapshot exposes them as `allowed_mentions` and `pings_nobody`;
+* `test_the_attribution_still_rides_on_the_one_edit` keeps the call log at
+  `["response.defer", "edit_original_response"]`, so the attribution cannot
+  quietly buy itself a second edit.
+
+Alongside those: `test_a_presser_with_no_usable_name_still_gets_a_line`
+covers a plain `User` (no `guild_permissions`, which is what somebody who has
+left the guild looks like) and an object with nothing nameable on it at all,
+which must fall back to `Pressed A.` rather than raise or emit a line
+starting with a space.
+
+The wording and the sanitising are unit-level and live in `test_view.py`: the
+per-console table over all eight consoles (`PRESS_LINES`, held against the
+`Button` entries in `retro/systems.py` -- which is the point, since the
+RetroPad field a button maps to is frequently not what the console calls it,
+a Genesis `C` being RetroPad `a`), the one-voice table (`ACTION_LINES`,
+checked against `RetroView.ACTION_NOTES`), and `SANITISED` /
+`HOSTILE_NAMES`, which are every shape of display name that would otherwise
+change the shape of the message -- markdown, backticks, start-of-line
+markdown, masked links, mass mentions, zero-width characters, newlines and a
+200 character name.
+
+**One control is allowed to be greyed out at any moment: Undo**, with an
+empty history (which is every session's first moment, and every session's
+state after a restart). So `fakes.pressable()` -- and the
+`any_disabled`/`all_disabled` keys of the interaction snapshot -- leave it
+out, while `fakes.playable()` keeps it for the tests that are about it.
+Without that split, "a press does not grey the controls out" quietly becomes
+"there was something to undo".
+
+**×3 used to be the second one, and is not any more**: on a clip too short
+for two taps it is not drawn at all, so whenever it is on the message it is
+live. `fakes.button()` therefore returns `None` for a control the view does
+not have, and the presence/absence table is
+`test_the_repeat_button_is_drawn_only_when_it_can_do_something` in
+`test_view.py` -- `REPEAT_BY_LENGTH` × all eight consoles, from the 0.2s
+settings floor to the 15s ceiling, checking the tap count, whether the button
+exists, its label, that the layout still fits Discord's grid, and that Wait
+and Undo have not moved.
+`test_changing_the_clip_length_adds_and_removes_the_button_in_place` walks a
+live view down to 0.2s and back up, because a Discord action row is ordered
+by insertion and simply re-adding the button would land it after Undo.
 
 The matching statement for the *content* of a clip is
 `test_one_clip_carries_on_from_the_last_with_no_frames_lost` in
@@ -129,6 +169,21 @@ then rewinds the save state and emulates the same frames one at a time, and
 requires the first clip's last picture and the second clip's first picture to
 be adjacent emulated frames. `tests/test_clips.py` makes the same statement
 about `capture_plan` at every clip length and frame rate, with no core.
+
+**A clip plays for exactly as long as it emulated**, and that rule is
+unconditional -- see `test_a_clip_plays_for_as_long_as_it_emulated`, whose
+docstring states it and says why it was nearly weakened. A clip opens on
+pictures where the press has not visibly landed yet (the hold is 160ms and a
+game reacts more slowly), which reads as the clip showing a moment from
+before the press, and trimming that lead-in would have made playback shorter
+than the span it covers. It was measured instead and rejected;
+`test_the_dead_lead_in_is_photographed_rather_than_trimmed` carries the
+numbers and asserts that every picture the capture plan asks for is still
+photographed, and
+`test_a_completely_static_screen_still_produces_a_whole_clip` covers the case
+the trim would have destroyed -- a screen where *every* picture is unchanged,
+which a trim would have reduced to a 17ms flash. That one `skip`s rather than
+fails if the ROM turns out not to be static under the core build in use.
 
 ## What the cog holds on to
 

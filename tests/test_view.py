@@ -7,6 +7,8 @@ trusted. Needs discord.py; the tables themselves are covered, with no
 dependencies at all, in test_systems.py.
 """
 
+import re
+
 import pytest
 
 discord = pytest.importorskip("discord", reason="the view tests need discord.py")
@@ -149,9 +151,14 @@ def test_the_controls_share_the_last_row(view):
         assert button.row == last, (name, button.row, last)
 
 
-#: console key -> (components, action rows, the last row's labels). The whole
-#: point of the table: removing Replay took the control cluster back to three
-#: wide, which fits beside every console's bottom row -- so all eight
+#: console key -> (components, action rows, the last row's labels) **at the
+#: default one second clip**, which is where the repeat button is drawn.
+#: test_the_repeat_button_is_drawn_only_when_it_can_do_something below walks
+#: the same table across every clip length; the rows and the labels either
+#: side of the repeat button are the same at all of them.
+#:
+#: The whole point of the table: removing Replay took the control cluster back
+#: to three wide, which fits beside every console's bottom row -- so all eight
 #: consoles' controls share that row again, the widest layouts are back to
 #: four of Discord's five action rows, and every console is one component and
 #: (on six of the eight) one row smaller than it was. Anything that changes
@@ -209,6 +216,120 @@ def test_the_repeat_button_taps_this_console_s_confirm_button(view, system):
     )
     assert repeat.field == system.confirm
     assert repeat.label == f"{system.label_for(system.confirm)} x{viewmod.REPEAT_TAPS}"
+
+
+# -- When the repeat button exists ---------------------------------------------
+#
+# It is *drawn only when it can do something*: below two taps it does no more
+# than the console's own confirm button one row over, and it used to be drawn
+# and greyed out for that case -- which was read as the feature having been
+# removed from the cog. Now it is simply not there, and it comes back on the
+# next press at a longer clip.
+#
+# The table is every clip length that changes the answer, against every
+# console, because this is what every player's controller looks like. The
+# boundaries (measured at DEFAULT_FPS with the default 160ms hold) are 0.48s
+# for the second tap and 0.68s for the third.
+
+#: clip seconds -> (taps, whether the button is drawn, the "xN" it says)
+REPEAT_BY_LENGTH = [
+    (0.2, 1, False, None),   # the settings floor
+    (0.3, 1, False, None),
+    (0.4, 1, False, None),
+    (0.47, 1, False, None),  # the last length with only one tap
+    (0.48, 2, True, "x2"),   # ...and the first with two
+    (0.5, 2, True, "x2"),
+    (0.67, 2, True, "x2"),
+    (0.68, 3, True, "x3"),   # the first with all three
+    (0.8, 3, True, "x3"),
+    (1.0, 3, True, "x3"),    # the default
+    (4.0, 3, True, "x3"),
+    (15.0, 3, True, "x3"),   # the settings ceiling
+]
+
+
+@pytest.mark.parametrize(
+    "seconds, taps, drawn, suffix", REPEAT_BY_LENGTH, ids=[str(r[0]) for r in REPEAT_BY_LENGTH]
+)
+def test_the_repeat_button_is_drawn_only_when_it_can_do_something(
+    retro, system, seconds, taps, drawn, suffix
+):
+    view = viewmod.RetroView(
+        retro.cog,
+        game_name="Test",
+        slug="test",
+        rom_filename=f"test.{system.extensions[0]}",
+        channel_id=1,
+        system=system,
+        clip_seconds=seconds,
+    )
+    button = next(
+        (c for c in view.children if isinstance(c, viewmod._RepeatButton)), None
+    )
+    assert view.repeat_taps == taps, (system.key, seconds)
+    assert view.has_repeat_button is drawn
+    assert (button is not None) is drawn, (system.key, seconds)
+    if button is None:
+        # Nothing dead is left behind, on the objects or on the wire.
+        ids = {c.custom_id for c in view.children}
+        assert f"{viewmod.CUSTOM_ID_PREFIX}:repeat" not in ids
+    else:
+        assert button.label.endswith(f" {suffix}"), button.label
+        assert not button.disabled, "a drawn repeat button is always live"
+
+    # Whatever the clip length, the layout is still one Discord will take,
+    # and Wait and Undo have not moved: the row reserves space for all three
+    # controls whether or not the third is drawn.
+    payload = view.to_components()
+    expected_components, expected_rows, full_row = LAYOUTS[system.key]
+    assert len(payload) == expected_rows, (system.key, seconds)
+    assert all(len(row["components"]) <= S.MAX_BUTTONS_PER_ROW for row in payload)
+    assert len(view.children) <= S.MAX_COMPONENTS
+    assert len(view.children) == expected_components - (0 if drawn else 1)
+    confirm = system.label_for(system.confirm)
+    wanted = []
+    for label in full_row:
+        if label.startswith(f"{confirm} x"):
+            if drawn:
+                wanted.append(f"{confirm} {suffix}")
+            continue
+        wanted.append(label)
+    labels = [b.get("label") or b["custom_id"] for b in payload[-1]["components"]]
+    assert labels == wanted, (system.key, seconds, labels)
+    # Undo is last either way, and the repeat button sits between Wait and
+    # Undo when it is there at all.
+    assert labels[-1] == "Undo"
+    assert labels[-2] == (f"{confirm} {suffix}" if drawn else "Wait")
+
+
+def test_changing_the_clip_length_adds_and_removes_the_button_in_place(view, system):
+    """Both directions, and the button lands back in its proper place.
+
+    A Discord action row is ordered by insertion, so adding the button back
+    by itself would put it after Undo and read "Wait Undo A x3". The row is
+    rebuilt instead; see RetroView._update_repeat_label.
+    """
+    confirm = system.label_for(system.confirm)
+    full = [b.get("label") for b in view.to_components()[-1]["components"]]
+    assert f"{confirm} x3" in full
+
+    view.clip_seconds = 0.2
+    view._update_repeat_label()
+    short = [b.get("label") for b in view.to_components()[-1]["components"]]
+    assert short == [label for label in full if label != f"{confirm} x3"]
+
+    view.clip_seconds = 0.5
+    view._update_repeat_label()
+    two = [b.get("label") for b in view.to_components()[-1]["components"]]
+    assert two == [f"{confirm} x2" if label == f"{confirm} x3" else label for label in full]
+
+    view.clip_seconds = 1.0
+    view._update_repeat_label()
+    assert [b.get("label") for b in view.to_components()[-1]["components"]] == full
+    # And it is still a view Discord will register for a message.
+    assert view.is_persistent()
+    ids = [c.custom_id for c in view.children]
+    assert len(set(ids)) == len(ids), ids
 
 
 # -- Saying which button was pressed ------------------------------------------
@@ -336,11 +457,14 @@ def test_wait_and_the_repeat_button_say_what_they_do(view, system):
     )
     assert repeat.label.endswith(f"x{view.repeat_taps}")
 
-    # A clip too short for two taps: the button is greyed out and the line
-    # drops the count rather than claiming a repeat that did not happen.
+    # A clip too short for two taps: the button is not drawn at all, and a
+    # click on a stale one still on an un-redrawn message drops the count
+    # rather than claiming a repeat that did not happen.
     view.clip_seconds = 0.2
     view._update_repeat_label()
     assert view.repeat_taps == 1
+    assert not view.has_repeat_button
+    assert view._repeat_button() is None
     assert view.press_note(system.confirm, viewmod.REPEAT_TAPS) == f"Pressed {confirm}."
 
 
@@ -361,6 +485,214 @@ def test_the_press_line_matches_the_tone_of_the_other_notes():
         assert note[0].isupper() and note.endswith("."), note
         assert "*" not in note and "`" not in note, note
         assert len(note) <= 40, note
+
+
+# -- Who did it ----------------------------------------------------------------
+#
+# Every action names its author as well as itself, in one voice for all four
+# of them, and the author's name is a string somebody else chose -- so the
+# two things checked here are the wording (a table over ACTION_NOTES) and the
+# sanitising (a table of hostile display names). The third property, that a
+# line can never notify anybody, is checked against real edits in
+# test_cog_session.py; what is checked here is the half of it that is a
+# property of the string: no mention syntax is ever emitted.
+
+
+class Named:
+    """The least a presser can be: something with a display_name."""
+
+    def __init__(self, **attributes):
+        for name, value in attributes.items():
+            setattr(self, name, value)
+
+
+#: action -> (the line with a name, the line without one). Written out rather
+#: than read from ACTION_NOTES, because "the wording is what it is" is the
+#: assertion: a change here is a change to what a player reads after every
+#: single press.
+ACTION_LINES = {
+    "press": ("Rob pressed A.", "Pressed A."),
+    "wait": ("Rob waited.", "Waited."),
+    "undo": ("Rob undid the last press.", "Undid the last press."),
+    "reset": ("Rob reset the game.", "Reset the game."),
+}
+
+
+@pytest.mark.parametrize("action", sorted(ACTION_LINES))
+def test_every_action_reads_in_one_voice(action):
+    named, plain = ACTION_LINES[action]
+    assert viewmod.action_note(action, Named(display_name="Rob"), "A") == named
+    # Nobody to name: the impersonal form of the very same sentence, never an
+    # empty line and never a stray leading space.
+    assert viewmod.action_note(action, None, "A") == plain
+    assert set(ACTION_LINES) == set(viewmod.ACTION_NOTES), "an action was added"
+    for line in (named, plain):
+        assert line[0].isupper() and line.endswith("."), line
+        assert "  " not in line and line == line.strip(), repr(line)
+
+
+def test_the_four_actions_are_the_four_the_view_can_perform():
+    """One table, and the impersonal names are read out of it.
+
+    The point of ACTION_NOTES being a dict is that the five lines a session
+    can show cannot drift apart: there is no second place to change one.
+    """
+    assert viewmod.PRESSED_NOTE == viewmod.ACTION_NOTES["press"][1]
+    assert viewmod.WAITED_NOTE == viewmod.ACTION_NOTES["wait"][1]
+    assert viewmod.UNDONE_NOTE == viewmod.ACTION_NOTES["undo"][1]
+    assert viewmod.RESET_NOTE == viewmod.ACTION_NOTES["reset"][1]
+    for named, plain in viewmod.ACTION_NOTES.values():
+        assert "{who}" in named and "{who}" not in plain
+        # The verb is lower case in the named form ("Rob pressed A.") and
+        # capitalised in the impersonal one ("Pressed A."), which is the only
+        # difference between them.
+        assert named.split()[1][0].islower(), named
+
+
+#: display name -> what goes on the line. Everything a name can contain that
+#: would otherwise change the shape of the message.
+SANITISED = {
+    "Rob": "Rob",
+    # Markdown of every kind, escaped unconditionally rather than "as
+    # needed", so no pairing trick gets through.
+    "**Rob**": "\\*\\*Rob\\*\\*",
+    "`Rob`": "\\`Rob\\`",
+    "~~Rob~~": "\\~\\~Rob\\~\\~",
+    "||Rob||": "\\|\\|Rob\\|\\|",
+    "R\\o*b": "R\\\\o\\*b",
+    "[Rob](http://x)": "\\[Rob\\]\\(http://x\\)",
+    # A URL in a name is not a link to be left alone, which is what
+    # discord.utils.escape_markdown would have done with it.
+    "http://x/__a__": "http://x/\\_\\_a\\_\\_",
+    # Markdown that is only markdown at the start of a line, which is exactly
+    # where the name sits.
+    "# Rob": "\\# Rob",
+    "- Rob": "\\- Rob",
+    "> Rob": "\\> Rob",
+    "+ Rob": "\\+ Rob",
+    "1. Rob": "1\\. Rob",
+    "Jean-Luc": "Jean\\-Luc",
+    # Mass mentions and a real user mention: no pingable syntax survives.
+    "@everyone": "@\u200beveryone",
+    "@here": "@\u200bhere",
+    "<@1234567890123456789>": "\\<@\u200b1234567890123456789\\>",
+    "<@&1234567890123456789>": "\\<@\u200b&1234567890123456789\\>",
+    # Angle brackets in general: a custom emoji and a timestamp would both
+    # have rendered.
+    "<:evil:1234567890123456789>": "\\<:evil:1234567890123456789\\>",
+    "<t:0:R>": "\\<t:0:R\\>",
+    # Invisible characters: dropped, because a name made of them is not a
+    # name.
+    "Ro\u200bb": "Rob",
+    "Rob\ufeff": "Rob",
+    "Ro\u00adb": "Rob",
+    "\u202eRob": "Rob",
+    "\u200b\u200b\u200b": "",
+    # Whitespace: collapsed to single spaces, so one line stays one line.
+    "Rob\nLoach": "Rob Loach",
+    "  Rob  Loach  ": "Rob Loach",
+    "Rob\tLoach": "Rob Loach",
+    " ": "",
+    "": "",
+}
+
+
+@pytest.mark.parametrize("raw", sorted(SANITISED))
+def test_a_display_name_is_made_safe_before_it_goes_on_the_line(raw):
+    assert viewmod.presser_name(Named(display_name=raw)) == SANITISED[raw]
+
+
+def test_a_very_long_display_name_cannot_own_the_line():
+    long = viewmod.presser_name(Named(display_name="R" * 200))
+    assert len(long) == viewmod.MAX_PRESSER_NAME
+    assert long.endswith("\N{HORIZONTAL ELLIPSIS}")
+    # 32 is Discord's own ceiling for a nickname, so a real name is never
+    # cut; the whole line stays short either way.
+    assert viewmod.MAX_PRESSER_NAME == 32
+    line = viewmod.action_note("undo", Named(display_name="R" * 200))
+    assert len(line) <= viewmod.MAX_PRESSER_NAME + 30, line
+
+
+#: Names crafted to notify somebody, or to break the line, or both.
+HOSTILE_NAMES = sorted(SANITISED) + [
+    "@everyone @here <@1234567890123456789>",
+    "\u200b@everyone\u200b",
+    "**@everyone**",
+    "#\u00ad @everyone",
+    "<@!1234567890123456789>",
+    "@" + "1" * 19,
+    "`@everyone`",
+    "[@everyone](http://x)",
+    "- @here\n- @here",
+    "R" * 200 + "@everyone",
+]
+
+
+@pytest.mark.parametrize("raw", HOSTILE_NAMES)
+def test_no_line_can_ever_emit_mention_syntax(view, raw):
+    """The half of "a press never pings" that is a property of the string.
+
+    Nothing Discord resolves into a notification survives: ``@everyone`` and
+    ``@here`` come back with a zero-width space wedged into them, and every
+    ``<`` is backslash-escaped so no ``<@id>`` can form. The other half --
+    that the edit also carries an AllowedMentions suppressing everything --
+    is checked against real edits in test_cog_session.py.
+    """
+    user = Named(display_name=raw)
+    lines = [
+        view.press_note("a", 1, user),
+        view.press_note(None, 1, user),
+        view.press_note("a", viewmod.REPEAT_TAPS, user),
+        view.undo_note(user),
+        view.reset_note(user),
+    ]
+    for line in lines:
+        assert "@everyone" not in line, line
+        assert "@here" not in line, line
+        # No un-escaped `<`, so none of the `<@id>`/`<@&id>`/`<#id>` family
+        # can be parsed out of it.
+        assert not re.search(r"(?<!\\)<", line), line
+        # Still one line, still one sentence.
+        assert "\n" not in line and line.endswith("."), line
+
+
+def test_anybody_the_cog_can_be_handed_is_named_or_gracefully_not():
+    """The awkward callers, which are all real.
+
+    A Member has a per-guild nickname; a plain User (a DM, or somebody who
+    has left the guild between clicking and being looked up) has a global
+    display name or just a username; and a stripped-down object with none of
+    them at all must still produce a sentence rather than a traceback or a
+    line beginning with a space.
+    """
+    # A Member: display_name is the nickname, and is preferred.
+    member = Named(display_name="Robbo", global_name="Rob Loach", name="robloach")
+    assert viewmod.presser_name(member) == "Robbo"
+    # A User with no nickname anywhere: discord.py's User.display_name
+    # already falls back to global_name, but an object that only carries one
+    # of the two is still named.
+    assert viewmod.presser_name(Named(global_name="Rob Loach")) == "Rob Loach"
+    assert viewmod.presser_name(Named(name="robloach")) == "robloach"
+    # Somebody who has left the guild: discord.py still hands over a Member
+    # or User object, with no guild_permissions on the User case -- which is
+    # not something naming them depends on.
+    left = Named(display_name="Gone", id=7)
+    assert not hasattr(left, "guild_permissions")
+    assert viewmod.presser_name(left) == "Gone"
+    # Nothing nameable at all, in every shape it can arrive in.
+    for nobody in (None, Named(), Named(display_name=""), Named(display_name=None),
+                   Named(display_name="\u200b"), object()):
+        assert viewmod.presser_name(nobody) == ""
+        assert viewmod.action_note("press", nobody, "A") == "Pressed A."
+
+
+def test_a_named_press_uses_the_console_s_own_button_name(view, system):
+    """The attribution does not disturb the half that comes from systems.py."""
+    user = Named(display_name="Rob")
+    for field, line in PRESS_LINES[system.key].items():
+        # "Pressed X." -> "Rob pressed X."
+        expected = f"Rob pressed {line[len('Pressed '):]}"
+        assert view.press_note(field, 1, user) == expected, field
 
 
 # -- The consoles whose buttons are not what the RetroPad calls them -----------

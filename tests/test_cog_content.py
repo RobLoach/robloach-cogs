@@ -290,7 +290,10 @@ async def test_the_settings_embed_says_what_a_short_clip_does_to_a_press(retro):
     assert "0.2 seconds of play" in values, values
     # The hold is a ceiling, and at a fifth of a second it is not honoured.
     assert "held for about 133ms rather than the 160ms" in values, values
-    assert "repeat button is greyed out" in values, values
+    # And the repeat button is absent rather than greyed out at this length;
+    # see MIN_REPEAT_TAPS in retro/RetroView.py.
+    assert "repeat button is not shown at this length" in values, values
+    assert "greyed out" not in values, values
 
 
 # -- ROM size and content checks ----------------------------------------------

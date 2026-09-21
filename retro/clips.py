@@ -463,8 +463,8 @@ def fast_frame_size(driver):
 #
 # Seconds in, frames out. These are plain functions of a frame rate rather
 # than methods so the view can lay a press schedule out before a core has
-# been loaded (to label the repeat button, which has to say how many taps it
-# will really do) and so the arithmetic can be tested without one.
+# been loaded (to decide whether to draw the repeat button at all, and what
+# number to put on it) and so the arithmetic can be tested without one.
 # RetroEmulator's methods of the same names (retro/emulator.py) are thin
 # wrappers that pass the core's own fps.
 

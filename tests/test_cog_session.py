@@ -6,6 +6,7 @@ tests/fakes.py. Nothing here needs a libretro core.
 
 import asyncio
 import os
+import re
 import time
 from pathlib import Path
 
@@ -102,27 +103,48 @@ async def test_retroset_cliplength_says_what_a_short_clip_does_to_a_press(retro)
 
     await cliplength(retro.cog, ctx, 0.2)
     assert "held for about 133ms" in ctx.sent[-1], ctx.sent[-1]
-    assert "greyed out" in ctx.sent[-1], ctx.sent[-1]
+    # Not "greyed out" any more: at one tap the button is not drawn at all,
+    # and the reply says so and says it comes back. See MIN_REPEAT_TAPS.
+    assert "is not shown at this length" in ctx.sent[-1], ctx.sent[-1]
+    assert "comes back" in ctx.sent[-1], ctx.sent[-1]
+    assert "greyed out" not in ctx.sent[-1], ctx.sent[-1]
 
 
 async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro):
+    """Changing the clip length re-draws the row on the next press.
+
+    Both ways round, which is the whole point of the button being hidden
+    rather than greyed out: at 0.2s only one tap fits, so the x3 button goes
+    away entirely, and at 4s it comes back -- in its proper place in the row,
+    between Wait and Undo, rather than tacked on the end.
+    """
     await retro.install_cores("gambatte")
     view, ctx, _ = await retro.posted_game(8054, "relength")
     cliplength = retro.cogmod.Retro.retroset_cliplength.callback
-    repeat = retro.control(view, "repeat")
-    assert repeat.label == "A x3" and not repeat.disabled
+    assert retro.control(view, "repeat").label == "A x3"
+    assert not retro.control(view, "repeat").disabled
 
     await cliplength(retro.cog, ctx, 0.2)
     assert view.clip_seconds == 0.2
-    # The next press redraws the controls, and the repeat button stops
-    # claiming three taps it can no longer do.
+    # The next press redraws the controls, and the repeat button -- which can
+    # now do no more than the console's own A button -- is gone.
     await view._press(retro.interaction(view, message=view.message), "a")
-    assert repeat.label == "A x1" and repeat.disabled
+    assert view.repeat_taps == 1 and not view.has_repeat_button
+    assert retro.control(view, "repeat") is None
     assert view.clip_frames(view.emulator) == 12
+    # Wait and Undo have not moved, because the row still reserves space for
+    # all three controls whether or not the third is drawn.
+    assert [c.label for c in view.children if c.row == 2] == [
+        "Start", "Select", "Wait", "Undo"
+    ]
 
     await cliplength(retro.cog, ctx, 4)
     await view._press(retro.interaction(view, message=view.message), "a")
-    assert repeat.label == "A x3" and not repeat.disabled
+    back = retro.control(view, "repeat")
+    assert back is not None and back.label == "A x3" and not back.disabled
+    assert [c.label for c in view.children if c.row == 2] == [
+        "Start", "Select", "Wait", "A x3", "Undo"
+    ]
 
 
 async def test_nothing_of_the_stop_button_is_left_in_the_view(retro):
@@ -456,7 +478,7 @@ async def test_a_press_edit_carries_one_clip_and_no_embed(retro):
     assert final["filenames"][0].endswith(".webp")
     # One line of text -- which button it was -- and nothing else. See the
     # "Which button was pressed" section below.
-    assert final["content"] == "Pressed A."
+    assert final["content"] == "Tester pressed A."
     assert final["spacers_disabled"], "the spacers were never re-enabled"
 
 
@@ -683,21 +705,21 @@ async def test_a_press_says_which_button_it_was(retro):
     # Still one edit: the line rides on the edit that carries the clip.
     assert interaction.kinds() == ["response.defer", "edit_original_response"]
     landed = interaction.log[-1][1]
-    assert landed["content"] == "Pressed A."
+    assert landed["content"] == "Tester pressed A."
     assert landed["n_attachments"] == 1, "and the clip came with it"
 
 
 @pytest.mark.parametrize(
     "field, expected",
     [
-        ("up", "Pressed \N{UPWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
-        ("down", "Pressed \N{DOWNWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
-        ("left", "Pressed \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
-        ("right", "Pressed \N{BLACK RIGHTWARDS ARROW}\N{VARIATION SELECTOR-16}."),
-        ("b", "Pressed B."),
-        ("start", "Pressed Start."),
-        ("select", "Pressed Select."),
-        (None, "Waited."),
+        ("up", "Tester pressed \N{UPWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
+        ("down", "Tester pressed \N{DOWNWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
+        ("left", "Tester pressed \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
+        ("right", "Tester pressed \N{BLACK RIGHTWARDS ARROW}\N{VARIATION SELECTOR-16}."),
+        ("b", "Tester pressed B."),
+        ("start", "Tester pressed Start."),
+        ("select", "Tester pressed Select."),
+        (None, "Tester waited."),
     ],
 )
 async def test_every_control_puts_its_own_name_on_the_message(retro, field, expected):
@@ -713,7 +735,7 @@ async def test_the_repeat_button_says_how_many_taps_it_really_did(retro):
     view, _, _ = await retro.posted_game(9022, "taps")
     interaction = retro.interaction(view, message=view.message)
     await retro.control(view, "repeat").callback(interaction)
-    assert interaction.log[-1][1]["content"] == "Pressed A x3."
+    assert interaction.log[-1][1]["content"] == "Tester pressed A x3."
 
     # A clip too short to fit three: the line follows press_plan down, like
     # the label on the button does, rather than claiming a tap that did not
@@ -721,7 +743,7 @@ async def test_the_repeat_button_says_how_many_taps_it_really_did(retro):
     view.clip_seconds = 0.5
     again = retro.interaction(view, message=view.message)
     await retro.control(view, "repeat").callback(again)
-    assert again.log[-1][1]["content"] == "Pressed A x2."
+    assert again.log[-1][1]["content"] == "Tester pressed A x2."
 
 
 async def test_the_press_line_is_replaced_by_the_next_press_rather_than_kept(retro):
@@ -735,11 +757,11 @@ async def test_the_press_line_is_replaced_by_the_next_press_rather_than_kept(ret
         await view._press(interaction, field)
         said.append(interaction.log[-1][1]["content"])
     assert said == [
-        "Pressed A.",
-        "Pressed B.",
-        "Pressed \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}.",
-        "Waited.",
-        "Pressed Start.",
+        "Tester pressed A.",
+        "Tester pressed B.",
+        "Tester pressed \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}.",
+        "Tester waited.",
+        "Tester pressed Start.",
     ]
     # Every one of those was a whole `content`, so there is never a press
     # line left over from an earlier press: the edit always writes one.
@@ -758,11 +780,11 @@ async def test_a_real_notice_still_beats_the_press_line(retro):
     await view._press(interaction, "a")
     content = interaction.log[-1][1]["content"] or ""
     assert "save state could not be used" in content, content
-    assert "Pressed" not in content
+    assert "pressed" not in content
     # ...and the press after it, with nothing to report, names itself again.
     again = retro.interaction(view, message=view.message)
     await view._press(again, "a")
-    assert again.log[-1][1]["content"] == "Pressed A."
+    assert again.log[-1][1]["content"] == "Tester pressed A."
 
 
 async def test_the_resume_line_beats_the_press_line(retro):
@@ -777,7 +799,7 @@ async def test_the_resume_line_beats_the_press_line(retro):
     # And it is said once: the next press names itself instead.
     again = retro.interaction(view, message=view.message)
     await view._press(again, "a")
-    assert again.log[-1][1]["content"] == "Pressed A."
+    assert again.log[-1][1]["content"] == "Tester pressed A."
 
 
 async def test_a_failed_press_explains_itself_rather_than_naming_a_button(retro):
@@ -792,8 +814,177 @@ async def test_a_failed_press_explains_itself_rather_than_naming_a_button(retro)
     await view._press(interaction, "a")
     snap = interaction.log[-1][1]
     assert "the core fell over" in (snap["content"] or "")
-    assert "Pressed" not in (snap["content"] or "")
+    assert "pressed" not in (snap["content"] or "")
     assert not snap["any_disabled"], "and the controls still work"
+
+
+# -- Who did it ---------------------------------------------------------------
+#
+# The line also names whoever did it, in one voice for all five actions, and
+# it must never notify them: a ping on every button press, from everybody in
+# the channel, would make the cog unusable in any channel anybody is in.
+#
+# Two guarantees, checked separately here because they fail separately:
+#
+# * the *string* contains no mention syntax, so there is nothing for Discord
+#   to resolve (the sanitising table is in test_view.py);
+# * the *edit* carries an AllowedMentions that suppresses everything, so even
+#   a line that somehow did could not deliver a notification.
+#
+# And all of it still rides on the one edit the action already makes.
+
+
+#: A press, the Wait button, the repeat button, Undo and `[p]retroreset`, each
+#: as "how to do it" and "what the message must then say". Everything a
+#: session can put on that line, in one table, so the voice cannot drift.
+#:
+#: Each of these takes the person doing it, because that is the thing under
+#: test: a button click carries ``interaction.user`` and `[p]retroreset` is a
+#: command carrying ``ctx.author``, and both have to come out the same way.
+async def do_press(retro, view, ctx, who, field="a"):
+    interaction = retro.interaction(view, user=who, message=view.message)
+    await view._press(interaction, field)
+    return interaction.log[-1][1]
+
+
+async def do_wait(retro, view, ctx, who):
+    return await do_press(retro, view, ctx, who, None)
+
+
+async def do_repeat(retro, view, ctx, who):
+    interaction = retro.interaction(view, user=who, message=view.message)
+    await retro.control(view, "repeat").callback(interaction)
+    return interaction.log[-1][1]
+
+
+async def do_undo(retro, view, ctx, who):
+    # Something to step back from first, by somebody else, so the line that
+    # is checked is the undoer's rather than the presser's.
+    await view._press(retro.interaction(view, message=view.message), "a")
+    interaction = retro.interaction(view, user=who, message=view.message)
+    await retro.control(view, "undo").callback(interaction)
+    return interaction.log[-1][1]
+
+
+async def do_reset(retro, view, ctx, who):
+    ctx.author = who
+    view.starter_id = who.id
+    await retro.cogmod.Retro.retroreset.callback(retro.cog, ctx)
+    # A command, so the edit is to the message rather than to an interaction.
+    return retro.message_edit(view)
+
+
+ATTRIBUTED = [
+    ("press", do_press, "pressed A."),
+    ("wait", do_wait, "waited."),
+    ("repeat", do_repeat, "pressed A x3."),
+    ("undo", do_undo, "undid the last press."),
+    ("reset", do_reset, "reset the game."),
+]
+
+
+@pytest.mark.parametrize(
+    "name, act, tail", ATTRIBUTED, ids=[row[0] for row in ATTRIBUTED]
+)
+async def test_every_action_says_who_did_it(retro, name, act, tail):
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9030 + len(name), f"who{name}")
+    rob = FakeUser(uid=4242, name="Rob", manage_messages=True)
+
+    landed = await act(retro, view, ctx, rob)
+
+    assert landed["content"] == f"Rob {tail}"
+    # One short line, above a clip, and never anything that could notify.
+    assert "\n" not in landed["content"]
+    assert landed["pings_nobody"], landed["allowed_mentions"]
+
+
+@pytest.mark.parametrize(
+    "name, act, tail", ATTRIBUTED, ids=[row[0] for row in ATTRIBUTED]
+)
+async def test_no_action_can_notify_anybody(retro, name, act, tail):
+    """A hostile display name changes neither of the two guarantees.
+
+    ``@everyone`` in somebody's nickname is the case worth being explicit
+    about: it comes out with a zero-width space in it *and* the edit carries
+    an AllowedMentions that would have refused it anyway.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9060 + len(name), f"ping{name}")
+    nasty = FakeUser(
+        uid=4243,
+        name="@everyone **<@111111111111111111>**",
+        manage_messages=True,
+    )
+
+    landed = await act(retro, view, ctx, nasty)
+
+    content = landed["content"] or ""
+    assert content.endswith(tail), content
+    assert "@everyone" not in content, content
+    assert "@here" not in content, content
+    assert not re.search(r"(?<!\\)<", content), content
+    # ...and the edit itself forbids every kind of mention, so the string
+    # guarantee is not the only thing standing between a press and a ping.
+    allowed = landed["allowed_mentions"]
+    assert allowed is not None, landed
+    for kind in ("everyone", "users", "roles", "replied_user"):
+        assert getattr(allowed, kind) is False, (kind, allowed)
+    assert landed["pings_nobody"]
+
+
+async def test_the_attribution_still_rides_on_the_one_edit(retro):
+    """The rule that must not be paid for: one press, one visible change."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9050, "oneeditnamed")
+
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
+    landed = interaction.log[-1][1]
+    assert landed["content"] == "Tester pressed A."
+    assert landed["n_attachments"] == 1, "the clip came on the same edit"
+
+
+async def test_a_presser_with_no_usable_name_still_gets_a_line(retro):
+    """A User rather than a Member, and an object with nothing on it at all.
+
+    Both are real: a plain ``discord.User`` arrives for somebody who has left
+    the guild, and neither the naming nor the press depends on the
+    ``guild_permissions`` a Member has and a User does not.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9051, "nameless")
+
+    # A plain User: no guild_permissions, but a global display name.
+    user = types.SimpleNamespace(id=99, display_name="Ex Member")
+    assert not hasattr(user, "guild_permissions")
+    interaction = retro.interaction(view, user=user, message=view.message)
+    await view._press(interaction, "a")
+    assert interaction.log[-1][1]["content"] == "Ex Member pressed A."
+
+    # Nothing nameable: the impersonal form of the same sentence, not a
+    # traceback and not a line starting with a space.
+    anonymous = types.SimpleNamespace(id=100)
+    interaction = retro.interaction(view, user=anonymous, message=view.message)
+    await view._press(interaction, "b")
+    assert interaction.log[-1][1]["content"] == "Pressed B."
+
+
+async def test_two_people_pressing_are_told_apart(retro):
+    """The whole point of the feature, on one message."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9052, "twopeople")
+
+    said = []
+    for uid, who, field in ((11, "Rob", "a"), (12, "Ada", "b"), (11, "Rob", None)):
+        interaction = retro.interaction(
+            view, user=FakeUser(uid=uid, name=who), message=view.message
+        )
+        await view._press(interaction, field)
+        said.append(interaction.log[-1][1]["content"])
+    assert said == ["Rob pressed A.", "Ada pressed B.", "Rob waited."]
 
 
 # -- Nothing of the Replay button is left --------------------------------------
@@ -913,7 +1104,7 @@ async def test_undo_makes_exactly_one_edit_to_the_message(retro):
     only = edits[0]
     assert only["has_attachments"] and only["n_attachments"] == 1
     assert only["filenames"][0].endswith(".webp")
-    assert only["content"] == retro.viewmod.UNDONE_NOTE
+    assert only["content"] == "Tester undid the last press."
     assert not only["any_disabled"], "the controls come back enabled"
     assert only["spacers_disabled"]
 
@@ -1104,7 +1295,7 @@ async def test_the_undo_s_own_clip_replaces_the_undone_press_s_on_the_message(re
     assert undoing.kinds() == ["response.defer", "edit_original_response"]
     snap = undoing.log[-1][1]
     assert snap["n_attachments"] == 1
-    assert snap["content"] == retro.viewmod.UNDONE_NOTE
+    assert snap["content"] == "Tester undid the last press."
 
 
 async def test_undo_writes_the_state_through_rather_than_waiting(retro):
@@ -1265,7 +1456,7 @@ async def test_a_press_resumes_a_sleeping_session_and_says_so_once(retro):
     # repeating it.
     again = retro.interaction(view, message=view.message)
     await view._press(again, "a")
-    assert again.log[-1][1]["content"] == "Pressed A."
+    assert again.log[-1][1]["content"] == "Tester pressed A."
 
 
 async def test_a_wake_that_has_something_to_report_beats_the_resume_line(retro):
@@ -1463,8 +1654,47 @@ async def test_retrostop_saves_frees_and_keeps_the_session(retro):
     assert not any(c.disabled for c in retro.pressable(view))
     assert "carry on" in ctx.sent[-1]
     stopped = view.message.edits[-1] if view.message.edits else {}
-    assert "Stopped by" in (stopped.get("content") or "")
+    assert "Stopped by Tester." in (stopped.get("content") or "")
     assert "embed" not in stopped
+
+
+async def test_the_names_the_stop_and_reset_replies_carry_are_sanitised_too(retro):
+    """Both are prose rather than the press line, and both name somebody.
+
+    The reset one matters most: it is a plain channel message rather than an
+    edit, so escaping the name is the only thing standing between a nickname
+    of "@everyone" and a notification.
+    """
+    await retro.install_cores("gambatte")
+    nasty = FakeUser(uid=77, name="@everyone **<@111111111111111111>** # big")
+
+    view, ctx, _ = await retro.posted_game(9082, "nastystop")
+    ctx.author = nasty
+    view.starter_id = nasty.id
+    await retro.cogmod.Retro.retrostop.callback(retro.cog, ctx)
+    stopped = (view.message.edits[-1].get("content") or "")
+    assert "Stopped by " in stopped, stopped
+
+    view, ctx, _ = await retro.posted_game(9083, "nastyreset")
+    ctx.author = nasty
+    view.starter_id = nasty.id
+    await retro.cogmod.Retro.retroreset.callback(retro.cog, ctx)
+    # The reply itself, not ctx.said() -- that joins in the repr of the
+    # game's own post, angle brackets and all.
+    reply = ctx.sent[-1]
+    assert "has been reset by " in reply, reply
+
+    for text in (stopped, reply):
+        assert "@everyone" not in text, text
+        assert not re.search(r"(?<!\\)<", text), text
+        assert "\\*\\*" in text, "the markdown in the name was escaped"
+
+    # And somebody with no usable name leaves a sentence that still reads.
+    view, ctx, _ = await retro.posted_game(9084, "namelessstop")
+    ctx.author = types.SimpleNamespace(id=78)
+    view.starter_id = 78
+    await retro.cogmod.Retro.retrostop.callback(retro.cog, ctx)
+    assert "Stopped. Press a button" in (view.message.edits[-1].get("content") or "")
 
 
 async def test_retrostop_saves_the_game_even_if_the_message_explodes(retro):
@@ -1530,7 +1760,7 @@ async def test_retroreset_puts_the_boot_clip_on_the_game_s_message(retro):
     # One edit of the game's own message, carrying the clip and the line that
     # says what happened -- the same shape a press makes.
     edit = view.message.edits[-1]
-    assert edit["content"] == retro.viewmod.RESET_NOTE == "Reset the game."
+    assert edit["content"] == "Tester reset the game."
     assert len(edit["attachments"]) == 1
     assert edit["attachments"][0].filename.endswith(".webp")
     assert not any(c.disabled for c in retro.pressable(view))

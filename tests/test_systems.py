@@ -157,7 +157,10 @@ def test_caption_for_is_the_label_or_the_emoji(system):
 # -- 3. Discord's 5x5x25 component grid ---------------------------------------
 #
 # systems.System.rows is the whole controller -- d-pad, face buttons and
-# layout spacers -- and RetroView appends Wait/repeat/Undo to it.
+# layout spacers -- and RetroView appends Wait/repeat/Undo to it. Space for
+# all three is always reserved, even at the clip lengths where the repeat
+# button is not drawn, so what is checked here is the budget rather than the
+# component count of any one session.
 
 
 def action_rows(system):
@@ -209,6 +212,10 @@ def test_the_worst_console_still_leaves_headroom():
     # console's controls share its bottom row again and the spare action row
     # is back. See test_every_console_s_layout in test_view.py.
     assert worst == 19, worst
+    # Three, and three even on a clip too short to draw the confirm x3
+    # button: this is the space reserved, so Wait and Undo stay put at every
+    # clip length. See MIN_REPEAT_TAPS in retro/RetroView.py and the
+    # per-length table in test_view.py.
     assert S.CONTROL_BUTTONS == 3, "Wait, confirm x3, Undo"
     # Every console's controls fit beside its own bottom row, which is what
     # gives the widest layout a row in hand.

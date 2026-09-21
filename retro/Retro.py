@@ -72,13 +72,14 @@ from .RetroView import (
     DEFAULT_TIMEOUT_MINUTES,
     MAX_HOLD_MS,
     MIN_HOLD_MS,
+    MIN_REPEAT_TAPS,
     REPEAT_TAPS,
-    RESET_NOTE,
     SAVE_STATE_EVERY_PRESSES,
     Progress,
     RetiredView,
     RetroView,
     press_plan,
+    presser_name,
     restore_into,
 )
 from .saves import (
@@ -2675,11 +2676,15 @@ class Retro(
                 "bot owner can stop it."
             )
             return
+        # Sanitised, exactly as the press line's name is: this sentence goes
+        # on the game's message, where a nickname full of markdown would
+        # otherwise reformat it. See RetroView.presser_name.
+        who = presser_name(ctx.author)
         try:
             async with view.lock:
                 await self.hibernate(
                     view,
-                    f"Stopped by {ctx.author.display_name}. Press a button "
+                    f"Stopped{' by ' + who if who else ''}. Press a button "
                     "to pick up where you left off.",
                 )
         except Exception:
@@ -2768,11 +2773,17 @@ class Retro(
             getattr(ctx.author, "id", "?"),
         )
         # The reset clip goes on the game's own message, with the line that
-        # says what happened -- one edit, like a press.
-        await view.show_clip(clip, RESET_NOTE)
+        # says who did what -- one edit, like a press, and named the same way
+        # a press is even though this is a command rather than a button.
+        await view.show_clip(clip, view.reset_note(ctx.author))
+        # Sanitised for the same reason the line on the message is, and for
+        # one more: this is a plain channel message rather than an edit, so
+        # escaping the name is the only thing between a nickname of
+        # "@everyone" and a notification. See RetroView.presser_name.
+        who = presser_name(ctx.author)
         await self._safe_send(
             ctx,
-            f"**{view.game_name}** has been reset by {ctx.author.display_name} "
+            f"**{view.game_name}** has been reset{' by ' + who if who else ''} "
             "\N{EM DASH} it is back at its title screen. Its in-game battery "
             "save is untouched, and nothing on disk has been overwritten: "
             "press **Undo** on the game to step straight back to the moment "
@@ -3000,10 +3011,11 @@ class Retro(
                 f"{hold_ms}ms configured, so the clip can still show the "
                 "button coming back up."
             )
-        if taps < 2:
+        if taps < MIN_REPEAT_TAPS:
             notes.append(
-                "The repeat button is greyed out at this length: only one "
-                "tap fits, which is what the confirm button already does."
+                "The repeat button is not shown at this length: only one tap "
+                "fits, which is what the confirm button already does. It "
+                "comes back on the next press at a longer clip."
             )
         elif taps < REPEAT_TAPS:
             notes.append(
@@ -3026,7 +3038,11 @@ class Retro(
 
         A very short clip is also a ceiling on the input inside it: a button
         is never held past the point where the clip can still show it coming
-        back up, and the repeat button taps as many times as fit.
+        back up, and the repeat button taps as many times as fit. Below about
+        0.48 seconds only one tap fits -- which is what the console's own
+        confirm button already does -- so the repeat button is not shown at
+        all, and it reappears on the next press at a longer clip. Wait and
+        Undo stay where they are either way.
 
         **Examples:**
         - `[p]retroset cliplength 0.8`

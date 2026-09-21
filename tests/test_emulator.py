@@ -486,7 +486,27 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
 
 @pytest.mark.parametrize("seconds", [0.2, 0.5, 0.8, 1.0, 4.0])
 def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
-    """Playback time tracks emulated time at every clip length, whole or not."""
+    """Playback time tracks emulated time at every clip length, whole or not.
+
+    **The rule, stated plainly, because it was nearly weakened:** a clip
+    plays for exactly as long as it emulated -- start to finish, with
+    nothing dropped off either end. Not "from the first visible change to
+    the end", and not "about as long". A second of clip is a second of
+    console.
+
+    That was in question because a clip opens on pictures where the press has
+    not visibly landed yet (the button is held for 160ms and a game reacts
+    more slowly still), which reads as the clip showing a moment from
+    *before* the press. Trimming those opening pictures would have made
+    playback shorter than the emulated span and turned this test into a
+    conditional one. It was measured instead, and rejected: the lead-in is
+    one picture on anything that responds, trimming it saves no bytes
+    because the encoder already merges it, and the rule only ever fires hard
+    on a frozen screen -- where it would render a one second clip as a 17ms
+    flash. See
+    :func:`test_the_dead_lead_in_is_photographed_rather_than_trimmed` for the
+    numbers and retro/README.md for the same statement in prose.
+    """
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
     frames = emulator.clip_frames(seconds)
@@ -567,6 +587,176 @@ def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gam
     hashes = frame_hashes(moved, image)
     assert hashes[0] != before
     assert hashes[0] != hashes[1], "the first two frames are duplicates"
+
+
+def dead_lead_in(emulator, frames, presses):
+    """How many opening pictures of a clip the press has not yet changed.
+
+    Records a clip by hand, twice from the same state: once with ``presses``
+    and once with no input at all. The answer is how many pictures at the
+    front of the two are byte-identical -- i.e. how much of the clip's
+    opening the press made no difference to.
+
+    Compared against a *no-input* clip rather than against the pre-press
+    frame, because those are different questions and only this one is the
+    interesting one: a game that animates on its own (uCity's cursor, a
+    Genesis title screen) produces a first picture that differs from the
+    pre-press frame while the press has plainly not landed yet.
+
+    Returns ``(dead pictures, total pictures, pictures identical to the
+    pre-press frame)``.
+    """
+    step = emulator.capture_step()
+    plan = dict(E.capture_plan(frames, step))
+    size = emulator.output_size()
+
+    def shoot(schedule):
+        down, up = {}, {}
+        for button, start, hold in schedule:
+            start = max(0, min(int(start), frames - 1))
+            end = max(start + 1, min(start + int(hold), frames))
+            down.setdefault(start, set()).add(button)
+            up.setdefault(end, set()).add(button)
+        shots, held = [], set()
+        try:
+            for index in range(frames):
+                held -= up.get(index, set())
+                held |= down.get(index, set())
+                emulator._pressed = frozenset(held)
+                emulator.advance(1)
+                if index in plan:
+                    shots.append(emulator._frame_image(size).tobytes())
+        finally:
+            emulator._pressed = frozenset()
+        return shots
+
+    state = emulator.save_state()
+    emulator.load_state(state)
+    before = emulator._frame_image(size).tobytes()
+    pressed = shoot(presses)
+    emulator.load_state(state)
+    waited = shoot(())
+
+    dead = 0
+    for mine, theirs in zip(pressed, waited, strict=True):
+        if mine != theirs:
+            break
+        dead += 1
+    stale = 0
+    for mine in pressed:
+        if mine != before:
+            break
+        stale += 1
+    return dead, len(pressed), stale
+
+
+@pytest.mark.parametrize("seconds", [0.5, 1.0, 4.0])
+def test_the_dead_lead_in_is_photographed_rather_than_trimmed(
+    emu, gambatte, ucity, seconds
+):
+    """A clip opens before the press has visibly landed, and stays that way.
+
+    A press is held for 160ms -- ten frames -- and a game takes longer than
+    that to show anything, while the clip's first picture is taken after a
+    single emulated frame. So a clip's opening pictures genuinely do look
+    like "a bit before the button was pressed", which is how this was
+    reported.
+
+    **Trimming that lead-in was measured and rejected.** The numbers, on real
+    cores at the default 160ms hold (dead pictures / pictures identical to
+    the pre-press frame, out of the whole clip):
+
+        core / ROM                0.5s        1s          4s
+        gambatte / uCity          1/0 of 9    1/0 of 16   1/0 of 61
+        fceumm / nestest (Start)  1/1 of 9    1/1 of 16   1/1 of 61
+        genesis_plus_gx (Start)   0/0 of 9    0/0 of 16   0/0 of 61
+        mgba / homebrew (A)       3/3 of 9    3/3 of 16   3/3 of 61
+        snes9x / homebrew (A)     1/1 of 9    1/1 of 16   1/1 of 61
+        snes9x / homebrew (Start) 9/9 of 9   16/16 of 16 61/61 of 61
+
+    Three things follow, and together they say leave it alone:
+
+    * it is **one picture**, about 67ms, on everything that responds at all.
+      Trimming 67ms off the front of a one second clip is not worth a rule;
+    * the rule that was proposed -- drop opening pictures byte-identical to
+      the pre-press frame -- trims **nothing at all** on a game that
+      animates (the uCity column above is 0 at every length, and uCity is a
+      Game Boy game, which is what this cog is played on). It only fires on
+      a frozen screen, and there it wants to trim the *whole clip*: the
+      snes9x Start row is a static title screen, and trimming it to the one
+      picture the rule has to keep turns a 1005ms clip into a 17ms flash;
+    * it costs nothing to keep. libwebp merges runs of identical pictures and
+      adds their durations together, so the lead-in is already one held
+      picture in the file. Measured: 1876 -> 1808 bytes on nestest (3.6%),
+      and 1350 -> 1350 bytes on the static SNES screen -- exactly zero, on
+      the case with the most pictures to drop.
+
+    So the invariant in
+    :func:`test_a_clip_plays_for_as_long_as_it_emulated` stands, unqualified,
+    and this test is what would notice a lead-in trim being added: every
+    picture the capture plan asks for is still photographed.
+    """
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    frames = emulator.clip_frames(seconds)
+    hold = emulator.frames_for_ms(160)
+    dead, total, stale = dead_lead_in(emulator, frames, [("down", 0, hold)])
+
+    expected = len(E.capture_plan(frames, emulator.capture_step()))
+    assert total == expected, "a picture the capture plan asked for was skipped"
+    # The lead-in exists, and it is small: a couple of pictures, not most of
+    # the clip. Not pinned to an exact number -- how fast a game reacts is
+    # the game's business and a core update may change it by a frame -- but
+    # it must not become "most of the clip", which is what would make
+    # trimming worth reconsidering.
+    assert 0 <= dead <= max(1, total // 4), (dead, total)
+    assert stale <= dead, "identical to the pre-press frame implies unchanged"
+
+    # And the clip really does start at the beginning: nothing was dropped
+    # off the front, so its playback still covers the whole emulated span.
+    durations = [
+        max(1, round(1000 * covered / emulator.fps))
+        for _, covered in E.capture_plan(frames, emulator.capture_step())
+    ]
+    emulated = 1000 * frames / emulator.fps
+    assert abs(sum(durations) - emulated) / emulated < 0.01
+
+
+def test_a_completely_static_screen_still_produces_a_whole_clip(
+    emu, gambatte, dmg_acid2
+):
+    """The case a lead-in trim would have destroyed.
+
+    dmg-acid2 draws one picture and holds it for ever, so *every* opening
+    picture of a press clip is byte-identical to the pre-press frame. A rule
+    that trimmed those would trim the entire clip and be left with the single
+    picture it is obliged to keep -- a one second clip played as a 17ms
+    flash. So: nothing is trimmed, every picture the plan asks for is taken,
+    and the clip still stands for the whole second it emulated.
+    """
+    emulator = emu(gambatte, dmg_acid2)
+    emulator.advance(emulator.frames_for_seconds(3))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    hold = emulator.frames_for_ms(160)
+    dead, total, stale = dead_lead_in(emulator, frames, [("a", 0, hold)])
+
+    plan = E.capture_plan(frames, emulator.capture_step())
+    if dead != total:
+        pytest.skip(
+            "dmg-acid2 is not static under this build of gambatte "
+            f"({dead} of {total} pictures unchanged); the all-static case "
+            "needs a ROM that really does hold one frame"
+        )
+    assert stale == total, "a static screen's pictures are the pre-press frame"
+    assert total == len(plan) >= 2, (total, len(plan))
+    # The encoder is free to merge them into one stored frame -- it does; see
+    # test_a_static_screen_collapses_to_a_still_that_is_still_a_clip -- but
+    # the durations the recording hands it still add up to the whole clip.
+    durations = [max(1, round(1000 * covered / emulator.fps)) for _, covered in plan]
+    emulated = 1000 * frames / emulator.fps
+    assert abs(sum(durations) - emulated) / emulated < 0.01
+    # ...and it is still a clip, not an error.
+    assert len(emulator.record(frames, presses=[("a", 0, hold)])) > 0
 
 
 def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, image, gambatte, ucity):

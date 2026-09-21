@@ -456,6 +456,8 @@ def test_no_module_level_container_is_keyed_by_user_input():
         ("retro.systems", "CORES"): "built once from SYSTEMS",
         ("retro.systems", "_BY_EXTENSION"): "built once from SYSTEMS",
         ("retro.RetroView", "_STYLES"): "two literal Discord styles",
+        ("retro.RetroView", "ACTION_NOTES"): "four literal action lines",
+        ("retro.RetroView", "MARKDOWN_ESCAPES"): "one str.translate table",
         ("retro.saves", "EXPORT_CHOICES"): "literal",
         ("retro.Retro", "DEFAULT_GLOBALS"): "the Config schema",
         ("retro.Retro", "DEFAULT_CHANNEL"): "the Config schema",

@@ -470,6 +470,41 @@ press continues from. It used to stop on the last frame that happened to fall
 on the sampling cadence, three frames (about 50ms) before the end of what it
 had already emulated, so every press began with a small invisible jump.
 
+**A clip plays for exactly as long as it emulated** — start to finish, with
+nothing dropped off either end. Not "from the first visible change", and not
+"about as long". A second of clip is a second of console.
+
+That is worth stating because a clip *looks* as though it opens a moment
+before the press. It does, and it is not a bug: the button is held for 160ms
+(ten frames) and a game takes longer than that to show anything, while the
+first picture is taken after a single emulated frame. So the opening of a clip
+is the game not having reacted yet, which is a fair description of "a bit
+before the button was pressed".
+
+Trimming that dead lead-in was measured and rejected. On real cores at the
+default hold, the number of opening pictures the press has made no difference
+to is **one** — about 67ms — on everything that reacts at all, and zero on a
+game that animates by itself. Three things follow:
+
+* the rule only fires hard on a *frozen* screen, where it wants to trim the
+  whole clip: a static SNES title screen has all 16 of its pictures
+  unchanged, so trimming down to the one picture it would have to keep turns a
+  1005ms clip into a 17ms flash;
+* it saves no bytes. The encoder already merges runs of identical pictures and
+  adds their durations together, so the lead-in is a single held picture in
+  the file already — 1876 → 1808 bytes on a NES menu (3.6%), and
+  1350 → 1350 bytes on that static SNES screen, i.e. exactly nothing on the
+  case with the most to drop;
+* it would make the clip shorter than the span it covers, which is the one
+  property of a clip that is easy to reason about.
+
+So the lead-in stays, and `tests/test_emulator.py` holds both halves of that:
+`test_a_clip_plays_for_as_long_as_it_emulated` for the rule and
+`test_the_dead_lead_in_is_photographed_rather_than_trimmed` for the
+measurement behind it. If a press ever feels slow to land, `[p]retroset hold`
+is the dial — a shorter hold reacts sooner, at the risk of a game not
+noticing the press at all below about 100ms.
+
 **Each console is posted at a size that suits it** rather than at a flat 2x.
 Discord scales an attached image down to the message column anyway, so
 doubling a TV console was work thrown away: a Game Boy frame is 160×144 and
@@ -524,13 +559,46 @@ the 0.18–0.40 s of decoding and re-encoding a Replay click cost, and a
 component on every console's controls. The only thing a session holds now is
 its **Undo** history, which is capped in both directions (see below).
 
-**Which button was pressed is written on the message.** Every press replaces
-the one line above the clip with its own name — `Pressed A.`, `Pressed ⬅️.`,
-`Pressed Start.`, `Pressed A ×3.`, `Waited.` — in the same voice as Undo's
-*Undid the last press.* The name comes from the console's own button table,
-so a Genesis press reads `Pressed C.` where the RetroPad would have called
-that button A, and the Neo Geo Pocket's A and B are the right way round. The
-d-pad has no labels, so it names itself with its arrow.
+**Who pressed which button is written on the message.** Every action replaces
+the one line above the clip with a sentence naming both — in one voice for all
+five of them:
+
+> Rob pressed A.
+> Rob pressed ⬅️.
+> Rob pressed A ×3.
+> Rob waited.
+> Rob undid the last press.
+> Rob reset the game.
+
+The *button* name comes from the console's own button table, so a Genesis
+press reads `Rob pressed C.` where the RetroPad would have called that button
+A, and the Neo Geo Pocket's A and B are the right way round. The d-pad has no
+labels, so it names itself with its arrow. `[p]retroreset` is a command rather
+than a button and is attributed the same way, from whoever ran it.
+
+The *person* is their server display name — their nickname in this server if
+they have one, otherwise their global display name — as **plain text**. If
+there is nobody to name (which should not happen, but a line is not worth
+losing over it) the same sentence is used impersonally: `Pressed A.`,
+`Waited.`
+
+**It can never notify anybody.** A ping on every button press, from everybody
+in the channel, would make the cog unusable in any channel people are actually
+in — so there are two independent guards and either one alone would be enough:
+
+* the name is escaped so that **no mention syntax is emitted at all**. Every
+  markdown character is backslashed (including `#`, `-`, `>` and `+`, which
+  are markdown only at the start of a line — which is exactly where a name
+  sits, so a nickname of `# hello` would otherwise have rendered the line as a
+  header), every `<` is escaped so no `<@id>` can form, and `@everyone` and
+  `@here` get a zero-width space wedged into them. Invisible characters
+  (zero-width spaces, the byte-order mark, right-to-left overrides) are
+  dropped, whitespace is collapsed so one line stays one line, and the name
+  is capped at 32 characters — Discord's own nickname limit, so a real name is
+  never cut — so no one player can take over the line;
+* every edit that carries the line also carries an `allowed_mentions` that
+  suppresses **everyone, users, roles and the replied-to user**, so even a
+  line that somehow did contain a live mention could not deliver one.
 
 It costs nothing: the line rides on the single edit that already carries the
 clip, so a press is still exactly one edit of the message. Anything more
@@ -616,7 +684,8 @@ history is gone.
 
 `[p]retroreset` reboots the game that is playing in the channel, as if you had
 flipped its power switch. The clip on its message shows the game booting, and
-the message says *Reset the game.*
+the message says *Rob reset the game.* — named from whoever ran the command,
+in the same voice a press is named in.
 
 **It is a command and not a button, deliberately.** A reset throws away the
 progress-in-flight of everybody in the channel, which is exactly the reason
@@ -676,11 +745,11 @@ failed* — and the same is true of a click that lands while the game is being
 rebooted by `[p]retroreset`.
 
 The clip and **one line** of text are all that is posted: no status card, no
-caption. The line says which button was pressed, unless there is something
+caption. The line says who pressed which button, unless there is something
 more important to say — the game having gone to sleep and come back, or a save
 state that could not be restored — and the next press rewrites it either way.
 Waking a sleeping game says *Resumed where you left off…* alongside the clip
-it came back with, instead of naming the button.
+it came back with, instead of naming the presser.
 
 **The game only runs while a clip is being recorded.** Between one press and the
 next the console is frozen mid-frame — it is not ticking away in the background,
@@ -707,10 +776,51 @@ set either value:
 * the **×3** button taps as many times as fit. Three 160ms taps 250ms apart
   need 1.4 seconds, so the spacing is squeezed first (218ms at a one second
   clip, 117ms at 0.8s — three taps closer together are still three taps) and
-  only then is a tap dropped: 0.5s does two, and below about 0.45s only one
-  would fit, which is what the confirm button already does, so the button
-  greys itself out and says `A ×1` rather than lying. Its label always counts
-  the taps it will really do.
+  only then is a tap dropped. Its label always counts the taps it will really
+  do, and below two taps **the button is not shown at all** — see below.
+
+### The ×3 button, and when it is there
+
+The **×3** button is the third control, between **Wait** and **↩️ Undo**, and
+it taps the console's own confirm button several times in one clip so a text
+box or a menu takes one round trip instead of three. It is labelled with that
+console's name for the button and the number of taps it will really do: `A ×3`
+on a Game Boy, `B ×3` on a Genesis, `1 ×3` on a Master System, `I ×3` on a PC
+Engine.
+
+**It is hidden, not greyed out, when only one tap fits.** One tap is not a
+repeat at all — it is exactly what the confirm button one row over already
+does — so rather than drawing a dead button, the row is drawn without it. It
+was greyed out until now, and that turned out to be worse than useless: a
+present, dead, unexplained control reads as broken, and it was reported as the
+feature having been *removed from the cog*. It comes back by itself on the
+next press as soon as the clip is long enough, because the controls are
+redrawn on every press, so `[p]retroset cliplength` corrects it either way
+without restarting anything.
+
+| Clip length | Taps | The button |
+| --- | --- | --- |
+| 0.2s (the floor) | 1 | not shown |
+| 0.4s | 1 | not shown |
+| 0.47s | 1 | not shown |
+| 0.48s | 2 | `A ×2` |
+| 0.5s | 2 | `A ×2` |
+| 0.67s | 2 | `A ×2` |
+| 0.68s | 3 | `A ×3` |
+| 1s (the default) | 3 | `A ×3` |
+| 15s (the ceiling) | 3 | `A ×3` |
+
+**Wait and Undo never move.** The controls row reserves space for all three of
+them whether or not the third is drawn, so on every one of the eight consoles
+the row is the same shape at every clip length and simply has one fewer button
+in it — a Game Boy is `Start Select Wait A ×3 Undo` at a second and
+`Start Select Wait Undo` at a fifth of one. `[p]retroset cliplength` and
+`[p]retroset settings` both say so when the length you have chosen is short
+enough to hide it.
+
+`[p]retroset hold` changes the numbers above, because the taps have to fit
+inside the clip alongside the hold; whatever you set, the label and the line
+on the message count the same real taps.
 
 ## Which build is this?
 

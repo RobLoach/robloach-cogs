@@ -192,11 +192,59 @@ def test_the_readme_says_the_replay_button_is_gone_and_what_it_saved():
 
 
 def test_the_readme_describes_the_press_line():
-    assert "Which button was pressed is written on the message" in COG_README
+    assert "Who pressed which button is written on the message" in COG_README
+    # All five actions, in one voice, with the presser named.
+    for line in (
+        "Rob pressed A.",
+        "Rob pressed ⬅️.",
+        "Rob pressed A ×3.",
+        "Rob waited.",
+        "Rob undid the last press.",
+        "Rob reset the game.",
+    ):
+        assert line in COG_README, line
+    # The impersonal fallback, for a presser who cannot be named.
     assert "`Pressed A.`" in COG_README
-    assert "Waited." in COG_README
-    # The two that would be wrong if the line were built from RetroPad names.
-    assert "`Pressed C.`" in COG_README
+    # The one that would be wrong if the line were built from RetroPad names.
+    assert "`Rob pressed C.`" in COG_README
+
+
+def test_the_readme_promises_a_press_can_never_notify_anybody():
+    """The two guards, both written down, because either alone would do.
+
+    A ping on every button press is the thing that would make the cog
+    unusable in a channel anybody is in, so the README has to say plainly
+    that it cannot happen and how.
+    """
+    assert "It can never notify anybody" in COG_README
+    assert "no mention syntax is emitted at all" in COG_README
+    assert "allowed_mentions" in COG_README
+    assert "32 characters" in COG_README, "the length cap"
+    assert "zero-width" in COG_README
+
+
+def test_the_readme_says_when_the_repeat_button_is_there():
+    """It exists; it is hidden at short clip lengths; that is the news.
+
+    The greyed-out version was read as the feature having been removed, so
+    the README now has a section saying it is there, when it appears, and
+    that nothing else moves when it does not.
+    """
+    assert "### The ×3 button, and when it is there" in COG_README
+    assert "hidden, not greyed out" in COG_README
+    assert "Wait and Undo never move" in COG_README
+    # The table's endpoints: the floor with no button, the default with three.
+    assert "| 0.2s (the floor) | 1 | not shown |" in COG_README
+    assert "| 1s (the default) | 3 | `A ×3` |" in COG_README
+
+
+def test_the_readme_states_the_clip_timing_invariant():
+    """And the decision behind it; see test_emulator.py for the numbers."""
+    assert "**A clip plays for exactly as long as it emulated**" in COG_README
+    assert "nothing dropped off either end" in COG_README
+    # The measurement that settled it, and the case it would have destroyed.
+    assert "Trimming that dead lead-in was measured and rejected" in COG_README
+    assert "17ms flash" in COG_README
 
 
 def test_the_readme_describes_resetting_a_game():
@@ -344,7 +392,8 @@ def test_the_readme_describes_the_single_restore_chain():
     [
         "Resume",
         "Undo",
-        "says which button it was",
+        "says who pressed which button",
+        "never a ping",
         "[p]retroreset",
         "detected automatically",
         "[p]retrosaves",
@@ -368,6 +417,10 @@ def test_the_end_user_data_statement_mentions_what_is_now_stored():
     assert "Undo" in statement
     # Saves can now leave the bot as an attachment and arrive as one.
     assert "export" in statement and "delete" in statement
+    # A press now puts somebody's display name into the message text, which
+    # is worth declaring even though nothing keeps a copy of it.
+    assert "display name of whoever last pressed a button" in statement
+    assert "is not stored anywhere either" in statement
 
 
 # -- The version, and why it cannot go stale ----------------------------------

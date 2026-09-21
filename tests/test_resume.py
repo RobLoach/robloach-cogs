@@ -241,21 +241,33 @@ async def test_resume_restarts_the_game_from_its_save_state(retro, retired):
     assert not interaction.log[-1][1]["all_disabled"]
 
 
-async def test_a_resumed_game_labels_its_repeat_button_from_the_real_core(
+async def test_a_resumed_game_draws_its_repeat_button_from_the_real_core(
     retro, retired
 ):
-    """The label counts the taps the clip length fits, so it needs the fps."""
+    """Whether the x3 button exists at all is decided from the real fps.
+
+    A session laid out while hibernated has no core, so it counts taps
+    against DEFAULT_FPS; the count is worked out again the moment the core is
+    up, which is before the message goes out. At a fifth of a second the
+    answer is one tap -- what the console's own A button already does -- so
+    the button is not drawn, and the resumed message went out without it
+    rather than with a dead "A x1" on it.
+    """
     await retro.cog.config.clip_seconds.set(0.2)
     retired.old.clip_seconds = 0.2
     interaction = retro.interaction(retired.view, message=retired.old.message)
     await retired.view.children[0].callback(interaction)
 
     back = retro.cog.sessions[retired.channel.id]
-    button = retro.control(back, "repeat")
-    # A fifth of a second fits one tap, which is what the confirm button
-    # already does -- and the message went out saying so, not "A x3".
-    assert button.label == "A x1" and button.disabled
-    assert back.repeat_taps == 1
+    assert back.repeat_taps == 1 and not back.has_repeat_button
+    assert retro.control(back, "repeat") is None
+    # The row the controls sit on still has Wait and Undo, in that order.
+    row = max(c.row for c in back.children)
+    assert [c.label for c in back.children if c.row == row][-2:] == ["Wait", "Undo"]
+    # ...and the message the resume posted was drawn from that same view, so
+    # what went out has no x3 button on it either.
+    labels = interaction.log[-1][1]["labels"]
+    assert not any((label or "").startswith("A x") for label in labels), labels
 
 
 async def test_resume_hibernates_whatever_else_was_live(retro, retired):

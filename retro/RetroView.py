@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import typing
+import unicodedata
 import zlib
 from pathlib import Path
 
@@ -93,6 +94,33 @@ REPEAT_TAPS = 3
 REPEAT_GAP_MS = 250
 MIN_REPEAT_GAP_MS = 80
 
+# The fewest taps worth having a button for. One tap is not a repeat at all --
+# it is precisely what the console's own confirm button does, one row over --
+# so at that point the button is not drawn.
+#
+# It used to be drawn and greyed out, which was worse than useless: a control
+# that is present, dead and unexplained reads as broken, and it was reported
+# as the repeat button having been *removed from the cog*. A control that
+# cannot do anything is clearer gone, and going frees a component. It comes
+# back by itself the moment the clip is long enough, because the row is drawn
+# again on every redraw (see RetroView._update_repeat_label), so changing
+# `[p]retroset cliplength` corrects it on the next press.
+#
+# Measured against press_plan at DEFAULT_FPS with the default 160ms hold --
+# the clip lengths where it appears at all:
+#
+#     clip    taps    the button
+#     0.2s      1     not drawn
+#     0.4s      1     not drawn
+#     0.5s      2     "A x2"
+#     0.8s      3     "A x3"
+#     1s        3     "A x3"   <- the default
+#     4s        3     "A x3"
+#
+# CONTROL_BUTTONS still reserves room for the whole cluster either way, so
+# Wait and Undo do not move when it comes and goes.
+MIN_REPEAT_TAPS = 2
+
 # Seconds of emulation to run before the first clip, so the console's boot
 # logo is out of the way. Converted to frames with the core's real frame rate.
 #
@@ -116,33 +144,207 @@ RESUMED_NOTE = "Resumed where you left off\N{HORIZONTAL ELLIPSIS}"
 # A crash or a power cut therefore costs at most this many presses of play.
 SAVE_STATE_EVERY_PRESSES = 3
 
-# What the Undo button says when it has put the game back.
-UNDONE_NOTE = "Undid the last press."
-
-# What `[p]retroreset` says on the message when the game has been rebooted.
-RESET_NOTE = "Reset the game."
-
-# -- Saying which button was pressed ------------------------------------------
+# -- Saying who did what ------------------------------------------------------
 #
-# Every press names itself on the message it edits, in one short line above
-# the clip and in the same voice as UNDONE_NOTE above: "Pressed A.", "Pressed
-# \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}.", "Pressed Start.",
-# "Pressed A x3.", "Waited."
+# Every action names itself, and its author, on the message it edits: one
+# short line above the clip, in one voice for all five of them --
 #
-# It rides on the one edit a press already makes (see RetroView._show), so it
-# costs nothing: no extra request, no extra rate-limit budget, and nothing
+#     Rob pressed A.
+#     Rob pressed \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}.
+#     Rob pressed A x3.
+#     Rob waited.
+#     Rob undid the last press.
+#     Rob reset the game.
+#
+# -- and the impersonal form of the same sentence ("Pressed A.", "Waited.")
+# whenever there is no name to use, which is the one thing that must never
+# fail: a click always gets a line, even from a user object that turns out to
+# have no usable name at all.
+#
+# It rides on the one edit the action already makes (see RetroView._show), so
+# it costs nothing: no extra request, no extra rate-limit budget, and nothing
 # that could re-render the message a second time and rewind the clip.
 #
-# The name of a button comes from the console's own Button in systems.py, via
-# System.caption_for -- never from a second table here. That is what makes a
-# Genesis press read "Pressed C." rather than "Pressed A." (its C is RetroPad
-# *a*) and what keeps the line in step with the label on the button that was
-# clicked. The d-pad has no labels at all, so it names itself with its arrow
-# emoji, which has already been through systems.validate_emoji() at import
-# time; a bare codepoint with no U+FE0F is what caused a 400 in production
-# once, and it cannot get in here without failing that check first.
-PRESSED_NOTE = "Pressed {button}."
-WAITED_NOTE = "Waited."
+# The name of a *button* comes from the console's own Button in systems.py,
+# via System.caption_for -- never from a second table here. That is what makes
+# a Genesis press read "pressed C." rather than "pressed A." (its C is
+# RetroPad *a*) and what keeps the line in step with the label on the button
+# that was clicked. The d-pad has no labels at all, so it names itself with
+# its arrow emoji, which has already been through systems.validate_emoji() at
+# import time; a bare codepoint with no U+FE0F is what caused a 400 in
+# production once, and it cannot get in here without failing that check first.
+#
+#: action -> (the line when the author is known, the line when it is not).
+#: Table-driven on purpose: five actions in one voice is a property of this
+#: dict rather than of five string literals scattered through the file, and
+#: the tests read it back.
+ACTION_NOTES: typing.Dict[str, typing.Tuple[str, str]] = {
+    "press": ("{who} pressed {button}.", "Pressed {button}."),
+    "wait": ("{who} waited.", "Waited."),
+    "undo": ("{who} undid the last press.", "Undid the last press."),
+    "reset": ("{who} reset the game.", "Reset the game."),
+}
+
+#: The impersonal forms, kept as names because the cog and the tests refer to
+#: them and because they are what a line falls back to.
+PRESSED_NOTE = ACTION_NOTES["press"][1]
+WAITED_NOTE = ACTION_NOTES["wait"][1]
+UNDONE_NOTE = ACTION_NOTES["undo"][1]
+RESET_NOTE = ACTION_NOTES["reset"][1]
+
+# How much of a display name goes on the line. 32 is Discord's own ceiling for
+# both a nickname and a global display name, so no real name is ever cut; the
+# cap is here for a name that arrives from somewhere else (a cached member
+# object, a future API, a test) and to make "one presser cannot own the line"
+# a property of this module rather than a hope about Discord's limits. The
+# worst case is therefore a 32 character name plus " undid the last press.",
+# which is 54 characters -- still one short line above the clip.
+MAX_PRESSER_NAME = 32
+
+# Unicode general categories that take up no space on screen: control
+# characters (Cc, which includes the newlines that would turn one line into
+# three), format characters (Cf, which is the zero-width space, the
+# zero-width joiner, the soft hyphen, the byte-order mark and the
+# right-to-left override), lone surrogates, private use, unassigned, and the
+# line/paragraph separators.
+#
+# Whitespace is handled before this, so a name written with newlines or tabs
+# in it still reads as separate words rather than having them run together.
+INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+
+# Every character Discord reads as markup, escaped unconditionally with a
+# backslash -- which Discord renders as the plain character, so "Jean\-Luc"
+# reads "Jean-Luc" and the only cost is a backslash nobody sees.
+#
+# Deliberately a table here rather than discord.utils.escape_markdown, for
+# two reasons that both matter for a *name*:
+#
+# * that helper defaults to ignore_links=True and leaves markdown inside
+#   anything URL-shaped alone, so a display name of
+#   "http://example.com/__x__" would come back unescaped. A display name is
+#   not prose with links in it;
+# * it also leaves the start-of-line syntax alone (`#` headers, `-`/`+`
+#   lists, `>` quotes), which is exactly where a presser's name sits. A
+#   display name of "# hello" would render the whole line as a header --
+#   precisely the "one user dominates the line" problem the length cap is
+#   for.
+#
+# (On Python 3.13 it additionally emits a DeprecationWarning from inside
+# discord.py, once per call, which a cog should not be minting on every
+# button press.)
+#
+# `<` is in here for the family of things angle brackets open: `<@123>` (a
+# mention), `<#123>` (a channel), `<:name:123>` (a custom emoji) and `<t:0>`
+# (a timestamp). Brackets and parentheses are for `[text](url)` masked links.
+# The backslash itself is first, and a single str.translate pass maps every
+# character from the *input*, so escaping it cannot cascade into the
+# backslashes this adds.
+#
+# @everyone, @here and <@id> are still handed to discord.py's own
+# escape_mentions afterwards: it is the maintained answer for those, it is
+# warning-free, and a second opinion on the one class of markup that can
+# actually notify somebody is worth having.
+MARKDOWN_ESCAPES = str.maketrans(
+    {character: f"\\{character}" for character in "\\*_~`|#-+<>[]()"}
+)
+
+#: A leading "1." starts an ordered list, so the stop after a leading run of
+#: digits is escaped too. The digits themselves are fine, and "1)" is already
+#: covered by the bracket in MARKDOWN_ESCAPES.
+LEADING_ORDINAL = re.compile(r"^(\d+)(\.)")
+
+# Nothing this cog writes may ping anybody, and the press line is why: a
+# notification on every button press, from everybody in the channel, would be
+# intolerable in a way that no amount of "well, it is only one line" fixes.
+#
+# Two independent guards, because one of them is a promise about a string and
+# the other is a promise to Discord:
+#
+# * presser_name() emits *no mention syntax at all*. The name is plain text
+#   with every mention-shaped thing escaped, so there is nothing for Discord
+#   to resolve into a ping in the first place;
+# * every edit that can carry a name also carries this, so even a line that
+#   somehow contained a live mention could not deliver one.
+#
+# Belt and braces on purpose: the first guard is the one that matters and the
+# second is the one that cannot be got wrong by a future edit to the wording.
+NO_PINGS = discord.AllowedMentions.none()
+
+
+def presser_name(user: typing.Any) -> str:
+    """
+    A person's display name, safe to drop into the middle of a sentence.
+
+    Returns ``""`` for anybody who cannot be named, which is the caller's
+    signal to use the impersonal form of the line. Never raises: a click must
+    never fail because of whatever somebody called themselves.
+
+    ``display_name`` is asked for first and works for every kind of author
+    this cog sees -- a :class:`discord.Member` (their per-guild nickname), a
+    plain :class:`discord.User` with no guild at all (their global display
+    name, or their username), and a member object left over from somebody who
+    has since left the guild (the nickname Discord last told us about). The
+    two fallbacks after it are for an object that has only one of the others.
+
+    What comes back is then made safe, in this order:
+
+    1. **whitespace is collapsed**, so a name with a newline in it cannot
+       turn one line above the clip into three;
+    2. **invisible characters are dropped** (see INVISIBLE_CATEGORIES): a
+       name made entirely of zero-width spaces is indistinguishable from
+       having no name, and is treated as such rather than producing
+       " pressed A.";
+    3. **the length is capped** at MAX_PRESSER_NAME, before escaping, so a
+       trailing backslash can never be cut off from the character it escapes;
+    4. **markdown and mentions are escaped** -- MARKDOWN_ESCAPES for every
+       character Discord reads as markup, LEADING_ORDINAL for the one piece
+       of it that is positional, and discord.py's ``escape_mentions`` for
+       ``@everyone``/``@here``/``<@id>``. The result contains no mention
+       syntax at all, which is the first of the two guarantees described
+       above NO_PINGS.
+    """
+    raw = ""
+    for attribute in ("display_name", "global_name", "name"):
+        value = getattr(user, attribute, None)
+        if isinstance(value, str) and value.strip():
+            raw = value
+            break
+    if not raw:
+        return ""
+
+    characters = []
+    for character in raw:
+        if character.isspace():
+            characters.append(" ")
+            continue
+        try:
+            category = unicodedata.category(character)
+        except (TypeError, ValueError):  # not reachable from a str, but free
+            continue
+        if category in INVISIBLE_CATEGORIES:
+            continue
+        characters.append(character)
+    name = " ".join("".join(characters).split())
+    if not name:
+        return ""
+    if len(name) > MAX_PRESSER_NAME:
+        name = name[: MAX_PRESSER_NAME - 1].rstrip() + "\N{HORIZONTAL ELLIPSIS}"
+
+    name = LEADING_ORDINAL.sub(r"\1\\\2", name.translate(MARKDOWN_ESCAPES))
+    return discord.utils.escape_mentions(name)
+
+
+def action_note(action: str, user: typing.Any = None, button: str = "") -> str:
+    """
+    The one line an action puts on the message, with its author's name in it.
+
+    ``action`` is a key of ACTION_NOTES. The impersonal form is used whenever
+    :func:`presser_name` cannot name the author, so this always returns a
+    sentence.
+    """
+    named, plain = ACTION_NOTES[action]
+    who = presser_name(user)
+    return (named if who else plain).format(who=who, button=button)
 
 # -- Undo ----------------------------------------------------------------------
 #
@@ -259,8 +461,10 @@ def press_plan(
       0.8-1s clips.
     * **the number of taps**, one at a time, when even the floor will not
       fit. Two taps is a worthwhile repeat button; one is just the confirm
-      button, and the view greys it out rather than pretending (see
-      :meth:`RetroView._update_repeat_label`).
+      button, and the view does not draw a button for it at all -- see
+      MIN_REPEAT_TAPS and :meth:`RetroView._update_repeat_label`. Measured at
+      DEFAULT_FPS with the default 160ms hold, the boundaries are 0.48s for
+      the second tap and 0.68s for the third.
 
     The hold itself is clamped last-ditch: it can never be longer than the
     budget, so a 0.2s clip (12 frames, budget 8) with a 400ms hold holds the
@@ -433,6 +637,11 @@ class _RepeatButton(discord.ui.Button):
     :meth:`RetroView._update_repeat_label`). The custom_id never changes, so
     Discord keeps routing clicks to it, and the line the press puts on the
     message counts the same taps the label does.
+
+    Below MIN_REPEAT_TAPS this button is not built at all, so it is never
+    drawn saying "A x1". A click on a stale one still sitting on a message
+    Discord has not re-rendered resolves to a custom_id the view no longer
+    has, which discord.py's ViewStore.dispatch_view drops silently.
     """
 
     def __init__(self, spec, row: int, taps: int = REPEAT_TAPS) -> None:
@@ -696,6 +905,12 @@ class RetroView(discord.ui.View):
         wide fits beside every console's bottom row here, including a
         two-button Start/Select; it was four while Replay existed, which was
         one too many for all but the Master System and the Neo Geo Pocket.
+
+        The room for the cluster is reserved with CONTROL_BUTTONS, i.e. for
+        all three of them, whether or not the confirm x3 button is drawn (see
+        MIN_REPEAT_TAPS): Wait and Undo must not move between one clip length
+        and another, and a layout that only fits on a short clip would be a
+        layout that breaks the day somebody lengthens the clip.
         """
         rows = self.system.rows
         if len(rows) > MAX_LAYOUT_ROWS:
@@ -729,12 +944,13 @@ class RetroView(discord.ui.View):
             )
         self.add_item(_WaitButton(control_row))
         confirm = self.system.button(self.system.confirm)
-        if confirm is not None:
+        taps = self.repeat_taps
+        if confirm is not None and taps >= MIN_REPEAT_TAPS:
             # Built with the taps this clip length can fit, so a session
-            # started on a short clip never shows a promise it cannot keep.
-            # CONTROL_BUTTONS still reserves room for the whole cluster
-            # either way, so the layout does not move when it is greyed out.
-            self.add_item(_RepeatButton(confirm, control_row, self.repeat_taps))
+            # started on a short clip never shows a promise it cannot keep --
+            # and not built at all on a clip too short for a repeat to mean
+            # anything, so it is never drawn dead. See MIN_REPEAT_TAPS.
+            self.add_item(_RepeatButton(confirm, control_row, taps))
         self.add_item(_UndoButton(control_row))
         if len(self.children) > MAX_COMPONENTS:
             raise ValueError(
@@ -860,22 +1076,36 @@ class RetroView(discord.ui.View):
 
         Three when there is room for three, fewer when there is not, and one
         -- meaning "no more than the confirm button itself" -- on a clip too
-        short for even two, which is when the button is greyed out.
+        short for even two, which is when the button is not drawn at all.
         """
         return len(self.press_plan(REPEAT_TAPS))
+
+    @property
+    def has_repeat_button(self) -> bool:
+        """Whether this clip length is long enough to draw the x3 button."""
+        return self.repeat_taps >= MIN_REPEAT_TAPS
 
     # -- The clip on the message --------------------------------------------
 
     def press_note(
-        self, field: typing.Optional[str], repeat: int = 1
+        self,
+        field: typing.Optional[str],
+        repeat: int = 1,
+        user: typing.Any = None,
     ) -> str:
         """
-        The one line that says which button this press was.
+        The one line that says who pressed which button.
 
-        See PRESSED_NOTE: the console's own name for the button, or the
+        See ACTION_NOTES: the console's own name for the button, or the
         d-pad's arrow, taken from systems.py so nothing can drift out of step
         with what is drawn on the button that was clicked. ``field`` of None
         is the Wait button, which pressed nothing.
+
+        ``user`` is whoever clicked -- ``interaction.user``, which is a
+        Member in a guild and a plain User otherwise, and is still handed over
+        for somebody who has left the guild since. Omitting it (or passing
+        anybody :func:`presser_name` cannot name) gives the impersonal form of
+        the same sentence rather than no line at all.
 
         The repeat button counts the taps that will really happen rather than
         the three that were asked for, exactly as its label does -- a short
@@ -883,37 +1113,95 @@ class RetroView(discord.ui.View):
         would be the same lie the label refuses to tell.
         """
         if field is None:
-            return WAITED_NOTE
+            return action_note("wait", user)
         button = self.system.caption_for(field)
         taps = len(self.press_plan(repeat)) if repeat > 1 else 1
         if taps > 1:
             button = f"{button} x{taps}"
-        return PRESSED_NOTE.format(button=button)
+        return action_note("press", user, button)
+
+    @staticmethod
+    def undo_note(user: typing.Any = None) -> str:
+        """The line the Undo button puts on the message; see ACTION_NOTES."""
+        return action_note("undo", user)
+
+    @staticmethod
+    def reset_note(user: typing.Any = None) -> str:
+        """
+        The line `[p]retroreset` puts on the message; see ACTION_NOTES.
+
+        A command rather than a button, so the author is ``ctx.author``
+        rather than ``interaction.user`` -- but the same person, named the
+        same way, in the same voice as every press above it.
+        """
+        return action_note("reset", user)
+
+    def _repeat_button(self) -> typing.Optional["_RepeatButton"]:
+        """The repeat button, or None on a clip too short to draw one."""
+        return next(
+            (child for child in self.children if isinstance(child, _RepeatButton)), None
+        )
 
     def _update_repeat_label(self) -> None:
         """
-        Make the repeat button say how many taps it will really do.
+        Draw the repeat button if it can do anything, and say how much.
 
         Three taps need about 1.4 seconds of clip; :func:`press_plan` squeezes
         the spacing to fit a shorter one and then drops taps, so the label has
-        to follow it rather than stating REPEAT_TAPS for ever. At one tap the
-        button does nothing the console's own confirm button does not, so it
-        is greyed out instead -- the same treatment Undo gets when there is
-        nothing to undo, and for the same reason: better a dead button than a
-        lying one. The layout never moves, because systems.py reserves room
-        for three controls whether or not this one is usable.
+        to follow it rather than stating REPEAT_TAPS for ever.
+
+        At one tap the button does nothing the console's own confirm button
+        does not, and it is **removed from the row** rather than greyed out.
+        That is a change from how it used to behave, and the reason is that
+        the greyed-out version was reported as the feature having been taken
+        out of the cog: a dead control with no explanation looks broken, and
+        Undo -- the other control that can have nothing to do -- at least has
+        a name that says what it would do and an ephemeral line if you click
+        it anyway. A missing control says "not at this clip length", which is
+        the truth. It also frees a component.
+
+        Called on every redraw (see :meth:`_set_disabled`), so changing
+        `[p]retroset cliplength` mid-game adds or removes the button on the
+        next press, both ways round -- and so does booting a core, since a
+        session laid out while hibernated used DEFAULT_FPS and a 50 fps PAL
+        core can fit a tap the fallback said would not fit (and vice versa).
+
+        Coming or going means rebuilding the whole row, because a Discord
+        action row is ordered by insertion: adding the button back would
+        otherwise land it after Undo and read "Wait Undo A x3". The rebuild
+        is a couple of dozen Button objects and only happens when the answer
+        actually changes, which is on a settings change and once per boot.
         """
-        button = next(
-            (child for child in self.children if isinstance(child, _RepeatButton)), None
-        )
-        if button is None:
-            return
         taps = self.repeat_taps
-        button.label = f"{button.name} x{taps}"
-        # Both ways round: a session built while hibernated laid the button
-        # out against DEFAULT_FPS, and a 50 fps PAL core can fit a tap that
-        # the fallback said would not fit (and vice versa).
-        button.disabled = taps < 2
+        button = self._repeat_button()
+        wanted = taps >= MIN_REPEAT_TAPS
+        if wanted != (button is not None):
+            self._rebuild_controls()
+            return
+        if button is not None:
+            button.label = f"{button.name} x{taps}"
+
+    def _rebuild_controls(self) -> None:
+        """
+        Draw the whole controller again, in row order.
+
+        Only :meth:`_update_repeat_label` needs this, and only when the
+        repeat button has to appear or disappear. The custom_ids are fixed
+        strings, so the freshly built buttons route exactly as the old ones
+        did and the view stays persistent.
+
+        Every caller edits the message with ``view=self`` immediately
+        afterwards, and both ``edit_original_response`` and ``Message.edit``
+        re-register the view's children as they go, so Discord is routing
+        clicks to the new buttons from that edit on. A click that lands in
+        the moment between the rebuild and the edit resolves to one of the
+        old, now detached items, which discord.py's ViewStore drops with a
+        log line rather than raising (it checks ``item.view is None``) -- the
+        same treatment a click on any button this cog has removed gets.
+        """
+        self.clear_items()
+        self._build_controls()
+        self._update_undo_button()
 
     # -- The undo history ---------------------------------------------------
 
@@ -1110,11 +1398,12 @@ class RetroView(discord.ui.View):
                 child.disabled = disabled
         if not disabled:
             # The repeat button and Undo are the two controls that can have
-            # nothing to do: the repeat button comes back only if the clip is
-            # long enough to fit more than one tap, and Undo only if a press
-            # this process saw has something to step back to. This runs on
-            # every redraw, so changing the clip length mid-game corrects the
-            # repeat button and every press re-arms Undo.
+            # nothing to do, and they answer it differently: the repeat
+            # button is *drawn at all* only if the clip is long enough to fit
+            # more than one tap, while Undo is always drawn and greyed out
+            # until a press this process saw has something to step back to.
+            # This runs on every redraw, so changing the clip length mid-game
+            # adds or removes the repeat button and every press re-arms Undo.
             self._update_repeat_label()
             self._update_undo_button()
 
@@ -1182,7 +1471,9 @@ class RetroView(discord.ui.View):
         if message is None:
             return
         try:
-            await message.edit(content=self._content(note), view=self)
+            await message.edit(
+                content=self._content(note), view=self, allowed_mentions=NO_PINGS
+            )
         except discord.HTTPException:
             # The message may have been deleted, or the bot may have lost
             # access to the channel; the session state is still correct.
@@ -1212,6 +1503,9 @@ class RetroView(discord.ui.View):
                 content=self._content(note),
                 attachments=[self._clip_file(clip)],
                 view=self,
+                # The line this carries names whoever ran the command; see
+                # NO_PINGS.
+                allowed_mentions=NO_PINGS,
             )
         except discord.HTTPException:
             log.warning(
@@ -1357,15 +1651,18 @@ class RetroView(discord.ui.View):
                 await self._recover(interaction, "The emulator hit an unexpected error.")
                 return
             self.touch()
-            # The press names itself on the message, on the very same edit
-            # that carries the clip (see :meth:`press_note`). The resume line
-            # beats it when there is one, because "the game was asleep and is
-            # back" is news and "you pressed A" is a label; a real notice
-            # beats both, which _show settles.
+            # The press names itself, and whoever made it, on the message --
+            # on the very same edit that carries the clip (see
+            # :meth:`press_note`). The resume line beats it when there is
+            # one, because "the game was asleep and is back" is news and
+            # "Rob pressed A" is a label; a real notice beats both, which
+            # _show settles.
             await self._show(
                 interaction,
                 clip,
-                RESUMED_NOTE if resuming else self.press_note(field, repeat),
+                RESUMED_NOTE
+                if resuming
+                else self.press_note(field, repeat, interaction.user),
             )
 
     @staticmethod
@@ -1470,6 +1767,9 @@ class RetroView(discord.ui.View):
                 content=content,
                 attachments=[self._clip_file(clip)],
                 view=self,
+                # The line above the clip names whoever clicked, and must
+                # never notify them or anybody else; see NO_PINGS.
+                allowed_mentions=NO_PINGS,
             )
         except discord.HTTPException as error:
             # The game itself is fine, so say so rather than leaving the
@@ -1490,7 +1790,7 @@ class RetroView(discord.ui.View):
         self._set_disabled(False)
         try:
             await interaction.edit_original_response(
-                content=self._content(reason), view=self
+                content=self._content(reason), view=self, allowed_mentions=NO_PINGS
             )
         except discord.HTTPException:
             log.warning("Failed to report a Libretro failure.", exc_info=True)
@@ -1541,10 +1841,10 @@ class RetroView(discord.ui.View):
             # The edit below replaces the undone press's clip with this one,
             # so what the channel is left looking at is where the game
             # actually is.
-            # UNDONE_NOTE rather than a press line: nothing was pressed, and
-            # "Undid the last press." is the sentence every other line here
-            # was written to match.
-            await self._show(interaction, clip, UNDONE_NOTE)
+            # An undo line rather than a press line: nothing was pressed, and
+            # "Rob undid the last press." is one of the five sentences in
+            # ACTION_NOTES that every line here is written to match.
+            await self._show(interaction, clip, self.undo_note(interaction.user))
 
     async def can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
         """

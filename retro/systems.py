@@ -290,7 +290,15 @@ def _face(label: str, field: str) -> Button:
 # row are there to keep that row aligned under the row above it.
 #
 # In full, per console (⬆⬇⬅➡ are the d-pad, · a spacer, and the three
-# controls the view appends are shown in brackets):
+# controls the view appends are shown in brackets).
+#
+# The middle one of the three -- the "confirm x3" repeat button -- is drawn
+# only on a clip long enough to fit more than one tap, which at the default
+# 160ms hold means 0.48 seconds and up (the default clip is 1 second, so it
+# is normally there). Below that the row is exactly the one shown here with
+# that button left out: Wait and Undo do not move, because the space is
+# reserved with CONTROL_BUTTONS for all three either way. See MIN_REPEAT_TAPS
+# in retro/RetroView.py.
 #
 #   Game Boy / NES        ·  ⬆                       12 components, 3 rows
 #                         ⬅  ⬇  ➡  B  A
@@ -345,6 +353,12 @@ MAX_ACTION_ROWS = 5
 MAX_BUTTONS_PER_ROW = 5
 MAX_COMPONENTS = 25
 # Wait, confirm x3 and Undo, which RetroView appends to every layout.
+#
+# Always three, even though the middle one is not drawn on a clip too short
+# for two taps: this is the *space reserved* for the cluster, and reserving
+# only two on a short clip would move Wait and Undo between one clip length
+# and the next, and would validate a layout that broke the moment somebody
+# lengthened the clip.
 CONTROL_BUTTONS = 3
 # How many rows a console's own grid may use, leaving room for the controls.
 MAX_LAYOUT_ROWS = 4

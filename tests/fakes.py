@@ -512,19 +512,24 @@ def playable(viewmod, view):
     return [c for c in view.children if not isinstance(c, viewmod._SpacerButton)]
 
 
-#: The controls that may legitimately be greyed out at any moment, because
-#: each of them can have nothing to do: the **x3** button on a clip too short
-#: to fit two taps, and **Undo** with an empty history -- which is every
-#: session's starting state and every session's state after a bot restart,
-#: since the history is memory only.
+#: The controls that may legitimately be greyed out at any moment. **Undo**
+#: is the only one: it is always drawn, and it is dead whenever the history is
+#: empty -- which is every session's starting state and every session's state
+#: after a bot restart, since the history is memory only.
 #:
-#: `playable()` keeps them, so a test that is *about* one of them still finds
-#: it (they are asked for by custom_id anyway). `pressable()` and the
-#: `any_disabled`/`all_disabled` snapshot keys below leave them out, so an
+#: The **x3** button used to be in here as well, for a clip too short to fit
+#: two taps. It is not any more, because that case is now answered by not
+#: drawing the button at all (see MIN_REPEAT_TAPS in retro/RetroView.py), so
+#: whenever it *is* on the message it is live -- which makes it fair game for
+#: the "a press does not grey the controls out" assertions below.
+#:
+#: `playable()` keeps Undo, so a test that is *about* it still finds it (it is
+#: asked for by custom_id anyway). `pressable()` and the
+#: `any_disabled`/`all_disabled` snapshot keys below leave it out, so an
 #: assertion that a press did not grey the controls out stays an assertion
 #: about the console's own buttons rather than quietly becoming one about
 #: whether there was anything to undo.
-CONDITIONAL_CONTROLS = ("repeat", "undo")
+CONDITIONAL_CONTROLS = ("undo",)
 
 
 def pressable(viewmod, view):
@@ -603,6 +608,24 @@ def footage_bytes(owner):
     return total
 
 
+#: The four ways a Discord message can notify somebody. ``replied_user`` is
+#: in here too: an edit does not re-ping a reply, but an AllowedMentions that
+#: left it on would not be "suppresses everything".
+MENTION_KINDS = ("everyone", "users", "roles", "replied_user")
+
+
+def mentions_suppressed(allowed):
+    """Whether this ``allowed_mentions`` can notify anybody at all.
+
+    False for a missing one, because Discord then falls back to the client's
+    default -- which allows user mentions. The press line carries a display
+    name, so "we did not say" is not good enough; see ``RetroView.NO_PINGS``.
+    """
+    if allowed is None:
+        return False
+    return all(not getattr(allowed, kind, True) for kind in MENTION_KINDS)
+
+
 def snapshot(viewmod, kwargs, view):
     """What an edit would have put on the wire, in a comparable shape."""
     files = kwargs.get("attachments") or []
@@ -617,6 +640,13 @@ def snapshot(viewmod, kwargs, view):
         "any_disabled": any(getattr(c, "disabled", False) for c in pressable(viewmod, view)),
         "labels": [getattr(c, "label", None) or getattr(c, "custom_id", None) for c in view.children],
         "content": kwargs.get("content"),
+        # The content names whoever clicked, so every edit that carries one
+        # has to carry an allowed_mentions that can never notify anybody.
+        # Kept as the object *and* as a plain bool, so a test can assert
+        # either "this edit suppressed everything" or "this is the exact
+        # AllowedMentions the view passes".
+        "allowed_mentions": kwargs.get("allowed_mentions"),
+        "pings_nobody": mentions_suppressed(kwargs.get("allowed_mentions")),
         "has_embed": "embed" in kwargs and kwargs["embed"] is not None,
         "spacers_disabled": all(
             c.disabled for c in view.children if isinstance(c, viewmod._SpacerButton)
@@ -1015,10 +1045,27 @@ class RetroEnv:
         return clip_bytes([(getattr(message, "kwargs", None) or {}).get("file")])
 
     def button(self, view, custom_id):
-        return next(c for c in view.children if c.custom_id == custom_id)
+        """The child with this custom_id, or None if the view has no such one.
+
+        None rather than StopIteration because a control is now allowed to be
+        *absent*: the x3 button is not drawn on a clip too short for two taps
+        (see MIN_REPEAT_TAPS), and "is it there?" is a question several tests
+        ask directly.
+        """
+        return next((c for c in view.children if c.custom_id == custom_id), None)
 
     def control(self, view, name):
         return self.button(view, f"{self.viewmod.CUSTOM_ID_PREFIX}:{name}")
+
+    def message_edit(self, view, index=-1):
+        """An edit of the session's own message, in interaction-snapshot shape.
+
+        A button press edits the *interaction* and is read through
+        ``interaction.log``; a command that moves the game on -- which is
+        `[p]retroreset` -- edits the message directly, and this is how those
+        edits are compared against the same keys.
+        """
+        return snapshot(self.viewmod, view.message.edits[index], view)
 
     def playable(self, view):
         return playable(self.viewmod, view)
