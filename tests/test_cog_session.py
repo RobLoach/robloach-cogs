@@ -551,7 +551,7 @@ async def test_a_press_no_longer_greys_the_controls_out(retro):
 
     def watched(field, repeat=1):
         disabled_midway.append(
-            [c.custom_id for c in retro.playable(view) if c.disabled]
+            [c.custom_id for c in retro.pressable(view) if c.disabled]
         )
         return original(field, repeat)
 
@@ -562,7 +562,10 @@ async def test_a_press_no_longer_greys_the_controls_out(retro):
         view.run_press = original
 
     assert disabled_midway == [[]], disabled_midway
-    assert not any(c.disabled for c in retro.playable(view))
+    assert not any(c.disabled for c in retro.pressable(view))
+    # ...and the one control that *starts* greyed out came back, because the
+    # press it was waiting for has happened. See fakes.CONDITIONAL_CONTROLS.
+    assert not retro.control(view, "undo").disabled
 
 
 async def test_the_clip_is_cached_for_replay(retro):
@@ -829,6 +832,343 @@ async def test_a_replay_that_cannot_be_stitched_falls_back_to_the_last_clip(
     assert not final["any_disabled"]
 
 
+# -- Undo ---------------------------------------------------------------------
+#
+# A misclick is the dominant frustration in turn-based play by button: you
+# press a direction, wait a second for the clip, and find you walked into
+# the wrong room. So every press pushes the state it is about to change onto
+# a bounded in-memory stack first and Undo pops it back. The real core does
+# the same round trip in test_saves_roundtrip.py; FakeEmulator's save state
+# carries its frame counter, which is what makes "back one press" checkable
+# here without a core.
+
+
+async def undo(retro, view):
+    """Click Undo, and hand back the interaction it was clicked with."""
+    interaction = retro.interaction(view, message=view.message)
+    await retro.control(view, "undo").callback(interaction)
+    return interaction
+
+
+async def test_undo_puts_the_game_back_where_the_last_press_found_it(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9200, "undome")
+    before = view.emulator.frame
+
+    await view._press(retro.interaction(view, message=view.message), "right")
+    assert view.emulator.frame > before, "the press moved the game on"
+    assert len(view.history) == 1, "and left something to step back to"
+
+    await undo(retro, view)
+    # The state that went back in is the one the press started from, to the
+    # frame: FakeEmulator records what it was asked to load.
+    assert view.emulator.loaded_from == before
+    assert not view.history, "the undo point was consumed, not reused"
+
+
+async def test_undo_makes_exactly_one_edit_to_the_message(retro):
+    """The same rule a press lives by; see _ack_now."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9201, "oneedit")
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    interaction = await undo(retro, view)
+
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
+    edits = [snap for kind, snap in interaction.log if kind != "response.defer"]
+    assert len(edits) == 1, interaction.kinds()
+    only = edits[0]
+    assert only["has_attachments"] and only["n_attachments"] == 1
+    assert only["filenames"][0].endswith(".webp")
+    assert only["content"] == retro.viewmod.UNDONE_NOTE
+    assert not only["any_disabled"], "the controls come back enabled"
+    assert only["spacers_disabled"]
+
+
+async def test_nothing_is_edited_while_the_undo_is_being_emulated(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9202, "midundo")
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    original = view.run_undo
+    seen = []
+
+    def watched():
+        seen.append(list(interaction.kinds()))
+        return original()
+
+    view.run_undo = watched
+    interaction = retro.interaction(view, message=view.message)
+    try:
+        await retro.control(view, "undo").callback(interaction)
+    finally:
+        view.run_undo = original
+    assert seen == [["response.defer"]], seen
+
+
+async def test_the_undo_button_is_dead_until_there_is_a_press_to_undo(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9203, "deadundo")
+    button = retro.control(view, "undo")
+    assert button.disabled, "a game that has only just booted"
+
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert not button.disabled
+
+    await undo(retro, view)
+    assert button.disabled, "and dead again once the history is spent"
+
+
+async def test_an_undo_with_nothing_to_undo_says_so_and_touches_nothing(retro):
+    """The fresh-restart path: the history is memory only, like the clips."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9204, "emptyundo")
+    view.forget_history()
+
+    interaction = await undo(retro, view)
+
+    assert interaction.kinds() == ["response.send_message"], interaction.kinds()
+    snap = interaction.log[0][1]
+    assert snap["ephemeral"] is True
+    assert "nothing to undo" in (snap["content"] or "")
+    assert "memory only" in (snap["content"] or "")
+    assert not view.message.edits, "the message itself was never touched"
+
+
+async def test_a_session_restored_after_a_restart_has_nothing_to_undo(retro):
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9205, "afterrestart")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert view.history
+
+    cog2, bot2 = retro.make_cog()
+    bot2.channels[channel.id] = channel
+    await cog2._restore_sessions()
+    restored = cog2.sessions[channel.id]
+
+    assert not restored.history and not restored.can_undo
+    assert restored.history_bytes == 0
+    button = next(
+        c for c in restored.children
+        if c.custom_id == f"{retro.viewmod.CUSTOM_ID_PREFIX}:undo"
+    )
+    assert button.disabled, "a restart cannot leave a button that lies"
+    # ...and clicking it anyway is answered, never an error.
+    interaction = retro.interaction(restored, message=view.message)
+    await button.callback(interaction)
+    assert interaction.kinds() == ["response.send_message"]
+
+
+async def test_undo_reaches_back_through_a_sleep(retro):
+    """The history outlives a hibernate, because the same view does.
+
+    A state is loadable by any instance of the same core build (that is how
+    waking a session works at all), so an undo point taken before the game
+    went to sleep is still good afterwards. Waking restores the *disk* state
+    first, which is where the game was when it slept; the undo then steps
+    back from there.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9206, "sleepundo")
+    before = view.emulator.frame
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog.hibernate(view, None)
+    assert not view.live and view.history
+
+    await undo(retro, view)
+
+    assert view.live, "the undo woke the session up first"
+    assert view.emulator.loaded_from == before
+    assert not view.history
+
+
+async def test_two_undos_step_back_two_presses(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9207, "twiceundo")
+    frames = [view.emulator.frame]
+    for field in ("right", "right"):
+        await view._press(retro.interaction(view, message=view.message), field)
+        frames.append(view.emulator.frame)
+    assert len(view.history) == 2
+
+    await undo(retro, view)
+    assert view.emulator.loaded_from == frames[1]
+    await undo(retro, view)
+    assert view.emulator.loaded_from == frames[0]
+    assert not view.history
+    # A third click has nothing left and says so rather than failing.
+    interaction = await undo(retro, view)
+    assert interaction.kinds() == ["response.send_message"]
+
+
+async def test_the_history_is_bounded_by_its_depth(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9208, "deep")
+    assert retro.viewmod.UNDO_DEPTH == 8
+
+    for _ in range(retro.viewmod.UNDO_DEPTH + 5):
+        await view._press(retro.interaction(view, message=view.message), "a")
+
+    assert len(view.history) == retro.viewmod.UNDO_DEPTH
+    assert view.history_bytes == sum(len(blob) for blob in view.history)
+
+
+async def test_the_history_is_bounded_by_bytes_as_well_as_by_count(
+    retro, monkeypatch
+):
+    """The count alone bounds nothing: a bigger console has bigger states."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9209, "fat")
+    for _ in range(4):
+        await view._press(retro.interaction(view, message=view.message), "a")
+    one = max(len(blob) for blob in view.history)
+
+    # A cap that fits two and a half of these, so the count (8) is no longer
+    # the bound that bites.
+    monkeypatch.setattr(retro.viewmod, "MAX_UNDO_BYTES", one * 2 + 1)
+    for _ in range(6):
+        await view._press(retro.interaction(view, message=view.message), "a")
+    assert len(view.history) < retro.viewmod.UNDO_DEPTH
+    assert view.history_bytes <= one * 2 + 1
+    assert view.history_bytes == sum(len(blob) for blob in view.history)
+
+    # A single state larger than the whole cap keeps exactly one entry: an
+    # Undo that cannot undo the press somebody just made is worse than the
+    # memory. Same compromise the replay buffer makes.
+    monkeypatch.setattr(retro.viewmod, "MAX_UNDO_BYTES", 1)
+    for _ in range(3):
+        await view._press(retro.interaction(view, message=view.message), "a")
+    assert len(view.history) == 1
+    await undo(retro, view)
+    assert not view.history
+
+
+async def test_undo_drops_the_undone_footage_and_leaves_its_own_in_its_place(retro):
+    """Replay must not show somebody walking into a room they are not in."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9210, "replayundo")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await view._press(retro.interaction(view, message=view.message), "right")
+    buffered = [data for data, _ in view.clips]
+    assert len(buffered) == 3, "the boot clip and two presses"
+
+    await undo(retro, view)
+
+    kept = [data for data, _ in view.clips]
+    assert len(kept) == 3, "one clip out, the undo's own clip in"
+    assert kept[:2] == buffered[:2], "the play that still stands is untouched"
+    assert buffered[-1] not in kept, "the undone press's footage is gone"
+    # The clip on the message is the newest one in the buffer, as ever, so a
+    # stitched replay is still a contiguous account of what really happened.
+    assert view.last_clip == kept[-1]
+
+
+async def test_undo_writes_the_state_through_rather_than_waiting(retro):
+    """Or a restart straight after an undo would bring the press back.
+
+    The autosave runs every SAVE_STATE_EVERY_PRESSES presses, so the state on
+    disk can easily be *newer* than the one Undo has just restored.
+    """
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9211, "through")
+    state_path = retro.cog._state_path(channel.id, view.slug)
+    frames = []
+    for field in ("a", "b", "start"):
+        await view._press(retro.interaction(view, message=view.message), field)
+        frames.append(view.emulator.frame)
+    assert state_path.is_file(), "the third press autosaved"
+    pressed = state_path.read_bytes()
+    assert int(pressed.rstrip(b"\0").split(b":")[1]) == frames[-1]
+
+    await undo(retro, view)
+
+    # What is on disk is the game as the undo left it, not as the press left
+    # it -- so a restart, a hibernate or a `[p]retro` now brings back the
+    # undone timeline rather than quietly putting the press back.
+    assert state_path.read_bytes() != pressed, "the undo was written through"
+    assert state_path.read_bytes() == view.emulator.save_state()
+    assert view.emulator.loaded_from == frames[-2], "and it is the right moment"
+    assert view.press_count == 3, "an undo is not a press and does not count as one"
+
+
+async def test_a_state_the_core_will_not_take_back_is_reported_once(retro):
+    """A core updated mid-session invalidates every state it ever wrote."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9212, "badstate")
+    for _ in range(3):
+        await view._press(retro.interaction(view, message=view.message), "a")
+    assert len(view.history) == 3
+
+    def refuse(data):
+        raise retro.emumod.EmulatorError("the core refused to load the save state")
+
+    view.emulator.load_state = refuse
+    interaction = await undo(retro, view)
+
+    # One edit, a sentence, and the controls still usable.
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
+    snap = interaction.log[-1][1]
+    assert "could not be undone" in (snap["content"] or "")
+    assert not snap["any_disabled"]
+    # The whole history went, rather than being retried press after press:
+    # every entry in it came from the same core.
+    assert not view.history and view.history_bytes == 0
+    assert retro.control(view, "undo").disabled
+
+
+async def test_an_undo_while_the_session_is_busy_only_defers(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9213, "busyundo")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    async with view.lock:
+        interaction = await undo(retro, view)
+    assert interaction.kinds() == ["response.defer"]
+    assert view.history, "and the history was not touched"
+
+
+async def test_a_retired_session_lets_go_of_its_undo_history(retro):
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9214, "retiredundo")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert view.history
+
+    await retro.cog._retire(view, "Replaced.")
+
+    assert not view.history and view.history_bytes == 0
+    assert not view.clips
+
+
+async def test_a_core_that_cannot_save_states_costs_undo_and_nothing_else(retro):
+    """Pressing buttons matters more than being able to take one back."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9215, "nostates")
+
+    def refuse():
+        raise retro.emumod.EmulatorError("This core does not support save states.")
+
+    view.emulator.save_state = refuse
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
+    assert interaction.log[-1][1]["n_attachments"] == 1, "the press still worked"
+    assert not view.history
+    assert retro.control(view, "undo").disabled
+
+
+async def test_the_undo_history_compresses_the_states_it_keeps(retro):
+    import zlib
+
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9216, "squeezed")
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    blob = view.history[-1]
+    assert zlib.decompress(blob).startswith(b"STATE:")
+    assert retro.viewmod.UNDO_COMPRESSION_LEVEL == 1
+    assert view.history_bytes == len(blob)
+
+
 # -- Hibernate and resume -----------------------------------------------------
 
 
@@ -848,7 +1188,7 @@ async def test_the_idle_task_saves_and_frees_a_sleeping_session(retro):
     assert state_path.is_file()
     # Sleeping changes nothing about the controls: the next press wakes it.
     assert [c.custom_id for c in view.children] == live_ids
-    assert not any(c.disabled for c in retro.playable(view))
+    assert not any(c.disabled for c in retro.pressable(view))
     assert all(c.disabled for c in view.children if isinstance(c, retro.viewmod._SpacerButton))
     assert retro.cog.config.channels[channel.id]["session"]["slug"] == view.slug
 
@@ -944,7 +1284,7 @@ async def test_a_pruned_rom_leaves_the_controls_usable_and_explains(retro):
 
     interaction = retro.interaction(view, message=view.message)
     await view._press(interaction, "a")
-    assert not any(getattr(c, "disabled", False) for c in retro.playable(view))
+    assert not any(getattr(c, "disabled", False) for c in retro.pressable(view))
     note = interaction.log[-1][1]["content"] or ""
     assert "Start the game again" in note
     assert not any(snap.get("has_attachments") for _, snap in interaction.log)
@@ -1071,7 +1411,7 @@ async def test_retrostop_saves_frees_and_keeps_the_session(retro):
     assert view.emulator is None and not emulator.started
     assert retro.cog._state_path(channel.id, view.slug).is_file()
     assert retro.cog.sessions.get(channel.id) is view
-    assert not any(c.disabled for c in retro.playable(view))
+    assert not any(c.disabled for c in retro.pressable(view))
     assert "carry on" in ctx.sent[-1]
     stopped = view.message.edits[-1] if view.message.edits else {}
     assert "Stopped by" in (stopped.get("content") or "")

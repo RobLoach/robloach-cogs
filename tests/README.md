@@ -25,8 +25,8 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` included), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
-| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
+| fast | console tables, button layouts, emoji, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` and the Undo button included), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
+| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip and the Undo round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
 `pytest -m emulator -n 2` roughly halves the slow half (26s to 15s here). It
@@ -98,6 +98,21 @@ on a screenshot:
 * `test_a_press_no_longer_greys_the_controls_out` -- the trade, pinned, so an
   intermediate "greyed out" edit cannot come back by accident.
 
+**Undo obeys the same rule**, and `test_undo_makes_exactly_one_edit_to_the_message`
+and `test_nothing_is_edited_while_the_undo_is_being_emulated` say so. An undo
+with an empty history is the one click that makes *no* edit at all: it
+answers privately, like Replay with an empty buffer, so the assertion there
+is `["response.send_message"]` and an untouched message.
+
+Three controls are allowed to be greyed out at any moment, because each of
+them can have nothing to do: **Replay** with an empty buffer, **×3** on a
+clip too short for two taps, and **Undo** with an empty history (which is
+every session's first moment, and every session's state after a restart). So
+`fakes.pressable()` -- and the `any_disabled`/`all_disabled` keys of the
+interaction snapshot -- leave those three out, while `fakes.playable()` keeps
+them for the tests that are about them. Without that split, "a press does not
+grey the controls out" quietly becomes "there was something to replay".
+
 The matching statement for the *content* of a clip is
 `test_one_clip_carries_on_from_the_last_with_no_frames_lost` in
 `test_emulator.py`: it records two consecutive clips off a real Game Boy,
@@ -164,8 +179,21 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
   fixture for the data migration and the Resume button; `test_restore.py`
   holds the two callers of the save state -> battery save -> cold boot chain
   against each other; `test_emulator.py` is for things that need a real core,
-  and `test_saves_roundtrip.py` for the one place the cog *and* a real core
-  are needed at once (it puts `RetroEmulator` back over the fake).
+  and `test_saves_roundtrip.py` for the two places the cog *and* a real core
+  are needed at once (it puts `RetroEmulator` back over the fake): the save
+  export/import round trip, and Undo. `test_packaging.py` covers the cog as
+  Red's Downloader sees it, `retro/version.py` included -- that module loads
+  standalone too, so the version can be checked with neither Red nor
+  `discord.py` installed.
+* **Comparing two save states is not a byte comparison.** Gambatte's state
+  carries a four-byte `time` field that a cartridge with no real-time clock
+  never initialises, so two states serialized from an identical machine come
+  out four bytes apart as soon as anything in the process has allocated in
+  between -- an `await` is enough. `test_saves_roundtrip.py` therefore
+  compares the console's work RAM, the cartridge's battery RAM and a hash of
+  the picture (all three of which *are* exactly the emulated machine) and
+  allows the state itself `STATE_SLACK` bytes of difference. Four out of
+  182,530, measured.
 * `FakeConfirm` answers Red's `ConfirmView` for the commands that ask before
   destroying something: set `FakeConfirm.reset(answer=False)` to press No, and
   read `FakeConfirm.asked` to prove the question was put at all. `FakeUser(...,

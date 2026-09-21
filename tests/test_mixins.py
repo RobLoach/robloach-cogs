@@ -91,6 +91,7 @@ COMMANDS = {
     "retroset hold",
     "retroset settings",
     "retroset timeout",
+    "retroset version",
     "retrostop",
 }
 

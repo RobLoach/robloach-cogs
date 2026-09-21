@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import typing
+import zlib
 from pathlib import Path
 
 import discord
@@ -37,6 +38,7 @@ from .systems import (
     REPLAY_EMOJI,
     RESUME_EMOJI,
     SYSTEMS,
+    UNDO_EMOJI,
     WAIT_EMOJI,
     System,
     is_spacer,
@@ -120,6 +122,57 @@ RESUMED_NOTE = "Resumed where you left off\N{HORIZONTAL ELLIPSIS}"
 # kilobytes of disk, so it happens every few presses rather than every press.
 # A crash or a power cut therefore costs at most this many presses of play.
 SAVE_STATE_EVERY_PRESSES = 3
+
+# What the Undo button says when it has put the game back.
+UNDONE_NOTE = "Undid the last press."
+
+# -- Undo ----------------------------------------------------------------------
+#
+# In turn-based play by button the dominant frustration is a misclick: you
+# press a direction, wait a second for the clip, and find you walked into the
+# wrong room. So every press pushes the machine state it is about to change
+# onto a bounded per-session stack first, and Undo pops it back.
+#
+# It is affordable because a save state is cheap in both directions.
+# `save_state()` is sub-millisecond, and a state is almost all zeroes, so it
+# compresses enormously. Measured on the real cores, two seconds after boot,
+# on a Raspberry Pi 5:
+#
+#     console             state     zlib 1   ratio     save   compress
+#     Game Boy          182,530     15,780    8.6%   0.19ms     0.92ms
+#     NES                13,758        870    6.3%   0.11ms     0.10ms
+#     Game Boy Advance  528,448      6,298    1.2%   0.79ms     1.01ms
+#     Super Nintendo    823,407     12,606    1.5%   0.56ms     1.52ms
+#     Genesis         1,036,288     19,524    1.9%   0.40ms     2.13ms
+#     Master System   1,036,288      7,991    0.8%   0.41ms     1.70ms
+#
+# and over eight real undo points taken a second of play apart, which is
+# what a session actually holds: 124 KiB on the Game Boy, 99 KiB on the
+# SNES, 152 KiB on the Genesis, worst single entry 19.1 KiB. A couple of
+# milliseconds and a hundred kilobytes per session, both on a press that is
+# already spending tens of milliseconds recording a clip.
+#
+# Level 1 rather than the default 6 deliberately: it is roughly twice as
+# fast and, on data this sparse, within a few kilobytes of the same size
+# (the Game Boy state is 15,780 bytes at level 1 and 13,373 at level 6).
+# Compressing happens in the worker thread that is emulating the press, so
+# it never touches the event loop; see RetroView.run_press.
+UNDO_COMPRESSION_LEVEL = 1
+
+# How many presses back Undo can reach. Eight is enough to walk out of a
+# corridor you should never have gone down, and small enough that the memory
+# is not worth thinking about.
+UNDO_DEPTH = 8
+
+# ...and the same bound in bytes, because the count alone is not one: the
+# numbers above are what today's consoles cost, and a core update or a bigger
+# machine can change them without anybody editing this file. A quarter of the
+# replay buffer's 8 MiB, which at the measured sizes is 100 times more than
+# UNDO_DEPTH states ever need; it only bites if a state compresses to a
+# quarter of a megabyte, and then it keeps fewer of them instead of growing.
+# One entry is always kept, even if it is over the cap on its own, for the
+# same reason _trim_clips never empties the replay buffer completely.
+MAX_UNDO_BYTES = 2 * 1024 * 1024
 
 # Every button needs a custom_id that survives a restart, because that is how
 # Discord routes a click back to a persistent view. They are scoped per
@@ -392,6 +445,31 @@ class _ReplayButton(discord.ui.Button):
         await self.view._replay(interaction)
 
 
+class _UndoButton(discord.ui.Button):
+    """
+    Step the game back to just before the last press.
+
+    Greyed out whenever there is nothing to undo, which is not a rare case:
+    the history is memory-only (see :attr:`RetroView.history`), so a message
+    that survived a bot restart has an empty one until somebody presses
+    something. A click that gets through anyway -- a stale button on a
+    message Discord has not re-rendered -- is answered with a private line
+    rather than an error; see :meth:`RetroView._undo`.
+    """
+
+    def __init__(self, row: int) -> None:
+        super().__init__(
+            label="Undo",
+            emoji=UNDO_EMOJI,
+            style=discord.ButtonStyle.secondary,
+            row=row,
+            custom_id=f"{CUSTOM_ID_PREFIX}:undo",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.view._undo(interaction)
+
+
 class _ResumeButton(discord.ui.Button):
     """The only control left on a message whose game has been replaced."""
 
@@ -560,6 +638,14 @@ class RetroView(discord.ui.View):
         # storage by the number of channels for a button nobody presses twice.
         # A bot restart therefore empties it, and Replay says so.
         self.clips: typing.Deque[typing.Tuple[bytes, float]] = collections.deque()
+        # The machine states the last few presses started from, oldest first,
+        # each one zlib-compressed. This is what the Undo button pops. Memory
+        # only, exactly like the replay buffer above and for the same reasons
+        # -- and unlike the buffer it is also *cheap* to lose, because the
+        # authoritative save state is on disk either way. A restart therefore
+        # empties it and Undo greys itself out until the next press.
+        self.history: typing.Deque[bytes] = collections.deque()
+        self._history_bytes: int = 0
         self.press_count: int = 0
         self.last_active: float = time.time()
         # Set when this session is replaced or the cog goes away, so an old
@@ -583,6 +669,7 @@ class RetroView(discord.ui.View):
         self._build_controls()
         self._update_replay_label()
         self._update_repeat_label()
+        self._update_undo_button()
 
     # -- Layout -------------------------------------------------------------
 
@@ -590,9 +677,12 @@ class RetroView(discord.ui.View):
         """
         Lay this console's controller out; see the row plan in systems.py.
 
-        The console's own grid comes first, spacers and all, and the three
-        control buttons go on the end of the last row if they fit there and on
-        a row of their own if they do not.
+        The console's own grid comes first, spacers and all, and the control
+        cluster -- Wait, confirm x3, Replay, Undo -- goes on the end of the
+        last row if all of it fits there and on a row of its own if it does
+        not. Which is most consoles now that the cluster is four wide: only a
+        one-button bottom row (the Master System's Pause, the Neo Geo
+        Pocket's Option) leaves room beside it.
         """
         rows = self.system.rows
         if len(rows) > MAX_LAYOUT_ROWS:
@@ -612,8 +702,8 @@ class RetroView(discord.ui.View):
                 else:
                     self.add_item(_GameButton(spec, row=index))
 
-        # Wait / confirm x3 / Replay. They share the last row when there is
-        # space, which is how Start and Select end up beside them.
+        # Wait / confirm x3 / Replay / Undo. They share the last row when
+        # there is space, which is how Pause ends up beside them.
         last = len(rows) - 1
         if len(rows[last]) + CONTROL_BUTTONS <= MAX_BUTTONS_PER_ROW:
             control_row = last
@@ -621,7 +711,7 @@ class RetroView(discord.ui.View):
             control_row = len(rows)
         if control_row >= MAX_ACTION_ROWS:
             raise ValueError(
-                f"{self.system.name} leaves no room for the Wait/Replay row; "
+                f"{self.system.name} leaves no room for the controls row; "
                 f"Discord allows {MAX_ACTION_ROWS} rows."
             )
         self.add_item(_WaitButton(control_row))
@@ -629,10 +719,11 @@ class RetroView(discord.ui.View):
         if confirm is not None:
             # Built with the taps this clip length can fit, so a session
             # started on a short clip never shows a promise it cannot keep.
-            # CONTROL_BUTTONS still reserves room for three controls either
-            # way, so the layout does not move when it is greyed out.
+            # CONTROL_BUTTONS still reserves room for the whole cluster
+            # either way, so the layout does not move when it is greyed out.
             self.add_item(_RepeatButton(confirm, control_row, self.repeat_taps))
         self.add_item(_ReplayButton(control_row))
+        self.add_item(_UndoButton(control_row))
         if len(self.children) > MAX_COMPONENTS:
             raise ValueError(
                 f"{self.system.name} needs {len(self.children)} components; "
@@ -870,6 +961,144 @@ class RetroView(discord.ui.View):
         # the fallback said would not fit (and vice versa).
         button.disabled = taps < 2
 
+    # -- The undo history ---------------------------------------------------
+
+    @property
+    def can_undo(self) -> bool:
+        """Whether there is a press to step back to."""
+        return bool(self.history)
+
+    @property
+    def history_bytes(self) -> int:
+        """How much memory the undo history is holding, compressed."""
+        return self._history_bytes
+
+    def remember_state(self, emulator: typing.Optional[RetroEmulator] = None) -> bool:
+        """
+        Push the state a press is about to change onto the undo history.
+
+        Called from :meth:`run_press`, i.e. in the worker thread, *before*
+        anything is emulated -- which is the whole contract: what Undo puts
+        back is the machine exactly as it was when the button was clicked.
+
+        Never raises. A core that cannot serialize (or one that fails to,
+        once) must not cost anybody a press: the history simply does not
+        grow, and Undo stays greyed out. Returns whether a state was stored.
+        """
+        emulator = emulator if emulator is not None else self.emulator
+        if emulator is None:
+            return False
+        try:
+            blob = zlib.compress(emulator.save_state(), UNDO_COMPRESSION_LEVEL)
+        except Exception:
+            # EmulatorError for a core with no save-state support, anything
+            # else for a core that broke. Either way: not worth a press.
+            log.debug("Could not record an undo point for %s.", self.slug, exc_info=True)
+            return False
+        self.history.append(blob)
+        self._history_bytes += len(blob)
+        self._trim_history()
+        return True
+
+    def _trim_history(self) -> None:
+        """
+        Drop the oldest undo points until the history fits both its bounds.
+
+        Count *and* bytes, because the count alone bounds nothing: see
+        MAX_UNDO_BYTES. The newest entry is always kept, even if it is over
+        the byte cap by itself, since an Undo button that cannot undo the
+        press somebody just made would be worse than the memory.
+        """
+        while len(self.history) > UNDO_DEPTH:
+            self._history_bytes -= len(self.history.popleft())
+        while len(self.history) > 1 and self._history_bytes > MAX_UNDO_BYTES:
+            self._history_bytes -= len(self.history.popleft())
+
+    def forget_history(self) -> None:
+        """Throw the undo history away, leaving the game exactly as it is."""
+        self.history.clear()
+        self._history_bytes = 0
+        self._update_undo_button()
+
+    def _update_undo_button(self) -> None:
+        """
+        Grey Undo out when there is nothing to undo.
+
+        Which is the state every session starts in, and the state a session
+        comes back from a bot restart in: the history is memory only. Same
+        treatment as Replay's empty buffer, and for the same reason -- better
+        a dead button than a lying one. The custom_id never changes, so none
+        of this affects how Discord routes a click.
+        """
+        button = next(
+            (child for child in self.children if isinstance(child, _UndoButton)), None
+        )
+        if button is not None:
+            button.disabled = not self.history
+
+    def run_undo(self) -> bytes:
+        """
+        Put the last press back and record a clip of where it landed.
+
+        Runs in a worker thread, called from ``Retro.run_undo``. Three things
+        happen, in this order:
+
+        1. the newest undo point is popped and loaded, so the machine is
+           back where the undone press found it;
+        2. the footage of that press is dropped from the replay buffer,
+           because it is footage of something the game no longer did. The
+           buffer rewinds with the game rather than showing a player walking
+           into a room they are not in;
+        3. a fresh clip is recorded with no input at all, so the channel can
+           see where the game ended up. The caller puts *that* clip in the
+           buffer in place of the one dropped, which is what keeps a
+           stitched replay a contiguous account of the play that still
+           stands: the undone second is gone and this second, run from the
+           same starting point, took its place.
+
+        That third step means an undo costs one clip's worth of emulated
+        time, exactly as the Wait button does, and that is deliberate. The
+        alternative -- recording the clip and then reloading the state, so
+        the machine is byte-for-byte where it was -- would leave the clip on
+        the message a second *ahead* of the game, and the next press would
+        re-emulate that second and play it again from the start. Which is
+        precisely the "the clip jumps backwards when I press a button" bug
+        that :meth:`_ack_now` exists to prevent, so Undo does not
+        reintroduce it. One second of a game that is frozen between presses
+        is a cheap price for a clip that still carries on where the last one
+        stopped.
+
+        Raises EmulatorError if there is nothing to undo, if the core is not
+        running, or if the state will not load -- which is a real case: a
+        core update mid-session invalidates every state it wrote, so the
+        whole history is dropped rather than retried press after press.
+        """
+        emulator = self.emulator
+        if emulator is None:
+            raise EmulatorError("The emulator is not running.")
+        if not self.history:
+            raise EmulatorError("There is nothing to undo.")
+        blob = self.history.pop()
+        self._history_bytes -= len(blob)
+        try:
+            emulator.load_state(zlib.decompress(blob))
+        except Exception as error:
+            # Every entry came from the same core, so if one will not go back
+            # in, none of them will.
+            self.forget_history()
+            raise EmulatorError(
+                "That press could not be undone: the emulator would not take "
+                "the state back (most likely its core was updated). The game "
+                "itself is untouched."
+            ) from error
+        # The press did not happen, so neither did its footage. The newest
+        # clip is always the one the undone press recorded: every press
+        # appends exactly one and _trim_clips only ever drops from the left.
+        if self.clips:
+            self.clips.pop()
+        self._update_replay_label()
+        return self._record(emulator, None)
+
     @staticmethod
     def _screen_filename(game_name: str, clip_format: str = DEFAULT_CLIP_FORMAT) -> str:
         """A stable, Discord-safe attachment name for this session's clips."""
@@ -893,13 +1122,16 @@ class RetroView(discord.ui.View):
             if hasattr(child, "disabled"):
                 child.disabled = disabled
         if not disabled:
-            # Replay and the repeat button are the two controls that can have
-            # nothing to do: Replay comes back only if there is something in
-            # the buffer, and the repeat button only if the clip is long
-            # enough to fit more than one tap. This runs on every redraw, so
-            # changing the clip length mid-game corrects both.
+            # Replay, the repeat button and Undo are the three controls that
+            # can have nothing to do: Replay comes back only if there is
+            # something in the buffer, the repeat button only if the clip is
+            # long enough to fit more than one tap, and Undo only if a press
+            # this process saw has something to step back to. This runs on
+            # every redraw, so changing the clip length mid-game corrects the
+            # repeat button and every press re-arms Undo.
             self._update_replay_label()
             self._update_repeat_label()
+            self._update_undo_button()
 
     # -- Messages -----------------------------------------------------------
 
@@ -1064,6 +1296,10 @@ class RetroView(discord.ui.View):
         # of gameplay with no input at all.
         if self.emulator is None:
             raise EmulatorError("The emulator is not running.")
+        # Before anything is emulated: this is the moment Undo puts back.
+        # Wait counts as a press here -- it moves the game on, so it is
+        # something to step back from.
+        self.remember_state(self.emulator)
         return self._record(self.emulator, field, repeat)
 
     # -- Interactions -------------------------------------------------------
@@ -1317,6 +1553,57 @@ class RetroView(discord.ui.View):
                 await self._whisper(
                     interaction, "Discord would not accept that clip again."
                 )
+
+    async def _undo(self, interaction: discord.Interaction) -> None:
+        """
+        Step the game back to just before the last press.
+
+        One edit of the message, like a press: a plain ``defer`` that changes
+        nothing on screen, then the single ``edit_original_response`` that
+        swaps the clip in. See :meth:`_ack_now` for why it cannot be two.
+
+        An empty history is the ordinary case rather than an error -- the
+        button is greyed out for it, and a bot restart empties it -- so a
+        click that gets through anyway is answered privately and the message
+        is not touched at all. That is one interaction response and zero
+        edits, exactly as Replay does with an empty buffer.
+        """
+        if self.closed or self.lock.locked():
+            await self._silent_ack(interaction)
+            return
+        if not self.history:
+            try:
+                await interaction.response.send_message(
+                    "There is nothing to undo yet. Undo steps back through "
+                    f"the last {UNDO_DEPTH} presses, and that history is kept "
+                    "in memory only \N{EM DASH} so it is empty until somebody "
+                    "presses something, and the bot has restarted since the "
+                    "last press here. The game itself is exactly where you "
+                    "left it.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                log.debug("Could not answer an empty Undo click.", exc_info=True)
+            return
+        async with self.lock:
+            await self._ack_now(interaction)
+            try:
+                clip = await self.cog.run_undo(self)
+            except EmulatorError as error:
+                log.warning("Undo failed in channel %s: %s", self.channel_id, error)
+                await self._recover(interaction, str(error))
+                return
+            except Exception:
+                log.exception("Unexpected undo failure in channel %s", self.channel_id)
+                await self._recover(interaction, "The emulator hit an unexpected error.")
+                return
+            # run_undo dropped the undone press's footage from the buffer;
+            # this clip takes its place, so the buffer stays a contiguous
+            # record of the play that actually stands and Replay cannot show
+            # somebody walking into a room they are not in.
+            self.last_clip = clip
+            self.touch()
+            await self._show(interaction, clip, UNDONE_NOTE)
 
     async def can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
         """

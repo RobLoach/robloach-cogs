@@ -43,7 +43,7 @@ from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.chat_formatting import humanize_list, pagify
 from redbot.core.utils.views import SimpleMenu
 
-from . import archives, net
+from . import archives, net, version
 from .abc import CompositeMetaClass
 from .cores import (
     AUTO_DOWNLOAD_COOLDOWN_SECONDS,
@@ -544,7 +544,8 @@ class Retro(
                 *lines,
                 "",
                 "Recent gameplay clips are held in memory only, for the Replay "
-                "button, and are lost whenever the bot restarts.",
+                "button, as are the save states the Undo button steps back "
+                "through, and both are lost whenever the bot restarts.",
             ]
         )
         return {"retro.txt": io.BytesIO(text.encode("utf-8"))}
@@ -748,10 +749,13 @@ class Retro(
         (which is still done, and still what answers a click that arrives in
         the gap) stops them acting; it does not let go of them.
 
-        The replay buffer is emptied here as well as handed over, because it
-        is the expensive part: a stray reference to the view from somewhere
-        unexpected should cost a few kilobytes of object, not eight
-        megabytes of footage.
+        The replay buffer and the undo history are emptied here as well as
+        handed over, because they are the expensive part: a stray reference
+        to the view from somewhere unexpected should cost a few kilobytes of
+        object, not eight megabytes of footage and a stack of save states.
+        Emptying the history costs nothing either way -- this is only called
+        for a view the cog has finished with, whose game is either retired
+        or gone, so there is nothing anybody could still want to undo.
 
         Call this *before* registering a replacement view on the same
         message: remove_view unconditionally drops that message id from
@@ -766,6 +770,12 @@ class Retro(
                 clips.clear()
             except Exception:  # pragma: no cover - a deque cannot fail here
                 log.debug("Could not empty a replay buffer.", exc_info=True)
+        forget = getattr(view, "forget_history", None)
+        if forget is not None:
+            try:
+                forget()
+            except Exception:  # pragma: no cover - a deque cannot fail here
+                log.debug("Could not empty an undo history.", exc_info=True)
         try:
             view.stop()
         except Exception:
@@ -826,6 +836,36 @@ class Retro(
             if view.press_count % SAVE_STATE_EVERY_PRESSES == 0:
                 await self._write_state(view)
                 await self._save_record(view)
+            return clip
+
+    async def run_undo(self, view: RetroView) -> bytes:
+        """
+        Step a session back one press, waking it up first if it was asleep.
+
+        The save state is written straight through rather than waiting for
+        the autosave cadence, which matters here in a way it does not for an
+        ordinary press: the state on disk may well be *newer* than the one
+        Undo has just restored (it is written every
+        SAVE_STATE_EVERY_PRESSES presses and whenever a game sleeps), so
+        without this a restart or a hibernate immediately after an undo
+        would quietly bring the undone press back. An undo is a deliberate
+        correction and a couple of hundred kilobytes of write; it is worth
+        being durable.
+
+        ``press_count`` is deliberately left alone. It only paces the
+        autosave, this path has just saved, and it is a count of presses the
+        channel made rather than a position in the game.
+
+        Raises EmulatorError if the session cannot be woken, if there is
+        nothing to undo, or if the core will not take the state back. Called
+        by the view from the Undo button.
+        """
+        async with self.emulator_lock:
+            await self._wake_locked(view)
+            clip = await asyncio.to_thread(view.run_undo)
+            view.touch()
+            await self._write_state(view)
+            await self._save_record(view)
             return clip
 
     async def hibernate(self, view: RetroView, reason: typing.Optional[str] = None) -> None:
@@ -3226,6 +3266,26 @@ class Retro(
             "is refused, and so is a public URL that redirects to one."
         )
 
+    @retroset.command(name="version")
+    async def retroset_version(self, ctx: commands.Context) -> None:
+        """
+        Say which build of this cog is actually loaded.
+
+        Three things: the version `info.json` declares, the commit it was
+        installed from when there is a `.git` to read, and a hash of the
+        `.py` files as they were when the cog was loaded. The last one is
+        the one that cannot go stale -- pulling new code without
+        `[p]reload retro` deliberately does not change it, which is exactly
+        the situation worth being able to prove.
+
+        Plain text rather than an embed, so it needs no extra permission and
+        can be pasted into a bug report as it stands.
+
+        **Examples:**
+        - `[p]retroset version`
+        """
+        await self._safe_send(ctx, version.describe())
+
     @retroset.command(name="settings")
     @commands.bot_has_permissions(embed_links=True)
     async def retroset_settings(self, ctx: commands.Context) -> None:
@@ -3240,6 +3300,21 @@ class Retro(
         embed = discord.Embed(
             title="Retro Settings",
             colour=await ctx.embed_colour(),
+        )
+
+        # First, and deliberately: half the confusing answers this command
+        # has ever given were because the bot was running an older build
+        # than the person reading it. `[p]retroset version` says more.
+        build = [version.summary()]
+        if version.FINGERPRINT:
+            build.append(f"loaded code `{version.FINGERPRINT}`")
+        embed.add_field(
+            name="Build",
+            value=(
+                " \N{EM DASH} ".join(build)
+                + f"\n`{ctx.clean_prefix}retroset version` for the details."
+            )[:1024],
+            inline=False,
         )
 
         if not installed:

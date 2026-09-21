@@ -180,9 +180,12 @@ def test_spacers_are_labelled_and_are_not_real_buttons(system):
 def test_the_worst_console_still_leaves_headroom():
     worst = max(sum(len(r) for r in x.rows) + S.CONTROL_BUTTONS for x in S.SYSTEMS)
     assert worst <= S.MAX_COMPONENTS
-    # The Super Nintendo is the biggest at 19; a much larger number means a
-    # console was added without thinking about the budget.
-    assert worst == 19, worst
+    # The Super Nintendo is the biggest at 20 -- 16 of its own plus the four
+    # controls; a much larger number means a console was added without
+    # thinking about the budget. The spare *row* is gone, though (see
+    # test_every_console_s_layout_after_the_undo_button), so the next console
+    # with a four-row grid has to end in a one- or two-button row.
+    assert worst == 20, worst
 
 
 @pytest.mark.parametrize(
@@ -339,11 +342,16 @@ def test_validate_emoji_returns_every_renderable_emoji():
     assert S.validate_emoji() == S.all_button_emoji()
 
 
-def test_the_emoji_set_is_exactly_the_seven_the_cog_renders():
-    # Four arrows, Wait, Replay and the Resume button a retired message keeps.
-    # The Stop button, and its U+23F9, are gone.
-    assert len(S.all_button_emoji()) == 7, S.all_button_emoji()
+def test_the_emoji_set_is_exactly_the_eight_the_cog_renders():
+    # Four arrows, Wait, Replay, Undo, and the Resume button a retired
+    # message keeps. The Stop button, and its U+23F9, are gone.
+    assert len(S.all_button_emoji()) == 8, S.all_button_emoji()
     assert S.RESUME_EMOJI in S.all_button_emoji()
+    # The Undo button is exactly the kind of place U+21BB was used once, so
+    # its emoji is held to the reviewed table like every other one.
+    assert S.UNDO_EMOJI in S.all_button_emoji()
+    assert S.UNDO_EMOJI == "↩️", repr(S.UNDO_EMOJI)
+    assert S.emoji_problem(S.UNDO_EMOJI) is None
 
 
 def test_no_stop_emoji_survives_anywhere():

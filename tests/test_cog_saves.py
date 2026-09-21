@@ -421,6 +421,59 @@ async def test_resetting_a_live_game_is_not_undone_by_the_next_press(battery):
     assert view.emulator.save_sram() == marker
 
 
+@pytest.mark.parametrize(
+    "name, kwargs",
+    [
+        ("retrosaves_reset", {"game": "ucity"}),
+        ("retrosaves_delete", {"game": "ucity"}),
+        ("retrosaves_rollback", {"game": "ucity"}),
+    ],
+)
+async def test_changing_the_saves_takes_the_undo_history_with_them(
+    battery, name, kwargs
+):
+    """Or one click of Undo would put back the save that was just destroyed.
+
+    An undo restores a state from *memory* and writes it straight to disk
+    (see Retro.run_undo), so the in-memory history has to go whenever a
+    command has been asked to destroy or replace what is on disk. Otherwise
+    `[p]retrosaves delete` -- "start this game completely fresh" -- would be
+    one button press away from coming back.
+    """
+    view, _, channel = await playing(battery, 9250, "ucity")
+    cog = battery.cog
+    # Seven presses: two automatic saves, so there is a previous generation
+    # for `rollback` to have something to do.
+    for _ in range(7):
+        await cog.run_press(view, "a")
+    assert view.history and cog._state_path(9250, "ucity").is_file()
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
+
+    await command(battery, name)(cog, ctx, **kwargs)
+
+    assert not view.history, name
+    assert view.history_bytes == 0
+    assert battery.control(view, "undo").disabled
+
+
+async def test_a_sleeping_session_loses_its_undo_history_too(battery):
+    # _pause_for_saves returns early for a session that is already asleep,
+    # which is exactly when the history is still full of states from before
+    # the command. It has to be dropped before that early return.
+    view, _, channel = await playing(battery, 9251, "ucity")
+    cog = battery.cog
+    for _ in range(4):
+        await cog.run_press(view, "a")
+    await cog.hibernate(view, None)
+    assert not view.live and view.history
+
+    ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
+    await command(battery, "retrosaves_reset")(cog, ctx, game="ucity")
+
+    assert not view.history
+
+
 async def test_a_session_that_will_not_hibernate_cleanly_still_frees_its_core(battery):
     # The same belt and braces `[p]retrostop` has: a stale view, or a message
     # the bot can no longer edit, must not leave a core running -- everything

@@ -458,6 +458,31 @@ def playable(viewmod, view):
     return [c for c in view.children if not isinstance(c, viewmod._SpacerButton)]
 
 
+#: The controls that may legitimately be greyed out at any moment, because
+#: each of them can have nothing to do: **Replay** with an empty buffer, the
+#: **x3** button on a clip too short to fit two taps, and **Undo** with an
+#: empty history -- which is every session's starting state and every
+#: session's state after a bot restart, since the history is memory only.
+#:
+#: `playable()` keeps them, so a test that is *about* one of them still finds
+#: it (they are asked for by custom_id anyway). `pressable()` and the
+#: `any_disabled`/`all_disabled` snapshot keys below leave them out, so an
+#: assertion that a press did not grey the controls out stays an assertion
+#: about the console's own buttons rather than quietly becoming one about
+#: whether there was anything to replay or undo.
+CONDITIONAL_CONTROLS = ("replay", "repeat", "undo")
+
+
+def pressable(viewmod, view):
+    """Every child that has to be clickable whatever the session is doing."""
+    tails = tuple(f":{name}" for name in CONDITIONAL_CONTROLS)
+    return [
+        c
+        for c in playable(viewmod, view)
+        if not (getattr(c, "custom_id", "") or "").endswith(tails)
+    ]
+
+
 def snapshot(viewmod, kwargs, view):
     """What an edit would have put on the wire, in a comparable shape."""
     files = kwargs.get("attachments") or []
@@ -465,8 +490,8 @@ def snapshot(viewmod, kwargs, view):
         "has_attachments": "attachments" in kwargs,
         "n_attachments": len(files),
         "filenames": [getattr(f, "filename", None) for f in files],
-        "all_disabled": all(getattr(c, "disabled", False) for c in playable(viewmod, view)),
-        "any_disabled": any(getattr(c, "disabled", False) for c in playable(viewmod, view)),
+        "all_disabled": all(getattr(c, "disabled", False) for c in pressable(viewmod, view)),
+        "any_disabled": any(getattr(c, "disabled", False) for c in pressable(viewmod, view)),
         "labels": [getattr(c, "label", None) or getattr(c, "custom_id", None) for c in view.children],
         "content": kwargs.get("content"),
         "has_embed": "embed" in kwargs and kwargs["embed"] is not None,
@@ -848,6 +873,9 @@ class RetroEnv:
 
     def playable(self, view):
         return playable(self.viewmod, view)
+
+    def pressable(self, view):
+        return pressable(self.viewmod, view)
 
     def forgive_cooldowns(self):
         """

@@ -7,11 +7,17 @@ The cog has to run on nothing but what Red ships plus what info.json's
 import ast
 import json
 import py_compile
+import re
 import sys
 
 import pytest
 
-from .loader import REPO_ROOT
+from .loader import REPO_ROOT, load_standalone
+
+#: retro/version.py imports nothing but the standard library, so it loads on
+#: its own like systems.py does -- which is also what lets the version be
+#: checked on a machine with neither Red nor discord.py.
+V = load_standalone("retro_version_standalone", "version.py")
 
 INFO_FILES = sorted(REPO_ROOT.glob("*/info.json")) + [REPO_ROOT / "info.json"]
 
@@ -84,9 +90,11 @@ def test_every_cog_source_compiles(path, tmp_path):
 
 
 def test_the_emulator_and_tables_import_with_nothing_installed():
-    # systems.py and archives.py are the two modules the cog's own tests and
-    # CI load on their own; they must never grow a third-party import.
-    for name in ("systems.py", "archives.py"):
+    # systems.py, archives.py and version.py are the modules the cog's own
+    # tests and CI load on their own; they must never grow a third-party
+    # import. version.py is in here because `[p]retroset version` has to be
+    # able to answer on any install, however broken.
+    for name in ("systems.py", "archives.py", "version.py"):
         source = (REPO_ROOT / "retro" / name).read_text()
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, ast.Import):
@@ -174,6 +182,16 @@ def test_the_readme_describes_the_fifteen_second_replay():
     assert "memory only" in COG_README
 
 
+def test_the_readme_describes_the_undo_button():
+    assert "### Undo" in COG_README
+    assert "steps the game back one press" in COG_README
+    # The two decisions somebody reading it has to know about: what a restart
+    # does to the history, and that the buffer rewinds with the game.
+    assert "The history is in memory only" in COG_README
+    assert "rewinds the replay buffer too" in COG_README
+    assert "↩️ Undo" in COG_README, "and it is drawn in the layout"
+
+
 def test_the_readme_describes_the_resume_button():
     assert "Resume" in COG_README
     assert "after a bot restart" in COG_README
@@ -215,7 +233,7 @@ def test_the_readme_describes_the_single_restore_chain():
 
 
 @pytest.mark.parametrize(
-    "phrase", ["Replay", "Resume", "detected automatically", "[p]retrosaves"]
+    "phrase", ["Replay", "Resume", "Undo", "detected automatically", "[p]retrosaves"]
 )
 def test_info_json_describes_the_new_behaviour(phrase):
     assert phrase in COG_INFO["description"], phrase
@@ -225,8 +243,134 @@ def test_the_end_user_data_statement_mentions_what_is_now_stored():
     statement = COG_INFO["end_user_data_statement"]
     assert "Resume" in statement
     assert "memory only" in statement
+    # The undo history is a stack of save states in memory, which is a thing
+    # the cog holds about a channel's game and therefore a thing to declare.
+    assert "Undo" in statement
     # Saves can now leave the bot as an attachment and arrive as one.
     assert "export" in statement and "delete" in statement
+
+
+# -- The version, and why it cannot go stale ----------------------------------
+#
+# This exists because a bot twice ran an older build than master and the
+# symptom looked like a bug in the cog: `[p]retroset cliplength 0.8` came
+# back "must be an integer" on a copy that predated the clip length becoming
+# a float. `[p]retroset version` answers it now, out of three facts -- see
+# retro/version.py.
+
+
+def test_info_json_declares_a_version():
+    assert "version" in COG_INFO, sorted(COG_INFO)
+    assert re.fullmatch(r"\d+\.\d+\.\d+", COG_INFO["version"]), COG_INFO["version"]
+
+
+def test_the_module_and_info_json_cannot_disagree_about_the_version():
+    # Not two values held in step by this test: info.json is the only place
+    # the number is written and version.py *reads* it, so the assertion is
+    # that the reading works rather than that somebody remembered to copy it.
+    assert V.VERSION == COG_INFO["version"]
+    assert V.VERSION != V.UNKNOWN_VERSION
+
+
+def test_no_python_file_carries_a_version_literal_of_its_own():
+    """The one kind of drift that has to be impossible rather than tested."""
+    pattern = re.compile(r"""^\s*(__version__|VERSION)\s*=\s*["']""")
+    offenders = []
+    for path in sorted((REPO_ROOT / "retro").glob("*.py")):
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            if pattern.match(line):
+                offenders.append(f"{path.name}:{number}: {line.strip()}")
+    assert not offenders, offenders
+
+
+def test_the_version_degrades_instead_of_raising(tmp_path):
+    missing = tmp_path / "nothing-here.json"
+    assert V.read_version(missing) == V.UNKNOWN_VERSION
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json at all")
+    assert V.read_version(broken) == V.UNKNOWN_VERSION
+    for payload in ('{"name": "Retro"}', '{"version": ""}', '{"version": 3}'):
+        broken.write_text(payload)
+        assert V.read_version(broken) == V.UNKNOWN_VERSION, payload
+    good = tmp_path / "good.json"
+    good.write_text('{"version": " 9.9.9 "}')
+    assert V.read_version(good) == "9.9.9"
+
+
+def test_the_fingerprint_is_of_the_loaded_sources():
+    # Captured at import, which is what makes it an answer about the running
+    # code rather than about whatever is on disk now; see version.py.
+    assert V.FINGERPRINT and len(V.FINGERPRINT) == V.FINGERPRINT_LENGTH
+    assert V.FINGERPRINT == V.code_fingerprint()
+    assert all(c in "0123456789abcdef" for c in V.FINGERPRINT)
+
+
+def test_the_fingerprint_changes_with_the_code_and_with_a_new_file(tmp_path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    first = V.code_fingerprint(tmp_path)
+    (tmp_path / "a.py").write_text("x = 2\n")
+    second = V.code_fingerprint(tmp_path)
+    (tmp_path / "b.py").write_text("")
+    third = V.code_fingerprint(tmp_path)
+    assert len({first, second, third}) == 3, (first, second, third)
+    # A directory with no sources at all has no fingerprint, rather than the
+    # hash of nothing (which would look like a real answer).
+    assert V.code_fingerprint(tmp_path / "empty") is None
+
+
+def test_the_commit_is_read_from_the_files_and_never_from_a_subprocess():
+    # There may be no git binary, and a command that answers a question must
+    # not be able to hang on one.
+    importers = imported_names().get("subprocess", set())
+    assert "version.py" not in importers, importers
+    source = (REPO_ROOT / "retro" / "version.py").read_text()
+    assert "GIT_SEARCH_DEPTH = 2" in source, "a deeper walk finds other repos"
+
+
+def test_the_commit_of_this_checkout_is_found_and_is_a_real_sha():
+    if not (REPO_ROOT / ".git").exists():
+        pytest.skip("this copy of the cog is not in a git checkout")
+    checkout = V.git_checkout()
+    assert checkout is not None
+    assert len(checkout.commit) in (40, 64), checkout.commit
+    assert all(c in "0123456789abcdef" for c in checkout.commit)
+
+
+def test_a_missing_git_directory_is_an_ordinary_answer(tmp_path):
+    # The case every Downloader install is in: Red copies the package into
+    # the bot's cog folder, which is not a checkout. It must degrade
+    # silently, never raise, and never claim a commit.
+    package = tmp_path / "somewhere" / "retro"
+    package.mkdir(parents=True)
+    assert V.git_checkout(package) is None
+    assert V._git_dir(package) is None
+
+
+def test_a_broken_git_directory_is_also_an_ordinary_answer(tmp_path):
+    package = tmp_path / "repo" / "retro"
+    package.mkdir(parents=True)
+    git = tmp_path / "repo" / ".git"
+    git.mkdir()
+    assert V.git_checkout(package) is None, "no HEAD at all"
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    assert V.git_checkout(package) is None, "a ref that resolves to nothing"
+    (git / "HEAD").write_text("this is not a commit id\n")
+    assert V.git_checkout(package) is None
+    # ...and the two shapes that do work: a packed ref, and a detached HEAD.
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+    (git / "packed-refs").write_text(
+        "# pack-refs with: peeled fully-peeled sorted \n"
+        f"{'a' * 40} refs/heads/main\n"
+        f"^{'b' * 40}\n"
+    )
+    assert V.git_checkout(package) == ("a" * 40, "main")
+    (git / "HEAD").write_text("c" * 40 + "\n")
+    assert V.git_checkout(package) == ("c" * 40, None)
+
+
+def test_the_readme_documents_the_version_command():
+    assert "[p]retroset version" in COG_README
+    assert "am I running the new code" in COG_README
 
 
 def test_the_load_bearing_constants_are_still_in_the_source():

@@ -484,9 +484,21 @@ class SavesMixin(MixinMeta):
         controls stay live and the next press wakes it from whatever this
         command left behind. Returns whether anything was put to sleep, so the
         reply can say so.
+
+        The session's **undo history** goes as well, and that is the same
+        point made about memory rather than about a running core. It holds
+        machine states from before this command, and an undo writes the state
+        it restores straight to disk (see ``Retro.run_undo``) -- so one click
+        of Undo after a `reset`, a `rollback`, a `delete` or an `import`
+        would put back the very save the command was asked to destroy or
+        replace. It is dropped for a *sleeping* session too, which is why it
+        happens before the live check below.
         """
         view = self.sessions.get(int(getattr(ctx.channel, "id", 0)))
-        if view is None or view.slug != entry.slug or not view.live:
+        if view is None or view.slug != entry.slug:
+            return False
+        view.forget_history()
+        if not view.live:
             return False
         reason = (
             f"Saved and put to sleep while {doing}. Press a button to pick "

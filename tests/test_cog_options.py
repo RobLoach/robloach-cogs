@@ -375,6 +375,46 @@ async def test_a_stale_override_is_shown_as_the_default_the_core_will_use(retro,
     assert "does not accept" in said
 
 
+# -- "am I running the new code?" ---------------------------------------------
+
+
+async def test_retroset_version_says_what_is_actually_loaded(retro):
+    ctx = retro.context(retro.channel(9730))
+    await retro.cogmod.Retro.retroset_version.callback(retro.cog, ctx)
+    said = ctx.said()
+
+    version = retro.cogmod.version
+    assert version.VERSION in said
+    assert version.VERSION != version.UNKNOWN_VERSION, "info.json has a version"
+    assert version.FINGERPRINT in said, "the part that cannot go stale"
+    assert "when the cog was loaded" in said
+    # Plain text, so the command needs no Embed Links permission and can be
+    # pasted straight into a bug report.
+    assert not any(isinstance(entry, dict) and "embed" in entry for entry in ctx.sent)
+
+
+async def test_retroset_version_mentions_the_commit_in_a_git_checkout(retro):
+    version = retro.cogmod.version
+    if version.COMMIT is None:
+        pytest.skip("this copy of the cog is not in a git checkout")
+    ctx = retro.context(retro.channel(9731))
+    await retro.cogmod.Retro.retroset_version.callback(retro.cog, ctx)
+    assert version.COMMIT[:12] in ctx.said()
+
+
+async def test_the_settings_embed_leads_with_the_build(retro):
+    # First field, deliberately: half the confusing answers this command has
+    # given were because the bot was running an older build than the reader.
+    ctx = retro.context(retro.channel(9732))
+    await retro.cogmod.Retro.retroset_settings.callback(retro.cog, ctx)
+    fields = ctx.sent[-1]["embed"].fields
+    assert fields[0].name == "Build", [f.name for f in fields]
+    value = fields[0].value
+    assert retro.cogmod.version.VERSION in value
+    assert retro.cogmod.version.FINGERPRINT in value
+    assert "retroset version" in value
+
+
 async def test_the_settings_embed_summarises_the_overrides(retro, options, monkeypatch):
     retro.patch("probe_core_options", lambda path, opts=None: {}, monkeypatch)
     ctx = retro.context(retro.channel(9724))

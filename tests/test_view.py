@@ -140,13 +140,62 @@ def test_every_spacer_is_disabled_labelled_and_not_a_game_button(view):
         assert not isinstance(spacer, viewmod._GameButton)
 
 
-def test_wait_and_replay_share_the_last_row(view):
+def test_the_controls_share_the_last_row(view):
     last = max(c.row for c in view.children)
-    for name in ("wait", "replay", "repeat"):
+    for name in ("wait", "replay", "repeat", "undo"):
         button = next(
             c for c in view.children if c.custom_id == f"{viewmod.CUSTOM_ID_PREFIX}:{name}"
         )
         assert button.row == last, (name, button.row, last)
+
+
+#: console key -> (components, action rows, the last row's labels). The whole
+#: point of the table: adding Undo to the control cluster made the cluster
+#: four wide, which is one too many to sit beside a two-button Start/Select
+#: row -- so six of the eight consoles moved their controls to a row of
+#: their own, and three of those now use all five of Discord's action rows.
+#: Anything that changes this has changed what every player sees.
+LAYOUTS = {
+    "gb": (13, 4, ["Wait", "A x3", "Replay", "Undo"]),
+    "gba": (15, 4, ["Wait", "A x3", "Replay", "Undo"]),
+    "nes": (13, 4, ["Wait", "A x3", "Replay", "Undo"]),
+    "snes": (20, 5, ["Wait", "A x3", "Replay", "Undo"]),
+    "genesis": (19, 5, ["Wait", "B x3", "Replay", "Undo"]),
+    "pce": (19, 5, ["Wait", "I x3", "Replay", "Undo"]),
+    "sms": (12, 3, ["Pause", "Wait", "1 x3", "Replay", "Undo"]),
+    "ngp": (12, 3, ["Option", "Wait", "A x3", "Replay", "Undo"]),
+}
+
+
+def test_every_console_s_layout_after_the_undo_button(view, system):
+    components, rows, last_row = LAYOUTS[system.key]
+    payload = view.to_components()
+    assert len(view.children) == components, len(view.children)
+    assert len(payload) == rows, len(payload)
+    assert sum(len(row["components"]) for row in payload) == components
+    labels = [
+        button.get("label") or button["custom_id"]
+        for button in payload[-1]["components"]
+    ]
+    assert labels == last_row, labels
+    # Whatever else moved, it still fits: five rows of five, 25 components.
+    assert rows <= S.MAX_ACTION_ROWS
+    assert all(len(row["components"]) <= S.MAX_BUTTONS_PER_ROW for row in payload)
+    assert components <= S.MAX_COMPONENTS
+
+
+def test_the_undo_button_is_one_of_the_controls_and_has_its_own_id(view):
+    undo = next(c for c in view.children if isinstance(c, viewmod._UndoButton))
+    assert undo.custom_id == f"{viewmod.CUSTOM_ID_PREFIX}:undo"
+    assert undo.label == "Undo" and undo.emoji is not None
+    assert str(undo.emoji) == S.UNDO_EMOJI
+    # Nothing was taken away to make room for it, and nothing was renamed:
+    # live messages route clicks by these exact strings.
+    ids = {c.custom_id for c in view.children}
+    for name in ("wait", "repeat", "replay", "undo"):
+        assert f"{viewmod.CUSTOM_ID_PREFIX}:{name}" in ids, name
+    # It starts greyed out, because a fresh session has nothing to undo.
+    assert undo.disabled
 
 
 def test_the_repeat_button_taps_this_console_s_confirm_button(view, system):

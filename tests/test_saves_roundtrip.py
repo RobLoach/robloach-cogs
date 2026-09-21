@@ -1,4 +1,4 @@
-"""`[p]retrosaves` export and import against a real core and a real cartridge.
+"""Saves, and Undo, against a real core and a real cartridge.
 
 Everywhere else the cog's save handling is driven against FakeEmulator, which
 answers a fixed number of bytes because a test of a *command* has no business
@@ -11,7 +11,18 @@ So this module runs the whole round trip on the real thing: the real Gambatte
 core, the real uCity cartridge (which reports 131,072 bytes of battery-backed
 save RAM), and the real Retro cog on top of them. Marked ``emulator`` and
 skipped cleanly without the assets, like the rest of the slow half.
+
+The Undo button is here for the same reason. FakeEmulator's save state is a
+frame counter, so everything about *when* a state is taken and *which* one
+goes back in is provable without a core (test_cog_session.py) -- but whether
+a real libretro core, handed a real compressed state, really puts the
+machine and the picture back where they were is not. That needs the real
+thing, and it is what the feature is for.
 """
+
+import hashlib
+import io
+import zlib
 
 import pytest
 
@@ -217,6 +228,178 @@ async def test_a_battery_save_for_another_cartridge_is_refused_by_size(real, cit
     said = ctx.said()
     assert "8,192 bytes" in said and "131,072 bytes" in said
     assert "Nothing was changed" in said
+
+
+# -- Undo, against the real core ----------------------------------------------
+
+
+#: RETRO_MEMORY_SYSTEM_RAM: the console's own work RAM, which for a Game Boy
+#: Color is 32 KiB of it.
+RETRO_MEMORY_SYSTEM_RAM = 2
+GBC_WRAM_BYTES = 32768
+
+#: How many bytes of a save state are allowed to differ between two machines
+#: that are in the same state.
+#:
+#: Not zero, which was a surprise worth writing down: a libretro save state
+#: is not quite a pure function of the emulated machine. Gambatte's state
+#: carries a four-byte ``time`` field that a cartridge with no real-time
+#: clock never writes, so two states serialized from an identical machine
+#: come out differing in those four bytes as soon as anything else in the
+#: process has allocated in between -- an ``await``, a hop into a worker
+#: thread. Four bytes out of 182,530, measured.
+#:
+#: So the comparisons below are made on the console's memory and on the
+#: picture, which *are* exactly the emulated machine, and the state itself is
+#: only held to "the same, bar those". It costs nothing in practice: the
+#: field is unused by a cartridge without an RTC, and a state is only ever
+#: loaded back into the same core, which ignores it too.
+STATE_SLACK = 16
+
+
+def differing_bytes(left, right):
+    assert len(left) == len(right), (len(left), len(right))
+    return sum(1 for a, b in zip(left, right, strict=True) if a != b)
+
+
+def machine(emulator):
+    """The emulated machine itself: the console's work RAM and the cartridge's."""
+    wram = emulator._session.core.get_memory(RETRO_MEMORY_SYSTEM_RAM)
+    assert wram is not None and len(wram) == GBC_WRAM_BYTES, wram
+    return bytes(wram), emulator.save_sram()
+
+
+def last_picture(clip):
+    """A hash of the final frame of a clip, i.e. what stays on the message."""
+    from PIL import Image
+
+    animation = Image.open(io.BytesIO(clip))
+    animation.seek(animation.n_frames - 1)
+    return hashlib.sha1(animation.convert("RGB").tobytes()).hexdigest()
+
+
+async def test_undo_puts_a_real_core_and_its_picture_back(real, city):
+    """The statement the whole feature rests on, on the real thing.
+
+    Undo is "restore the state the press started from, then record a clip
+    forward from it", so what it has to be held to is that the machine ends
+    up on the *pre-press* timeline -- not that it is frozen at the exact
+    moment of the click. The reference is therefore built by hand out of the
+    same two steps, from the same state, in the same core: load, record one
+    clip of no input, and nothing else. Gambatte is deterministic, so the
+    console's memory, the cartridge's memory and the final picture all have
+    to come out identical; see STATE_SLACK for the four bytes of the save
+    state that do not.
+    """
+    pytest.importorskip("PIL", reason="comparing pictures needs Pillow")
+    view, _, _ = city
+    cog = real.cog
+    emulator = view.emulator
+
+    before = emulator.save_state()
+    interaction = real.interaction(view, message=view.message)
+    await view._press(interaction, "start")
+    pressed_state = emulator.save_state()
+    pressed_machine = machine(emulator)
+    pressed_picture = last_picture(view.last_clip)
+    assert differing_bytes(pressed_state, before) > 100, "the press moved the game on"
+
+    # The undo point is the state the press began from, compressed.
+    assert len(view.history) == 1
+    stored = zlib.decompress(view.history[-1])
+    assert differing_bytes(stored, before) <= STATE_SLACK
+    assert len(view.history[-1]) < len(before) // 4, "and it is worth compressing"
+    assert len(view.history[-1]) == view.history_bytes
+
+    undoing = real.interaction(view, message=view.message)
+    await real.control(view, "undo").callback(undoing)
+    undone_state = emulator.save_state()
+    undone_machine = machine(emulator)
+    undone_clip = view.last_clip
+
+    # The reference: the same state, the same core, one clip of no input.
+    emulator.load_state(before)
+    reference_clip = view._record(emulator, None)
+    reference_state = emulator.save_state()
+
+    assert undone_machine == machine(emulator), "the machine is where it was"
+    assert undone_machine != pressed_machine
+    assert differing_bytes(undone_state, reference_state) <= STATE_SLACK
+    assert last_picture(undone_clip) == last_picture(reference_clip), (
+        "and so is the picture the channel is left looking at"
+    )
+    assert last_picture(undone_clip) != pressed_picture, (
+        "the press really did change the screen, so the comparison means "
+        "something"
+    )
+    # Gambatte encodes the same frames to the same bytes, so the whole clip
+    # matches too; it is the picture above that says what is being claimed.
+    assert undone_clip == reference_clip
+
+    # One edit, as a press is. Undoing is not allowed to cost two.
+    assert undoing.kinds() == ["response.defer", "edit_original_response"]
+    assert undoing.log[-1][1]["n_attachments"] == 1
+    # And the save on disk is the undone moment, written through rather than
+    # left for the autosave to catch up with.
+    on_disk = cog._state_path(view.channel_id, view.slug).read_bytes()
+    assert differing_bytes(on_disk, undone_state) <= STATE_SLACK
+    assert differing_bytes(on_disk, pressed_state) > 100
+
+
+async def test_undo_reaches_back_across_a_real_core_being_freed(real, city):
+    """A state outlives the core instance that made it, which is why this works.
+
+    The session sleeps (the shared object is unloaded), then Undo wakes it:
+    a brand new core, the ROM loaded again, the *disk* state restored -- and
+    then the undo point from before the sleep goes in on top.
+    """
+    view, _, _ = city
+    emulator = view.emulator
+
+    before = emulator.save_state()
+    await view._press(real.interaction(view, message=view.message), "start")
+    await real.cog.hibernate(view, None)
+    assert not view.live and len(view.history) == 1
+
+    await real.control(view, "undo").callback(
+        real.interaction(view, message=view.message)
+    )
+
+    assert view.live, "the undo woke it up"
+    fresh = view.emulator
+    assert fresh is not emulator, "on a freshly loaded core"
+    undone_machine = machine(fresh)
+    assert not view.history
+
+    # The same reference as the test above, built on the new core: the undo
+    # point crossed the unload intact, so loading it and running one clip
+    # lands in the same place the undo did.
+    fresh.load_state(before)
+    view._record(fresh, None)
+    assert machine(fresh) == undone_machine
+
+
+async def test_a_real_eight_deep_history_is_about_a_hundred_kilobytes(real, city):
+    """The memory figure the depth was chosen against, measured for real."""
+    view, _, _ = city
+    viewmod = real.viewmod
+    raw = len(view.emulator.save_state())
+
+    for index in range(viewmod.UNDO_DEPTH + 2):
+        await view._press(
+            real.interaction(view, message=view.message),
+            "start" if index % 2 else "a",
+        )
+
+    assert len(view.history) == viewmod.UNDO_DEPTH, "the depth cap bit"
+    assert view.history_bytes == sum(len(blob) for blob in view.history)
+    assert view.history_bytes <= viewmod.MAX_UNDO_BYTES
+    # uCity's states are 182 KiB each raw and about 16 KiB compressed, so a
+    # full history is a fraction of what the raw states would be and a
+    # fraction of the replay buffer beside it.
+    assert view.history_bytes < raw, (view.history_bytes, raw)
+    assert view.history_bytes < 300 * 1024, view.history_bytes
+    assert max(len(blob) for blob in view.history) < raw // 4
 
 
 async def test_the_listing_reports_the_cartridges_real_numbers(real, city):

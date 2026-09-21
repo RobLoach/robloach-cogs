@@ -84,7 +84,8 @@ can start it by name:
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
 - `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 1 second; anything from 0.2 to 15 works, fractions included (`0.8` is a real answer).
 - `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it. The default is 160. It is a ceiling: a clip too short to show the button coming back up holds it for less.
-- `[p]retroset settings` (owner) shows the current configuration, including the system directory and any BIOS files in it.
+- `[p]retroset settings` (owner) shows the current configuration, including the build that is loaded, the system directory and any BIOS files in it.
+- `[p]retroset version` (owner) answers **“am I running the new code?”** — the declared version, the commit it was installed from, and a fingerprint of the source that was actually loaded. See [Which build is this?](#which-build-is-this).
 
 ## Attaching a ROM
 
@@ -131,14 +132,16 @@ rather than swapped.
 ## The controller
 
 The buttons are laid out like the console's own pad rather than as a list: the
-d-pad is a cross on the left, the face buttons sit to its right, and Start and
-Select share the bottom row with **Wait**, **×3** and **Replay**. A Game Boy
-looks like this, where `·` is a greyed-out spacer that holds the column open:
+d-pad is a cross on the left, the face buttons sit to its right, and the
+controls — **Wait**, **×3**, **Replay** and **Undo** — sit on a row of their
+own underneath. A Game Boy looks like this, where `·` is a greyed-out spacer
+that holds the column open:
 
 ```
 ·  ⬆️
 ⬅️  ⬇️  ➡️   B  A
-Start  Select   ⏩ Wait   A ×3   🔁 Replay
+Start  Select
+⏩ Wait   A ×3   🔁 Replay   ↩️ Undo
 ```
 
 Consoles with more buttons grow upwards and sideways into the same shape — the
@@ -150,11 +153,29 @@ the six-button Genesis and PC Engine keep their real two-by-three face cluster:
 ·  ⬆️   X  Y  Z
 ⬅️  ⬇️  ➡️
 ·  ·   A  B  C
-Mode  Start   ⏩ Wait   B ×3   🔁 Replay
+Mode  Start
+⏩ Wait   B ×3   🔁 Replay   ↩️ Undo
 ```
 
-Discord allows five rows of five components, and the widest layout (the Super
-Nintendo) uses four rows and nineteen buttons, so there is room to spare.
+Discord allows five rows of five components, and this is what each console
+uses once the controls are added:
+
+| Console | Components | Rows |
+| --- | --- | --- |
+| Game Boy / Color, NES | 13 | 4 |
+| Game Boy Advance | 15 | 4 |
+| Super Nintendo | 20 | 5 |
+| Sega Genesis | 19 | 5 |
+| PC Engine | 19 | 5 |
+| Master System / Game Gear | 12 | 3 |
+| Neo Geo Pocket | 12 | 3 |
+
+The Master System and the Neo Geo Pocket have a one-button bottom row
+(**Pause**, **Option**), so their controls still fit beside it. Everywhere
+else the four controls are one too many to share a row with Start and Select,
+which is why the widest layouts now use all five rows — five components of
+headroom left and no spare row, so a ninth console would have to end in a
+one- or two-button row.
 
 ## Core options
 
@@ -366,6 +387,11 @@ would be undone by the very next button press. Every command here that changes
 a file hibernates the session first and says that it did; its controls stay
 live, and the next press starts it from whatever the command left behind.
 
+They also **drop the session's Undo history**, for the same reason one step
+further out: an undo restores a state from memory and writes it straight back
+to disk, so without that, `[p]retrosaves delete` — "start this game
+completely fresh" — would be one button press away from coming back.
+
 **Who may do what.** Listing, `info` and `export` are open to the channel,
 like playing. `reset`, `delete` and `import` are limited to the person who
 started the game, anybody with **Manage Messages**, and the bot owner — the
@@ -445,6 +471,82 @@ storage by the number of channels for a button most people press once. So after
 a bot restart there is nothing to replay yet, and the button is greyed out and
 says so until the next press refills it.
 
+### Undo
+
+**↩️ Undo steps the game back one press.** Playing a game a second at a time
+makes a misclick the most annoying thing that can happen: you press a
+direction, wait for the clip, and find you walked into the wrong room. So
+every press takes a save state of the machine *before* it changes anything,
+and Undo puts the newest one back and records a fresh clip so the channel can
+see where it landed.
+
+It reaches back **eight presses**, and Wait and **×3** count as presses — they
+move the game on, so they are things to step back from. Pressing Undo eight
+times walks the game back eight presses; there is no redo.
+
+This is cheap enough to be free. A save state takes well under a millisecond
+to make, and a state is almost all zeroes, so it compresses enormously —
+measured on the real cores on a Raspberry Pi 5:
+
+| Console | Save state | Compressed | Ratio |
+| --- | --- | --- | --- |
+| Game Boy | 182,530 | 15,780 | 8.6% |
+| NES | 13,758 | 870 | 6.3% |
+| Game Boy Advance | 528,448 | 6,298 | 1.2% |
+| Super Nintendo | 823,407 | 12,606 | 1.5% |
+| Genesis | 1,036,288 | 19,524 | 1.9% |
+
+A full eight-deep history of real play is **124 KiB** on the Game Boy, 99 KiB
+on the SNES and 152 KiB on the Genesis, and compressing one costs about a
+millisecond inside a press that already spends tens of them recording a clip.
+The history is capped by bytes as well as by count (2 MiB, a quarter of the
+replay buffer's), because the sizes above are what *today's* cores cost and a
+count alone bounds nothing.
+
+**The history is in memory only**, exactly like the replay buffer — and
+unlike the buffer it is cheap to lose, because the real save state is on disk
+either way. So a bot restart empties it: the button greys itself out, and a
+click that gets through anyway says
+
+> There is nothing to undo yet. Undo steps back through the last 8 presses,
+> and that history is kept in memory only — so it is empty until somebody
+> presses something, and the bot has restarted since the last press here. The
+> game itself is exactly where you left it.
+
+rather than failing. A game going to *sleep* is different: the session object
+survives, and a save state can be loaded into any instance of the same core
+build, so Undo still reaches back across a sleep — waking the game restores
+the moment it fell asleep at, and the undo steps back from there. If a core
+has been **updated** in the meantime it will refuse the old state; that
+empties the history, says so in one line, and leaves the game exactly as it
+was.
+
+**Undo rewinds the replay buffer too.** The clip of the press that was undone
+is dropped from it and the undo's own clip takes its place, so **Replay** is
+always a contiguous account of the play that still stands rather than footage
+of somebody walking into a room they are not in.
+
+Two deliberate details:
+
+* **An undo costs one clip's worth of emulated time**, exactly as pressing
+  Wait does, because it records forwards from the restored state rather than
+  freezing at it. Restoring and then rewinding again would leave the clip on
+  the message a second *ahead* of the game, and the next press would replay
+  that second — which is precisely the "the clip jumps backwards when I press
+  a button" problem described below. A game that is frozen between presses
+  can afford the second.
+* **An undo writes the save state to disk immediately** instead of waiting
+  for the next automatic save. The state on disk is easily *newer* than the
+  one Undo just restored, so without that a restart or a sleep straight
+  afterwards would quietly put the undone press back.
+
+There is no `[p]retro` command for it, deliberately: the button is where the
+misclick happened, the history it pops only exists in that session's memory,
+and `[p]retrosaves rollback` (aliased **`[p]retrosaves undo`**) is already
+the durable, on-disk version of the same idea — it goes back to the previous
+*save state generation* for a game, which is the answer when the in-memory
+history is gone.
+
 **A press changes the message exactly once.** The controls used to grey
 themselves out the instant you clicked and come back with the new clip, which
 was two edits of one message — and a Discord client re-renders a message from
@@ -499,6 +601,53 @@ set either value:
   would fit, which is what the confirm button already does, so the button
   greys itself out and says `A ×1` rather than lying. Its label always counts
   the taps it will really do.
+
+## Which build is this?
+
+Twice now a puzzling answer has turned out to be a bot running an older build
+than the repository — most memorably `[p]retroset cliplength 0.8` replying
+*must be an integer*, on a copy that predated the clip length becoming
+fractional. That looks like a bug in the cog and is not one, so the cog can
+now answer the question itself:
+
+```
+[p]retroset version
+```
+
+> **Version** `1.0.0`
+> **Commit** `e41aedb0a8e6` on `master`
+> **Loaded code** `5fe2e0c2125f`, newest file 2026-09-21 10:00:28
+> **Loaded at** 2026-09-21 10:00:32
+
+Three separate facts, because only together are they honest:
+
+* **the version** is what `info.json` declares. That file is the *single
+  source of truth* — `retro/version.py` reads it, and there is no version
+  literal in any `.py` for it to drift from (a test in
+  `tests/test_packaging.py` checks both halves of that). It is still a number
+  somebody has to remember to bump, which is why it is not the only thing
+  shown. The scheme is `MAJOR.MINOR.PATCH`: a feature bumps the minor, a fix
+  the patch. An install from before this existed reports `0.0.0+unknown`.
+* **the commit**, when the cog is installed from a git checkout — which is
+  the normal case for Red's Downloader, since it clones the repo. It is read
+  straight out of `.git` (HEAD, then a loose ref or `packed-refs`): no `git`
+  binary is needed and no subprocess is started, so there is nothing to hang
+  on. The search goes up exactly one directory from the package, so a bot
+  whose data folder happens to live inside some *other* repository is never
+  told a commit that has nothing to do with this cog. No `.git`, an
+  unreadable one, or a ref that resolves to nothing: the line is simply not
+  printed.
+* **the fingerprint of the loaded code**, which is the part that cannot go
+  stale. It is a hash of every `retro/*.py` *as they were when the cog was
+  loaded*, so two bots showing the same fingerprint really are running the
+  same code — and `git pull` without `[p]reload retro` deliberately does
+  **not** change it, because that is exactly the situation worth being able
+  to prove.
+
+`[p]retroset settings` leads with a one-line version of the same thing.
+Nothing here can fail a command: every piece of it degrades to "not shown"
+rather than raising, and `retro/version.py` imports nothing but the standard
+library so it works on the most broken install there is.
 
 ## Permissions
 
