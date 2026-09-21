@@ -19,7 +19,7 @@ from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.chat_formatting import humanize_list, pagify
 from redbot.core.utils.views import ConfirmView, SimpleMenu
 
-from . import archives
+from . import archives, net
 from .emulator import (
     CLIP_SECONDS,
     DEFAULT_FPS,
@@ -42,6 +42,7 @@ from .RetroView import (
     MIN_HOLD_MS,
     REPEAT_TAPS,
     SAVE_STATE_EVERY_PRESSES,
+    Progress,
     RetiredView,
     RetroView,
     press_plan,
@@ -73,6 +74,13 @@ MAX_BIOS_SIZE = 16 * 1024 * 1024
 MAX_BIOS_SIZE_LABEL = "16 MiB"
 
 BUILDBOT = "https://buildbot.libretro.com/nightly"
+
+# How long one user-supplied download may take in total. A 32 MiB ROM on a
+# slow link is a couple of minutes; past that it is a tarpit rather than a
+# download, and the bot has other things to do.
+DOWNLOAD_TIMEOUT_SECONDS = 120
+# The core downloads fetch eleven files from one host in a row.
+CORE_DOWNLOAD_TIMEOUT_SECONDS = 300
 
 # Where to point people who want games they are allowed to play.
 HOMEBREW_URL = "https://retrobrews.github.io/"
@@ -110,6 +118,55 @@ MAX_CACHED_GAMES_PER_CHANNEL = 5
 # (snes9x and genesis_plus_gx both use it), but no option in any of the eleven
 # cores this cog installs offers "reset".
 OPTION_RESET = "reset"
+
+# -- Rate limits ---------------------------------------------------------------
+#
+# `[p]retro <url>` makes the bot download up to 32 MiB and write a ROM plus
+# save files to disk, and it is open to everybody in the channel. Without a
+# limit, one person holding down Enter is an outbound-bandwidth and disk
+# amplifier pointed at whatever they like.
+#
+# The numbers below are chosen to be invisible in normal play and to bite hard
+# on abuse. Normal play is: start a game once, then press buttons for an hour
+# -- and a button press is not a command, so it goes through none of this and
+# is never rate limited. Starting *three different games in a minute* is
+# already unusual, and the channel bucket allows six across everybody, so a
+# busy channel of several people each starting something is fine.
+#
+# The cost of getting this wrong in the other direction is worse than the
+# attack: a cooldown that blocks normal play makes the cog annoying, while the
+# disk budget below is what actually bounds the damage.
+START_COOLDOWN_RATE = 3
+START_COOLDOWN_SECONDS = 60.0
+CHANNEL_START_COOLDOWN_RATE = 6
+CHANNEL_START_COOLDOWN_SECONDS = 60.0
+
+# `[p]retrosaves import`/`export` each move a file and, for an import, boot a
+# core to validate it. Four a minute is more than anybody does by hand.
+SAVE_COOLDOWN_RATE = 4
+SAVE_COOLDOWN_SECONDS = 60.0
+
+# `[p]retroset bios add` is owner-only and downloads up to 64 MiB, so this is
+# a guard against a fat-fingered loop rather than against a stranger.
+BIOS_COOLDOWN_RATE = 3
+BIOS_COOLDOWN_SECONDS = 60.0
+
+# -- The disk budget -----------------------------------------------------------
+#
+# Everything this cog stores lives under one directory: the cores (about 5 MiB
+# for the lot), the cached ROMs (up to 32 MiB each, five per channel), the save
+# states and battery saves with one previous generation each, and any BIOS
+# files the owner has installed. The per-channel ROM cache bounds one channel;
+# nothing bounded the total, so a bot in fifty channels had no ceiling at all.
+#
+# 1 GiB is the default: a hundred times the cores, room for something like a
+# hundred ordinary cartridges with their saves, and small enough that a VPS
+# with a 20 GB disk cannot be filled by a Discord channel. The owner can
+# change it, and 0 means "no limit" for somebody who would rather watch it
+# themselves.
+DEFAULT_DISK_BUDGET_MB = 1024
+# A ceiling on the setting itself, so a typo cannot ask for an exabyte.
+MAX_DISK_BUDGET_MB = 1024 * 1024
 
 # How many of an option's allowed values one line of `[p]retroset coreoptions
 # <core>` shows before it gives up and points at the single-option view. Some
@@ -168,6 +225,22 @@ MAX_LISTED_BIOS_FILES = 12
 # `.state2` and friends are its numbered slots).
 SRAM_EXTENSIONS = (".srm", ".sav")
 STATE_EXTENSIONS = (".state", ".st", ".savestate")
+
+# -- The previous generation --------------------------------------------------
+#
+# An atomic write cannot leave a truncated save behind, but it is perfectly
+# capable of writing a *bad* one: a core that has been updated writes a state
+# the next build will not read, a game can be saved two frames into a game-over
+# screen, and `[p]retrosaves delete` is one confirmation away from a channel's
+# only copy. Save states are the thing players actually care about, so every
+# successful write rotates the file it replaces to this suffix first, one
+# generation deep.
+#
+# One generation, not five: it doubles the storage for each save (which the
+# disk budget above has to account for), and the case it exists for -- "the
+# last save is bad, give me the one before it" -- is served by one. Rotation
+# is a rename, so it costs nothing and cannot half-happen.
+BACKUP_SUFFIX = ".bak"
 
 # The ceiling on an imported battery save is the same one the emulator applies
 # to a cartridge's save memory, so anything this accepts is at least the right
@@ -242,6 +315,12 @@ DEFAULT_GLOBALS: typing.Dict[str, typing.Any] = {
     # Set once the RetroCog -> Retro move has been done, so it never runs a
     # second time and cannot undo a later change by copying stale data over it.
     "legacy_namespace_migrated": False,
+    # How much disk the whole data directory may use, in MiB. 0 is no limit.
+    "disk_budget_mb": DEFAULT_DISK_BUDGET_MB,
+    # The SSRF guard's escape hatch, off by default: with it on, a URL that
+    # resolves to a private or loopback address is fetched instead of refused.
+    # See `[p]retroset allowprivateurls`, which spells out what that means.
+    "allow_private_urls": False,
 }
 
 #: The per-channel settings and their defaults.
@@ -292,6 +371,12 @@ class SaveInfo(typing.NamedTuple):
     live: bool
     #: Who started it, when anything still remembers. See _may_manage_saves.
     starter_id: typing.Optional[int]
+    #: The same, for the generation before each of them. Defaulted, because
+    #: every save had two files before it had four.
+    state_backup_size: typing.Optional[int] = None
+    state_backup_written: typing.Optional[float] = None
+    sram_backup_size: typing.Optional[int] = None
+    sram_backup_written: typing.Optional[float] = None
 
     @property
     def has_state(self) -> bool:
@@ -302,13 +387,31 @@ class SaveInfo(typing.NamedTuple):
         return bool(self.sram_size)
 
     @property
+    def has_state_backup(self) -> bool:
+        return bool(self.state_backup_size)
+
+    @property
+    def has_sram_backup(self) -> bool:
+        return bool(self.sram_backup_size)
+
+    @property
+    def has_backup(self) -> bool:
+        """Whether there is a previous generation to roll back to."""
+        return self.has_state_backup or self.has_sram_backup
+
+    @property
     def has_save(self) -> bool:
-        return self.has_state or self.has_sram
+        return self.has_state or self.has_sram or self.has_backup
 
     @property
     def last_written(self) -> float:
-        """When either half of this save was last written, 0.0 if never."""
-        return max(self.state_written or 0.0, self.sram_written or 0.0)
+        """When any part of this save was last written, 0.0 if never."""
+        return max(
+            self.state_written or 0.0,
+            self.sram_written or 0.0,
+            self.state_backup_written or 0.0,
+            self.sram_backup_written or 0.0,
+        )
 
     @property
     def restore(self) -> str:
@@ -316,15 +419,20 @@ class SaveInfo(typing.NamedTuple):
         How this game would come back if it were started right now.
 
         The same chain :func:`RetroView.restore_into` runs, read off the files
-        rather than by booting anything: the save state first, the cartridge's
-        battery save second, the beginning last. It cannot know whether a
-        state the core will reject is on disk -- only the core can say that --
-        so the answer is what would be *tried*.
+        rather than by booting anything: the save state, then the generation
+        before it, then the cartridge's battery save, then the generation
+        before that, then the beginning. It cannot know whether a state the
+        core will reject is on disk -- only the core can say that -- so the
+        answer is what would be *tried* first.
         """
         if self.has_state:
             return "state"
+        if self.has_state_backup:
+            return "backup-state"
         if self.has_sram:
             return "sram"
+        if self.has_sram_backup:
+            return "backup-sram"
         return "fresh"
 
 
@@ -352,6 +460,15 @@ class Retro(commands.Cog):
         self.retired: typing.Dict[int, RetiredView] = {}
         # Serializes every core operation across all channels.
         self.emulator_lock: asyncio.Lock = asyncio.Lock()
+        # The per-channel half of the start rate limit. `[p]retro` carries a
+        # per-user cooldown as a decorator, which discord.py can only give a
+        # command one of; this is the second bucket, checked by hand at the
+        # point a start is about to cost a download. See _channel_start_delay.
+        self.start_buckets = commands.CooldownMapping.from_cooldown(
+            CHANNEL_START_COOLDOWN_RATE,
+            CHANNEL_START_COOLDOWN_SECONDS,
+            commands.BucketType.channel,
+        )
         self._idle_task: typing.Optional[asyncio.Task] = None
         self._download_task: typing.Optional[asyncio.Task] = None
 
@@ -407,6 +524,157 @@ class Retro(commands.Cog):
         for retired in self.retired.values():
             retired.alive = False
         self.retired.clear()
+
+    # -- Red's end-user data API --------------------------------------------
+    #
+    # Red asks every cog that stores anything about a member to implement
+    # these two, and this cog stores exactly one thing: the id of whoever
+    # started a game. It is in two places -- the channel's live session record
+    # and the records behind the Resume buttons of the games it has moved on
+    # from -- and it is used for exactly one decision: whether somebody may
+    # stop or destroy a game they did not start (see RetroView.can_stop and
+    # _may_manage_saves).
+    #
+    # Nothing else here is end user data. A save state, a battery save and a
+    # cached ROM belong to the *channel*: several people play one game, the
+    # files are keyed by channel and game, and no part of them records who
+    # pressed which button. So a deletion request scrubs the id and leaves the
+    # game alone. The alternative -- deleting the save -- would let one member
+    # of a channel destroy everybody else's progress by asking politely, which
+    # is not what a privacy request is for.
+
+    async def red_delete_data_for_user(
+        self,
+        *,
+        requester: str,
+        user_id: int,
+    ) -> None:
+        """
+        Forget that this member started anything. Keeps the games.
+
+        The stored id is replaced with nothing, in Config and in the live
+        session objects, so the session carries on with an anonymous starter:
+        anyone can still play it, and stopping or wiping it falls back to
+        moderators and the bot owner.
+
+        Every requester gets the same treatment, including ``"user"`` (where
+        Red allows a cog to keep data it genuinely needs): a starter id is a
+        convenience, not something this cog cannot run without. An unknown
+        requester string -- which Red's own documentation warns may appear --
+        is treated the same way and logged, because scrubbing is the safe
+        default for a request this code does not recognise.
+        """
+        user_id = int(user_id)
+        if requester not in ("discord_deleted_user", "owner", "user", "user_strict"):
+            log.warning(
+                "Retro was asked to delete user data for an unrecognised "
+                "requester %r; treating it as a full deletion.",
+                requester,
+            )
+        scrubbed = 0
+        try:
+            channels = await self.config.all_channels()
+        except Exception:
+            log.exception("Could not read the Retro channels to scrub a user id.")
+            channels = {}
+        for channel_id in list(channels):
+            scope = self.config.channel_from_id(int(channel_id))
+            try:
+                async with scope.session() as session:
+                    if session and int(session.get("starter_id") or 0) == user_id:
+                        session["starter_id"] = None
+                        scrubbed += 1
+            except Exception:
+                log.exception(
+                    "Could not scrub a user id from channel %s's Retro session.",
+                    channel_id,
+                )
+            try:
+                async with scope.retired() as retired:
+                    for key, record in list((retired or {}).items()):
+                        if record and int(record.get("starter_id") or 0) == user_id:
+                            record["starter_id"] = None
+                            retired[key] = record
+                            scrubbed += 1
+            except Exception:
+                log.exception(
+                    "Could not scrub a user id from channel %s's retired Retro "
+                    "records.",
+                    channel_id,
+                )
+        # And in memory, so a session that is already loaded does not write
+        # the id straight back on its next save.
+        for view in self.sessions.values():
+            if view.starter_id == user_id:
+                view.starter_id = None
+                scrubbed += 1
+        for retired_view in self.retired.values():
+            record = getattr(retired_view, "record", None)
+            if record and int(record.get("starter_id") or 0) == user_id:
+                record["starter_id"] = None
+                scrubbed += 1
+        log.info(
+            "Retro scrubbed %s reference(s) to user %s at the request of %r.",
+            scrubbed,
+            user_id,
+            requester,
+        )
+
+    async def red_get_data_for_user(
+        self, *, user_id: int
+    ) -> typing.MutableMapping[str, io.BytesIO]:
+        """
+        Everything this cog knows about one member, as a readable file.
+
+        Which is a list of the games they started that something still
+        remembers, and nothing else -- there is no per-user anything here. An
+        empty mapping when their id appears nowhere, which is what Red expects
+        from a cog with no data for somebody.
+        """
+        user_id = int(user_id)
+        lines: typing.List[str] = []
+        try:
+            channels = await self.config.all_channels()
+        except Exception:
+            log.exception("Could not read the Retro channels for a data request.")
+            channels = {}
+        for channel_id, data in (channels or {}).items():
+            session = (data or {}).get("session") or {}
+            if session and int(session.get("starter_id") or 0) == user_id:
+                lines.append(
+                    f"- You started \"{session.get('game_name') or 'a game'}\" "
+                    f"in channel {channel_id}. It is the game that channel is "
+                    "currently playing."
+                )
+            for record in ((data or {}).get("retired") or {}).values():
+                if record and int(record.get("starter_id") or 0) == user_id:
+                    lines.append(
+                        f"- You started \"{record.get('game_name') or 'a game'}\" "
+                        f"in channel {channel_id}. That channel has moved on to "
+                        "another game, and this one keeps a Resume button."
+                    )
+        if not lines:
+            return {}
+        text = "\n".join(
+            [
+                "Retro (the retro game emulator cog) stores your Discord user "
+                "id as the person who started a game, so that you -- as well "
+                "as the channel's moderators and the bot owner -- can stop it "
+                "or manage its saves. That is the only thing it stores about "
+                "you.",
+                "",
+                "The game itself belongs to the channel: its emulator save "
+                "state, the game's in-cartridge battery save and a cached copy "
+                "of the ROM are shared by everybody who plays there, and none "
+                "of them record who pressed which button.",
+                "",
+                *lines,
+                "",
+                "Recent gameplay clips are held in memory only, for the Replay "
+                "button, and are lost whenever the bot restarts.",
+            ]
+        )
+        return {"retro.txt": io.BytesIO(text.encode("utf-8"))}
 
     # -- The RetroCog -> Retro rename ---------------------------------------
     #
@@ -1339,26 +1607,74 @@ class Retro(commands.Cog):
         return self._data_dir("states") / f"{channel_id}-{slug}.srm"
 
     @staticmethod
+    def _backup_path(path: Path) -> Path:
+        """
+        Where the generation before this one is kept.
+
+        ``9000-ucity.state`` -> ``9000-ucity.state.bak``, and the same for a
+        ``.srm``. Deliberately a suffix on the whole name rather than a
+        different extension, so the backup sorts next to the file it belongs
+        to and nothing that globs for ``*.state`` can mistake it for a save
+        the cog would load on its own.
+        """
+        return path.with_name(path.name + BACKUP_SUFFIX)
+
+    def _save_paths(
+        self, channel_id: int, slug: str
+    ) -> typing.Tuple[Path, Path, Path, Path]:
+        """``(state, state backup, sram, sram backup)`` for one game."""
+        state = self._state_path(channel_id, slug)
+        sram = self._sram_path(channel_id, slug)
+        return state, self._backup_path(state), sram, self._backup_path(sram)
+
+    @staticmethod
     def _slug(name: str) -> str:
         """A lowercase, filesystem-safe id for a game within a channel."""
         slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-").lower()[:48]
         return slug or "game"
 
-    @staticmethod
-    def _write_atomic(path: Path, data: bytes) -> None:
-        # Write beside the target and rename, so a crash halfway through
-        # cannot leave a truncated save state behind.
+    @classmethod
+    def _write_atomic(cls, path: Path, data: bytes, keep_backup: bool = False) -> None:
+        """
+        Replace a file's contents in one step, never leaving half of one.
+
+        Write beside the target and rename, so a crash halfway through cannot
+        leave a truncated save state behind.
+
+        ``keep_backup`` additionally rotates whatever was there to
+        ``<name>.bak`` first, one generation deep. Both steps are renames
+        within one directory, so the only moment either file is missing is
+        between two atomic operations, and the restore chain tries the backup
+        when the live file is not there (see :func:`RetroView.restore_into`).
+        Only the saves ask for this: a cached ROM or a downloaded core is
+        re-fetchable and a second copy of it is just disk.
+        """
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_bytes(data)
+        if keep_backup:
+            try:
+                # replace(), not a copy: a rename is atomic and costs nothing,
+                # so the previous generation is never half-written either.
+                path.replace(cls._backup_path(path))
+            except FileNotFoundError:
+                # Nothing to rotate. The first save of a new game.
+                pass
         temporary.replace(path)
 
     def _prune_cached_games(self, channel_id: int, keep_slug: str) -> None:
         """
-        Drop the oldest cached ROM+state pairs for a channel.
+        Drop the oldest cached ROM+save sets for a channel.
 
         Files are keyed by slug so every game a channel plays keeps its own
         save and can be resumed later, but a channel that works through a
         pile of ROMs should not keep them all forever.
+
+        This is the count-based cache policy the cog has always had: the
+        MAX_CACHED_GAMES_PER_CHANNEL most recent games in a channel are kept
+        whole, and a game that falls off the end takes its saves (and their
+        previous generations) with it, so no battery save outlives the ROM it
+        belongs to. The *disk budget* below is the other, separate limit, and
+        it deliberately never touches a save -- see _prune_roms_for_budget.
         """
         try:
             roms = list(self._roms_dir().glob(f"{channel_id}-*"))
@@ -1366,14 +1682,20 @@ class Retro(commands.Cog):
             return
         entries = []
         for path in roms:
+            # The leftovers of an interrupted _write_atomic are not games.
+            if path.suffix == ".tmp":
+                continue
             try:
-                entries.append((path.stat().st_mtime, path))
+                entries.append((path.stat().st_mtime, path.name, path))
             except OSError:
                 continue
+        # Newest first. The name is in the key so two ROMs written in the same
+        # filesystem tick (which happens on a coarse mtime) order predictably
+        # rather than by comparing Paths.
         entries.sort(reverse=True)
         prefix = f"{channel_id}-"
         seen = 0
-        for _, path in entries:
+        for _, _, path in entries:
             slug = path.stem[len(prefix):]
             if slug == keep_slug:
                 continue
@@ -1382,10 +1704,186 @@ class Retro(commands.Cog):
                 continue
             try:
                 path.unlink(missing_ok=True)
-                self._state_path(channel_id, slug).unlink(missing_ok=True)
-                self._sram_path(channel_id, slug).unlink(missing_ok=True)
+                for save in self._save_paths(channel_id, slug):
+                    save.unlink(missing_ok=True)
             except OSError:
                 log.warning("Could not prune the cached ROM %s", path, exc_info=True)
+
+    # -- The disk budget ----------------------------------------------------
+    #
+    # One number for the whole data directory, because that is the thing that
+    # can fill a disk: the per-channel ROM cache bounds one channel, and a bot
+    # is in as many channels as it is invited to.
+    #
+    # Two rules, and the second one is the important one:
+    #
+    #   * measure everything, including the cores, the BIOS files and the
+    #     previous generation of every save. A budget that only counted ROMs
+    #     would be a budget that could be walked past.
+    #   * when it is full, prune *cached ROMs* and nothing else. A ROM is
+    #     re-downloadable and a save is not, so a save is never deleted to
+    #     make room for somebody else's download. If pruning ROMs is not
+    #     enough, the download is refused and says so.
+
+    def _data_usage(self) -> typing.Dict[str, int]:
+        """
+        How many bytes each part of the data directory holds. Blocking.
+
+        Keyed by the top-level folder (``roms``, ``states``, ``cores``,
+        ``system``) with anything loose at the root under ``other``, plus a
+        ``total``. Symlinks are counted as nothing rather than followed:
+        nothing here creates one, and following one would let a link into
+        somebody's home directory look like the cog's own usage.
+        """
+        root = cog_data_path(self)
+        usage: typing.Dict[str, int] = {"total": 0}
+        try:
+            entries = list(root.rglob("*"))
+        except OSError:
+            log.warning("Could not measure the Retro data directory.", exc_info=True)
+            return usage
+        for path in entries:
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                size = int(path.stat().st_size)
+            except OSError:
+                continue
+            try:
+                first = path.relative_to(root).parts[0]
+            except ValueError:  # pragma: no cover - rglob stays under root
+                first = "other"
+            key = "other" if first == path.name else first
+            usage[key] = usage.get(key, 0) + size
+            usage["total"] += size
+        return usage
+
+    async def _disk_budget(self) -> int:
+        """The ceiling on the whole data directory in bytes; 0 is no limit."""
+        try:
+            megabytes = int(await self.config.disk_budget_mb())
+        except Exception:
+            log.exception("Could not read the Retro disk budget.")
+            megabytes = DEFAULT_DISK_BUDGET_MB
+        return max(0, min(MAX_DISK_BUDGET_MB, megabytes)) * 1024 * 1024
+
+    def _protected_roms(self) -> typing.Set[str]:
+        """
+        The cached ROMs the budget may not prune: the ones in play.
+
+        A live or merely sleeping session wakes by re-reading its cached ROM,
+        so pruning one out from under a channel would break a game that is on
+        screen right now. Everything else is fair game -- its saves stay
+        exactly where they are, and starting it again by name or URL picks
+        them straight back up.
+        """
+        return {
+            view.rom_filename
+            for view in self.sessions.values()
+            if view.rom_filename
+        }
+
+    def _prune_roms_for_budget(
+        self, need: int, keep: typing.Set[str]
+    ) -> typing.Tuple[int, typing.List[str]]:
+        """
+        Delete cached ROMs, oldest first, until ``need`` bytes are free.
+
+        Blocking. Returns (bytes freed, names deleted). Touches nothing but
+        ``roms/``: no save state, no battery save, no backup of either. The
+        oldest ROM across every channel goes first, which is the same "least
+        recently played wins" rule the per-channel cache uses.
+        """
+        freed = 0
+        deleted: typing.List[str] = []
+        try:
+            entries = []
+            for path in self._roms_dir().iterdir():
+                if path.name in keep or path.suffix == ".tmp":
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    entries.append((path.stat().st_mtime, path.name, path))
+                except OSError:
+                    continue
+        except OSError:
+            log.warning("Could not read the ROM cache to prune it.", exc_info=True)
+            return 0, []
+        entries.sort()
+        for _, name, path in entries:
+            if freed >= need:
+                break
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError:
+                log.warning("Could not prune the cached ROM %s", path, exc_info=True)
+                continue
+            freed += size
+            deleted.append(name)
+        return freed, deleted
+
+    async def _make_room(
+        self, incoming: int, keep_rom: typing.Optional[str] = None
+    ) -> typing.Tuple[bool, str]:
+        """
+        Check the budget, prune cached ROMs if that helps, and report.
+
+        Returns ``(there is room, the sentence to say)``. The sentence is
+        worth saying either way: a refusal has to explain itself, and a
+        download that only fitted because five cached ROMs were thrown away
+        should say so rather than silently deleting other channels' caches.
+        """
+        budget = await self._disk_budget()
+        if not budget:
+            return True, ""
+        usage = await asyncio.to_thread(self._data_usage)
+        total = usage.get("total", 0)
+        if total + incoming <= budget:
+            return True, ""
+        keep = self._protected_roms()
+        if keep_rom:
+            keep.add(keep_rom)
+        freed, deleted = await asyncio.to_thread(
+            self._prune_roms_for_budget, total + incoming - budget, keep
+        )
+        if deleted:
+            log.info(
+                "Pruned %s cached ROM(s) (%s bytes) to stay inside the %s MiB "
+                "Retro disk budget.",
+                len(deleted),
+                freed,
+                budget // (1024 * 1024),
+            )
+        if total - freed + incoming <= budget:
+            if not deleted:
+                return True, ""
+            return True, (
+                f"Freed {self._humanize_bytes(freed)} by dropping "
+                f"{len(deleted)} cached ROM(s) that nobody is playing, to stay "
+                f"inside the bot's {self._humanize_bytes(budget)} storage "
+                "budget. Nothing anyone had saved was touched \N{EM DASH} "
+                "those games will re-download themselves when somebody starts "
+                "them again."
+            )
+        lines = [
+            "The bot has run out of room for that: its game storage is "
+            f"{self._humanize_bytes(total - freed)} of the "
+            f"{self._humanize_bytes(budget)} it is allowed, and this needs "
+            f"another {self._humanize_bytes(incoming)}."
+        ]
+        if deleted:
+            lines.append(
+                f"{len(deleted)} cached ROM(s) were dropped to try "
+                f"({self._humanize_bytes(freed)}) and it still does not fit."
+            )
+        lines.append(
+            "No save was deleted to make room and none will be. Free some up "
+            "with `[p]retrosaves delete <game>`, or ask the bot owner to raise "
+            "`[p]retroset diskbudget`."
+        )
+        return False, " ".join(lines)
 
     # -- Emulator lifecycle -------------------------------------------------
 
@@ -1510,7 +2008,7 @@ class Retro(commands.Cog):
         view.message_id = message_id or None
         view.message = getattr(interaction, "message", None)
 
-        state, sram, notice = self._saved_progress(channel_id, view.slug)
+        progress, notice = self._saved_progress(channel_id, view.slug)
         emulator = RetroEmulator(
             core_path,
             rom_path,
@@ -1524,7 +2022,7 @@ class Retro(commands.Cog):
             async with self.emulator_lock:
                 # One core at a time, here as everywhere else.
                 await self._evict_locked(exclude=view)
-                clip = await asyncio.to_thread(view._boot, emulator, state, sram)
+                clip = await asyncio.to_thread(view._boot, emulator, progress)
         except Exception as error:
             log.warning(
                 "Could not resume %s in channel %s: %s", view.slug, channel_id, error
@@ -1559,7 +2057,7 @@ class Retro(commands.Cog):
         view._update_repeat_label()
         view.last_clip = clip
         view.touch()
-        self._settle_boot(view, state, notice)
+        self._settle_boot(view, progress, notice)
         await self._forget_retired(channel_id, message_id)
         await self._forget_retired_slug(channel_id, view.slug)
         try:
@@ -1655,7 +2153,7 @@ class Retro(commands.Cog):
         # holds whatever the player saved from inside the game). The notice is
         # dropped here on purpose -- waking a session up is not an event worth
         # narrating, so only a *failed* restore says anything.
-        state, sram, _ = self._saved_progress(view.channel_id, view.slug)
+        progress, _ = self._saved_progress(view.channel_id, view.slug)
 
         emulator = RetroEmulator(
             core_path,
@@ -1668,38 +2166,55 @@ class Retro(commands.Cog):
             # The same restore chain a fresh start runs, from the same
             # function, so waking and starting cannot drift apart.
             view.boot_outcome = await asyncio.to_thread(
-                restore_into, emulator, state, sram, view.slug
+                restore_into, emulator, progress, view.slug
             )
         except Exception:
             await asyncio.to_thread(emulator.stop)
             raise
-        self._settle_boot(view, state, None)
+        self._settle_boot(view, progress, None)
         view.emulator = emulator
         await self._learn_options(view.core, emulator)
 
+    def _read_file(self, path: Path) -> typing.Optional[bytes]:
+        """The contents of one save file, or None if it is not usable."""
+        try:
+            if not path.is_file():
+                return None
+            return path.read_bytes() or None
+        except OSError:
+            log.warning("Could not read the Retro save file %s", path, exc_info=True)
+            return None
+
     def _saved_progress(
         self, channel_id: int, slug: str
-    ) -> typing.Tuple[typing.Optional[bytes], typing.Optional[bytes], typing.Optional[str]]:
+    ) -> typing.Tuple[Progress, typing.Optional[str]]:
         """
         What this channel already has saved for one game.
 
-        Returns ``(save state, battery save, the line to say if it all works)``.
-        Read on every start, not only on a wake: a channel that played this
-        game before -- even weeks and several other games ago -- has its
-        progress cached under the same key, and booting over the top of it
-        would quietly throw the player's game away.
+        Returns ``(the progress, the line to say if it all works)``. Read on
+        every start, not only on a wake: a channel that played this game
+        before -- even weeks and several other games ago -- has its progress
+        cached under the same key, and booting over the top of it would
+        quietly throw the player's game away.
+
+        All four files are read, the previous generation of each included, so
+        the boot has everything :func:`RetroView.restore_into` might need. The
+        backups cost a couple of hundred kilobytes of read that is usually
+        wasted, which is a great deal cheaper than being unable to offer them
+        at the moment the newest file turns out to be bad.
         """
-        state: typing.Optional[bytes] = None
-        path = self._state_path(channel_id, slug)
-        try:
-            if path.is_file():
-                state = path.read_bytes() or None
-        except OSError:
-            log.warning("Could not read the Libretro save state %s", path, exc_info=True)
-        sram = self._read_sram(channel_id, slug)
-        if state:
+        state_path, state_backup, sram_path, sram_backup = self._save_paths(
+            channel_id, slug
+        )
+        progress = Progress(
+            state=self._read_file(state_path),
+            state_backup=self._read_file(state_backup),
+            sram=self._read_file(sram_path),
+            sram_backup=self._read_file(sram_backup),
+        )
+        if progress.state:
             notice = "Picked up from where this channel left off."
-        elif sram:
+        elif progress.sram or progress.sram_backup:
             notice = (
                 "Started from the title screen with this channel's in-game "
                 "save already in place \N{EM DASH} load it from the game's own "
@@ -1707,12 +2222,12 @@ class Retro(commands.Cog):
             )
         else:
             notice = None
-        return state, sram, notice
+        return progress, notice
 
     def _settle_boot(
         self,
         view: RetroView,
-        state: typing.Optional[bytes],
+        progress: typing.Optional[Progress],
         notice: typing.Optional[str],
     ) -> None:
         """
@@ -1730,25 +2245,50 @@ class Retro(commands.Cog):
         build of the core that wrote it and a core update invalidates every
         one on disk -- that should cost the exact moment, never the session
         and never the player's own in-game save.
+
+        An unusable state is deleted so it is not retried on every press for
+        the rest of the game's life. Which files that means depends on how far
+        down the chain the boot had to go: a boot that came back from the
+        *previous* generation deletes only the newer, broken one, and leaves
+        the generation that worked exactly where it is -- it is the newest
+        good copy the channel has, and the next boot finds it in the same way.
         """
+        progress = progress if progress is not None else Progress()
         outcome = getattr(view, "boot_outcome", "fresh")
-        if state and outcome != "state":
-            try:
-                self._state_path(view.channel_id, view.slug).unlink(missing_ok=True)
-            except OSError:
-                pass
-            view.notice = self._cold_boot_notice(outcome == "sram")
+        state_path, state_backup, _, _ = self._save_paths(view.channel_id, view.slug)
+        if outcome == "backup-state":
+            self._discard(state_path)
+            view.notice = (
+                "This game's latest save state could not be used (most likely "
+                "the emulator core was updated), so it came back from the one "
+                "before it \N{EM DASH} a few presses of play earlier."
+            )
+            log.info("Restored %s from its previous save state.", view.slug)
+            return
+        if progress.has_state and outcome not in ("state", "backup-state"):
+            # Neither generation loaded, so both are dead weight.
+            self._discard(state_path)
+            self._discard(state_backup)
+            view.notice = self._cold_boot_notice(outcome in ("sram", "backup-sram"))
             log.info(
                 "Cold-booted %s after an unusable save state; battery save %s.",
                 view.slug,
-                "restored" if outcome == "sram" else "not available",
+                "restored" if outcome in ("sram", "backup-sram") else "not available",
             )
             return
-        if outcome in ("state", "sram"):
+        if outcome in ("state", "sram", "backup-sram"):
             # "fresh" is deliberately not here: nothing was restored, so there
             # is nothing to announce, and the caller's notice (which would say
             # a battery save is in place) would be a lie.
             view.notice = notice
+
+    @staticmethod
+    def _discard(path: Path) -> None:
+        """Delete a save file that no core will load. Never raises."""
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not delete the unusable save %s", path, exc_info=True)
 
     @staticmethod
     def _cold_boot_notice(sram_restored: bool) -> str:
@@ -1833,6 +2373,10 @@ class Retro(commands.Cog):
         a core update). Both are captured here, before any caller frees the
         emulator, because afterwards there is nothing left to read.
 
+        Each write rotates the file it replaces to ``<name>.bak`` first, so
+        the channel always has the generation before this one to fall back to.
+        See BACKUP_SUFFIX and ``[p]retrosaves rollback``.
+
         The return value is whether the *state* was written; a cartridge with
         no battery is the normal case and is not a failure.
         """
@@ -1849,7 +2393,7 @@ class Retro(commands.Cog):
             return False
         path = self._state_path(view.channel_id, view.slug)
         try:
-            await asyncio.to_thread(self._write_atomic, path, data)
+            await asyncio.to_thread(self._write_atomic, path, data, True)
         except OSError:
             log.warning("Could not write the Libretro state %s", path, exc_info=True)
             return False
@@ -1880,7 +2424,7 @@ class Retro(commands.Cog):
             return False
         path = self._sram_path(view.channel_id, view.slug)
         try:
-            await asyncio.to_thread(self._write_atomic, path, data)
+            await asyncio.to_thread(self._write_atomic, path, data, True)
         except OSError:
             log.warning("Could not write the battery save %s", path, exc_info=True)
             return False
@@ -1888,14 +2432,7 @@ class Retro(commands.Cog):
 
     def _read_sram(self, channel_id: int, slug: str) -> typing.Optional[bytes]:
         """The stored battery save for a game, or None if there isn't one."""
-        path = self._sram_path(channel_id, slug)
-        try:
-            if not path.is_file():
-                return None
-            return path.read_bytes() or None
-        except OSError:
-            log.warning("Could not read the battery save %s", path, exc_info=True)
-            return None
+        return self._read_file(self._sram_path(channel_id, slug))
 
     async def _hibernation_loop(self) -> None:
         """Put sessions to sleep once they have been idle for long enough."""
@@ -2030,6 +2567,20 @@ class Retro(commands.Cog):
                 ctx, "This channel is already starting a game. Give it a moment."
             )
             return
+        if isinstance(error, commands.CommandOnCooldown):
+            # Every expensive command in this cog carries a cooldown, and
+            # every one of them is expensive because it downloads or uploads
+            # something. So the answer says what the limit is for, and points
+            # at the thing that is never limited.
+            seconds = max(1, int(getattr(error, "retry_after", 0) or 0) + 1)
+            await self._safe_send(
+                ctx,
+                f"That has been run a few times in the last minute, so it is "
+                f"rate limited. Try again in {seconds}s \N{EM DASH} the limit "
+                "is on fetching and uploading files, not on playing: the "
+                "buttons under a game are never rate limited.",
+            )
+            return
         original = getattr(error, "original", None)
         if original is not None:
             message = self._friendly_error(original)
@@ -2083,24 +2634,32 @@ class Retro(commands.Cog):
             return f"{BUILDBOT}/windows/{arch}/latest/{name}.zip", name
         return None
 
-    async def _download_core(
-        self, session: aiohttp.ClientSession, core: str
-    ) -> typing.Tuple[bool, int, str]:
+    async def _download_core(self, core: str) -> typing.Tuple[bool, int, str]:
         """
         Fetch one core from the buildbot and record where it landed.
 
         Returns (installed, bytes on disk, message). Never raises: a core
         that fails is reported and the rest of the set carries on.
+
+        The buildbot is a fixed, known-good, public host, but it goes through
+        the same guard as a stranger's URL rather than around it: a general
+        bypass is the kind of thing that later grows a second caller. There is
+        nothing to bypass anyway -- buildbot.libretro.com resolves to a public
+        address, which is exactly what the guard allows.
         """
         target = self._buildbot_url(core)
         if target is None:
             return False, 0, "no build for this platform"
         url, name = target
+        timeout = aiohttp.ClientTimeout(total=CORE_DOWNLOAD_TIMEOUT_SECONDS)
         try:
-            async with session.get(url) as resp:
+            async with net.guarded_get(url, timeout=timeout) as resp:
                 if resp.status != 200:
                     return False, 0, f"buildbot returned status {resp.status}"
                 payload = await resp.read()
+        except net.BlockedURL as error:
+            log.warning("Refusing to fetch the %s core: %s", core, error)
+            return False, 0, "the buildbot URL was refused by the URL guard"
         except aiohttp.ClientError as error:
             return False, 0, f"download failed: {error}"
         except asyncio.TimeoutError:
@@ -2140,51 +2699,81 @@ class Retro(commands.Cog):
             )
         return True, len(data), "installed"
 
+    async def _allow_private_urls(self) -> bool:
+        """Whether the owner has turned the private-address guard off."""
+        try:
+            return bool(await self.config.allow_private_urls())
+        except Exception:
+            # A Config that will not answer must not turn the guard off.
+            log.exception("Could not read the Retro private-URL setting.")
+            return False
+
     async def _download_bytes(
         self, url: str, max_size: int, size_label: str, what: str = "file"
     ) -> typing.Tuple[str, bytes]:
         """
         Fetch a URL into memory, capped at ``max_size``.
 
+        Every byte the bot fetches on somebody else's word comes through here,
+        so this is where the SSRF guard lives: :func:`net.guarded_get` refuses
+        a scheme that is not http(s), resolves the hostname and refuses any
+        address that is not a public one, connects to the address it just
+        checked, and re-checks every redirect hop. See retro/net.py.
+
         Returns (filename, data). Raises DownloadError with a message written
-        for the person who gave us the URL.
+        for the person who gave us the URL -- and a *single* message, shared
+        between "that address is not allowed", "nothing answered" and "it
+        timed out", so the reply cannot be used to map the bot's network.
         """
-        if not str(url).lower().startswith(("http://", "https://")):
-            raise DownloadError(f"The {what} URL must start with `http://` or `https://`.")
         too_big = f"That {what} is bigger than the {size_label} limit."
+        timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_SECONDS)
+        allow_private = await self._allow_private_urls()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        raise DownloadError(
-                            f"Downloading the {what} failed with status {resp.status}."
-                        )
-                    if (resp.content_length or 0) > max_size:
-                        raise DownloadError(too_big)
-                    # read(n) only returns the next chunk, so loop until the
-                    # body ends or the size cap is exceeded.
-                    chunks = []
-                    total = 0
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                        chunks.append(chunk)
-                        total += len(chunk)
-                        if total > max_size:
-                            break
-                    data = b"".join(chunks)
-                    # Redirects (e.g. GitHub release assets) often end at a
-                    # URL whose path has no real filename, so prefer the
-                    # Content-Disposition header, then the URL we were given.
-                    filename = ""
-                    if resp.content_disposition is not None:
-                        filename = resp.content_disposition.filename or ""
-                    if not filename:
-                        filename = Path(urlparse(url).path).name
-                    if not filename:
-                        filename = Path(str(resp.url.path)).name
+            async with net.guarded_get(
+                url, timeout=timeout, allow_private=allow_private
+            ) as resp:
+                if resp.status != 200:
+                    raise DownloadError(
+                        f"Downloading the {what} failed with status {resp.status}."
+                    )
+                if (resp.content_length or 0) > max_size:
+                    raise DownloadError(too_big)
+                # read(n) only returns the next chunk, so loop until the
+                # body ends or the size cap is exceeded.
+                chunks = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > max_size:
+                        break
+                data = b"".join(chunks)
+                # Redirects (e.g. GitHub release assets) often end at a
+                # URL whose path has no real filename, so prefer the
+                # Content-Disposition header, then the URL we were given.
+                filename = ""
+                if resp.content_disposition is not None:
+                    filename = resp.content_disposition.filename or ""
+                if not filename:
+                    filename = Path(urlparse(url).path).name
+                if not filename:
+                    filename = Path(str(resp.url.path)).name
+        except net.BlockedURL as error:
+            # The reason goes to the log and nowhere else. The reply below is
+            # the same one a refused connection and a timeout get.
+            log.warning("Refusing to fetch a %s URL: %s", what, error)
+            raise DownloadError(net.REFUSAL) from error
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as error:
+            # Deliberately indistinguishable from a blocked address: "connection
+            # refused" and "timed out" are exactly the two answers a port
+            # scanner is looking for. The detail is logged instead.
+            log.info("A %s download did not connect: %r", what, error)
+            raise DownloadError(net.REFUSAL) from error
         except aiohttp.ClientError as error:
+            # Something went wrong *after* a connection to an allowed address
+            # was made (a malformed response, a broken chunked body), which
+            # says nothing about the bot's network, so it can be reported.
             raise DownloadError(f"Downloading the {what} failed: {error}") from error
-        except asyncio.TimeoutError as error:
-            raise DownloadError(f"Downloading the {what} timed out.") from error
         if len(data) > max_size:
             raise DownloadError(too_big)
         return filename, data
@@ -2248,20 +2837,14 @@ class Retro(commands.Cog):
         )
         succeeded = 0
         failed = 0
-        timeout = aiohttp.ClientTimeout(total=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for name in missing:
-                ok, size, message = await self._download_core(session, name)
-                if ok:
-                    succeeded += 1
-                    log.info(
-                        "Installed the %s libretro core (%s KiB).", name, size // 1024
-                    )
-                else:
-                    failed += 1
-                    log.warning(
-                        "Could not download the %s libretro core: %s", name, message
-                    )
+        for name in missing:
+            ok, size, message = await self._download_core(name)
+            if ok:
+                succeeded += 1
+                log.info("Installed the %s libretro core (%s KiB).", name, size // 1024)
+            else:
+                failed += 1
+                log.warning("Could not download the %s libretro core: %s", name, message)
         log.info(
             "Automatic core download finished: %s installed, %s failed.",
             succeeded,
@@ -2457,9 +3040,61 @@ class Retro(commands.Cog):
         view.emulator = None
         view.closed = True
 
+    # -- Rate limiting ------------------------------------------------------
+    #
+    # Two buckets on the one command, because the two things being protected
+    # are different: the per-user cooldown (a decorator) stops one person
+    # looping a download, and the per-channel one stops a roomful of people
+    # doing it between them. Neither is charged for anything cheap -- see
+    # _forgive_cooldown, which is called on every path through `[p]retro` that
+    # does not fetch a ROM.
+
+    @staticmethod
+    def _forgive_cooldown(ctx: commands.Context) -> None:
+        """
+        Hand a command's cooldown back: this invocation cost nothing.
+
+        Bare `[p]retro` to bring the channel's game back, asking for the game
+        that is already running, and a name that is not a saved game all take
+        this path. Charging for them is what turns a rate limit that only bites
+        on abuse into one that makes the cog annoying.
+        """
+        command = getattr(ctx, "command", None)
+        reset = getattr(command, "reset_cooldown", None)
+        if reset is None:
+            return
+        try:
+            reset(ctx)
+        except Exception:
+            log.debug("Could not reset a Retro cooldown.", exc_info=True)
+
+    def _channel_start_delay(self, ctx: commands.Context) -> float:
+        """
+        Seconds this channel must wait before starting another game, or 0.
+
+        Checked (and charged) only where a start is about to cost a download,
+        so the channel bucket is not spent on a resume either.
+        """
+        try:
+            bucket = self.start_buckets.get_bucket(ctx)
+            if bucket is None:  # pragma: no cover - only a custom BucketType
+                return 0.0
+            return float(bucket.update_rate_limit() or 0.0)
+        except Exception:
+            # A rate limit that cannot be calculated must not stop the game.
+            log.debug("Could not check the Retro channel cooldown.", exc_info=True)
+            return 0.0
+
     # -- Commands -----------------------------------------------------------
 
     @commands.max_concurrency(1, commands.BucketType.channel)
+    # Three fetches a minute each. Starting a game is a once-an-hour action in
+    # normal play and every press afterwards is a button, not a command, so
+    # this is only ever reached by somebody hammering it -- and the cheap
+    # paths hand it straight back (see _forgive_cooldown).
+    @commands.cooldown(
+        START_COOLDOWN_RATE, START_COOLDOWN_SECONDS, commands.BucketType.user
+    )
     @commands.guild_only()
     # Only Attach Files: the game is a clip and a row of buttons, with no
     # embed anywhere in the play loop. (`[p]retroset settings` still uses one,
@@ -2493,6 +3128,7 @@ class Retro(commands.Cog):
         """
         installed = await self._installed_cores()
         if not installed:
+            self._forgive_cooldown(ctx)
             await ctx.send(
                 "No emulator cores are installed. Ask the bot owner to run "
                 f"`{ctx.clean_prefix}retroset download` first."
@@ -2504,6 +3140,9 @@ class Retro(commands.Cog):
 
         # Bare `[p]retro` with a session in the channel means "bring it back".
         if game is None and not ctx.message.attachments:
+            # Nothing is fetched down either of these paths, so neither is
+            # charged against the cooldown.
+            self._forgive_cooldown(ctx)
             if existing is not None:
                 await self._resume_session(ctx, existing)
                 return
@@ -2520,6 +3159,7 @@ class Retro(commands.Cog):
             elif game.lower().startswith(("http://", "https://")):
                 url, source = game, game
             else:
+                self._forgive_cooldown(ctx)
                 await ctx.send(
                     f"There's no saved game called `{game}`. Pass a ROM URL, "
                     f"attach a ROM, or see `{ctx.clean_prefix}retroset game list`."
@@ -2528,8 +3168,30 @@ class Retro(commands.Cog):
             # Asking for the game that is already going here resumes it
             # rather than downloading the ROM all over again.
             if existing is not None and existing.source.lower() == source.lower():
+                self._forgive_cooldown(ctx)
                 await self._resume_session(ctx, existing)
                 return
+
+        # Past this point a ROM really is going to be fetched and written, so
+        # this is where the channel's share of the rate limit and the bot's
+        # disk budget are spent.
+        delay = self._channel_start_delay(ctx)
+        if delay:
+            await self._safe_send(
+                ctx,
+                "This channel has started a lot of games in the last minute, "
+                f"so this one was not fetched. Try again in {delay:.0f}s "
+                "\N{EM DASH} the game already on screen still works, and "
+                "pressing its buttons is never rate limited.",
+            )
+            return
+        room, note = await self._make_room(0)
+        if note:
+            # Either the refusal, or the report of what was pruned to avoid
+            # one. Both are worth saying out loud.
+            await self._safe_send(ctx, note)
+        if not room:
+            return
 
         async with ctx.typing():
             rom = await self._fetch_rom(ctx, url)
@@ -2608,6 +3270,16 @@ class Retro(commands.Cog):
         """Cache the ROM, boot it, and post the controls."""
         extension = Path(filename).suffix.lower() or f".{system.extensions[0]}"
         rom_filename = f"{ctx.channel.id}-{slug}{extension}"
+        # The real size is only known now, so this is the check that counts:
+        # the one in `[p]retro` refuses a download when the disk is already
+        # full, and this one refuses to write what came back. Pruning here
+        # excludes this game's own ROM, which may already be on disk from the
+        # last time the channel played it.
+        room, note = await self._make_room(len(data), keep_rom=rom_filename)
+        if note:
+            await self._safe_send(ctx, note)
+        if not room:
+            return
         try:
             rom_path = self._roms_dir() / rom_filename
             await asyncio.to_thread(self._write_atomic, rom_path, data)
@@ -2651,7 +3323,7 @@ class Retro(commands.Cog):
         # rather than booting over the top of it. Same fallback chain as
         # waking a hibernated session: save state, then the cartridge's
         # battery save, then the beginning.
-        state, sram, restored_notice = self._saved_progress(ctx.channel.id, slug)
+        progress, restored_notice = self._saved_progress(ctx.channel.id, slug)
 
         emulator = RetroEmulator(
             core_path,
@@ -2674,10 +3346,9 @@ class Retro(commands.Cog):
                     await view.start(
                         ctx,
                         emulator,
-                        state,
-                        sram,
+                        progress,
                         on_booted=lambda booted: self._settle_boot(
-                            booted, state, restored_notice
+                            booted, progress, restored_notice
                         ),
                     )
         except EmulatorError as error:
@@ -2837,7 +3508,14 @@ class Retro(commands.Cog):
         prefix = f"{int(channel_id)}-"
         found: typing.Set[str] = set()
         directories = (
-            (self._data_dir("states"), ("*.state", "*.srm")),
+            # The backups are listed too: a game whose newest save state has
+            # been thrown out for being unloadable still has progress worth
+            # managing, and it would be a strange listing that hid the only
+            # copy left.
+            (
+                self._data_dir("states"),
+                ("*.state", "*.srm", "*.state" + BACKUP_SUFFIX, "*.srm" + BACKUP_SUFFIX),
+            ),
             (self._roms_dir(), ("*",)),
         )
         for directory, patterns in directories:
@@ -2856,6 +3534,8 @@ class Retro(commands.Cog):
                         # A write that was interrupted; not a game.
                         continue
                     name = path.name[len(prefix):]
+                    if name.endswith(BACKUP_SUFFIX):
+                        name = name[: -len(BACKUP_SUFFIX)]
                     slug = name.rsplit(".", 1)[0] if "." in name else name
                     if slug:
                         found.add(slug)
@@ -2913,8 +3593,13 @@ class Retro(commands.Cog):
         session: typing.Optional[RetroView],
     ) -> SaveInfo:
         """Gather one game's files and whatever is known about it."""
-        state = self._file_facts(self._state_path(channel_id, slug))
-        sram = self._file_facts(self._sram_path(channel_id, slug))
+        state_path, state_backup_path, sram_path, sram_backup_path = self._save_paths(
+            channel_id, slug
+        )
+        state = self._file_facts(state_path)
+        sram = self._file_facts(sram_path)
+        state_backup = self._file_facts(state_backup_path)
+        sram_backup = self._file_facts(sram_backup_path)
         rom = self._cached_rom(channel_id, slug)
         system = meta.get("system")
         if system is None and rom is not None:
@@ -2935,6 +3620,10 @@ class Retro(commands.Cog):
             current=current,
             live=bool(current and session.live),
             starter_id=meta.get("starter_id"),
+            state_backup_size=state_backup[0] if state_backup else None,
+            state_backup_written=state_backup[1] if state_backup else None,
+            sram_backup_size=sram_backup[0] if sram_backup else None,
+            sram_backup_written=sram_backup[1] if sram_backup else None,
         )
 
     def _match_save(
@@ -3125,17 +3814,26 @@ class Retro(commands.Cog):
 
     def _restore_sentence(self, entry: SaveInfo) -> str:
         """What starting this game right now would do, in a sentence."""
+        fallback = (
+            "the previous save state is tried next"
+            if entry.has_state_backup
+            else "the battery save below is used instead"
+            if entry.has_sram
+            else "the game starts from the beginning instead"
+        )
         if entry.restore == "state":
             return (
                 "**from its save state** \N{EM DASH} the exact moment it was "
-                "left at. If the emulator core has been updated since, the "
-                + (
-                    "battery save below is used instead."
-                    if entry.has_sram
-                    else "game starts from the beginning instead."
-                )
+                f"left at. If the emulator core has been updated since, "
+                f"{fallback}."
             )
-        if entry.restore == "sram":
+        if entry.restore == "backup-state":
+            return (
+                "**from its previous save state** \N{EM DASH} the newer one "
+                "has already been thrown out for being unloadable, so this is "
+                "the exact moment a few presses before that."
+            )
+        if entry.restore in ("sram", "backup-sram"):
             return (
                 "**from the title screen, with the in-game save in place** "
                 "\N{EM DASH} load it from the game's own menu to carry on."
@@ -3166,6 +3864,18 @@ class Retro(commands.Cog):
             parts.append(
                 f"battery save {self._humanize_bytes(entry.sram_size)}, "
                 f"{self._when(entry.sram_written)}"
+            )
+        if entry.has_backup:
+            # Worth a word in the listing, because it is the thing somebody
+            # who has just lost a save wants to know is there.
+            kept = []
+            if entry.has_state_backup:
+                kept.append("state")
+            if entry.has_sram_backup:
+                kept.append("battery")
+            parts.append(
+                f"1 previous generation kept ({humanize_list(kept)}, "
+                f"{self._when(max(entry.state_backup_written or 0.0, entry.sram_backup_written or 0.0))})"
             )
         if not parts:
             parts.append("nothing saved yet")
@@ -3236,11 +3946,16 @@ class Retro(commands.Cog):
             return
         saved = sum(1 for entry in entries if entry.has_save)
         total = sum(
-            (entry.state_size or 0) + (entry.sram_size or 0) for entry in entries
+            (entry.state_size or 0)
+            + (entry.sram_size or 0)
+            + (entry.state_backup_size or 0)
+            + (entry.sram_backup_size or 0)
+            for entry in entries
         )
         lines = [
             f"**{len(entries)} game(s)** in this channel, {saved} with saved "
-            f"progress, {self._humanize_bytes(total)} in total.",
+            f"progress, {self._humanize_bytes(total)} in total (previous "
+            "generations included).",
             "",
         ]
         for entry in entries:
@@ -3250,8 +3965,9 @@ class Retro(commands.Cog):
                 "",
                 f"`{ctx.clean_prefix}retrosaves info <game>` for one in full, "
                 f"`{ctx.clean_prefix}retrosaves export <game>` to take a copy "
-                f"away, `{ctx.clean_prefix}retrosaves reset <game>` to go back "
-                "to the last in-game save.",
+                f"away, `{ctx.clean_prefix}retrosaves rollback <game>` to go "
+                f"back one save, `{ctx.clean_prefix}retrosaves reset <game>` "
+                "to go back to the last in-game save.",
             ]
         )
         await self._send_pages(ctx, "\n".join(lines))
@@ -3312,6 +4028,29 @@ class Retro(commands.Cog):
                 "**Battery save**: none \N{EM DASH} either nobody has saved "
                 "from inside the game yet, or this cartridge has no battery."
             )
+        if entry.has_backup:
+            kept = []
+            if entry.has_state_backup:
+                kept.append(
+                    f"a save state of {self._humanize_bytes(entry.state_backup_size)} "
+                    f"from {self._when(entry.state_backup_written)}"
+                )
+            if entry.has_sram_backup:
+                kept.append(
+                    f"a battery save of {self._humanize_bytes(entry.sram_backup_size)} "
+                    f"from {self._when(entry.sram_backup_written)}"
+                )
+            lines.append(
+                f"**Previous generation**: {humanize_list(kept)}. It is used "
+                "automatically if the newer one turns out to be unloadable, "
+                f"and `{ctx.clean_prefix}retrosaves rollback {entry.slug}` "
+                "swaps back to it on purpose."
+            )
+        else:
+            lines.append(
+                "**Previous generation**: none yet \N{EM DASH} one is kept "
+                "from the second automatic save onwards."
+            )
         if entry.rom is not None:
             size = self._file_facts(entry.rom)
             lines.append(
@@ -3355,6 +4094,12 @@ class Retro(commands.Cog):
         return "sram", text
 
     @commands.bot_has_permissions(attach_files=True)
+    # An export uploads a file per invocation; four a minute is far more than
+    # anybody does by hand and is the difference between a feature and an
+    # outbound-bandwidth amplifier.
+    @commands.cooldown(
+        SAVE_COOLDOWN_RATE, SAVE_COOLDOWN_SECONDS, commands.BucketType.user
+    )
     @retrosaves.command(name="export", aliases=["download", "backup"])
     async def retrosaves_export(self, ctx: commands.Context, *, game: str) -> None:
         """
@@ -3481,7 +4226,7 @@ class Retro(commands.Cog):
         if not await self._may_manage_saves(ctx, entry):
             await self._refuse_management(ctx, entry, "reset its save")
             return
-        if not entry.has_state:
+        if not entry.has_state and not entry.has_state_backup:
             await self._safe_send(
                 ctx,
                 f"**{entry.game_name}** has no save state, so there is "
@@ -3499,9 +4244,12 @@ class Retro(commands.Cog):
         # its own save state back over this on the very next press.
         paused = await self._pause_for_saves(ctx, entry, "its save state was reset")
         try:
-            await asyncio.to_thread(
-                self._state_path(ctx.channel.id, entry.slug).unlink, True
-            )
+            # The previous generation goes with it. Leaving it would be a
+            # command that appears to do nothing: the restore chain would fall
+            # straight through to the backup and the game would come back at
+            # almost exactly the moment that was just dropped.
+            for path in self._save_paths(ctx.channel.id, entry.slug)[:2]:
+                await asyncio.to_thread(path.unlink, True)
         except OSError as error:
             log.warning("Could not delete a Retro save state.", exc_info=True)
             await self._safe_send(ctx, f"The save state could not be deleted: {error}")
@@ -3516,6 +4264,11 @@ class Retro(commands.Cog):
             f"Dropped the save state for **{entry.game_name}** "
             f"({self._humanize_bytes(entry.state_size)})."
         ]
+        if entry.has_state_backup:
+            lines.append(
+                "Its previous save state went with it, since the game would "
+                "otherwise have come straight back from that instead."
+            )
         if entry.has_sram:
             lines.append(
                 "Its in-game save is untouched, so the game will start from "
@@ -3535,6 +4288,134 @@ class Retro(commands.Cog):
                 "it to start it again."
             )
         await self._safe_send(ctx, " ".join(lines))
+
+    @retrosaves.command(name="rollback", aliases=["undo", "previous"])
+    async def retrosaves_rollback(self, ctx: commands.Context, *, game: str) -> None:
+        """
+        Go back to the save before the last one.
+
+        Every successful save keeps the generation it replaced, so if the last
+        automatic save landed somewhere useless — the moment after a game
+        over, a boss room nobody can get out of, a state a fresh emulator core
+        will not load — this swaps it back for the one before it, which is a
+        few presses of play earlier.
+
+        It is a **swap**, not a delete: what is being rolled back from becomes
+        the new previous generation, so running it a second time puts things
+        exactly as they were. Nothing here is destroyed, and nothing here is
+        kept forever either — the next few button presses save the game again
+        and rotate the older copy out, so roll back before carrying on.
+
+        Only the person who started the game, moderators (Manage Messages) and
+        the bot owner can do this.
+
+        **Examples:**
+        - `[p]retrosaves rollback ucity`
+
+        **Arguments:**
+        - `<game>` - A game this channel has played.
+        """
+        entry = await self._resolve_save(ctx, game)
+        if entry is None:
+            return
+        if not await self._may_manage_saves(ctx, entry):
+            await self._refuse_management(ctx, entry, "roll its save back")
+            return
+        if not entry.has_backup:
+            await self._safe_send(
+                ctx,
+                f"**{entry.game_name}** has no previous save to go back to. "
+                "One is kept from its second automatic save onwards, so play "
+                "it for a few more presses and there will be. "
+                f"`{ctx.clean_prefix}retrosaves reset {entry.slug}` goes back "
+                "to the last in-game save instead, and "
+                f"`{ctx.clean_prefix}retrosaves import {entry.slug}` installs "
+                "a copy you exported earlier.",
+            )
+            return
+
+        # Same rule as everything else in this group: the live core holds the
+        # authoritative copy and would write it straight back over this.
+        paused = await self._pause_for_saves(ctx, entry, "its save was rolled back")
+        try:
+            swapped = await asyncio.to_thread(
+                self._rollback_saves, ctx.channel.id, entry.slug
+            )
+        except OSError as error:
+            log.warning("Could not roll a Retro save back.", exc_info=True)
+            await self._safe_send(ctx, f"The save could not be rolled back: {error}")
+            return
+        if not swapped:
+            await self._safe_send(
+                ctx,
+                "Nothing could be rolled back; the bot's data folder may be "
+                "read-only. The details are in the bot's log.",
+            )
+            return
+        log.info(
+            "Rolled %s back to its previous %s in channel %s at %s's request.",
+            entry.slug,
+            humanize_list(swapped),
+            ctx.channel.id,
+            getattr(ctx.author, "id", "?"),
+        )
+        lines = [
+            f"**{entry.game_name}** has been rolled back to its previous "
+            f"{humanize_list(swapped)}."
+        ]
+        lines.append(
+            "The copy it was on is now the previous generation, so running "
+            f"`{ctx.clean_prefix}retrosaves rollback {entry.slug}` again puts "
+            "it back."
+        )
+        if paused:
+            lines.append(
+                "The game was running, so it was saved and put to sleep first "
+                "\N{EM DASH} otherwise the next button press would have "
+                "written the newer save straight back. Press a button on it to "
+                "carry on from the rolled-back save."
+            )
+        await self._safe_send(ctx, " ".join(lines))
+
+    def _rollback_saves(self, channel_id: int, slug: str) -> typing.List[str]:
+        """
+        Swap each half of a save with its previous generation. Blocking.
+
+        Returns what was swapped, for the reply. A *swap* rather than a
+        promotion, so the command is its own undo: the file being rolled back
+        from lands in the backup slot instead of being deleted.
+
+        Done through a third name so that neither file is ever lost if the
+        process dies between the two renames -- the worst case leaves a
+        ``.bak`` and a ``.rollback`` and no live file, and the restore chain
+        then falls through to the battery save rather than to nothing. Each
+        rename is atomic on its own.
+        """
+        swapped: typing.List[str] = []
+        state, state_backup, sram, sram_backup = self._save_paths(channel_id, slug)
+        for live, backup, label in (
+            (state, state_backup, "save state"),
+            (sram, sram_backup, "battery save"),
+        ):
+            if not backup.is_file():
+                continue
+            spare = live.with_name(live.name + ".rollback")
+            try:
+                if live.is_file():
+                    live.replace(spare)
+                backup.replace(live)
+                if spare.is_file():
+                    spare.replace(backup)
+            except OSError:
+                log.warning(
+                    "Could not swap %s with %s while rolling back.",
+                    live,
+                    backup,
+                    exc_info=True,
+                )
+                continue
+            swapped.append(label)
+        return swapped
 
     @retrosaves.command(name="delete", aliases=["wipe", "erase", "clear"])
     async def retrosaves_delete(self, ctx: commands.Context, *, game: str) -> None:
@@ -3587,6 +4468,9 @@ class Retro(commands.Cog):
                 f"its in-game battery save ({self._humanize_bytes(entry.sram_size)})"
             )
             named.append("its in-game battery save")
+        if entry.has_backup:
+            pieces.append("the previous generation of both")
+            named.append("the previous generation")
         question = (
             f"Delete {humanize_list(pieces)} for **{entry.game_name}**?\n"
             "The game will start from the very beginning next time, and none "
@@ -3644,12 +4528,16 @@ class Retro(commands.Cog):
     def _delete_saves(
         self, channel_id: int, slug: str
     ) -> typing.Optional[int]:
-        """Remove both save files for one game. Blocking; None if it failed."""
+        """
+        Remove every save file for one game. Blocking; None if it failed.
+
+        All four of them: both halves and the previous generation of each.
+        "Wipe this game's progress" has to mean it, and a rollback that
+        resurrected what somebody had just deleted would be worse than not
+        having a rollback at all.
+        """
         removed = 0
-        for path in (
-            self._state_path(channel_id, slug),
-            self._sram_path(channel_id, slug),
-        ):
+        for path in self._save_paths(channel_id, slug):
             try:
                 facts = self._file_facts(path)
                 path.unlink(missing_ok=True)
@@ -3659,6 +4547,11 @@ class Retro(commands.Cog):
             removed += facts[0] if facts else 0
         return removed
 
+    # An import downloads two attachments and boots a real core to check them
+    # against the cartridge, which is the most expensive thing in this group.
+    @commands.cooldown(
+        SAVE_COOLDOWN_RATE, SAVE_COOLDOWN_SECONDS, commands.BucketType.user
+    )
     @retrosaves.command(name="import", aliases=["upload", "restore"])
     async def retrosaves_import(self, ctx: commands.Context, *, game: str) -> None:
         """
@@ -3712,9 +4605,12 @@ class Retro(commands.Cog):
         if replacing:
             question = (
                 f"Importing this will overwrite {humanize_list(replacing)} for "
-                f"**{entry.game_name}**. That cannot be undone \N{EM DASH} "
-                f"`{ctx.clean_prefix}retrosaves export {entry.slug}` takes a "
-                "copy first. Go ahead?"
+                f"**{entry.game_name}**. What is there now is kept as the "
+                f"previous generation, so `{ctx.clean_prefix}retrosaves "
+                f"rollback {entry.slug}` can swap back to it \N{EM DASH} but "
+                "only until the next automatic save rotates it out, so "
+                f"`{ctx.clean_prefix}retrosaves export {entry.slug}` is the "
+                "way to keep a copy. Go ahead?"
             )
             if not await self._confirm(ctx, question):
                 await self._safe_send(
@@ -4006,15 +4902,23 @@ class Retro(commands.Cog):
         there would restore the game over the top of the save that was just
         brought in -- the import would look as though it had done nothing.
         """
+        state_path, state_backup, sram_path, _ = self._save_paths(channel_id, slug)
         written: typing.List[str] = []
         if sram is not None:
-            self._write_atomic(self._sram_path(channel_id, slug), sram)
+            # keep_backup: whatever was there is still the channel's own
+            # progress, and an import is exactly the kind of mistake somebody
+            # wants to undo. `[p]retrosaves rollback` brings it back.
+            self._write_atomic(sram_path, sram, True)
             written.append(f"a {self._humanize_bytes(len(sram))} battery save")
         if state is not None:
-            self._write_atomic(self._state_path(channel_id, slug), state)
+            self._write_atomic(state_path, state, True)
             written.append(f"a {self._humanize_bytes(len(state))} save state")
         elif sram is not None:
-            self._state_path(channel_id, slug).unlink(missing_ok=True)
+            # Both generations of the state go, for the reason in the
+            # docstring: either of them would be restored over the top of the
+            # battery save that was just imported.
+            state_path.unlink(missing_ok=True)
+            state_backup.unlink(missing_ok=True)
         return written
 
     @commands.group()
@@ -4094,27 +4998,25 @@ class Retro(commands.Cog):
         installed: typing.List[str] = []
         failed: typing.List[str] = []
         total_bytes = 0
-        timeout = aiohttp.ClientTimeout(total=300)
         async with ctx.typing():
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                for index, name in enumerate(wanted, start=1):
-                    ok, size, message = await self._download_core(session, name)
-                    if ok:
-                        installed.append(f"`{name}` ({CORES[name]}, {size // 1024} KiB)")
-                        total_bytes += size
-                    else:
-                        failed.append(f"`{name}`: {message}")
-                    if status is None:
-                        continue
-                    try:
-                        await status.edit(
-                            content=(
-                                f"Downloading cores... {index}/{len(wanted)} "
-                                f"({len(installed)} installed, {len(failed)} failed)"
-                            )
+            for index, name in enumerate(wanted, start=1):
+                ok, size, message = await self._download_core(name)
+                if ok:
+                    installed.append(f"`{name}` ({CORES[name]}, {size // 1024} KiB)")
+                    total_bytes += size
+                else:
+                    failed.append(f"`{name}`: {message}")
+                if status is None:
+                    continue
+                try:
+                    await status.edit(
+                        content=(
+                            f"Downloading cores... {index}/{len(wanted)} "
+                            f"({len(installed)} installed, {len(failed)} failed)"
                         )
-                    except discord.HTTPException:
-                        pass
+                    )
+                except discord.HTTPException:
+                    pass
 
         lines = []
         if installed:
@@ -4660,6 +5562,24 @@ class Retro(commands.Cog):
         if not parsed.netloc:
             await ctx.send("That URL is missing a hostname.")
             return
+        # A stored URL is fetched later, on a player's `[p]retro <name>`, and
+        # that fetch is guarded (see _download_bytes). Checking it here as well
+        # means a URL that can never work is refused while the person adding it
+        # is still looking at it, rather than confusing a player next week.
+        # This is the owner, so the reason is spelled out rather than hidden
+        # behind the one generic refusal players get.
+        refusal = await net.refuse_reason(
+            url, allow_private=await self._allow_private_urls()
+        )
+        if refusal is not None:
+            await ctx.send(
+                f"That URL will not be fetched: {refusal}. The bot refuses to "
+                "make requests to its own network (see the SSRF note in the "
+                "README). If this really is a ROM library on your LAN, "
+                f"`{ctx.clean_prefix}retroset allowprivateurls true` turns the "
+                "guard off \N{EM DASH} read what that command says first."
+            )
+            return
         key = self._slug(name)
         async with self.config.games() as games:
             existed = key in games
@@ -4727,6 +5647,11 @@ class Retro(commands.Cog):
         BIOS-free, so this is only needed if you add a core that is not.
         """
 
+    # Owner-only already, so this is a guard against a script gone wrong
+    # rather than against a stranger: one `bios add` can pull 64 MiB.
+    @commands.cooldown(
+        BIOS_COOLDOWN_RATE, BIOS_COOLDOWN_SECONDS, commands.BucketType.user
+    )
     @retroset_bios.command(name="add")
     async def retroset_bios_add(
         self,
@@ -4802,6 +5727,11 @@ class Retro(commands.Cog):
             await ctx.send(
                 f"That BIOS file is bigger than the {MAX_BIOS_SIZE_LABEL} limit."
             )
+            return
+        room, note = await self._make_room(len(data))
+        if note:
+            await self._safe_send(ctx, note)
+        if not room:
             return
 
         target = self._system_dir() / name
@@ -4915,6 +5845,12 @@ class Retro(commands.Cog):
                 f" The `{name}` you named was ignored: a zip of "
                 f"{len(files)} files keeps its own names."
             )
+
+        room, budget_note = await self._make_room(sum(len(f.data) for f in files))
+        if budget_note:
+            await self._safe_send(ctx, budget_note)
+        if not room:
+            return
 
         try:
             written, total = await asyncio.to_thread(self._write_bios_files, files)
@@ -5108,6 +6044,166 @@ class Retro(commands.Cog):
                 f"them with `{ctx.clean_prefix}retroset download`."
             )
 
+    @retroset.command(name="diskbudget", aliases=["disk", "budget"])
+    async def retroset_diskbudget(
+        self, ctx: commands.Context, megabytes: typing.Optional[int] = None
+    ) -> None:
+        """
+        Set how much disk the cog may use in total, in MiB.
+
+        Everything the cog stores counts: the emulator cores, every channel's
+        cached ROMs, every save state and battery save with the one previous
+        generation each, and any BIOS files you have installed. When a new
+        download would go over the budget, cached ROMs nobody is playing are
+        deleted oldest first to make room, and if that is not enough the
+        download is refused with an explanation.
+
+        **No save is ever deleted to make room**, not even to let somebody
+        else start a game. If the budget is full of saves, free some with
+        `[p]retrosaves delete <game>` or raise the number here.
+
+        The default is 1024 MiB. `0` means no limit at all, which is a real
+        answer for a machine with a big disk and a small number of channels.
+
+        Run it with no argument to see the budget and what is using it.
+
+        **Examples:**
+        - `[p]retroset diskbudget`
+        - `[p]retroset diskbudget 4096`
+        - `[p]retroset diskbudget 0`
+
+        **Arguments:**
+        - `[megabytes]` - The ceiling in MiB, or `0` for no limit.
+        """
+        if megabytes is None:
+            await self._safe_send(ctx, await self._usage_report(ctx))
+            return
+        megabytes = max(0, min(MAX_DISK_BUDGET_MB, int(megabytes)))
+        await self.config.disk_budget_mb.set(megabytes)
+        if not megabytes:
+            await ctx.send(
+                "The disk budget is off: the cog will keep downloading games "
+                "until the disk itself runs out. Cached ROMs are still pruned "
+                f"to the {MAX_CACHED_GAMES_PER_CHANNEL} most recent games per "
+                "channel."
+            )
+            return
+        await self._safe_send(
+            ctx,
+            f"The disk budget is now {megabytes:,} MiB.\n"
+            + await self._usage_report(ctx),
+        )
+
+    async def _usage_report(self, ctx: commands.Context) -> str:
+        """What the data directory holds, against what it is allowed."""
+        usage = await asyncio.to_thread(self._data_usage)
+        budget = await self._disk_budget()
+        total = usage.get("total", 0)
+        headline = (
+            f"Game storage is using **{self._humanize_bytes(total)}**"
+            + (
+                f" of the {self._humanize_bytes(budget)} allowed"
+                f" ({100 * total / budget:.0f}%)."
+                if budget
+                else " and has no budget set."
+            )
+        )
+        named = {
+            "cores": "emulator cores",
+            "roms": "cached ROMs",
+            "states": "saves (and their previous generation)",
+            "system": "BIOS files",
+            "other": "everything else",
+        }
+        parts = [
+            f"{label}: {self._humanize_bytes(usage[key])}"
+            for key, label in named.items()
+            if usage.get(key)
+        ]
+        lines = [headline]
+        if parts:
+            lines.append(humanize_list(parts) + ".")
+        if budget and total > budget:
+            lines.append(
+                "It is over budget, so the next download will prune cached "
+                "ROMs (never saves) and may be refused."
+            )
+        lines.append(f"`{cog_data_path(self)}`")
+        return "\n".join(lines)
+
+    @retroset.command(name="allowprivateurls", aliases=["allowprivate"])
+    async def retroset_allowprivateurls(
+        self, ctx: commands.Context, enabled: typing.Optional[bool] = None
+    ) -> None:
+        """
+        Let ROM URLs point inside your own network. Off, and best left off.
+
+        **What this protects.** `[p]retro <url>` is open to everybody in the
+        channel, and the bot fetches that URL from wherever the bot is
+        running. Normally every address the URL resolves to must be a public
+        one: loopback, private, link-local, unique-local, multicast and
+        reserved addresses are all refused, at every redirect hop, so nobody
+        can use the bot to reach `http://localhost:8080`, the Docker bridge,
+        your router, or a cloud metadata service at 169.254.169.254 — which
+        on most hosting providers hands out credentials to anything that asks.
+
+        **Turning this on removes that protection for everybody**, not just
+        for you: any member who can run `[p]retro` can then aim the bot at any
+        address it can reach, and use the difference between the replies to
+        map your network. Only do it on a bot you run at home, for a ROM
+        library on your own LAN, in a server whose members you trust
+        completely — and prefer `[p]retroset game add` with the guard left on
+        if the library is reachable from the internet at all.
+
+        Run it with no argument to see the current setting.
+
+        **Examples:**
+        - `[p]retroset allowprivateurls`
+        - `[p]retroset allowprivateurls true`
+        - `[p]retroset allowprivateurls false`
+
+        **Arguments:**
+        - `[enabled]` - `true` or `false`.
+        """
+        if enabled is None:
+            current = await self._allow_private_urls()
+            await ctx.send(
+                "Private and loopback ROM URLs are "
+                + (
+                    "**allowed**. Anybody who can run "
+                    f"`{ctx.clean_prefix}retro` can make the bot fetch from "
+                    "inside your network; turn it back off with "
+                    f"`{ctx.clean_prefix}retroset allowprivateurls false`."
+                    if current
+                    else "**refused**, which is the default and the safe "
+                    "setting. A URL that resolves to a private or loopback "
+                    "address is not fetched."
+                )
+            )
+            return
+        await self.config.allow_private_urls.set(bool(enabled))
+        if enabled:
+            log.warning(
+                "The Retro cog's private-address URL guard has been turned "
+                "OFF by the bot owner: any member who can run [p]retro can "
+                "now make this bot issue requests inside its own network."
+            )
+            await ctx.send(
+                "\N{WARNING SIGN}\N{VARIATION SELECTOR-16} ROM URLs may now "
+                "point inside your network, including at `localhost`. Every "
+                "member who can run "
+                f"`{ctx.clean_prefix}retro` can use that, so only leave it on "
+                "if you trust everybody in every server this bot is in. Turn "
+                f"it off with `{ctx.clean_prefix}retroset allowprivateurls "
+                "false`."
+            )
+            return
+        await ctx.send(
+            "ROM URLs must point at public addresses again. A URL that "
+            "resolves to a loopback, private, link-local or reserved address "
+            "is refused, and so is a public URL that redirects to one."
+        )
+
     @retroset.command(name="settings")
     @commands.bot_has_permissions(embed_links=True)
     async def retroset_settings(self, ctx: commands.Context) -> None:
@@ -5258,4 +6354,26 @@ class Retro(commands.Cog):
                 "survives a core update even when the save state does not."
             )
         embed.add_field(name="Sessions", value=sessions_value, inline=False)
+        embed.add_field(
+            name="Storage",
+            value=(await self._usage_report(ctx))[:1024],
+            inline=False,
+        )
+        embed.add_field(
+            name="ROM URLs",
+            value=(
+                (
+                    "\N{WARNING SIGN}\N{VARIATION SELECTOR-16} **Private and "
+                    "loopback addresses are allowed.** Anybody who can run "
+                    f"`{ctx.clean_prefix}retro` can make the bot fetch from "
+                    "inside this network."
+                    if await self._allow_private_urls()
+                    else "Only public addresses are fetched; a URL that "
+                    "resolves to a loopback, private, link-local or reserved "
+                    "address is refused, redirects included."
+                )
+                + f"\n`{ctx.clean_prefix}retroset allowprivateurls`"
+            )[:1024],
+            inline=False,
+        )
         await self._safe_send(ctx, embed=embed)

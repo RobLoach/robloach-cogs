@@ -6,6 +6,7 @@ not usable.
 """
 
 import asyncio
+import contextlib
 import io
 import time
 import types
@@ -76,6 +77,17 @@ def buildbot(retro, monkeypatch):
             ClientError=Exception,
         ),
     )
+
+    # Core downloads go through the SSRF guard, so that is what has to be
+    # stood in for here. The guard itself is tested in test_net.py; these
+    # tests are about which cores get fetched and what is reported.
+    @contextlib.asynccontextmanager
+    async def fake_guarded_get(url, **kwargs):
+        core = url.rsplit("/", 1)[-1].replace("_libretro.so.zip", "")
+        served.append(core)
+        yield FakeResponse(core)
+
+    monkeypatch.setattr(retro.netmod, "guarded_get", fake_guarded_get)
     return served
 
 
@@ -737,7 +749,9 @@ def auto(retro, monkeypatch):
     cog, _ = retro.make_cog()
     attempted = []
 
-    async def fake_download(session, name):
+    # _download_core makes its own guarded session now, so it takes just
+    # the core name.
+    async def fake_download(name):
         attempted.append(name)
         if name == "snes9x":
             return False, 0, "buildbot returned status 404"

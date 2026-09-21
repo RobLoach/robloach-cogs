@@ -693,6 +693,7 @@ class RetroEnv:
         self.cogmod = sys.modules["retro.Retro"]
         self.viewmod = sys.modules["retro.RetroView"]
         self.sysmod = sys.modules["retro.systems"]
+        self.netmod = sys.modules["retro.net"]
         # The emulator module itself, for the clip arithmetic and its bounds.
         # FakeEmulator stands in for the *class*, not for the constants and
         # the plain functions around it, which are the real ones under test.
@@ -783,6 +784,19 @@ class RetroEnv:
     def playable(self, view):
         return playable(self.viewmod, view)
 
+    def forgive_cooldowns(self):
+        """
+        Clear the manual rate-limit buckets.
+
+        The cooldowns exist to blunt abuse, but most tests start several
+        games in a burst to set up a scenario, which would trip them. Tests
+        that are *about* rate limiting call the commands without this.
+        """
+        for name in ("start_buckets", "save_buckets", "bios_buckets"):
+            cache = getattr(getattr(self.cog, name, None), "_cache", None)
+            if cache is not None:
+                cache.clear()
+
     def serve(self, name, data):
         """Replace the cog's downloader with one that always serves this."""
 
@@ -797,6 +811,7 @@ class RetroEnv:
     ):
         """Start a session the way `[p]retro` does, and return its view."""
         cog = cog or self.cog
+        self.forgive_cooldowns()
         filename = filename or f"{name}.gbc"
         system = self.sysmod.system_for_extension(Path(filename).suffix)
         slug = cog._slug(name)

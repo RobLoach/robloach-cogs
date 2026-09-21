@@ -20,6 +20,9 @@ from .fakes import ROM_BYTES, FakeEmulator  # noqa: E402
 
 
 async def play(retro, ctx, game, cog=None):
+    # These tests start games in bursts to build a scenario; the start
+    # cooldown is exercised on its own in test_limits.py.
+    retro.forgive_cooldowns()
     await retro.cogmod.Retro.retro.callback(cog or retro.cog, ctx, game=game)
 
 

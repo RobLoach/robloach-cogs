@@ -63,15 +63,22 @@ def _passthrough(*args, **kwargs):
 
 
 guild_only = is_owner = bot_has_permissions = max_concurrency = _passthrough
-BucketType = types.SimpleNamespace(channel=1, guild=2, user=3, default=0)
+cooldown = dynamic_cooldown = _passthrough
 
 
 # Red re-exports discord.ext.commands' exception hierarchy; the cog's
 # cog_command_error annotates against it and isinstance-checks a few members.
+# BucketType, Cooldown and CooldownMapping are the real ones rather than
+# stand-ins: the cog builds a CooldownMapping itself for the per-channel half
+# of the start rate limit, and a fake would only ever prove itself right.
 from discord.ext.commands import (  # noqa: E402,F401
     BotMissingPermissions,
+    BucketType,
     CheckFailure,
     CommandError,
     CommandInvokeError,
+    CommandOnCooldown,
+    Cooldown,
+    CooldownMapping,
     MaxConcurrencyReached,
 )

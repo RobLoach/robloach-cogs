@@ -194,37 +194,83 @@ def press_plan(
     return [(tap * (hold + gap), hold) for tap in range(taps)]
 
 
+class Progress(typing.NamedTuple):
+    """
+    One game's saved progress, in the order a boot is willing to try it.
+
+    Four files rather than two, because every save keeps one previous
+    generation (see BACKUP_SUFFIX in Retro.py): a successful write of a *bad*
+    save is not something an atomic write can protect anybody from, and a save
+    state is the thing players care most about. The backups are only ever
+    reached when the newer file cannot be used.
+    """
+
+    #: The most recent save state, and the generation before it.
+    state: typing.Optional[bytes] = None
+    state_backup: typing.Optional[bytes] = None
+    #: The cartridge's battery memory, and the generation before it.
+    sram: typing.Optional[bytes] = None
+    sram_backup: typing.Optional[bytes] = None
+
+    @property
+    def has_state(self) -> bool:
+        """Whether there is any save state at all to try."""
+        return bool(self.state or self.state_backup)
+
+    @property
+    def has_anything(self) -> bool:
+        return bool(self.state or self.state_backup or self.sram or self.sram_backup)
+
+
+#: What a restore did, in the order :func:`restore_into` tries them. Read by
+#: ``Retro._settle_boot`` to decide what to say and what to throw away.
+RESTORE_ORDER = ("state", "backup-state", "sram", "backup-sram", "fresh")
+
+
 def restore_into(
     emulator: RetroEmulator,
-    state: typing.Optional[bytes] = None,
-    sram: typing.Optional[bytes] = None,
+    progress: typing.Optional[Progress] = None,
     slug: str = "",
 ) -> str:
     """
     Start a core and put back as much of a game as is restorable.
 
-    The one implementation of the save state -> battery save -> cold boot
-    chain. Both paths that bring a game up go through it: starting a game the
-    channel has played before (:meth:`RetroView._boot`) and waking a
-    hibernated session (``Retro._wake_locked``). They used to have a copy each
-    and were kept in step by the tests rather than by construction.
+    The one implementation of the save state -> previous save state -> battery
+    save -> previous battery save -> cold boot chain. Both paths that bring a
+    game up go through it: starting a game the channel has played before
+    (:meth:`RetroView._boot`) and waking a hibernated session
+    (``Retro._wake_locked``). They used to have a copy each and were kept in
+    step by the tests rather than by construction.
+
+    The order is the order of confidence. A save state is the exact moment and
+    is tried first; its previous generation is the same thing one autosave
+    older, which is worth far more than the title screen. The cartridge's
+    battery save is not a moment at all but it survives a core update, so it
+    comes after both states, and its own previous generation after it.
 
     Returns what actually happened, which is what the cog reads to decide
-    whether to say anything and whether to throw the save state away:
+    whether to say anything and whether to throw a save state away:
 
     * ``"state"`` - the exact moment came back;
-    * ``"sram"`` - the moment did not, but the cartridge's battery save did;
+    * ``"backup-state"`` - the newest state was unusable, the one before it
+      was not;
+    * ``"sram"`` - no state could be used, but the cartridge's battery save
+      went in;
+    * ``"backup-sram"`` - the same, from the previous generation of it;
     * ``"fresh"`` - there was nothing to restore, or none of it could be used.
 
     Blocking, so callers run it in a worker thread.
     """
+    progress = progress if progress is not None else Progress()
     emulator.start()
-    if state:
+    for data, outcome in ((progress.state, "state"), (progress.state_backup, "backup-state")):
+        if not data:
+            continue
         try:
-            emulator.load_state(state)
+            emulator.load_state(data)
             # Straight back to the exact moment, so none of the boot frames
             # below are wanted: the game is already past its title screen.
-            return "state"
+            return outcome
         except EmulatorError as error:
             # A state from a different build of the core, a truncated file, or
             # -- the case the battery save exists for -- a state whose size no
@@ -232,15 +278,25 @@ def restore_into(
             # the exact moment, not the session and not the player's own
             # in-game save.
             log.warning(
-                "Discarding an unusable Libretro save state for %s: %s", slug, error
+                "Discarding an unusable Libretro save state (%s) for %s: %s",
+                outcome,
+                slug,
+                error,
             )
     # Cold boot. The core only allocates the cartridge's save memory once it
     # has loaded the game, so the battery save goes in after start(), and the
     # boot frames run afterwards so the game reaches its own title screen with
     # the save already in place.
-    restored = bool(sram) and emulator.load_sram(sram)
+    restored = "fresh"
+    for data, outcome in ((progress.sram, "sram"), (progress.sram_backup, "backup-sram")):
+        # load_sram() answers False for a save that is the wrong size for this
+        # cartridge, which is exactly when the generation before it is worth a
+        # try: an import or a core update can leave a mismatched newest file.
+        if data and emulator.load_sram(data):
+            restored = outcome
+            break
     emulator.advance(emulator.frames_for_seconds(BOOT_SECONDS))
-    return "sram" if restored else "fresh"
+    return restored
 
 
 class _GameButton(discord.ui.Button):
@@ -904,18 +960,16 @@ class RetroView(discord.ui.View):
         self,
         ctx: commands.Context,
         emulator: RetroEmulator,
-        state: typing.Optional[bytes] = None,
-        sram: typing.Optional[bytes] = None,
+        progress: typing.Optional[Progress] = None,
         on_booted: typing.Optional[typing.Callable[["RetroView"], None]] = None,
     ) -> discord.Message:
         """
         Boot the emulator and post the first clip with the controls.
 
-        ``state`` and ``sram`` are this channel's saved progress for this game,
-        if it has played it before. Starting a game the channel already has a
-        save for picks up where it left off rather than cold-booting over the
-        top of it, which is the same state -> SRAM -> fresh chain a hibernated
-        session is woken with.
+        ``progress`` is this channel's saved progress for this game, if it has
+        played it before. Starting a game the channel already has a save for
+        picks up where it left off rather than cold-booting over the top of
+        it, through the same chain a hibernated session is woken with.
 
         ``on_booted`` is called once the core is up and :attr:`boot_outcome`
         says how much of the game came back with it, and *before* the message
@@ -924,7 +978,7 @@ class RetroView(discord.ui.View):
         a second one after it.
         """
         self.starter_id = ctx.author.id
-        clip = await asyncio.to_thread(self._boot, emulator, state, sram)
+        clip = await asyncio.to_thread(self._boot, emulator, progress)
         self.emulator = emulator
         # Now that there is a core, the repeat button's label can be written
         # from its real frame rate rather than DEFAULT_FPS -- and it is
@@ -947,8 +1001,7 @@ class RetroView(discord.ui.View):
     def _boot(
         self,
         emulator: RetroEmulator,
-        state: typing.Optional[bytes] = None,
-        sram: typing.Optional[bytes] = None,
+        progress: typing.Optional[Progress] = None,
     ) -> bytes:
         """
         Bring a game up, restoring as much of it as is restorable.
@@ -958,7 +1011,7 @@ class RetroView(discord.ui.View):
         save state away. The restoring itself is :func:`restore_into`, shared
         with the wake path so the two cannot drift. Runs in a worker thread.
         """
-        self.boot_outcome = restore_into(emulator, state, sram, self.slug)
+        self.boot_outcome = restore_into(emulator, progress, self.slug)
         return self._record(emulator, None)
 
     def _schedule(
