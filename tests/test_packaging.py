@@ -177,9 +177,35 @@ def test_no_documentation_still_offers_retroset_core():
     assert "[p]retroset core <path>` command for pointing" in COG_README
 
 
-def test_the_readme_describes_the_fifteen_second_replay():
-    assert "Replay** shows the last **15 seconds" in COG_README
-    assert "memory only" in COG_README
+def test_the_readme_says_the_replay_button_is_gone_and_what_it_saved():
+    # The docs may explain that it was removed -- that is where the 8 MiB a
+    # session no longer holds is written down -- but must not present it as
+    # something to press.
+    assert "Replay** shows the last" not in COG_README
+    assert "session keeps one clip" in COG_README
+    assert "8 MiB" in COG_README
+    for line in COG_README.splitlines():
+        assert "🔁" not in line, line
+        assert "Replay 12s" not in line, line
+
+
+def test_the_readme_describes_the_press_line():
+    assert "Which button was pressed is written on the message" in COG_README
+    assert "`Pressed A.`" in COG_README
+    assert "Waited." in COG_README
+    # The two that would be wrong if the line were built from RetroPad names.
+    assert "`Pressed C.`" in COG_README
+
+
+def test_the_readme_describes_resetting_a_game():
+    assert "### Resetting a game" in COG_README
+    assert "[p]retroreset" in COG_README
+    # The distinction that has to be unmistakable, and the three decisions.
+    assert "completely different" in COG_README
+    assert "Nothing on disk is written" in COG_README
+    assert "battery save is not touched" in COG_README
+    assert "A reset is an undo point" in COG_README
+    assert "command and not a button" in COG_README
 
 
 def test_the_readme_describes_the_undo_button():
@@ -188,7 +214,7 @@ def test_the_readme_describes_the_undo_button():
     # The two decisions somebody reading it has to know about: what a restart
     # does to the history, and that the buffer rewinds with the game.
     assert "The history is in memory only" in COG_README
-    assert "rewinds the replay buffer too" in COG_README
+    assert "undo's own clip replaces the undone press's" in COG_README
     assert "↩️ Undo" in COG_README, "and it is drawn in the layout"
 
 
@@ -233,10 +259,23 @@ def test_the_readme_describes_the_single_restore_chain():
 
 
 @pytest.mark.parametrize(
-    "phrase", ["Replay", "Resume", "Undo", "detected automatically", "[p]retrosaves"]
+    "phrase",
+    [
+        "Resume",
+        "Undo",
+        "says which button it was",
+        "[p]retroreset",
+        "detected automatically",
+        "[p]retrosaves",
+    ],
 )
 def test_info_json_describes_the_new_behaviour(phrase):
     assert phrase in COG_INFO["description"], phrase
+
+
+def test_info_json_no_longer_advertises_the_replay_button():
+    assert "Replay" not in COG_INFO["description"]
+    assert "Replay" not in COG_INFO["end_user_data_statement"]
 
 
 def test_the_end_user_data_statement_mentions_what_is_now_stored():

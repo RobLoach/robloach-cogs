@@ -1,6 +1,6 @@
 """Every console's controls, as the payload discord.py would really send.
 
-This is the check that would have caught the 400 the Replay button's emoji
+This is the check that would have caught the 400 a control button's emoji
 once caused: a real RetroView is built for every console and the dict
 discord.py hands to the HTTP layer is inspected, rather than the tables being
 trusted. Needs discord.py; the tables themselves are covered, with no
@@ -142,7 +142,7 @@ def test_every_spacer_is_disabled_labelled_and_not_a_game_button(view):
 
 def test_the_controls_share_the_last_row(view):
     last = max(c.row for c in view.children)
-    for name in ("wait", "replay", "repeat", "undo"):
+    for name in ("wait", "repeat", "undo"):
         button = next(
             c for c in view.children if c.custom_id == f"{viewmod.CUSTOM_ID_PREFIX}:{name}"
         )
@@ -150,24 +150,25 @@ def test_the_controls_share_the_last_row(view):
 
 
 #: console key -> (components, action rows, the last row's labels). The whole
-#: point of the table: adding Undo to the control cluster made the cluster
-#: four wide, which is one too many to sit beside a two-button Start/Select
-#: row -- so six of the eight consoles moved their controls to a row of
-#: their own, and three of those now use all five of Discord's action rows.
-#: Anything that changes this has changed what every player sees.
+#: point of the table: removing Replay took the control cluster back to three
+#: wide, which fits beside every console's bottom row -- so all eight
+#: consoles' controls share that row again, the widest layouts are back to
+#: four of Discord's five action rows, and every console is one component and
+#: (on six of the eight) one row smaller than it was. Anything that changes
+#: this has changed what every player sees.
 LAYOUTS = {
-    "gb": (13, 4, ["Wait", "A x3", "Replay", "Undo"]),
-    "gba": (15, 4, ["Wait", "A x3", "Replay", "Undo"]),
-    "nes": (13, 4, ["Wait", "A x3", "Replay", "Undo"]),
-    "snes": (20, 5, ["Wait", "A x3", "Replay", "Undo"]),
-    "genesis": (19, 5, ["Wait", "B x3", "Replay", "Undo"]),
-    "pce": (19, 5, ["Wait", "I x3", "Replay", "Undo"]),
-    "sms": (12, 3, ["Pause", "Wait", "1 x3", "Replay", "Undo"]),
-    "ngp": (12, 3, ["Option", "Wait", "A x3", "Replay", "Undo"]),
+    "gb": (12, 3, ["Start", "Select", "Wait", "A x3", "Undo"]),
+    "gba": (14, 3, ["Start", "Select", "Wait", "A x3", "Undo"]),
+    "nes": (12, 3, ["Start", "Select", "Wait", "A x3", "Undo"]),
+    "snes": (19, 4, ["Start", "Select", "Wait", "A x3", "Undo"]),
+    "genesis": (18, 4, ["Mode", "Start", "Wait", "B x3", "Undo"]),
+    "pce": (18, 4, ["Select", "Run", "Wait", "I x3", "Undo"]),
+    "sms": (11, 3, ["Pause", "Wait", "1 x3", "Undo"]),
+    "ngp": (11, 3, ["Option", "Wait", "A x3", "Undo"]),
 }
 
 
-def test_every_console_s_layout_after_the_undo_button(view, system):
+def test_every_console_s_layout(view, system):
     components, rows, last_row = LAYOUTS[system.key]
     payload = view.to_components()
     assert len(view.children) == components, len(view.children)
@@ -192,8 +193,12 @@ def test_the_undo_button_is_one_of_the_controls_and_has_its_own_id(view):
     # Nothing was taken away to make room for it, and nothing was renamed:
     # live messages route clicks by these exact strings.
     ids = {c.custom_id for c in view.children}
-    for name in ("wait", "repeat", "replay", "undo"):
+    for name in ("wait", "repeat", "undo"):
         assert f"{viewmod.CUSTOM_ID_PREFIX}:{name}" in ids, name
+    # And the Replay button that used to sit between x3 and Undo is gone,
+    # along with its custom_id: a click on a stale one is dropped silently
+    # (see test_a_click_on_a_removed_button_is_dropped_silently).
+    assert f"{viewmod.CUSTOM_ID_PREFIX}:replay" not in ids
     # It starts greyed out, because a fresh session has nothing to undo.
     assert undo.disabled
 
@@ -204,6 +209,158 @@ def test_the_repeat_button_taps_this_console_s_confirm_button(view, system):
     )
     assert repeat.field == system.confirm
     assert repeat.label == f"{system.label_for(system.confirm)} x{viewmod.REPEAT_TAPS}"
+
+
+# -- Saying which button was pressed ------------------------------------------
+#
+# Every press names itself on the message it edits, and the name comes from
+# the console's own Button table in systems.py rather than from a second one
+# in RetroView -- which is the whole point, because the RetroPad field a
+# button maps to is frequently *not* what the console calls it. The table
+# below is the per-console answer, written out in full: an entry that changes
+# has changed what a player reads after every press.
+
+
+#: console key -> {RetroPad field: the line a press of it puts on the message}
+#: for every button that console has, the four d-pad arrows included.
+PRESS_LINES = {
+    "gb": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "b": "Pressed B.", "a": "Pressed A.",
+        "start": "Pressed Start.", "select": "Pressed Select.",
+    },
+    "gba": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "l": "Pressed L.", "r": "Pressed R.",
+        "b": "Pressed B.", "a": "Pressed A.",
+        "start": "Pressed Start.", "select": "Pressed Select.",
+    },
+    "nes": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "b": "Pressed B.", "a": "Pressed A.",
+        "start": "Pressed Start.", "select": "Pressed Select.",
+    },
+    "snes": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "l": "Pressed L.", "r": "Pressed R.",
+        "y": "Pressed Y.", "x": "Pressed X.",
+        "b": "Pressed B.", "a": "Pressed A.",
+        "start": "Pressed Start.", "select": "Pressed Select.",
+    },
+    # The Genesis pad's A/B/C are RetroPad y/b/a and its X/Y/Z are x/l/r, so
+    # every one of these would read wrongly if the line were built from the
+    # RetroPad's own names: a press of the Genesis C would say "Pressed A."
+    "genesis": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "x": "Pressed X.", "l": "Pressed Y.", "r": "Pressed Z.",
+        "y": "Pressed A.", "b": "Pressed B.", "a": "Pressed C.",
+        "start": "Pressed Start.", "select": "Pressed Mode.",
+    },
+    "sms": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "b": "Pressed 1.", "a": "Pressed 2.",
+        "start": "Pressed Pause.",
+    },
+    "pce": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "x": "Pressed IV.", "l": "Pressed V.", "r": "Pressed VI.",
+        "y": "Pressed III.", "a": "Pressed II.", "b": "Pressed I.",
+        "start": "Pressed Run.", "select": "Pressed Select.",
+    },
+    # A and B the right way round, i.e. swapped from the RetroPad convention.
+    "ngp": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "b": "Pressed A.", "a": "Pressed B.",
+        "start": "Pressed Option.",
+    },
+}
+
+
+def test_every_button_of_every_console_names_itself(view, system):
+    expected = PRESS_LINES[system.key]
+    # The table covers this console exactly: no button missing, none invented.
+    assert set(expected) == set(system.fields), (
+        sorted(set(expected) ^ set(system.fields))
+    )
+    for field, line in expected.items():
+        assert view.press_note(field) == line, field
+
+
+def test_the_press_line_is_the_label_the_button_itself_carries(view, system):
+    """The anti-drift assertion: one source, which is systems.py.
+
+    Not a restatement of the table above -- this one says the line and the
+    component are built from the same Button, so a console renamed in
+    systems.py cannot end up with controls saying one thing and the message
+    saying another.
+    """
+    for button in game_buttons(view):
+        caption = button.label or str(button.emoji)
+        assert view.press_note(button.field) == f"Pressed {caption}."
+
+
+def test_the_dpad_names_itself_with_an_emoji_discord_accepts(view, system):
+    """The class of bug that caused a production 400, held off here too.
+
+    The d-pad carries no label, so its line is its emoji -- which means a
+    bare codepoint with no U+FE0F would be posted as message *text* rather
+    than on a button. It cannot be: these are the same strings the buttons
+    carry, and systems.validate_emoji() has already refused that at import.
+    """
+    for field in ("up", "down", "left", "right"):
+        line = view.press_note(field)
+        emoji = line[len("Pressed "):-1]
+        assert S.emoji_problem(emoji) is None, (field, emoji)
+        assert emoji.endswith(S.VARIATION_SELECTOR_16), (field, emoji)
+
+
+def test_wait_and_the_repeat_button_say_what_they_do(view, system):
+    assert view.press_note(None) == "Waited."
+    assert view.press_note(None) == viewmod.WAITED_NOTE
+    # The repeat button counts the taps that will really happen, exactly as
+    # its own label does, so the line and the button cannot disagree.
+    repeat = next(
+        c for c in view.children if c.custom_id == f"{viewmod.CUSTOM_ID_PREFIX}:repeat"
+    )
+    confirm = system.caption_for(system.confirm)
+    assert view.press_note(system.confirm, viewmod.REPEAT_TAPS) == (
+        f"Pressed {confirm} x{view.repeat_taps}."
+    )
+    assert repeat.label.endswith(f"x{view.repeat_taps}")
+
+    # A clip too short for two taps: the button is greyed out and the line
+    # drops the count rather than claiming a repeat that did not happen.
+    view.clip_seconds = 0.2
+    view._update_repeat_label()
+    assert view.repeat_taps == 1
+    assert view.press_note(system.confirm, viewmod.REPEAT_TAPS) == f"Pressed {confirm}."
+
+
+def test_a_field_this_console_does_not_have_still_reads_as_something(view):
+    """A stale click, i.e. a message drawn for a different game."""
+    assert view.press_note("nonexistent") == "Pressed NONEXISTENT."
+
+
+def test_the_press_line_matches_the_tone_of_the_other_notes():
+    # One short sentence, capitalised, full stop, no markdown: the same shape
+    # as the line Undo has always shown.
+    for note in (
+        viewmod.UNDONE_NOTE,
+        viewmod.WAITED_NOTE,
+        viewmod.RESET_NOTE,
+        viewmod.PRESSED_NOTE.format(button="A"),
+    ):
+        assert note[0].isupper() and note.endswith("."), note
+        assert "*" not in note and "`" not in note, note
+        assert len(note) <= 40, note
 
 
 # -- The consoles whose buttons are not what the RetroPad calls them -----------
@@ -329,8 +486,8 @@ def test_a_clip_length_is_printed_without_a_pointless_decimal():
     assert format_seconds(0.8) == "0.8"
     assert format_seconds(0.25) == "0.25"
     assert format_seconds(15.0) == "15"
-    # The Replay button's figure: a buffer of clips is an approximation, and
-    # round() used to turn two 0.2s clips into "Replay 0s".
+    # An approximate figure rather than a setting, where round() to whole
+    # seconds used to turn 0.4 seconds of footage into "0s".
     assert format_seconds(0.4018, 1) == "0.4"
     assert format_seconds(3.0135, 1) == "3"
     assert describe_seconds(1.0) == "1 second"

@@ -15,17 +15,11 @@ from .emulator import (
     CLIP_SECONDS,
     DEFAULT_CLIP_FORMAT,
     DEFAULT_FPS,
-    MAX_REPLAY_BYTES,
-    MAX_REPLAY_CLIPS,
-    MAX_REPLAY_FRAMES,
-    REPLAY_SECONDS,
     EmulatorError,
     RetroEmulator,
     clamp_clip_seconds,
     clip_extension,
     clip_frame_count,
-    concatenate_clips,
-    format_seconds,
     frame_count,
     input_budget,
 )
@@ -35,7 +29,6 @@ from .systems import (
     MAX_BUTTONS_PER_ROW,
     MAX_COMPONENTS,
     MAX_LAYOUT_ROWS,
-    REPLAY_EMOJI,
     RESUME_EMOJI,
     SYSTEMS,
     UNDO_EMOJI,
@@ -126,6 +119,31 @@ SAVE_STATE_EVERY_PRESSES = 3
 # What the Undo button says when it has put the game back.
 UNDONE_NOTE = "Undid the last press."
 
+# What `[p]retroreset` says on the message when the game has been rebooted.
+RESET_NOTE = "Reset the game."
+
+# -- Saying which button was pressed ------------------------------------------
+#
+# Every press names itself on the message it edits, in one short line above
+# the clip and in the same voice as UNDONE_NOTE above: "Pressed A.", "Pressed
+# \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}.", "Pressed Start.",
+# "Pressed A x3.", "Waited."
+#
+# It rides on the one edit a press already makes (see RetroView._show), so it
+# costs nothing: no extra request, no extra rate-limit budget, and nothing
+# that could re-render the message a second time and rewind the clip.
+#
+# The name of a button comes from the console's own Button in systems.py, via
+# System.caption_for -- never from a second table here. That is what makes a
+# Genesis press read "Pressed C." rather than "Pressed A." (its C is RetroPad
+# *a*) and what keeps the line in step with the label on the button that was
+# clicked. The d-pad has no labels at all, so it names itself with its arrow
+# emoji, which has already been through systems.validate_emoji() at import
+# time; a bare codepoint with no U+FE0F is what caused a 400 in production
+# once, and it cannot get in here without failing that check first.
+PRESSED_NOTE = "Pressed {button}."
+WAITED_NOTE = "Waited."
+
 # -- Undo ----------------------------------------------------------------------
 #
 # In turn-based play by button the dominant frustration is a misclick: you
@@ -166,12 +184,16 @@ UNDO_DEPTH = 8
 
 # ...and the same bound in bytes, because the count alone is not one: the
 # numbers above are what today's consoles cost, and a core update or a bigger
-# machine can change them without anybody editing this file. A quarter of the
-# replay buffer's 8 MiB, which at the measured sizes is 100 times more than
-# UNDO_DEPTH states ever need; it only bites if a state compresses to a
-# quarter of a megabyte, and then it keeps fewer of them instead of growing.
-# One entry is always kept, even if it is over the cap on its own, for the
-# same reason _trim_clips never empties the replay buffer completely.
+# machine can change them without anybody editing this file. At the measured
+# sizes two megabytes is 100 times more than UNDO_DEPTH states ever need; it
+# only bites if a state compresses to a quarter of a megabyte, and then it
+# keeps fewer of them instead of growing. One entry is always kept, even if
+# it is over the cap on its own: an Undo button that cannot undo the press
+# somebody has just made would be worse than the memory.
+#
+# This is now the *only* bound on anything a session holds, beyond the one
+# clip that is on the message. It used to be a quarter of the 8 MiB replay
+# buffer that sat beside it.
 MAX_UNDO_BYTES = 2 * 1024 * 1024
 
 # Every button needs a custom_id that survives a restart, because that is how
@@ -186,14 +208,20 @@ MAX_UNDO_BYTES = 2 * 1024 * 1024
 CUSTOM_ID_PREFIX = "libretro"
 
 # The controller grid comes from systems.py (see the row plan there); this
-# view adds the three control buttons -- Wait, confirm x3, Replay -- to the
+# view adds the three control buttons -- Wait, confirm x3, Undo -- to the
 # last row if they fit and to a row of their own if they do not.
 #
-# The Stop button that used to sit here is gone: `[p]retrostop` is the way to
-# put a game to sleep. A message posted before it was removed still has the
-# button drawn on it until its next press redraws the row, and a click on that
-# stale button resolves to a custom_id this view no longer has -- which
-# discord.py's ViewStore.dispatch_view drops silently rather than raising.
+# Two buttons that used to sit here are gone, and neither is coming back:
+# Stop (`[p]retrostop` is the way to put a game to sleep) and Replay. There
+# is no Reset button either, deliberately: rebooting somebody's game is
+# destructive to their progress-in-flight, so it is `[p]retroreset`, a
+# command with the same permission check `[p]retrostop` has, rather than one
+# more thing a passer-by can click by mistake.
+#
+# A message posted before a button was removed still has it drawn on it until
+# its next press redraws the row, and a click on that stale button resolves to
+# a custom_id this view no longer has -- which discord.py's
+# ViewStore.dispatch_view drops silently rather than raising.
 _STYLES = {
     "primary": discord.ButtonStyle.primary,
     "secondary": discord.ButtonStyle.secondary,
@@ -402,7 +430,8 @@ class _RepeatButton(discord.ui.Button):
     is rewritten whenever the controls are redrawn, so changing
     `[p]retroset cliplength` mid-game corrects it (see
     :meth:`RetroView._update_repeat_label`). The custom_id never changes, so
-    Discord keeps routing clicks to it.
+    Discord keeps routing clicks to it, and the line the press puts on the
+    message counts the same taps the label does.
     """
 
     def __init__(self, spec, row: int, taps: int = REPEAT_TAPS) -> None:
@@ -421,33 +450,12 @@ class _RepeatButton(discord.ui.Button):
         await self.view._press(interaction, self.field, repeat=REPEAT_TAPS)
 
 
-class _ReplayButton(discord.ui.Button):
-    """
-    Play the last few clips back as one animation.
-
-    The label is rewritten every time the buffer changes (see
-    :meth:`RetroView._update_replay_label`), because the buffer is memory-only:
-    a message that survived a bot restart really can have nothing to replay,
-    and a button that says "Replay 15s" when it holds nothing is a lie. The
-    custom_id never changes, so Discord keeps routing clicks to it.
-    """
-
-    def __init__(self, row: int) -> None:
-        super().__init__(
-            label="Replay",
-            emoji=REPLAY_EMOJI,
-            style=discord.ButtonStyle.secondary,
-            row=row,
-            custom_id=f"{CUSTOM_ID_PREFIX}:replay",
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await self.view._replay(interaction)
-
-
 class _UndoButton(discord.ui.Button):
     """
     Step the game back to just before the last press.
+
+    The one control that can put the game *back*, which is also why there is
+    no Reset button beside it: see the note above _STYLES.
 
     Greyed out whenever there is nothing to undo, which is not a rare case:
     the history is memory-only (see :attr:`RetroView.history`), so a message
@@ -579,12 +587,13 @@ class RetroView(discord.ui.View):
 
     Anyone in the channel can press the buttons (it's a social feature); only
     the person who started the game, moderators, and the bot owner can stop
-    the session, which is what `[p]retrostop` is for.
+    the session (`[p]retrostop`) or reboot it (`[p]retroreset`).
 
-    The message carries the clip and nothing else. There is no status card:
-    the buttons say what they do, and the only text that ever appears is the
-    occasional sentence that has to be said (the game went to sleep, a save
-    state could not be restored, an emulator error).
+    The message carries the clip and one line of text. There is no status
+    card: the buttons say what they do, and the line says what just happened
+    -- which button was pressed, or whatever had to be said instead (the game
+    was asleep and has come back, a save state could not be restored, an
+    emulator error). It is rewritten by every press, so it is never stale.
     """
 
     def __init__(
@@ -631,19 +640,22 @@ class RetroView(discord.ui.View):
 
         # The live emulator, or None while hibernated.
         self.emulator: typing.Optional[RetroEmulator] = None
-        # The most recent clips, oldest first, so Replay can stitch the last
-        # REPLAY_SECONDS back together. Memory only and deliberately so: these
-        # are hundreds of kilobytes each, they are worthless the moment the
-        # session moves on, and writing them to disk would multiply the cog's
-        # storage by the number of channels for a button nobody presses twice.
-        # A bot restart therefore empties it, and Replay says so.
-        self.clips: typing.Deque[typing.Tuple[bytes, float]] = collections.deque()
+        # The clip that is on the message right now, or None before the first
+        # one (and after a restart, since this is memory only).
+        #
+        # One clip, not a buffer of them. A session used to keep its last
+        # fifteen seconds of footage -- up to MAX_REPLAY_BYTES, i.e. 8 MiB --
+        # so the Replay button could stitch it back together; that button is
+        # gone and so is the buffer. What is left is the single attachment the
+        # single edit a press makes has already uploaded, a few tens of
+        # kilobytes, which is what the tests read to check the picture the
+        # channel is left looking at.
+        self.last_clip: typing.Optional[bytes] = None
         # The machine states the last few presses started from, oldest first,
         # each one zlib-compressed. This is what the Undo button pops. Memory
-        # only, exactly like the replay buffer above and for the same reasons
-        # -- and unlike the buffer it is also *cheap* to lose, because the
-        # authoritative save state is on disk either way. A restart therefore
-        # empties it and Undo greys itself out until the next press.
+        # only, and *cheap* to lose, because the authoritative save state is
+        # on disk either way. A restart therefore empties it and Undo greys
+        # itself out until the next press.
         self.history: typing.Deque[bytes] = collections.deque()
         self._history_bytes: int = 0
         self.press_count: int = 0
@@ -667,7 +679,6 @@ class RetroView(discord.ui.View):
         self.message: typing.Optional[discord.Message] = None
         self.lock: asyncio.Lock = asyncio.Lock()
         self._build_controls()
-        self._update_replay_label()
         self._update_repeat_label()
         self._update_undo_button()
 
@@ -678,11 +689,11 @@ class RetroView(discord.ui.View):
         Lay this console's controller out; see the row plan in systems.py.
 
         The console's own grid comes first, spacers and all, and the control
-        cluster -- Wait, confirm x3, Replay, Undo -- goes on the end of the
-        last row if all of it fits there and on a row of its own if it does
-        not. Which is most consoles now that the cluster is four wide: only a
-        one-button bottom row (the Master System's Pause, the Neo Geo
-        Pocket's Option) leaves room beside it.
+        cluster -- Wait, confirm x3, Undo -- goes on the end of the last row
+        if all of it fits there and on a row of its own if it does not. Three
+        wide fits beside every console's bottom row here, including a
+        two-button Start/Select; it was four while Replay existed, which was
+        one too many for all but the Master System and the Neo Geo Pocket.
         """
         rows = self.system.rows
         if len(rows) > MAX_LAYOUT_ROWS:
@@ -702,8 +713,8 @@ class RetroView(discord.ui.View):
                 else:
                     self.add_item(_GameButton(spec, row=index))
 
-        # Wait / confirm x3 / Replay / Undo. They share the last row when
-        # there is space, which is how Pause ends up beside them.
+        # Wait / confirm x3 / Undo. They share the last row when there is
+        # space, which on every console here they do.
         last = len(rows) - 1
         if len(rows[last]) + CONTROL_BUTTONS <= MAX_BUTTONS_PER_ROW:
             control_row = last
@@ -722,7 +733,6 @@ class RetroView(discord.ui.View):
             # CONTROL_BUTTONS still reserves room for the whole cluster
             # either way, so the layout does not move when it is greyed out.
             self.add_item(_RepeatButton(confirm, control_row, self.repeat_taps))
-        self.add_item(_ReplayButton(control_row))
         self.add_item(_UndoButton(control_row))
         if len(self.children) > MAX_COMPONENTS:
             raise ValueError(
@@ -852,89 +862,42 @@ class RetroView(discord.ui.View):
         """
         return len(self.press_plan(REPEAT_TAPS))
 
-    # -- The replay buffer --------------------------------------------------
+    # -- The clip on the message --------------------------------------------
 
-    @property
-    def last_clip(self) -> typing.Optional[bytes]:
-        """The clip currently on the message, or None if there isn't one."""
-        return self.clips[-1][0] if self.clips else None
-
-    @last_clip.setter
-    def last_clip(self, data: typing.Optional[bytes]) -> None:
-        if data is None:
-            self.clips.clear()
-            self._update_replay_label()
-        else:
-            self.remember_clip(data)
-
-    @property
-    def buffered_seconds(self) -> float:
-        """How much footage Replay would actually show, in seconds."""
-        return min(float(REPLAY_SECONDS), sum(seconds for _, seconds in self.clips))
-
-    def remember_clip(self, data: bytes) -> None:
-        """Add a freshly recorded clip to the replay buffer."""
-        if not data:
-            return
-        self.clips.append((bytes(data), float(self.clip_seconds)))
-        self._trim_clips()
-        self._update_replay_label()
-
-    def _trim_clips(self) -> None:
+    def remember_clip(self, data: typing.Optional[bytes]) -> None:
         """
-        Drop the oldest clips until the buffer fits all three of its bounds.
+        Record which clip is on the message now.
 
-        Seconds is the bound that is meant to apply, and now does at every
-        clip length: MAX_REPLAY_CLIPS is derived from REPLAY_SECONDS and the
-        shortest clip allowed, so the count cannot cut the replay short the
-        way a flat eight clips did once a clip became one second. The byte
-        cap is a backstop for a game that somehow encodes enormous ones. The
-        clip that straddles the fifteen-second edge is kept, because
-        :func:`concatenate_clips` trims it frame by frame.
+        One clip, kept because it is the picture the channel is left looking
+        at and therefore the thing a test can hold the emulator to; see
+        :attr:`last_clip` for what used to be here instead. Empty or ``None``
+        means "nothing on the message", which is a restored session's state.
         """
-        while len(self.clips) > MAX_REPLAY_CLIPS:
-            self.clips.popleft()
-        while len(self.clips) > 1 and sum(len(d) for d, _ in self.clips) > MAX_REPLAY_BYTES:
-            self.clips.popleft()
-        covered = 0.0
-        keep = 0
-        for _, seconds in reversed(self.clips):
-            keep += 1
-            covered += seconds
-            if covered >= REPLAY_SECONDS:
-                break
-        while len(self.clips) > keep:
-            self.clips.popleft()
+        self.last_clip = bytes(data) if data else None
 
-    def _update_replay_label(self) -> None:
+    def press_note(
+        self, field: typing.Optional[str], repeat: int = 1
+    ) -> str:
         """
-        Make the Replay button say what it would actually replay.
+        The one line that says which button this press was.
 
-        The buffer only lives in memory, so a message that survived a restart
-        has nothing to replay at all; the button is greyed out until the next
-        press rather than claiming otherwise. With more than one clip buffered
-        it says how many seconds it will show, since that is the thing the
-        player cannot otherwise know. The custom_id never changes, so none of
-        this affects how Discord routes a click.
+        See PRESSED_NOTE: the console's own name for the button, or the
+        d-pad's arrow, taken from systems.py so nothing can drift out of step
+        with what is drawn on the button that was clicked. ``field`` of None
+        is the Wait button, which pressed nothing.
 
-        The figure is written to one decimal place rather than rounded to a
-        whole second: two 0.2s clips are 0.4 seconds of footage, and
-        ``round()`` made that button say "Replay 0s".
+        The repeat button counts the taps that will really happen rather than
+        the three that were asked for, exactly as its label does -- a short
+        clip fits two, and a line saying "x3" over a clip showing two taps
+        would be the same lie the label refuses to tell.
         """
-        button = next(
-            (child for child in self.children if isinstance(child, _ReplayButton)), None
-        )
-        if button is None:
-            return
-        if not self.clips:
-            button.label = "Replay"
-            button.disabled = True
-        elif len(self.clips) == 1:
-            button.label = "Replay"
-            button.disabled = False
-        else:
-            button.label = f"Replay {format_seconds(self.buffered_seconds, 1)}s"
-            button.disabled = False
+        if field is None:
+            return WAITED_NOTE
+        button = self.system.caption_for(field)
+        taps = len(self.press_plan(repeat)) if repeat > 1 else 1
+        if taps > 1:
+            button = f"{button} x{taps}"
+        return PRESSED_NOTE.format(button=button)
 
     def _update_repeat_label(self) -> None:
         """
@@ -944,9 +907,9 @@ class RetroView(discord.ui.View):
         the spacing to fit a shorter one and then drops taps, so the label has
         to follow it rather than stating REPEAT_TAPS for ever. At one tap the
         button does nothing the console's own confirm button does not, so it
-        is greyed out instead -- the same treatment Replay gets when there is
-        nothing to replay, and for the same reason: better a dead button than
-        a lying one. The layout never moves, because systems.py reserves room
+        is greyed out instead -- the same treatment Undo gets when there is
+        nothing to undo, and for the same reason: better a dead button than a
+        lying one. The layout never moves, because systems.py reserves room
         for three controls whether or not this one is usable.
         """
         button = next(
@@ -1025,8 +988,7 @@ class RetroView(discord.ui.View):
         Grey Undo out when there is nothing to undo.
 
         Which is the state every session starts in, and the state a session
-        comes back from a bot restart in: the history is memory only. Same
-        treatment as Replay's empty buffer, and for the same reason -- better
+        comes back from a bot restart in: the history is memory only. Better
         a dead button than a lying one. The custom_id never changes, so none
         of this affects how Discord routes a click.
         """
@@ -1040,23 +1002,20 @@ class RetroView(discord.ui.View):
         """
         Put the last press back and record a clip of where it landed.
 
-        Runs in a worker thread, called from ``Retro.run_undo``. Three things
+        Runs in a worker thread, called from ``Retro.run_undo``. Two things
         happen, in this order:
 
         1. the newest undo point is popped and loaded, so the machine is
            back where the undone press found it;
-        2. the footage of that press is dropped from the replay buffer,
-           because it is footage of something the game no longer did. The
-           buffer rewinds with the game rather than showing a player walking
-           into a room they are not in;
-        3. a fresh clip is recorded with no input at all, so the channel can
-           see where the game ended up. The caller puts *that* clip in the
-           buffer in place of the one dropped, which is what keeps a
-           stitched replay a contiguous account of the play that still
-           stands: the undone second is gone and this second, run from the
-           same starting point, took its place.
+        2. a fresh clip is recorded with no input at all, so the channel can
+           see where the game ended up. That clip replaces the undone
+           press's on the message, which is all there is to put back now:
+           there used to be a buffer of recent clips here that had to be
+           rewound in step with the game so a stitched replay could not show
+           somebody walking into a room they were not in, and both the
+           buffer and the replay are gone.
 
-        That third step means an undo costs one clip's worth of emulated
+        That second step means an undo costs one clip's worth of emulated
         time, exactly as the Wait button does, and that is deliberate. The
         alternative -- recording the clip and then reloading the state, so
         the machine is byte-for-byte where it was -- would leave the clip on
@@ -1091,12 +1050,49 @@ class RetroView(discord.ui.View):
                 "the state back (most likely its core was updated). The game "
                 "itself is untouched."
             ) from error
-        # The press did not happen, so neither did its footage. The newest
-        # clip is always the one the undone press recorded: every press
-        # appends exactly one and _trim_clips only ever drops from the left.
-        if self.clips:
-            self.clips.pop()
-        self._update_replay_label()
+        return self._record(emulator, None)
+
+    def run_reset(self) -> bytes:
+        """
+        Reboot the machine and record a clip of it coming back up.
+
+        Runs in a worker thread, called from ``Retro.run_reset``, which is
+        what `[p]retroreset` goes through. There is deliberately no button
+        for this: see the note above _STYLES.
+
+        Three things happen, in this order:
+
+        1. the state the reset is about to throw away is pushed onto the undo
+           history, so one click of **Undo** puts the player back where they
+           were. A reset is the most destructive thing this cog can do to
+           progress-in-flight, and absorbing exactly that class of mistake is
+           what the history is for; it costs a sub-millisecond save_state()
+           and some tens of kilobytes. The rest of the history is left alone:
+           every entry in it came from this same core and this same ROM, so
+           it is still loadable, and a second click of Undo means what it
+           always means -- the machine one press further back;
+        2. ``retro_reset``, i.e. the power switch. The cartridge's battery
+           memory survives it (see :meth:`RetroEmulator.reset`), so the
+           player's own in-game save is not touched;
+        3. BOOT_SECONDS of emulation and then a clip, exactly as a cold boot
+           does, so the channel sees the game at its title screen rather than
+           one second of a blank screen with the logo still coming up.
+
+        Nothing is written to disk here, and that is the point of doing it
+        this way: the save state on disk still holds the moment before the
+        reset until the game saves again of its own accord (every
+        SAVE_STATE_EVERY_PRESSES presses, or when it next sleeps). See
+        ``Retro.retroreset``, which says so in the reply.
+
+        Raises EmulatorError if the core is not running or will not reset.
+        """
+        emulator = self.emulator
+        if emulator is None:
+            raise EmulatorError("The emulator is not running.")
+        # Before anything is thrown away: this is the moment Undo puts back.
+        self.remember_state(emulator)
+        emulator.reset()
+        emulator.advance(emulator.frames_for_seconds(BOOT_SECONDS))
         return self._record(emulator, None)
 
     @staticmethod
@@ -1113,7 +1109,7 @@ class RetroView(discord.ui.View):
         out for the second it took to emulate, and that cost an extra edit of
         the message, which is what made the previous clip play again from the
         beginning (see :meth:`_ack_now`). ``False`` is still called on every
-        redraw, because that is also where Replay and the repeat button are
+        redraw, because that is also where the repeat button and Undo are
         made to say what they will really do.
         """
         for child in self.children:
@@ -1122,14 +1118,12 @@ class RetroView(discord.ui.View):
             if hasattr(child, "disabled"):
                 child.disabled = disabled
         if not disabled:
-            # Replay, the repeat button and Undo are the three controls that
-            # can have nothing to do: Replay comes back only if there is
-            # something in the buffer, the repeat button only if the clip is
+            # The repeat button and Undo are the two controls that can have
+            # nothing to do: the repeat button comes back only if the clip is
             # long enough to fit more than one tap, and Undo only if a press
             # this process saw has something to step back to. This runs on
             # every redraw, so changing the clip length mid-game corrects the
             # repeat button and every press re-arms Undo.
-            self._update_replay_label()
             self._update_repeat_label()
             self._update_undo_button()
 
@@ -1137,13 +1131,14 @@ class RetroView(discord.ui.View):
 
     def _content(self, message: typing.Optional[str] = None) -> typing.Optional[str]:
         """
-        The text to put on the message with the clip, which is usually none.
+        The text to put on the message with the clip: one short line, or none.
 
-        The clip and the buttons are the whole interface: a card repeating the
-        console's name over a picture of that console is noise. Text appears
-        only when there is something to say -- ``message`` from the caller
-        (the game went to sleep, the emulator failed), or a pending one-off
-        notice, which is cleared as it is shown so it appears exactly once.
+        The clip and the buttons are most of the interface: a card repeating
+        the console's name over a picture of that console is noise. Text is
+        one line and no more -- ``message`` from the caller (which button was
+        pressed, the game went to sleep, the emulator failed), or a pending
+        one-off notice, which beats it and is cleared as it is shown so it
+        appears exactly once.
 
         Returning None is meaningful rather than lazy: discord.py sends an
         explicit null for it, which *clears* whatever the message said before,
@@ -1202,6 +1197,41 @@ class RetroView(discord.ui.View):
             # access to the channel; the session state is still correct.
             log.warning("Failed to refresh the Libretro message.", exc_info=True)
 
+    async def show_clip(self, clip: bytes, note: typing.Optional[str] = None) -> bool:
+        """
+        Put a clip on the session's message from outside an interaction.
+
+        :meth:`_show` is the same edit made from a button click, where the
+        interaction is what has to be edited; this is for a *command* that
+        moved the game on and wants the game's own message to show it --
+        `[p]retroreset`. One edit, for the same reason a press makes one (see
+        :meth:`_ack_now`), and the same precedence: a pending :attr:`notice`
+        beats ``note``.
+
+        Returns whether the message was edited. Never raises: the command has
+        its own reply to fall back on, and a message that has been deleted is
+        not a reason for the reset itself to look like it failed.
+        """
+        self.remember_clip(clip)
+        message = await self.resolve_message()
+        if message is None:
+            return False
+        self._set_disabled(False)
+        try:
+            self.message = await message.edit(
+                content=self._content(note),
+                attachments=[self._clip_file(clip)],
+                view=self,
+            )
+        except discord.HTTPException:
+            log.warning(
+                "Failed to put a new clip on the Libretro message in channel %s.",
+                self.channel_id,
+                exc_info=True,
+            )
+            return False
+        return True
+
     # -- Starting -----------------------------------------------------------
 
     async def start(
@@ -1233,7 +1263,7 @@ class RetroView(discord.ui.View):
         # written before the message goes out, so the first thing anybody
         # sees is already correct.
         self._update_repeat_label()
-        self.last_clip = clip
+        self.remember_clip(clip)
         self.touch()
         if on_booted is not None:
             on_booted(self)
@@ -1337,9 +1367,18 @@ class RetroView(discord.ui.View):
                 log.exception("Unexpected emulator failure in channel %s", self.channel_id)
                 await self._recover(interaction, "The emulator hit an unexpected error.")
                 return
-            self.last_clip = clip
+            self.remember_clip(clip)
             self.touch()
-            await self._show(interaction, clip, RESUMED_NOTE if resuming else None)
+            # The press names itself on the message, on the very same edit
+            # that carries the clip (see :meth:`press_note`). The resume line
+            # beats it when there is one, because "the game was asleep and is
+            # back" is news and "you pressed A" is a label; a real notice
+            # beats both, which _show settles.
+            await self._show(
+                interaction,
+                clip,
+                RESUMED_NOTE if resuming else self.press_note(field, repeat),
+            )
 
     @staticmethod
     async def _silent_ack(interaction: discord.Interaction) -> None:
@@ -1416,11 +1455,18 @@ class RetroView(discord.ui.View):
         Swap in the new clip and redraw the controls. The *only* edit a press
         makes; see :meth:`_ack_now` for why there is not a second one.
 
-        ``note`` is a line the *press* wants said (that the game was asleep
-        and has come back). A pending :attr:`notice` beats it, because that is
-        something the wake itself discovered and has to report -- that the
-        save state was rejected after a core update, for instance -- and only
-        one of the two can be shown.
+        ``note`` is a line the *click* wants said: which button was pressed
+        (see :meth:`press_note`), that the game was asleep and has come back,
+        or that the last press was undone. A pending :attr:`notice` beats it,
+        because that is something the wake itself discovered and has to
+        report -- that the save state was rejected after a core update, for
+        instance -- and only one line can be shown.
+
+        So the order of precedence, most important first, is: a notice, then
+        the resumed line, then which button was pressed. It is never empty on
+        a press any more, which is what stops a line going stale: the one
+        edit a press makes always writes the whole ``content``, so the press
+        before last cannot still be on screen.
         """
         self._set_disabled(False)
         content = self._content()
@@ -1461,99 +1507,6 @@ class RetroView(discord.ui.View):
         except discord.HTTPException:
             log.warning("Failed to report a Libretro failure.", exc_info=True)
 
-    async def _replay(self, interaction: discord.Interaction) -> None:
-        """
-        Play the last few clips back as one animation.
-
-        Re-uploading bytes creates a new attachment, and Discord plays a
-        freshly loaded clip from the start; the clips are encoded to run
-        through exactly once, so re-uploading is the only way to see one twice.
-
-        With one clip buffered that is all this does, and it stays a single
-        instant edit. With more, the buffered clips are decoded and stitched
-        into one animation covering the last REPLAY_SECONDS -- a second or so
-        of work on a real game -- and that too is one edit and no more, for
-        exactly the reason a press is (see :meth:`_ack_now`): the edit that
-        used to grey the controls out while the stitching ran also made the
-        clip already on the message play again from its first frame, so
-        pressing Replay showed the old clip, then the stitched one.
-        """
-        if self.closed or self.lock.locked():
-            await self._silent_ack(interaction)
-            return
-        if not self.clips:
-            # The buffer only lives in memory, so a restart empties it.
-            await interaction.response.send_message(
-                "There is nothing to replay: this game's clips are kept in "
-                "memory only, and the bot has restarted since the last one. "
-                "Press a button to record one.",
-                ephemeral=True,
-            )
-            return
-        if len(self.clips) == 1:
-            try:
-                await interaction.response.edit_message(
-                    content=self._content(),
-                    attachments=[self._clip_file(self.last_clip)],
-                    view=self,
-                )
-            except discord.HTTPException:
-                log.exception(
-                    "Failed to replay the Libretro clip in channel %s.", self.channel_id
-                )
-                await self._whisper(
-                    interaction, "Discord would not accept that clip again."
-                )
-            return
-
-        async with self.lock:
-            clips = [data for data, _ in self.clips]
-            # The clips' own nominal lengths go with them: a clip in which
-            # nothing moved carries no timing of its own, and the session is
-            # the only thing that knows it stood for a second of play.
-            lengths = [seconds for _, seconds in self.clips]
-            await self._ack_now(interaction)
-            try:
-                clip, seconds = await asyncio.to_thread(
-                    concatenate_clips,
-                    clips,
-                    seconds=lengths,
-                    max_seconds=REPLAY_SECONDS,
-                    max_frames=MAX_REPLAY_FRAMES,
-                    clip_format=self.clip_format,
-                )
-            except Exception as error:
-                # Stitching is a nicety on top of a game that is running
-                # perfectly well, so a failure falls back to the single clip
-                # the old Replay button would have shown.
-                log.warning(
-                    "Could not stitch the replay for channel %s: %s",
-                    self.channel_id,
-                    error,
-                )
-                clip, seconds = self.last_clip, 0.0
-            # Never disabled, so this is only here to redraw the two controls
-            # that can have nothing to do; see _set_disabled.
-            self._set_disabled(False)
-            note = (
-                None
-                if not seconds
-                else f"The last {format_seconds(seconds, 1)} seconds, replayed."
-            )
-            try:
-                self.message = await interaction.edit_original_response(
-                    content=self._content(note),
-                    attachments=[self._clip_file(clip)],
-                    view=self,
-                )
-            except discord.HTTPException:
-                log.exception(
-                    "Failed to replay the Libretro clip in channel %s.", self.channel_id
-                )
-                await self._whisper(
-                    interaction, "Discord would not accept that clip again."
-                )
-
     async def _undo(self, interaction: discord.Interaction) -> None:
         """
         Step the game back to just before the last press.
@@ -1565,8 +1518,7 @@ class RetroView(discord.ui.View):
         An empty history is the ordinary case rather than an error -- the
         button is greyed out for it, and a bot restart empties it -- so a
         click that gets through anyway is answered privately and the message
-        is not touched at all. That is one interaction response and zero
-        edits, exactly as Replay does with an empty buffer.
+        is not touched at all: one interaction response, zero edits.
         """
         if self.closed or self.lock.locked():
             await self._silent_ack(interaction)
@@ -1597,25 +1549,35 @@ class RetroView(discord.ui.View):
                 log.exception("Unexpected undo failure in channel %s", self.channel_id)
                 await self._recover(interaction, "The emulator hit an unexpected error.")
                 return
-            # run_undo dropped the undone press's footage from the buffer;
-            # this clip takes its place, so the buffer stays a contiguous
-            # record of the play that actually stands and Replay cannot show
-            # somebody walking into a room they are not in.
-            self.last_clip = clip
+            # This clip replaces the undone press's on the message, so what
+            # the channel is left looking at is where the game actually is.
+            self.remember_clip(clip)
             self.touch()
+            # UNDONE_NOTE rather than a press line: nothing was pressed, and
+            # "Undid the last press." is the sentence every other line here
+            # was written to match.
             await self._show(interaction, clip, UNDONE_NOTE)
 
     async def can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
         """
-        Whether this user may stop the session with `[p]retrostop`.
+        Whether this user may stop or reset the session.
 
-        Anyone in the channel can play; ending someone else's game is the one
-        thing that is not open to everybody.
+        Anyone in the channel can play; ending someone else's game
+        (`[p]retrostop`) and rebooting it (`[p]retroreset`) are the two things
+        that are not open to everybody, because both of them cost the whole
+        channel its progress-in-flight. One check for both, rather than two
+        that could drift.
+
+        ``guild_permissions`` is duck-typed rather than gated on
+        ``isinstance(user, discord.Member)``, exactly as
+        ``SavesMixin._may_manage_saves`` does it: a Member has the attribute
+        and a plain User does not, which *is* the question being asked, and
+        an isinstance check on a library class only makes the branch
+        impossible to exercise in a test.
         """
         if user.id == self.starter_id:
             return True
         if await self.cog.bot.is_owner(user):
             return True
-        if isinstance(user, discord.Member) and user.guild_permissions.manage_messages:
-            return True
-        return False
+        permissions = getattr(user, "guild_permissions", None)
+        return bool(permissions is not None and getattr(permissions, "manage_messages", False))

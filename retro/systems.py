@@ -49,7 +49,6 @@ __all__ = [
     "SPACER_LABEL",
     "is_spacer",
     "WAIT_EMOJI",
-    "REPLAY_EMOJI",
     "RESUME_EMOJI",
     "UNDO_EMOJI",
     "EMOJI_CODEPOINTS",
@@ -130,8 +129,8 @@ def is_spacer(button: Button) -> bool:
 #   In components.2.components.1.emoji.name: Invalid emoji
 #
 # and, because that is a 400 on the *send*, one bad character breaks the whole
-# command rather than rendering a blank button. This happened for real: the
-# Replay button briefly used U+21BB CLOCKWISE OPEN CIRCLE ARROW, which is an
+# command rather than rendering a blank button. This happened for real: a
+# control button briefly used U+21BB CLOCKWISE OPEN CIRCLE ARROW, which is an
 # ordinary symbol with no emoji form at all.
 #
 # So every emoji the cog can put on a button is listed here, deliberately, and
@@ -153,7 +152,6 @@ EMOJI_CODEPOINTS: typing.Dict[int, bool] = {
     0x27A1: True,   # BLACK RIGHTWARDS ARROW
     0x23E9: False,  # BLACK RIGHT-POINTING DOUBLE TRIANGLE
     0x25B6: True,   # BLACK RIGHT-POINTING TRIANGLE
-    0x1F501: False,  # CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS
     # LEFTWARDS ARROW WITH HOOK, which Unicode's emoji-data.txt calls "right
     # arrow curving left" and every client draws as the undo/reply arrow. It
     # is Emoji=Yes, Emoji_Presentation=No, so it MUST carry U+FE0F -- the
@@ -170,7 +168,6 @@ VARIATION_SELECTOR_16 = "\N{VARIATION SELECTOR-16}"
 # validate_emoji() sees every emoji the cog can render without importing
 # discord.py.
 WAIT_EMOJI = "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE}"
-REPLAY_EMOJI = "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS}"
 RESUME_EMOJI = "\N{BLACK RIGHT-POINTING TRIANGLE}\N{VARIATION SELECTOR-16}"
 UNDO_EMOJI = "\N{LEFTWARDS ARROW WITH HOOK}\N{VARIATION SELECTOR-16}"
 
@@ -218,7 +215,7 @@ def emoji_problem(emoji: str) -> typing.Optional[str]:
 
 def all_button_emoji() -> typing.Tuple[str, ...]:
     """Every emoji the cog can put on a button, deduplicated and sorted."""
-    found = {WAIT_EMOJI, REPLAY_EMOJI, RESUME_EMOJI, UNDO_EMOJI}
+    found = {WAIT_EMOJI, RESUME_EMOJI, UNDO_EMOJI}
     for button in DPAD:
         if button.emoji:
             found.add(button.emoji)
@@ -275,9 +272,9 @@ def _face(label: str, field: str) -> Button:
 #
 # Discord gives a message five action rows of five components each, 25 in
 # total. Each console's ``rows`` below is its whole controller as a grid; the
-# view appends the control cluster -- Wait / confirm x3 / Replay / Undo -- to
-# the last row if all four of them fit, and to a row of their own if they do
-# not (see RetroView._build_controls).
+# view appends the control cluster -- Wait / confirm x3 / Undo -- to the last
+# row if all three of them fit, and to a row of their own if they do not (see
+# RetroView._build_controls).
 #
 # Every layout is built from the same shape, so a Genesis pad and a Game Boy
 # pad are recognisably the same thing:
@@ -286,77 +283,69 @@ def _face(label: str, field: str) -> Button:
 #     row 1:  ⬅ ⬇ ➡  <the face buttons that fit beside the d-pad>
 #     row 2:  ·  ·    <the lower face row, on consoles that need one>
 #     next :  Start / Select / Mode / ...
-#     last :  Wait  confirm x3  Replay  Undo   (sharing the row above when it fits)
+#     last :  Wait  confirm x3  Undo   (sharing the row above when it fits)
 #
 # "·" is SPACER: a disabled button that holds the column above "down" open so
 # the d-pad reads as a cross instead of a line. The spacers on a lower face
 # row are there to keep that row aligned under the row above it.
 #
-# In full, per console (⬆⬇⬅➡ are the d-pad, · a spacer, and the four
+# In full, per console (⬆⬇⬅➡ are the d-pad, · a spacer, and the three
 # controls the view appends are shown in brackets):
 #
-#   Game Boy / NES        ·  ⬆                       13 components, 4 rows
+#   Game Boy / NES        ·  ⬆                       12 components, 3 rows
 #                         ⬅  ⬇  ➡  B  A
-#                         Start  Select
-#                         [Wait  A x3  Replay  Undo]
+#                         Start  Select  [Wait  A x3  Undo]
 #
-#   Game Boy Advance      ·  ⬆  L  R                 15 components, 4 rows
+#   Game Boy Advance      ·  ⬆  L  R                 14 components, 3 rows
 #                         ⬅  ⬇  ➡  B  A
-#                         Start  Select
-#                         [Wait  A x3  Replay  Undo]
+#                         Start  Select  [Wait  A x3  Undo]
 #
-#   Super Nintendo        ·  ⬆  L  R                 20 components, 5 rows
+#   Super Nintendo        ·  ⬆  L  R                 19 components, 4 rows
 #                         ⬅  ⬇  ➡  Y  X
 #                         ·  ·  ·  B  A
-#                         Start  Select
-#                         [Wait  A x3  Replay  Undo]
+#                         Start  Select  [Wait  A x3  Undo]
 #
-#   Sega Genesis          ·  ⬆  X  Y  Z              19 components, 5 rows
+#   Sega Genesis          ·  ⬆  X  Y  Z              18 components, 4 rows
 #                         ⬅  ⬇  ➡
 #                         ·  ·  A  B  C
-#                         Mode  Start
-#                         [Wait  B x3  Replay  Undo]
+#                         Mode  Start  [Wait  B x3  Undo]
 #
-#   PC Engine             ·  ⬆  IV  V  VI            19 components, 5 rows
+#   PC Engine             ·  ⬆  IV  V  VI            18 components, 4 rows
 #                         ⬅  ⬇  ➡
 #                         ·  ·  III  II  I
-#                         Select  Run
-#                         [Wait  I x3  Replay  Undo]
+#                         Select  Run  [Wait  I x3  Undo]
 #
-#   Master System         ·  ⬆                       12 components, 3 rows
+#   Master System         ·  ⬆                       11 components, 3 rows
 #                         ⬅  ⬇  ➡  1  2
-#                         Pause  [Wait  1 x3  Replay  Undo]
+#                         Pause  [Wait  1 x3  Undo]
 #
-#   Neo Geo Pocket        ·  ⬆                       12 components, 3 rows
+#   Neo Geo Pocket        ·  ⬆                       11 components, 3 rows
 #                         ⬅  ⬇  ➡  A  B
-#                         Option  [Wait  A x3  Replay  Undo]
+#                         Option  [Wait  A x3  Undo]
 #
 # Undo is in the control cluster rather than in any console's grid because
-# that is what it is: a control, like Wait and Replay, and not a button the
-# console has. The cost of adding it was that the cluster no longer fits
-# beside Start/Select on a two-button bottom row, so on six of the eight
-# consoles the controls moved to a row of their own -- which is why the Super
-# Nintendo, the Genesis and the PC Engine now use all five action rows. The
-# Master System and the Neo Geo Pocket have a one-button bottom row and still
-# share it. Nothing was put next to the d-pad on purpose: the cell left of
-# "up" is the one free column every console has, and a labelled button there
-# would both shift ⬆ out of line (Discord sizes a button to its content) and
-# sit exactly where a thumb aims for a direction.
+# that is what it is: a control, like Wait, and not a button the console has.
+# The cluster was four wide while Replay existed, which is one too many to sit
+# beside a two-button Start/Select row; with Replay gone it is three again and
+# every console's controls share the bottom row, so the widest layouts are
+# back to four action rows and the whole set is one row and one component per
+# console smaller than it was. Nothing was put next to the d-pad on purpose:
+# the cell left of "up" is the one free column every console has, and a
+# labelled button there would both shift ⬆ out of line (Discord sizes a
+# button to its content) and sit exactly where a thumb aims for a direction.
 #
-# The worst case is the Super Nintendo at 20 components over five rows, so
-# there are five components of headroom and no spare row: a ninth console
-# with a four-row grid and a bottom row of three or more is the first thing
-# that would not fit. MAX_LAYOUT_ROWS and MAX_BUTTONS_PER_ROW enforce the
-# budget, validate_layouts() below checks it at import time, and the row plan
-# above is asserted on in CI.
+# The worst case is the Super Nintendo at 19 components over four rows, so
+# there are six components of headroom and a spare row. MAX_LAYOUT_ROWS and
+# MAX_BUTTONS_PER_ROW enforce the budget, validate_layouts() below checks it
+# at import time, and the row plan above is asserted on in CI.
 #
 # Discord's own limits, repeated here rather than imported from discord.py so
 # that this module keeps working with nothing but the standard library.
 MAX_ACTION_ROWS = 5
 MAX_BUTTONS_PER_ROW = 5
 MAX_COMPONENTS = 25
-# Wait, confirm x3, Replay and Undo, which RetroView appends to every layout.
-CONTROL_BUTTONS = 4
+# Wait, confirm x3 and Undo, which RetroView appends to every layout.
+CONTROL_BUTTONS = 3
 # How many rows a console's own grid may use, leaving room for the controls.
 MAX_LAYOUT_ROWS = 4
 
@@ -398,6 +387,33 @@ class System(typing.NamedTuple):
         if found is None or not found.label:
             return field.upper()
         return found.label
+
+    def caption_for(self, field: str) -> str:
+        """
+        How a press of this button is named in the message above the clip.
+
+        The console's own name for it when it has one -- A, Start, Mode, I
+        through VI, Option, Pause -- and the button's emoji when it has no
+        label at all, which is the d-pad: an arrow says which way somebody
+        went far better than the word "UP" does.
+
+        Read from the very same :class:`Button` the view renders rather than
+        from a second table beside it, so a console that names its buttons
+        unusually (the Genesis A is RetroPad *y*; the Neo Geo Pocket's A and B
+        are swapped from the RetroPad convention) is described the way its own
+        players read it, and nothing can drift out of step with the controls.
+        Every emoji here has already been through :func:`validate_emoji` at
+        import time, so nothing this returns can be a character Discord
+        refuses.
+
+        Falls back to :meth:`label_for` for a field this console does not
+        have, which is only reachable from a stale click on a message drawn
+        for a different game.
+        """
+        found = self.button(field)
+        if found is None:
+            return self.label_for(field)
+        return found.label or found.emoji or field.upper()
 
 
 # Extensions we never claim. ".fds" needs Nintendo's disksys.rom BIOS, and

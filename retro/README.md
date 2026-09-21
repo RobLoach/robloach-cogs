@@ -71,6 +71,7 @@ can start it by name:
 
 - `[p]retro [name|url]` starts a game from a saved name, a URL, or a ROM attached to the message. `.zip` files are unpacked for you. With no arguments it brings back the game already going in the channel.
 - `[p]retrostop` saves the game and puts it to sleep. The controls keep working — pressing any button wakes it up again. There is no Stop button under the screen; this command is how a game is stopped.
+- `[p]retroreset` reboots the game that is running, as if you had flipped its power switch. There is no Reset button under the screen either, deliberately — see [Resetting a game](#resetting-a-game). Not to be confused with `[p]retrosaves reset`, which deletes a save state *file*.
 - `[p]retrosaves [game]` (aliased `saves`) lists what this channel has saved, or shows one game in detail. See [Managing saves](#managing-saves).
 - `[p]retrosaves export <game>` posts a game's battery save as a file to keep. `export state <game>` or `export both <game>` sends the save state too.
 - `[p]retrosaves import <game>` installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real core first.
@@ -132,16 +133,15 @@ rather than swapped.
 ## The controller
 
 The buttons are laid out like the console's own pad rather than as a list: the
-d-pad is a cross on the left, the face buttons sit to its right, and the
-controls — **Wait**, **×3**, **Replay** and **Undo** — sit on a row of their
-own underneath. A Game Boy looks like this, where `·` is a greyed-out spacer
-that holds the column open:
+d-pad is a cross on the left, the face buttons sit to its right, and the three
+controls — **Wait**, **×3** and **Undo** — sit on the end of the bottom row.
+A Game Boy looks like this, where `·` is a greyed-out spacer that holds the
+column open:
 
 ```
 ·  ⬆️
 ⬅️  ⬇️  ➡️   B  A
-Start  Select
-⏩ Wait   A ×3   🔁 Replay   ↩️ Undo
+Start  Select  ⏩ Wait   A ×3   ↩️ Undo
 ```
 
 Consoles with more buttons grow upwards and sideways into the same shape — the
@@ -153,8 +153,7 @@ the six-button Genesis and PC Engine keep their real two-by-three face cluster:
 ·  ⬆️   X  Y  Z
 ⬅️  ⬇️  ➡️
 ·  ·   A  B  C
-Mode  Start
-⏩ Wait   B ×3   🔁 Replay   ↩️ Undo
+Mode  Start  ⏩ Wait   B ×3   ↩️ Undo
 ```
 
 Discord allows five rows of five components, and this is what each console
@@ -162,20 +161,26 @@ uses once the controls are added:
 
 | Console | Components | Rows |
 | --- | --- | --- |
-| Game Boy / Color, NES | 13 | 4 |
-| Game Boy Advance | 15 | 4 |
-| Super Nintendo | 20 | 5 |
-| Sega Genesis | 19 | 5 |
-| PC Engine | 19 | 5 |
-| Master System / Game Gear | 12 | 3 |
-| Neo Geo Pocket | 12 | 3 |
+| Game Boy / Color, NES | 12 | 3 |
+| Game Boy Advance | 14 | 3 |
+| Super Nintendo | 19 | 4 |
+| Sega Genesis | 18 | 4 |
+| PC Engine | 18 | 4 |
+| Master System / Game Gear | 11 | 3 |
+| Neo Geo Pocket | 11 | 3 |
 
-The Master System and the Neo Geo Pocket have a one-button bottom row
-(**Pause**, **Option**), so their controls still fit beside it. Everywhere
-else the four controls are one too many to share a row with Start and Select,
-which is why the widest layouts now use all five rows — five components of
-headroom left and no spare row, so a ninth console would have to end in a
-one- or two-button row.
+Three controls fit beside every console's bottom row, so none of them needs a
+row of its own. The cluster was four wide while there was a **Replay** button,
+which was one too many to share a row with Start and Select — so six of the
+eight consoles had their controls on a separate row and the widest three used
+all five of Discord's action rows. Removing Replay gave every console one
+component and, on six of them, one whole row back: the worst case is now the
+Super Nintendo at 19 components over four rows, leaving six components and a
+spare row in hand.
+
+There is no **Stop** button and no **Reset** button. Both are commands
+(`[p]retrostop`, `[p]retroreset`), because both are destructive to a game
+everybody in the channel is playing and neither should be one mis-tap away.
 
 ## Core options
 
@@ -447,29 +452,42 @@ console whose frame is wider than the corrected width (a Genesis in its
 A clip in which nothing moved at all — a title screen, a menu, a game waiting
 for you — is written as a single still frame of a few hundred bytes, which is
 exactly as informative and much likelier at a second than it was at four.
-Replay still counts it as the second of play it stood for.
 
-**Replay** shows the last **15 seconds**, not just the last clip. Each session
-keeps its most recent clips in memory, and pressing Replay decodes them and
-stitches them into one animation, oldest first, ending on the moment you just
-played. The button says how much it holds — `Replay 12s`, or `Replay 0.4s` on
-very short clips — so it never promises more than it has. Fifteen seconds is
-reachable at every clip length now: the clip cap used to be eight, which at
-a one second clip meant Replay could only ever hold eight seconds of the
-fifteen it advertised. The buffer holds as many clips as fifteen seconds
-takes — 76 at the 0.2s floor, 16 at a second, 5 at four seconds — bounded by
-8 MiB of memory it has never come close to. Fifteen seconds of Game Boy play
-in the buffer is 31 KiB at a second a clip and 81 KiB at 0.2s, and stitching
-it costs 0.18–0.40 seconds and produces a 13–25 KiB animation. The hard
-ceiling is 300 frames, which is more pictures than fifteen seconds needs at
-any clip length and keeps even a pathological, fully-changing SNES picture
-under seven seconds.
+**A session keeps one clip: the one on its message.** There used to be a
+**Replay** button that stitched the last fifteen seconds of play back into
+one animation, and with it a per-session buffer of recent clips bounded at
+**8 MiB**. Both are gone. It was not worth its keep — most people pressed it
+once — and it was the single largest thing a channel's session held on to.
+Measured on the real cores, fifteen seconds of play at the default clip
+length, buffer against the one clip that replaces it:
 
-The buffer is **memory only**. That is a deliberate trade: clips are worthless
-the moment the session moves on, and writing them would multiply the cog's
-storage by the number of channels for a button most people press once. So after
-a bot restart there is nothing to replay yet, and the button is greyed out and
-says so until the next press refills it.
+| Console | Buffer (15 × 1s) | One clip |
+| --- | --- | --- |
+| Game Boy (µCity) | 13.5 KiB | 0.7 KiB |
+| NES (nestest) | 21.8 KiB | 1.4 KiB |
+| Super Nintendo | 153.9 KiB | 12.4 KiB |
+| Genesis | 111.2 KiB | 2.0 KiB |
+
+At the 0.2s clip floor the buffer held 76 clips, 36.1 KiB of them, against
+0.5 KiB now. The *press* is no faster for it in any way anybody can feel: the
+bookkeeping the buffer needed on every press — copy, append, three caps to
+re-check, a button label to rewrite — measured 6.1 µs against a press that
+spends 37 ms recording a clip, so about 0.015% of it. What was really saved is
+the memory, the 0.18–0.40 s of decoding and re-encoding a Replay click cost,
+and a component on every console's controls.
+
+**Which button was pressed is written on the message.** Every press replaces
+the one line above the clip with its own name — `Pressed A.`, `Pressed ⬅️.`,
+`Pressed Start.`, `Pressed A ×3.`, `Waited.` — in the same voice as Undo's
+*Undid the last press.* The name comes from the console's own button table,
+so a Genesis press reads `Pressed C.` where the RetroPad would have called
+that button A, and the Neo Geo Pocket's A and B are the right way round. The
+d-pad has no labels, so it names itself with its arrow.
+
+It costs nothing: the line rides on the single edit that already carries the
+clip, so a press is still exactly one edit of the message. Anything more
+important wins — the resumed note, or a save state that could not be used —
+and the next press always rewrites the whole line, so it can never go stale.
 
 ### Undo
 
@@ -499,13 +517,12 @@ measured on the real cores on a Raspberry Pi 5:
 A full eight-deep history of real play is **124 KiB** on the Game Boy, 99 KiB
 on the SNES and 152 KiB on the Genesis, and compressing one costs about a
 millisecond inside a press that already spends tens of them recording a clip.
-The history is capped by bytes as well as by count (2 MiB, a quarter of the
-replay buffer's), because the sizes above are what *today's* cores cost and a
+The history is capped by bytes as well as by count (2 MiB), because the sizes
+above are what *today's* cores cost and a
 count alone bounds nothing.
 
-**The history is in memory only**, exactly like the replay buffer — and
-unlike the buffer it is cheap to lose, because the real save state is on disk
-either way. So a bot restart empties it: the button greys itself out, and a
+**The history is in memory only** — and it is cheap to lose, because the real
+save state is on disk either way. So a bot restart empties it: the button greys itself out, and a
 click that gets through anyway says
 
 > There is nothing to undo yet. Undo steps back through the last 8 presses,
@@ -521,20 +538,20 @@ has been **updated** in the meantime it will refuse the old state; that
 empties the history, says so in one line, and leaves the game exactly as it
 was.
 
-**Undo rewinds the replay buffer too.** The clip of the press that was undone
-is dropped from it and the undo's own clip takes its place, so **Replay** is
-always a contiguous account of the play that still stands rather than footage
-of somebody walking into a room they are not in.
+**The undo's own clip replaces the undone press's** on the message, so what
+the channel is left looking at is where the game actually is. (This used to
+be a larger job: the replay buffer had to rewind in step with the game, or a
+stitched replay would show somebody walking into a room they were not in.)
 
 Two deliberate details:
 
 * **An undo costs one clip's worth of emulated time**, exactly as pressing
   Wait does, because it records forwards from the restored state rather than
   freezing at it. Restoring and then rewinding again would leave the clip on
-  the message a second *ahead* of the game, and the next press would replay
-  that second — which is precisely the "the clip jumps backwards when I press
-  a button" problem described below. A game that is frozen between presses
-  can afford the second.
+  the message a second *ahead* of the game, and the next press would play
+  that second again — which is precisely the "the clip jumps backwards when I
+  press a button" problem described below. A game that is frozen between
+  presses can afford the second.
 * **An undo writes the save state to disk immediately** instead of waiting
   for the next automatic save. The state on disk is easily *newer* than the
   one Undo just restored, so without that a restart or a sleep straight
@@ -546,6 +563,50 @@ and `[p]retrosaves rollback` (aliased **`[p]retrosaves undo`**) is already
 the durable, on-disk version of the same idea — it goes back to the previous
 *save state generation* for a game, which is the answer when the in-memory
 history is gone.
+
+### Resetting a game
+
+`[p]retroreset` reboots the game that is playing in the channel, as if you had
+flipped its power switch. The clip on its message shows the game booting, and
+the message says *Reset the game.*
+
+**It is a command and not a button, deliberately.** A reset throws away the
+progress-in-flight of everybody in the channel, which is exactly the reason
+`[p]retrostop` is not a button either, and it has the same permission check:
+only the person who **started** the game, anybody with **Manage Messages**,
+and the bot owner can run it. Everyone else is told so and nothing happens.
+
+**`[p]retroreset` and `[p]retrosaves reset` are completely different
+commands**, which is the one thing to be clear about:
+
+| | what it does |
+| --- | --- |
+| `[p]retroreset` | reboots the game **now**. Nothing on disk is deleted. |
+| `[p]retrosaves reset <game>` | deletes a save **state file**, so the game next starts from its last in-game save. Touches no running game. |
+
+Three decisions inside it, and the reasons for them:
+
+* **Nothing on disk is written.** A reset does not save, so the `.state` file
+  still holds the moment *before* the reset — a reset is not allowed to
+  quietly overwrite a good save state with a title screen. It becomes the
+  saved game only when the rebooted game saves of its own accord: the next
+  automatic save (within three presses) or the next time it sleeps, both of
+  which also rotate the pre-reset state into the previous generation that
+  `[p]retrosaves rollback` can bring back.
+* **The cartridge's battery save is not touched at all.** That is the save the
+  player made from inside the game, and resetting a real console never wiped
+  one — `retro_reset` is the reset line, not a new cartridge. Use
+  `[p]retrosaves delete` if that is really what you want.
+* **A reset is an undo point.** The state it is about to throw away is pushed
+  onto the session's history first, so one click of **↩️ Undo** puts the
+  player back where they were. Nothing else in this cog can lose as much in
+  one command, and the undo machinery exists for exactly that class of
+  mistake; it costs a sub-millisecond save state and some tens of kilobytes.
+  The older undo points are left alone — they came from the same core and the
+  same ROM, so a second click still means "one press further back".
+
+A sleeping game is woken first (there is no power switch without a core) and
+then rebooted. If nothing is playing in the channel, the command says so.
 
 **A press changes the message exactly once.** The controls used to grey
 themselves out the instant you clicked and come back with the new clip, which
@@ -563,14 +624,15 @@ anything that shows you something either edits this message (and rewinds the
 clip) or posts a second one (an ephemeral "still emulating" notice, which was
 tried and removed for being spam). Clicks that arrive while a press is being
 emulated are still swallowed silently — nobody ever sees *This interaction
-failed* — and pressing **Replay** on a stitched replay behaves the same way,
-for the same reason.
+failed* — and the same is true of a click that lands while the game is being
+rebooted by `[p]retroreset`.
 
-Nothing but the clip is posted: no status card, no caption. The buttons say what
-they do. A line of text only appears when there is something to say, such as the
-game having gone to sleep or a save state that could not be restored, and it is
-cleared again by the next press. Waking a sleeping game says *Resumed where you
-left off…* alongside the clip it came back with.
+The clip and **one line** of text are all that is posted: no status card, no
+caption. The line says which button was pressed, unless there is something
+more important to say — the game having gone to sleep and come back, or a save
+state that could not be restored — and the next press rewrites it either way.
+Waking a sleeping game says *Resumed where you left off…* alongside the clip
+it came back with, instead of naming the button.
 
 **The game only runs while a clip is being recorded.** Between one press and the
 next the console is frozen mid-frame — it is not ticking away in the background,
@@ -658,9 +720,9 @@ because it posts the save file itself. **Embed Links** is used by one
 owner-only command, `[p]retroset settings`.
 
 Among the people in a channel, playing and looking at saves are open to
-everybody; destroying a save is not. `[p]retrostop`, `[p]retrosaves reset`,
-`[p]retrosaves delete` and `[p]retrosaves import` all want the person who
-started the game, **Manage Messages**, or the bot owner.
+everybody; destroying progress is not. `[p]retrostop`, `[p]retroreset`,
+`[p]retrosaves reset`, `[p]retrosaves delete` and `[p]retrosaves import` all
+want the person who started the game, **Manage Messages**, or the bot owner.
 
 ## BIOS files
 

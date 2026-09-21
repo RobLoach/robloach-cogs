@@ -20,7 +20,7 @@ built. Each one is a separate concern with its own module:
 What is left here is the cog itself: its Config schema, the session
 lifecycle (start, hibernate, wake, retire, resume), talking to Discord
 without letting an HTTP failure surface as a traceback, the rate limits, and
-the `[p]retro`, `[p]retrostop` and `[p]retroset` commands.
+the `[p]retro`, `[p]retrostop`, `[p]retroreset` and `[p]retroset` commands.
 
 Constants that moved into those modules are re-exported at the bottom of
 this one, so `retro.Retro.<NAME>` keeps meaning what it always did.
@@ -59,7 +59,6 @@ from .emulator import (
     MAX_CLIP_SECONDS,
     MIN_CLIP_SECONDS,
     MIN_ROM_SIZE,
-    REPLAY_SECONDS,
     EmulatorError,
     RetroEmulator,
     clamp_clip_seconds,
@@ -73,6 +72,7 @@ from .RetroView import (
     MAX_HOLD_MS,
     MIN_HOLD_MS,
     REPEAT_TAPS,
+    RESET_NOTE,
     SAVE_STATE_EVERY_PRESSES,
     Progress,
     RetiredView,
@@ -543,9 +543,9 @@ class Retro(
                 "",
                 *lines,
                 "",
-                "Recent gameplay clips are held in memory only, for the Replay "
-                "button, as are the save states the Undo button steps back "
-                "through, and both are lost whenever the bot restarts.",
+                "The clip a game is currently showing is held in memory only, "
+                "as are the save states the Undo button steps back through, "
+                "and both are lost whenever the bot restarts.",
             ]
         )
         return {"retro.txt": io.BytesIO(text.encode("utf-8"))}
@@ -744,18 +744,21 @@ class Retro(
         ``bot.remove_view``.
 
         So without this, a channel that plays twenty games leaves twenty
-        RetroViews reachable for the life of the process, each one holding
-        its replay buffer of up to MAX_REPLAY_BYTES. Marking them ``closed``
-        (which is still done, and still what answers a click that arrives in
-        the gap) stops them acting; it does not let go of them.
+        RetroViews reachable for the life of the process, each one holding a
+        clip and a stack of save states. Marking them ``closed`` (which is
+        still done, and still what answers a click that arrives in the gap)
+        stops them acting; it does not let go of them.
 
-        The replay buffer and the undo history are emptied here as well as
-        handed over, because they are the expensive part: a stray reference
-        to the view from somewhere unexpected should cost a few kilobytes of
-        object, not eight megabytes of footage and a stack of save states.
-        Emptying the history costs nothing either way -- this is only called
-        for a view the cog has finished with, whose game is either retired
-        or gone, so there is nothing anybody could still want to undo.
+        The clip on the message and the undo history are dropped here as well
+        as handed over, because they are the expensive part: a stray
+        reference to the view from somewhere unexpected should cost a few
+        kilobytes of object, not a clip and a stack of save states. (It used
+        to be worth far more than that: a session kept up to MAX_REPLAY_BYTES
+        -- eight megabytes -- of footage for the Replay button, and this is
+        where that was let go of.) Emptying the history costs nothing either
+        way: this is only called for a view the cog has finished with, whose
+        game is either retired or gone, so there is nothing anybody could
+        still want to undo.
 
         Call this *before* registering a replacement view on the same
         message: remove_view unconditionally drops that message id from
@@ -764,12 +767,8 @@ class Retro(
 
         Never raises: it is on every discard path, including cog_unload.
         """
-        clips = getattr(view, "clips", None)
-        if clips is not None:
-            try:
-                clips.clear()
-            except Exception:  # pragma: no cover - a deque cannot fail here
-                log.debug("Could not empty a replay buffer.", exc_info=True)
+        if hasattr(view, "last_clip"):
+            view.last_clip = None
         forget = getattr(view, "forget_history", None)
         if forget is not None:
             try:
@@ -865,6 +864,39 @@ class Retro(
             clip = await asyncio.to_thread(view.run_undo)
             view.touch()
             await self._write_state(view)
+            await self._save_record(view)
+            return clip
+
+    async def run_reset(self, view: RetroView) -> bytes:
+        """
+        Reboot a session's game, waking it up first if it was asleep.
+
+        Waking first is not a formality: a reset has to be a reset of *this*
+        game as the channel left it, and the only way to reach the core's
+        power switch is to have a core. A sleeping session is therefore
+        restored from its save state and then immediately rebooted, which
+        looks odd written down and is exactly right -- what the player asked
+        for is "put this game back to its title screen", and the ROM is the
+        only thing that needs to be in place for that.
+
+        Nothing is written to disk, unlike ``run_undo``, which writes the
+        state it restored straight through. That asymmetry is the whole of the
+        save-state decision behind `[p]retroreset`: an undo is a correction
+        that should survive a restart, while a reset must not quietly
+        overwrite a good save state with the title screen. The record is
+        saved (it is only the session's bookkeeping) but the ``.state`` file
+        is left holding the moment before the reset until the game saves
+        again of its own accord -- the next autosave, or its next sleep. See
+        ``RetroView.run_reset`` and the command's own help.
+
+        Raises EmulatorError if the session cannot be woken or the core will
+        not reset. Called by `[p]retroreset` and nothing else: there is no
+        Reset button.
+        """
+        async with self.emulator_lock:
+            await self._wake_locked(view)
+            clip = await asyncio.to_thread(view.run_reset)
+            view.touch()
             await self._save_record(view)
             return clip
 
@@ -1043,7 +1075,7 @@ class Retro(
         # button's label can be written from its real frame rate, and this is
         # the last chance before the message goes back out.
         view._update_repeat_label()
-        view.last_clip = clip
+        view.remember_clip(clip)
         view.touch()
         self._settle_boot(view, progress, notice)
         await self._forget_retired(channel_id, message_id)
@@ -1875,7 +1907,7 @@ class Retro(
             except EmulatorError as error:
                 await self._safe_send(ctx, f"The game could not be resumed: {error}")
                 return
-        view.last_clip = clip
+        view.remember_clip(clip)
         view.touch()
         try:
             view.message = await ctx.send(
@@ -2324,6 +2356,92 @@ class Retro(
         await ctx.send(
             "The game has been saved and put to sleep. Press any button on "
             "it to carry on."
+        )
+
+    @commands.guild_only()
+    @commands.command()
+    async def retroreset(self, ctx: commands.Context) -> None:
+        """
+        Reboot this channel's game, as if you had flipped its power switch.
+
+        The game starts again from its title screen, here and now, and the
+        clip on its message shows it booting. **This is not the same thing as
+        `[p]retrosaves reset`**, which touches no running game at all: that
+        one deletes a save state *file* on disk so the game starts from the
+        last in-game save the next time somebody plays it. This one reboots
+        the game that is playing right now.
+
+        Nothing on disk is deleted or overwritten. The save state still holds
+        the moment before the reset until the game saves again of its own
+        accord -- a few presses of the rebooted game, or the next time it
+        goes to sleep -- so a reset that was a mistake is recoverable: press
+        **Undo**, which steps straight back to the moment before it. The
+        cartridge's battery save (the one the game itself writes when you
+        save from its own menu) is not touched at all, exactly as resetting a
+        real console never wiped one.
+
+        Only the person who started the game, members with the Manage
+        Messages permission, and the bot owner can reset it, for the same
+        reason only they can stop it: it throws away everybody's
+        progress-in-flight.
+
+        **Examples:**
+        - `[p]retroreset`
+        """
+        view = self.sessions.get(ctx.channel.id)
+        if view is None:
+            await self._safe_send(
+                ctx,
+                "No game is running in this channel. Start one with "
+                f"`{ctx.clean_prefix}retro <name or url>`.",
+            )
+            return
+        if not await view.can_stop(ctx.author):
+            await self._safe_send(
+                ctx,
+                "Only the person who started the game, moderators, or the "
+                "bot owner can reset it.",
+            )
+            return
+        # The view's own lock, exactly as `[p]retrostop` takes it, so a press
+        # that is already being emulated finishes before the machine is
+        # rebooted underneath it.
+        async with ctx.typing():
+            try:
+                async with view.lock:
+                    clip = await self.run_reset(view)
+            except EmulatorError as error:
+                await self._safe_send(
+                    ctx, f"**{view.game_name}** could not be reset: {error}"
+                )
+                return
+            except Exception:
+                log.exception(
+                    "Unexpected failure resetting the Retro session in channel %s.",
+                    ctx.channel.id,
+                )
+                await self._safe_send(
+                    ctx, "The emulator hit an unexpected error; the game is untouched."
+                )
+                return
+        log.info(
+            "Reset %s in channel %s at %s's request.",
+            view.slug,
+            ctx.channel.id,
+            getattr(ctx.author, "id", "?"),
+        )
+        # The reset clip goes on the game's own message, with the line that
+        # says what happened -- one edit, like a press.
+        await view.show_clip(clip, RESET_NOTE)
+        await self._safe_send(
+            ctx,
+            f"**{view.game_name}** has been reset by {ctx.author.display_name} "
+            "\N{EM DASH} it is back at its title screen. Its in-game battery "
+            "save is untouched, and nothing on disk has been overwritten: "
+            "press **Undo** on the game to step straight back to the moment "
+            "before the reset, or carry on playing and the reset becomes the "
+            "save a few presses from now. To throw away a save state *file* "
+            f"instead, use `{ctx.clean_prefix}retrosaves reset`.",
         )
 
     @commands.group()
@@ -3415,9 +3533,7 @@ class Retro(
             value=(
                 f"{describe_seconds(clip_seconds)} of play per button press "
                 f"({format_seconds(MIN_CLIP_SECONDS)}-"
-                f"{format_seconds(MAX_CLIP_SECONDS)}, fractions allowed). "
-                f"Replay stitches the last {REPLAY_SECONDS} seconds back "
-                "together from clips kept in memory, so a restart empties it."
+                f"{format_seconds(MAX_CLIP_SECONDS)}, fractions allowed)."
             ),
             inline=False,
         )

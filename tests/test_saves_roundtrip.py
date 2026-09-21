@@ -395,11 +395,102 @@ async def test_a_real_eight_deep_history_is_about_a_hundred_kilobytes(real, city
     assert view.history_bytes == sum(len(blob) for blob in view.history)
     assert view.history_bytes <= viewmod.MAX_UNDO_BYTES
     # uCity's states are 182 KiB each raw and about 16 KiB compressed, so a
-    # full history is a fraction of what the raw states would be and a
-    # fraction of the replay buffer beside it.
+    # full history is a fraction of what the raw states would be -- and, now
+    # that the replay buffer is gone, the only thing a session holds beyond
+    # the one clip on its message.
     assert view.history_bytes < raw, (view.history_bytes, raw)
     assert view.history_bytes < 300 * 1024, view.history_bytes
     assert max(len(blob) for blob in view.history) < raw // 4
+
+
+# -- retroreset, against the real core ----------------------------------------
+
+
+async def test_retroreset_reboots_a_real_core_through_the_cog(real, city):
+    """`[p]retroreset` on the real thing, end to end.
+
+    FakeEmulator's reset is a frame counter going back to zero, which proves
+    the plumbing and nothing about the machine; this is the statement the
+    command actually makes. The reference is the same core booting the same
+    ROM from scratch in ``restore_into``'s own words -- a cold boot -- which
+    is what "as if you had flipped the power switch" has to mean.
+
+    The work RAM is compared as a distance rather than for equality: a Game
+    Boy reset is the reset line and not the power rail, so a handful of bytes
+    the boot code never writes keep whatever the previous game left there.
+    See RESET_RAM_SLACK in test_emulator.py, where the same claim is made
+    against the core on its own.
+    """
+    pytest.importorskip("PIL", reason="comparing pictures needs Pillow")
+    view, ctx, channel = city
+    cog = real.cog
+    emulator = view.emulator
+    state_path = cog._state_path(channel.id, view.slug)
+
+    # A cold boot of this ROM, for reference, and the machine it leaves.
+    booted_wram, _ = machine(emulator)
+
+    # Play, and save, so there is something for the reset to threaten.
+    saved = in_game_save()
+    assert emulator.load_sram(saved) is True
+    for field in ("start", "a", "down"):
+        await view._press(real.interaction(view, message=view.message), field)
+    await cog._write_state(view)
+    assert state_path.is_file()
+    on_disk_before = state_path.read_bytes()
+    played_wram, _ = machine(emulator)
+    played_picture = last_picture(view.last_clip)
+    assert differing_bytes(played_wram, booted_wram) > 0, "the play moved nothing"
+
+    await command(real, "retroreset")(cog, ctx)
+
+    # 1. The machine is back at boot, and a long way from where the play got.
+    reset_wram, reset_sram = machine(emulator)
+    near = differing_bytes(reset_wram, booted_wram)
+    far = differing_bytes(reset_wram, played_wram)
+    assert near * 5 < far, (near, far)
+    assert far > 0, "the reset did nothing at all"
+
+    # 2. The picture the channel is left looking at is the game booting, not
+    #    the game that was thrown away.
+    assert last_picture(view.last_clip) != played_picture
+
+    # 3. The player's own in-game save is untouched: a real console's reset
+    #    never wiped one, and neither does this.
+    assert reset_sram == saved
+    assert cog._sram_path(channel.id, view.slug).read_bytes() == saved
+
+    # 4. And the save state on disk still holds the moment *before* the
+    #    reset, so an accidental reset is recoverable. This is the decision:
+    #    a reset does not write, and the file is only replaced when the game
+    #    saves of its own accord.
+    assert state_path.read_bytes() == on_disk_before
+    # The undo point the reset pushed *is* that moment -- the autosave above
+    # wrote the same machine -- so the two agree bar the four bytes of a
+    # Gambatte state that are not a function of the console (STATE_SLACK).
+    assert differing_bytes(
+        zlib.decompress(view.history[-1]), on_disk_before
+    ) <= STATE_SLACK, "the undo point is not the moment before the reset"
+
+    # 5. One click of Undo puts the real machine back on the pre-reset
+    #    timeline. Not frozen at the exact moment: an undo records one clip
+    #    forward from the state it restores (see run_undo), so the reference
+    #    is built by hand out of those same two steps, exactly as
+    #    test_undo_puts_a_real_core_and_its_picture_back does it.
+    await real.control(view, "undo").callback(
+        real.interaction(view, message=view.message)
+    )
+    undone = machine(emulator)
+    assert view.live
+    assert undone[1] == saved, "the undo lost the in-game save"
+    # Far closer to the play than to the reboot, which is the point.
+    assert differing_bytes(undone[0], played_wram) * 5 < differing_bytes(
+        reset_wram, played_wram
+    )
+
+    emulator.load_state(on_disk_before)
+    view._record(emulator, None)
+    assert machine(emulator) == undone, "the undo is not the pre-reset timeline"
 
 
 async def test_the_listing_reports_the_cartridges_real_numbers(real, city):

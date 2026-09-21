@@ -133,13 +133,18 @@ async def test_nothing_of_the_stop_button_is_left_in_the_view(retro):
     assert not hasattr(view, "_sync_children")
 
 
-async def test_can_stop_is_kept_for_retrostop(retro):
+async def test_can_stop_is_kept_for_retrostop_and_retroreset(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(8053, "whosegame")
     assert await view.can_stop(FakeUser(uid=view.starter_id))
     assert not await view.can_stop(FakeUser(uid=4242))
     # The bot owner may always stop a game; FakeBot says owner is user 1.
     assert await view.can_stop(FakeUser(uid=1))
+    # A moderator, i.e. Manage Messages. Read off `guild_permissions` rather
+    # than from isinstance(user, discord.Member), which is what makes this
+    # branch checkable at all; see can_stop.
+    assert await view.can_stop(FakeUser(uid=4243, manage_messages=True))
+    assert not await view.can_stop(FakeUser(uid=4244, manage_messages=False))
 
 
 async def test_a_started_session_is_registered_as_a_persistent_view(retro):
@@ -448,7 +453,9 @@ async def test_a_press_edit_carries_one_clip_and_no_embed(retro):
     final = interaction.log[-1][1]
     assert final["n_attachments"] == 1
     assert final["filenames"][0].endswith(".webp")
-    assert final["content"] is None
+    # One line of text -- which button it was -- and nothing else. See the
+    # "Which button was pressed" section below.
+    assert final["content"] == "Pressed A."
     assert final["spacers_disabled"], "the spacers were never re-enabled"
 
 
@@ -568,7 +575,7 @@ async def test_a_press_no_longer_greys_the_controls_out(retro):
     assert not retro.control(view, "undo").disabled
 
 
-async def test_the_clip_is_cached_for_replay(retro):
+async def test_the_clip_on_the_message_is_kept_as_bytes(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9003, "cached")
     await view._press(retro.interaction(view, message=view.message), "a")
@@ -600,10 +607,15 @@ async def test_a_press_while_the_session_is_busy_only_defers(retro):
     async with view.lock:
         held = retro.interaction(view, message=view.message)
         await view._press(held, "b")
-        replay = retro.interaction(view, message=view.message)
-        await retro.control(view, "replay").callback(replay)
+        repeat = retro.interaction(view, message=view.message)
+        await retro.control(view, "repeat").callback(repeat)
+        waiting = retro.interaction(view, message=view.message)
+        await retro.control(view, "wait").callback(waiting)
+    # Deferred and nothing else: no edit, and no line naming a press that
+    # never happened.
     assert held.kinds() == ["response.defer"]
-    assert replay.kinds() == ["response.defer"]
+    assert repeat.kinds() == ["response.defer"]
+    assert waiting.kinds() == ["response.defer"]
 
 
 async def test_two_simultaneous_presses_produce_exactly_one_clip(retro):
@@ -640,196 +652,187 @@ async def test_two_simultaneous_presses_produce_exactly_one_clip(retro):
     assert edits == 1, "two presses, one visible change"
 
 
-# -- Replay -------------------------------------------------------------------
+# -- Which button was pressed -------------------------------------------------
+#
+# Every press names itself in the one line of content the message carries,
+# above the clip and on the very same edit as the clip. The per-console
+# wording is a table in test_view.py (PRESS_LINES); what is checked here is
+# that the line really reaches the message, that it beats nothing important,
+# and that it cannot go stale.
 
 
-async def test_replay_re_uploads_the_only_cached_clip(retro):
+async def test_a_press_says_which_button_it_was(retro):
     await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9020, "replayme")
-    assert len(view.clips) == 1, "the boot clip is the whole buffer so far"
+    view, _, _ = await retro.posted_game(9020, "named")
 
     interaction = retro.interaction(view, message=view.message)
-    await retro.control(view, "replay").callback(interaction)
-    kind, snap = interaction.log[0]
-    assert kind == "response.edit_message"
-    assert snap["n_attachments"] == 1
-    assert snap["filenames"][0].endswith(".webp")
-    assert not snap["any_disabled"], "a one-clip replay leaves the buttons alone"
+    await view._press(interaction, "a")
 
-
-async def test_replay_stitches_the_last_few_clips_into_one(retro):
-    pytest.importorskip("PIL", reason="stitching clips back together needs Pillow")
-    from .fakes import FAKE_CLIP_FRAMES
-
-    await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9022, "stitched")
-    for _ in range(2):
-        await view._press(retro.interaction(view, message=view.message), "a")
-    assert len(view.clips) == 3
-
-    interaction = retro.interaction(view, message=view.message)
-    await retro.control(view, "replay").callback(interaction)
-
-    # Stitching takes a moment, and it used to grey the controls out while it
-    # ran -- an edit that replayed the clip already on the message from its
-    # first frame. Replay is one edit now, for the same reason a press is.
+    # Still one edit: the line rides on the edit that carries the clip.
     assert interaction.kinds() == ["response.defer", "edit_original_response"]
-    final = interaction.log[-1][1]
-    assert final["n_attachments"] == 1
-    assert not final["any_disabled"]
-    assert "replayed" in (final["content"] or "")
-
-    # The result really is all three clips, end to end and in order, and the
-    # buffer itself is left alone -- a replay is not a new clip.
-    from retro.emulator import concatenate_clips, decode_clip
-
-    stitched, seconds = concatenate_clips([data for data, _ in view.clips])
-    frames, _ = decode_clip(stitched)
-    assert len(frames) == 3 * FAKE_CLIP_FRAMES
-    assert seconds == pytest.approx(9.0)
-    last_frame, _ = decode_clip(view.clips[-1][0])
-    assert frames[-1].tobytes() == last_frame[-1].tobytes(), (
-        "the newest footage is at the end"
-    )
-    assert len(view.clips) == 3
+    landed = interaction.log[-1][1]
+    assert landed["content"] == "Pressed A."
+    assert landed["n_attachments"] == 1, "and the clip came with it"
 
 
-async def test_a_clip_in_which_nothing_moved_still_counts_as_a_clip(retro):
-    """libwebp writes a still image when every picture is identical.
-
-    Which is far likelier at a one second clip than at four: a title screen,
-    a menu or a game waiting for input produces one frame with no timing in
-    it at all, and the buffer's own record of how long it was is the only
-    thing that can say otherwise.
-    """
-    pytest.importorskip("PIL", reason="this needs Pillow to encode anything")
-    from PIL import Image
-
-    from retro.emulator import concatenate_clips, decode_clip, encode_animation
-
-    still = encode_animation([Image.new("RGB", (8, 8))] * 3, 1000)
-    frames, durations = decode_clip(still)
-    assert len(frames) == 1 and durations == [1], "not a still after all"
-    assert decode_clip(still, 1000)[1] == [1000]
-
-    assert concatenate_clips([still, still])[1] == pytest.approx(0.002)
-    assert concatenate_clips([still, still], seconds=[1.0, 1.0])[1] == pytest.approx(2.0)
-
-    # ...and the session really does hand its lengths over, so Replay says
-    # "the last 3 seconds" rather than "the last 0".
+@pytest.mark.parametrize(
+    "field, expected",
+    [
+        ("up", "Pressed \N{UPWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
+        ("down", "Pressed \N{DOWNWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
+        ("left", "Pressed \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}."),
+        ("right", "Pressed \N{BLACK RIGHTWARDS ARROW}\N{VARIATION SELECTOR-16}."),
+        ("b", "Pressed B."),
+        ("start", "Pressed Start."),
+        ("select", "Pressed Select."),
+        (None, "Waited."),
+    ],
+)
+async def test_every_control_puts_its_own_name_on_the_message(retro, field, expected):
     await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9027, "frozen")
-    view.clips.clear()
-    for _ in range(3):
-        view.remember_clip(still)
+    view, _, _ = await retro.posted_game(9021, "eachname")
     interaction = retro.interaction(view, message=view.message)
-    await retro.control(view, "replay").callback(interaction)
-    assert "The last 3 seconds, replayed." == interaction.log[-1][1]["content"]
+    await view._press(interaction, field)
+    assert interaction.log[-1][1]["content"] == expected
 
 
-async def test_a_stitched_replay_is_bounded_by_seconds(retro):
-    pytest.importorskip("PIL", reason="stitching clips back together needs Pillow")
+async def test_the_repeat_button_says_how_many_taps_it_really_did(retro):
     await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9023, "bounded")
-    for _ in range(25):
-        await view._press(retro.interaction(view, message=view.message), "a")
+    view, _, _ = await retro.posted_game(9022, "taps")
+    interaction = retro.interaction(view, message=view.message)
+    await retro.control(view, "repeat").callback(interaction)
+    assert interaction.log[-1][1]["content"] == "Pressed A x3."
 
-    # One-second clips, fifteen seconds of replay: fifteen clips, never
-    # twenty-six -- and never the eight the old clip cap allowed, which is
-    # what made a fifteen-second Replay unreachable at this clip length.
-    assert view.buffered_seconds == retro.viewmod.REPLAY_SECONDS == 15
-    assert len(view.clips) == 15
-    assert len(view.clips) <= retro.viewmod.MAX_REPLAY_CLIPS
-    assert sum(len(data) for data, _ in view.clips) <= retro.viewmod.MAX_REPLAY_BYTES
+    # A clip too short to fit three: the line follows press_plan down, like
+    # the label on the button does, rather than claiming a tap that did not
+    # happen.
+    view.clip_seconds = 0.5
+    again = retro.interaction(view, message=view.message)
+    await retro.control(view, "repeat").callback(again)
+    assert again.log[-1][1]["content"] == "Pressed A x2."
 
 
-async def test_the_clip_count_cap_can_never_cut_the_replay_short(retro):
-    """The cap that used to bite first: 8 clips of 1s is 8 seconds, not 15."""
-    E = retro.emumod
-    assert E.MAX_REPLAY_CLIPS >= E.REPLAY_SECONDS / E.MIN_CLIP_SECONDS
-    # Enough pictures for fifteen seconds at any clip length, too: a clip
-    # contributes CLIP_FPS pictures per second however it is sliced.
-    assert E.MAX_REPLAY_FRAMES >= E.REPLAY_SECONDS * E.CLIP_FPS
-
+async def test_the_press_line_is_replaced_by_the_next_press_rather_than_kept(retro):
+    """It must not go stale: yesterday's press over today's clip is a lie."""
     await retro.install_cores("gambatte")
-    for seconds, presses in ((0.2, 80), (0.8, 25), (1.0, 20), (4.0, 6)):
-        view, _, _ = await retro.posted_game(9030 + int(seconds * 10), f"cap{seconds}")
-        view.clip_seconds = seconds
-        view.clips.clear()
-        for _ in range(presses):
-            await view._press(retro.interaction(view, message=view.message), "a")
-        assert view.buffered_seconds == pytest.approx(E.REPLAY_SECONDS), seconds
-        assert len(view.clips) <= E.MAX_REPLAY_CLIPS
+    view, _, _ = await retro.posted_game(9023, "notstale")
+
+    said = []
+    for field in ("a", "b", "left", None, "start"):
+        interaction = retro.interaction(view, message=view.message)
+        await view._press(interaction, field)
+        said.append(interaction.log[-1][1]["content"])
+    assert said == [
+        "Pressed A.",
+        "Pressed B.",
+        "Pressed \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}.",
+        "Waited.",
+        "Pressed Start.",
+    ]
+    # Every one of those was a whole `content`, so there is never a press
+    # line left over from an earlier press: the edit always writes one.
+    assert all(line is not None for line in said)
 
 
-async def test_the_replay_button_says_how_much_it_will_replay(retro):
+async def test_a_real_notice_still_beats_the_press_line(retro):
+    """Only one line fits, and "your save state was rejected" is the news."""
     await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9024, "labelled")
-    button = retro.control(view, "replay")
-    assert button.label == "Replay", "one clip, nothing extra to promise"
-    assert not button.disabled
-
-    await view._press(retro.interaction(view, message=view.message), "a")
-    assert button.label == "Replay 2s", "two one-second clips"
-    assert not button.disabled
-
-    # A fifth of a second a clip: round() made this button say "Replay 0s".
-    view.clips.clear()
-    view.clip_seconds = 0.2
-    for _ in range(2):
-        await view._press(retro.interaction(view, message=view.message), "a")
-    assert button.label == "Replay 0.4s", button.label
-
-
-async def test_the_replay_button_is_dead_and_says_so_with_an_empty_buffer(retro):
-    await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9021, "nocache")
-    view.last_clip = None
-    button = retro.control(view, "replay")
-    assert button.disabled and button.label == "Replay"
+    view, _, channel = await retro.posted_game(9024, "noticewins")
+    await retro.cog.hibernate(view, None)
+    # A state the fake core will refuse, i.e. what a core update looks like.
+    retro.cog._state_path(channel.id, view.slug).write_bytes(b"not a state")
 
     interaction = retro.interaction(view, message=view.message)
-    await button.callback(interaction)
-    kind, snap = interaction.log[0]
-    assert kind == "response.send_message"
-    assert snap["ephemeral"] is True
-    assert "memory" in (snap["content"] or "")
+    await view._press(interaction, "a")
+    content = interaction.log[-1][1]["content"] or ""
+    assert "save state could not be used" in content, content
+    assert "Pressed" not in content
+    # ...and the press after it, with nothing to report, names itself again.
+    again = retro.interaction(view, message=view.message)
+    await view._press(again, "a")
+    assert again.log[-1][1]["content"] == "Pressed A."
 
 
-async def test_a_restored_session_has_a_dead_replay_button(retro):
-    # The buffer is memory only, so a message that survived a restart has
-    # nothing to replay and must not pretend otherwise.
+async def test_the_resume_line_beats_the_press_line(retro):
+    """"The game was asleep and is back" is news; "you pressed A" is a label."""
     await retro.install_cores("gambatte")
-    view, _, channel = await retro.posted_game(9025, "afterboot")
+    view, _, _ = await retro.posted_game(9025, "resumewins")
     await retro.cog.hibernate(view, None)
 
-    cog2, bot2 = retro.make_cog()
-    bot2.channels[channel.id] = channel
-    await cog2._restore_sessions()
-    restored = cog2.sessions[channel.id]
-    button = next(
-        c for c in restored.children
-        if c.custom_id == f"{retro.viewmod.CUSTOM_ID_PREFIX}:replay"
-    )
-    assert button.disabled and not restored.clips
-
-
-async def test_a_replay_that_cannot_be_stitched_falls_back_to_the_last_clip(
-    retro, monkeypatch
-):
-    await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9026, "brokenstitch")
-    await view._press(retro.interaction(view, message=view.message), "a")
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("no encoder here")
-
-    monkeypatch.setattr(retro.viewmod, "concatenate_clips", boom)
     interaction = retro.interaction(view, message=view.message)
-    await retro.control(view, "replay").callback(interaction)
-    final = interaction.log[-1][1]
-    assert final["n_attachments"] == 1, "the game is fine; show what we have"
-    assert not final["any_disabled"]
+    await view._press(interaction, "a")
+    assert interaction.log[-1][1]["content"] == retro.viewmod.RESUMED_NOTE
+    # And it is said once: the next press names itself instead.
+    again = retro.interaction(view, message=view.message)
+    await view._press(again, "a")
+    assert again.log[-1][1]["content"] == "Pressed A."
+
+
+async def test_a_failed_press_explains_itself_rather_than_naming_a_button(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9026, "pressfails")
+
+    def boom(field, repeat=1):
+        raise retro.emumod.EmulatorError("the core fell over")
+
+    view.run_press = boom
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+    snap = interaction.log[-1][1]
+    assert "the core fell over" in (snap["content"] or "")
+    assert "Pressed" not in (snap["content"] or "")
+    assert not snap["any_disabled"], "and the controls still work"
+
+
+# -- Nothing of the Replay button is left --------------------------------------
+
+
+def test_the_replay_button_and_its_buffer_are_gone(retro):
+    """Removed in full, not merely hidden: it saved 8 MiB a session.
+
+    A session used to keep its recent clips so Replay could stitch the last
+    fifteen seconds back together. All of it went -- the button, its
+    custom_id, its emoji, the buffer and the stitching -- so this is a list
+    of names that must not come back rather than a behaviour check.
+    """
+    for name in (
+        "_ReplayButton",
+        "REPLAY_SECONDS",
+        "MAX_REPLAY_BYTES",
+        "MAX_REPLAY_CLIPS",
+        "MAX_REPLAY_FRAMES",
+        "concatenate_clips",
+    ):
+        assert not hasattr(retro.viewmod, name), name
+    for name in (
+        "REPLAY_SECONDS",
+        "MAX_REPLAY_BYTES",
+        "MAX_REPLAY_CLIPS",
+        "MAX_REPLAY_FRAMES",
+        "concatenate_clips",
+        "decode_clip",
+    ):
+        assert not hasattr(retro.clipsmod, name), name
+        assert not hasattr(retro.emumod, name), name
+        assert name not in retro.emumod.__all__, name
+    assert not hasattr(retro.sysmod, "REPLAY_EMOJI")
+
+
+async def test_a_session_holds_one_clip_and_not_a_buffer_of_them(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9027, "oneclip")
+    assert not hasattr(view, "clips"), "the replay buffer is gone"
+    assert not hasattr(view, "buffered_seconds")
+    assert not hasattr(view, "_trim_clips")
+
+    sizes = []
+    for _ in range(20):
+        await view._press(retro.interaction(view, message=view.message), "a")
+        assert isinstance(view.last_clip, bytes) and view.last_clip
+        sizes.append(len(view.last_clip))
+    # Twenty presses, and what is held is still one clip's worth: the thing
+    # that used to grow to fifteen seconds of footage per session.
+    assert max(sizes) < 64 * 1024, max(sizes)
 
 
 # -- Undo ---------------------------------------------------------------------
@@ -1043,24 +1046,34 @@ async def test_the_history_is_bounded_by_bytes_as_well_as_by_count(
     assert not view.history
 
 
-async def test_undo_drops_the_undone_footage_and_leaves_its_own_in_its_place(retro):
-    """Replay must not show somebody walking into a room they are not in."""
+async def test_the_undo_s_own_clip_replaces_the_undone_press_s_on_the_message(retro):
+    """What the channel is left looking at is where the game actually is.
+
+    This is what is left of a coupling that used to be much larger: Undo had
+    to drop the undone press's footage from the replay buffer as well, so a
+    stitched replay could not show somebody walking into a room they were not
+    in. The buffer is gone, so the whole of it is "the clip on the message is
+    the one the undo just recorded" -- and the assertion is the interaction
+    log rather than the attribute, because the message is what a player sees.
+    """
     await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9210, "replayundo")
+    view, _, _ = await retro.posted_game(9210, "undoclip")
     await view._press(retro.interaction(view, message=view.message), "a")
-    await view._press(retro.interaction(view, message=view.message), "right")
-    buffered = [data for data, _ in view.clips]
-    assert len(buffered) == 3, "the boot clip and two presses"
+    pressed = retro.interaction(view, message=view.message)
+    await view._press(pressed, "right")
+    pressed_clip = view.last_clip
+    assert isinstance(pressed_clip, bytes) and pressed_clip
 
-    await undo(retro, view)
+    undoing = await undo(retro, view)
 
-    kept = [data for data, _ in view.clips]
-    assert len(kept) == 3, "one clip out, the undo's own clip in"
-    assert kept[:2] == buffered[:2], "the play that still stands is untouched"
-    assert buffered[-1] not in kept, "the undone press's footage is gone"
-    # The clip on the message is the newest one in the buffer, as ever, so a
-    # stitched replay is still a contiguous account of what really happened.
-    assert view.last_clip == kept[-1]
+    assert view.last_clip != pressed_clip, "a fresh clip was recorded"
+    assert isinstance(view.last_clip, bytes) and view.last_clip
+    # And it is the clip that went out: one edit, one attachment, the undo
+    # line above it.
+    assert undoing.kinds() == ["response.defer", "edit_original_response"]
+    snap = undoing.log[-1][1]
+    assert snap["n_attachments"] == 1
+    assert snap["content"] == retro.viewmod.UNDONE_NOTE
 
 
 async def test_undo_writes_the_state_through_rather_than_waiting(retro):
@@ -1135,7 +1148,7 @@ async def test_a_retired_session_lets_go_of_its_undo_history(retro):
     await retro.cog._retire(view, "Replaced.")
 
     assert not view.history and view.history_bytes == 0
-    assert not view.clips
+    assert view.last_clip is None, "and it let go of the clip it was holding"
 
 
 async def test_a_core_that_cannot_save_states_costs_undo_and_nothing_else(retro):
@@ -1217,10 +1230,11 @@ async def test_a_press_resumes_a_sleeping_session_and_says_so_once(retro):
     assert not landed["has_embed"]
     assert landed["n_attachments"] == 1, "and the clip came with it"
 
-    # Said once: the next press clears it rather than repeating it.
+    # Said once: the next press replaces it with its own line rather than
+    # repeating it.
     again = retro.interaction(view, message=view.message)
     await view._press(again, "a")
-    assert again.log[-1][1]["content"] is None
+    assert again.log[-1][1]["content"] == "Pressed A."
 
 
 async def test_a_wake_that_has_something_to_report_beats_the_resume_line(retro):
@@ -1432,6 +1446,235 @@ async def test_retrostop_saves_the_game_even_if_the_message_explodes(retro):
     await retro.cogmod.Retro.retrostop.callback(retro.cog, ctx)
     assert not emulator.started
     assert state.is_file()
+
+
+# -- retroreset ---------------------------------------------------------------
+#
+# Rebooting the running game, which the cog's author asked for as a *command*
+# and not a button: it throws away everybody's progress-in-flight, so it has
+# the permission check `[p]retrostop` has rather than being one more thing a
+# passer-by can click. `[p]retrosaves reset` is a different command entirely
+# (it deletes a save state file on disk), and the help text of each says so.
+
+
+def reset_command(retro):
+    return retro.cogmod.Retro.retroreset.callback
+
+
+async def test_retroreset_reboots_the_running_game(retro):
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9090, "resetme")
+    emulator = view.emulator
+    for _ in range(3):
+        await view._press(retro.interaction(view, message=view.message), "a")
+    played = emulator.frame
+    assert played > 0
+
+    await reset_command(retro)(retro.cog, ctx)
+
+    # The same core, power-cycled: FakeEmulator's frame counter *is* its
+    # machine state, so being back near zero is "the game booted again".
+    assert view.emulator is emulator, "the core was not swapped out"
+    assert emulator.resets == 1
+    boot = emulator.frames_for_seconds(retro.viewmod.BOOT_SECONDS)
+    expected = 1 + boot + view.clip_frames(emulator)
+    assert emulator.frame == expected, (emulator.frame, expected)
+    assert emulator.frame < played, "the game was not rebooted"
+    assert view.live, "and it is still playable"
+
+
+async def test_retroreset_puts_the_boot_clip_on_the_game_s_message(retro):
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9091, "resetclip")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    before = view.last_clip
+
+    await reset_command(retro)(retro.cog, ctx)
+
+    assert view.last_clip != before, "a fresh clip was recorded"
+    # One edit of the game's own message, carrying the clip and the line that
+    # says what happened -- the same shape a press makes.
+    edit = view.message.edits[-1]
+    assert edit["content"] == retro.viewmod.RESET_NOTE == "Reset the game."
+    assert len(edit["attachments"]) == 1
+    assert edit["attachments"][0].filename.endswith(".webp")
+    assert not any(c.disabled for c in retro.pressable(view))
+    # ...and the reply in the channel says what happened and how to get back.
+    said = ctx.said()
+    assert "has been reset" in said
+    assert "Undo" in said
+    assert "retrosaves reset" in said, "the other reset is named, so the two cannot be confused"
+
+
+async def test_retroreset_is_an_undo_point_rather_than_a_dead_end(retro):
+    """A reset is the most destructive thing here, so Undo absorbs it.
+
+    The state the reset threw away is pushed onto the history first, so one
+    click of Undo puts the player back where they were -- and the entries
+    from before it are left alone, because they came from the same core and
+    the same ROM and still mean "the machine N presses ago".
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9092, "resetundo")
+    frames = []
+    for field in ("a", "right"):
+        await view._press(retro.interaction(view, message=view.message), field)
+        frames.append(view.emulator.frame)
+    assert len(view.history) == 2
+
+    await reset_command(retro)(retro.cog, ctx)
+    assert len(view.history) == 3, "the pre-reset moment went onto the history"
+    assert not retro.control(view, "undo").disabled
+
+    # One click and the game is back at the moment before the reset.
+    interaction = retro.interaction(view, message=view.message)
+    await retro.control(view, "undo").callback(interaction)
+    assert view.emulator.loaded_from == frames[-1]
+    assert len(view.history) == 2, "and the older undo points are still there"
+
+
+async def test_retroreset_does_not_overwrite_the_save_state_on_disk(retro):
+    """The decision: a reset must not silently replace a good save.
+
+    Nothing is written when the reset happens, so the ``.state`` file still
+    holds the moment before it -- which is what makes an accidental reset
+    recoverable even across a restart. It is replaced when the game saves of
+    its own accord, i.e. a few presses later or when it next sleeps.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9093, "resetdisk")
+    state_path = retro.cog._state_path(channel.id, view.slug)
+    for field in ("a", "b", "start"):
+        await view._press(retro.interaction(view, message=view.message), field)
+    assert state_path.is_file(), "the third press autosaved"
+    before = state_path.read_bytes()
+
+    await reset_command(retro)(retro.cog, ctx)
+
+    assert state_path.read_bytes() == before, "the reset overwrote the save state"
+    assert int(before.rstrip(b"\0").split(b":")[1]) > view.emulator.frame
+
+    # ...and it is the game carrying on that replaces it, not the reset.
+    for field in ("a", "b", "start"):
+        await view._press(retro.interaction(view, message=view.message), field)
+    assert state_path.read_bytes() != before
+
+
+async def test_retroreset_leaves_the_in_game_battery_save_alone(retro):
+    """The player's own save, which a real console's reset never wiped."""
+    from .fakes import FakeEmulator
+
+    FakeEmulator.sram_bytes = 2048
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9094, "resetsram")
+    saved = bytes((i * 7) % 251 for i in range(2048))
+    assert view.emulator.load_sram(saved) is True
+
+    await reset_command(retro)(retro.cog, ctx)
+
+    assert view.emulator.save_sram() == saved, "the reset wiped the in-game save"
+
+
+async def test_retroreset_wakes_a_sleeping_session_first(retro):
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9095, "resetasleep")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog.hibernate(view, None)
+    assert not view.live
+
+    await reset_command(retro)(retro.cog, ctx)
+
+    assert view.live, "the reset woke the session up"
+    assert view.emulator.resets == 1
+    assert "has been reset" in ctx.said()
+
+
+async def test_retroreset_with_no_game_running_says_so(retro):
+    await retro.install_cores("gambatte")
+    channel = retro.channel(9096)
+    ctx = retro.context(channel)
+
+    await reset_command(retro)(retro.cog, ctx)
+
+    said = ctx.said()
+    assert "No game is running in this channel." in said
+    assert "retro <name or url>" in said
+
+
+async def test_only_the_starter_a_moderator_or_the_owner_may_reset(retro):
+    """The same gate `[p]retrostop` has, and for a stronger reason."""
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9097, "resetperms")
+    starter = ctx.author
+    assert view.starter_id == starter.id
+
+    stranger = retro.context(channel, author=FakeUser(uid=99))
+    await reset_command(retro)(retro.cog, stranger)
+    assert "can reset it" in stranger.said()
+    assert view.emulator.resets == 0, "a stranger rebooted somebody's game"
+
+    for author in (
+        starter,
+        FakeUser(uid=98, manage_messages=True),  # a moderator
+        FakeUser(uid=1),                         # the bot owner
+    ):
+        allowed = retro.context(channel, author=author)
+        await reset_command(retro)(retro.cog, allowed)
+        assert "has been reset" in allowed.said(), author.id
+    assert view.emulator.resets == 3
+
+    # And it is exactly the check retrostop uses, rather than a second copy.
+    assert await view.can_stop(starter) is True
+    assert await view.can_stop(FakeUser(uid=99)) is False
+
+
+async def test_a_core_that_will_not_reset_leaves_the_game_alone(retro):
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9098, "resetfails")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    frame = view.emulator.frame
+
+    def refuse():
+        raise retro.emumod.EmulatorError("the core could not be reset")
+
+    view.emulator.reset = refuse
+    await reset_command(retro)(retro.cog, ctx)
+
+    assert "could not be reset" in ctx.said()
+    assert view.emulator.frame == frame, "the game moved even though the reset failed"
+    assert view.live
+
+
+def test_the_two_reset_commands_each_say_they_are_not_the_other(retro):
+    """The one thing somebody about to run either of them has to understand.
+
+    `[p]retroreset` reboots the game that is playing; `[p]retrosaves reset`
+    deletes a save state file on disk for any game the channel has played.
+    Both help texts name the other and say what the difference is, because
+    the names are one word apart and the consequences are not.
+    """
+    # The callback's docstring, which is what Red turns into the help text:
+    # `Command.__doc__` is the *class*'s docstring under the real Red.
+    reboot = retro.cogmod.Retro.retroreset.callback.__doc__
+    drop = retro.cogmod.Retro.retrosaves_reset.callback.__doc__
+
+    assert "[p]retrosaves reset" in reboot
+    assert "This one reboots" in reboot and "playing right now" in reboot
+    assert "Nothing on disk is deleted or overwritten" in reboot
+
+    assert "[p]retroreset" in drop
+    assert "touches no file at all" in drop
+    assert "deletes a save state *file* on disk" in drop
+
+
+async def test_there_is_no_reset_button_under_the_screen(retro):
+    """The author's instruction: a command, and deliberately not a button."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9099, "nobutton")
+    ids = [c.custom_id for c in view.children]
+    assert not any("reset" in i for i in ids), ids
+    labels = [(c.label or "") for c in view.children]
+    assert not any("Reset" in label for label in labels), labels
 
 
 # -- Unloading ----------------------------------------------------------------

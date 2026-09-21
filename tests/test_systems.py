@@ -132,10 +132,32 @@ def test_label_for_falls_back_to_the_field_name(system):
     assert system.label_for("up") == "UP"  # the d-pad has no labels
 
 
+def test_caption_for_is_the_label_or_the_emoji(system):
+    """What a press says it was; see RetroView.press_note.
+
+    The console's own label where there is one, and the button's emoji where
+    there is not -- which is the d-pad, whose arrows are the whole reason
+    label_for() above is not the answer.
+    """
+    for button in system.buttons:
+        expected = button.label or button.emoji
+        assert system.caption_for(button.field) == expected, button
+    for field in ("up", "down", "left", "right"):
+        caption = system.caption_for(field)
+        assert caption == system.button(field).emoji
+        # An emoji that goes out as message text is held to the same reviewed
+        # table as one that goes on a button: a bare codepoint without its
+        # U+FE0F is the bug that caused a 400 in production.
+        assert S.emoji_problem(caption) is None, (field, caption)
+    # A field this console does not have falls back rather than raising: a
+    # stale click on a message drawn for another game reaches this.
+    assert system.caption_for("nonexistent") == "NONEXISTENT"
+
+
 # -- 3. Discord's 5x5x25 component grid ---------------------------------------
 #
 # systems.System.rows is the whole controller -- d-pad, face buttons and
-# layout spacers -- and RetroView appends Wait/repeat/Replay to it.
+# layout spacers -- and RetroView appends Wait/repeat/Undo to it.
 
 
 def action_rows(system):
@@ -180,12 +202,22 @@ def test_spacers_are_labelled_and_are_not_real_buttons(system):
 def test_the_worst_console_still_leaves_headroom():
     worst = max(sum(len(r) for r in x.rows) + S.CONTROL_BUTTONS for x in S.SYSTEMS)
     assert worst <= S.MAX_COMPONENTS
-    # The Super Nintendo is the biggest at 20 -- 16 of its own plus the four
+    # The Super Nintendo is the biggest at 19 -- 16 of its own plus the three
     # controls; a much larger number means a console was added without
-    # thinking about the budget. The spare *row* is gone, though (see
-    # test_every_console_s_layout_after_the_undo_button), so the next console
-    # with a four-row grid has to end in a one- or two-button row.
-    assert worst == 20, worst
+    # thinking about the budget. It was 20 over five rows while the cluster
+    # was four wide (Wait / x3 / Replay / Undo); with Replay gone every
+    # console's controls share its bottom row again and the spare action row
+    # is back. See test_every_console_s_layout in test_view.py.
+    assert worst == 19, worst
+    assert S.CONTROL_BUTTONS == 3, "Wait, confirm x3, Undo"
+    # Every console's controls fit beside its own bottom row, which is what
+    # gives the widest layout a row in hand.
+    for system in S.SYSTEMS:
+        assert len(system.rows[-1]) + S.CONTROL_BUTTONS <= S.MAX_BUTTONS_PER_ROW, (
+            system.key
+        )
+        assert action_rows(system) == len(system.rows), system.key
+    assert max(action_rows(x) for x in S.SYSTEMS) == S.MAX_ACTION_ROWS - 1
 
 
 @pytest.mark.parametrize(
@@ -333,7 +365,7 @@ def test_system_for_core_finds_the_first_console():
 # -- 6. Button emoji ----------------------------------------------------------
 #
 # Regression cover for the 400/50035 "Invalid emoji" that took out a whole
-# command: the Replay button briefly used U+21BB, which is not an emoji at
+# command: a control button briefly used U+21BB, which is not an emoji at
 # all. Python's unicodedata has no emoji properties, so systems.py carries a
 # reviewed table and these checks hold it to it.
 
@@ -342,10 +374,12 @@ def test_validate_emoji_returns_every_renderable_emoji():
     assert S.validate_emoji() == S.all_button_emoji()
 
 
-def test_the_emoji_set_is_exactly_the_eight_the_cog_renders():
-    # Four arrows, Wait, Replay, Undo, and the Resume button a retired
-    # message keeps. The Stop button, and its U+23F9, are gone.
-    assert len(S.all_button_emoji()) == 8, S.all_button_emoji()
+def test_the_emoji_set_is_exactly_the_seven_the_cog_renders():
+    # Four arrows, Wait, Undo, and the Resume button a retired message keeps.
+    # The Stop button (U+23F9) and the Replay button (U+1F501) are gone, and
+    # so are their codepoints -- validate_emoji() refuses a table entry no
+    # button uses, which is what makes that impossible to leave behind.
+    assert len(S.all_button_emoji()) == 7, S.all_button_emoji()
     assert S.RESUME_EMOJI in S.all_button_emoji()
     # The Undo button is exactly the kind of place U+21BB was used once, so
     # its emoji is held to the reviewed table like every other one.
@@ -354,9 +388,12 @@ def test_the_emoji_set_is_exactly_the_eight_the_cog_renders():
     assert S.emoji_problem(S.UNDO_EMOJI) is None
 
 
-def test_no_stop_emoji_survives_anywhere():
+def test_no_stop_or_replay_emoji_survives_anywhere():
     assert not hasattr(S, "STOP_EMOJI")
+    assert not hasattr(S, "REPLAY_EMOJI")
     assert 0x23F9 not in S.EMOJI_CODEPOINTS
+    assert 0x1F501 not in S.EMOJI_CODEPOINTS
+    assert "REPLAY_EMOJI" not in S.__all__
 
 
 @pytest.mark.parametrize("emoji", S.all_button_emoji())

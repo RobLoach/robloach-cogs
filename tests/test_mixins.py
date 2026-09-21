@@ -65,6 +65,9 @@ def test_every_mixin_module_exists_and_is_imported():
 #: lost, and a group whose subcommand failed to attach fails silently.
 COMMANDS = {
     "retro",
+    # Reboots the running game. Deliberately not a button: see the note
+    # above _STYLES in retro/RetroView.py.
+    "retroreset",
     "retrosaves",
     "retrosaves delete",
     "retrosaves export",

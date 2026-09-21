@@ -47,10 +47,11 @@ except ImportError:  # pragma: no cover - Pillow is in requirements-dev
     HAS_PILLOW = False
 
 #: Frames per clip in the animations FakeEmulator produces. Small enough to
-#: be free, more than one so a stitched replay really has to concatenate.
+#: be free, more than one so a clip really is an animation and a test can
+#: read its last frame.
 FAKE_CLIP_FRAMES = 3
 #: Each frame's duration, so `FAKE_CLIP_FRAMES * FAKE_FRAME_MS` milliseconds
-#: is one clip's worth of "footage" as far as the replay code is concerned.
+#: is one clip's worth of footage.
 FAKE_FRAME_MS = 1000
 
 
@@ -90,10 +91,18 @@ class FakeEmulator:
         self.last_format = None
         self.sram = None
         self.loaded_sram = None
+        #: How many times this instance has been power-cycled; see reset().
+        self.resets = 0
         FakeEmulator.instances.append(self)
 
     @classmethod
-    def reset(cls):
+    def reset_all(cls):
+        """Forget every instance and every per-test setting.
+
+        Not called ``reset``: that is a real method on RetroEmulator now
+        (libretro's ``retro_reset``, which `[p]retroreset` goes through), and
+        a classmethod of the same name would shadow it on every instance.
+        """
         cls.instances = []
         cls.sram_bytes = 0
         cls.definitions_by_core = {}
@@ -151,17 +160,30 @@ class FakeEmulator:
         self._require()
         self.frame += hold_frames + release_frames
 
+    def reset(self):
+        """A power cycle: the machine starts over, the cartridge does not.
+
+        The frame counter *is* this fake's machine state -- it is what its
+        save state carries -- so putting it back to zero is exactly "the game
+        is at its boot state again". ``self.sram`` is deliberately left
+        alone, because ``retro_reset`` does not reallocate a cartridge's
+        battery memory and resetting a real console never wiped a save.
+        """
+        self._require()
+        self.frame = 0
+        self.resets += 1
+        self.advance(1)
+
     def record(self, frames=None, *, scale=2, fps=15, presses=None, clip_format="WEBP"):
         self._require()
         self.last_presses = list(presses or ())
         self.last_format = clip_format
         self.frame += frames or 300
         if HAS_PILLOW:
-            # A real, tiny animation rather than a sentinel: the Replay button
-            # decodes its buffered clips and stitches them back together, and
-            # a test of that against made-up bytes would only ever exercise
-            # the error path. The frame count is the emulated frame number, so
-            # one clip is still distinguishable from another.
+            # A real, tiny animation rather than a sentinel, so a test can
+            # open a clip and look at its last picture the way the channel
+            # does. The frame count is the emulated frame number, so one clip
+            # is still distinguishable from another.
             return _tiny_animation(self.frame, clip_format)
         return b"RIFF\0\0\0\0WEBPVP8X" + f"frame={self.frame}".encode().ljust(58, b"\0")
 
@@ -459,18 +481,18 @@ def playable(viewmod, view):
 
 
 #: The controls that may legitimately be greyed out at any moment, because
-#: each of them can have nothing to do: **Replay** with an empty buffer, the
-#: **x3** button on a clip too short to fit two taps, and **Undo** with an
-#: empty history -- which is every session's starting state and every
-#: session's state after a bot restart, since the history is memory only.
+#: each of them can have nothing to do: the **x3** button on a clip too short
+#: to fit two taps, and **Undo** with an empty history -- which is every
+#: session's starting state and every session's state after a bot restart,
+#: since the history is memory only.
 #:
 #: `playable()` keeps them, so a test that is *about* one of them still finds
 #: it (they are asked for by custom_id anyway). `pressable()` and the
 #: `any_disabled`/`all_disabled` snapshot keys below leave them out, so an
 #: assertion that a press did not grey the controls out stays an assertion
 #: about the console's own buttons rather than quietly becoming one about
-#: whether there was anything to replay or undo.
-CONDITIONAL_CONTROLS = ("replay", "repeat", "undo")
+#: whether there was anything to undo.
+CONDITIONAL_CONTROLS = ("repeat", "undo")
 
 
 def pressable(viewmod, view):
@@ -772,7 +794,7 @@ class RetroEnv:
             (self.cores_dir / f"{core}_libretro.so").write_bytes(b"\x7fELF fake core")
         (self.cores_dir / "nestopia_libretro.so").write_bytes(b"\x7fELF not ours")
 
-        FakeEmulator.reset()
+        FakeEmulator.reset_all()
         FakeConfirm.reset()
         self.configs = FakeConfigFactory()
         #: Every cog_data_path() call the cog made, so a test can prove the

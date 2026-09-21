@@ -25,8 +25,8 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves` and the Undo button included), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
-| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip and the Undo round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
+| fast | console tables, button layouts, emoji, the per-console press line, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves`, `[p]retroreset` and the Undo button included), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; a few tests that read a clip's frames back want Pillow) |
+| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, resetting a core, save states, battery saves, core options, BIOS directory, and the save export/import round trip, the Undo round trip and the `[p]retroreset` round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
 `pytest -m emulator -n 2` roughly halves the slow half (26s to 15s here). It
@@ -35,14 +35,10 @@ process. The fast suite is *slower* under `-n`, so it is left serial.
 
 Almost all of the slow half is Pillow encoding real WebP, so the clips the
 tests record are deliberately as short as the assertion allows -- a test
-about *which end* a replay is trimmed from proves the same thing with 0.4
-second clips as with two second ones. The tests that are genuinely about
-length keep it: `test_a_clip_plays_for_as_long_as_it_emulated` runs at every
-clip length up to four seconds, `test_buffered_clips_stitch_back_into_one_animation`
-records sixteen seconds so the fifteen second window has something to trim,
-and `test_stitching_fifteen_seconds_is_quick_enough_to_do_on_a_button_press`
-has to keep stitching a real fifteen seconds or it is measuring nothing.
-Don't shorten those three.
+about which picture a clip *opens* on proves the same thing with 0.4 second
+clips as with two second ones. The one test that is genuinely about length
+keeps it: `test_a_clip_plays_for_as_long_as_it_emulated` runs at every clip
+length up to four seconds. Don't shorten that one.
 
 `-m redbot` marks the few tests that need the real Red-DiscordBot (command
 permission metadata, the assembled cog's `__cog_commands__`, and the two
@@ -101,17 +97,27 @@ on a screenshot:
 **Undo obeys the same rule**, and `test_undo_makes_exactly_one_edit_to_the_message`
 and `test_nothing_is_edited_while_the_undo_is_being_emulated` say so. An undo
 with an empty history is the one click that makes *no* edit at all: it
-answers privately, like Replay with an empty buffer, so the assertion there
-is `["response.send_message"]` and an untouched message.
+answers privately, so the assertion there is `["response.send_message"]` and
+an untouched message.
 
-Three controls are allowed to be greyed out at any moment, because each of
-them can have nothing to do: **Replay** with an empty buffer, **×3** on a
-clip too short for two taps, and **Undo** with an empty history (which is
-every session's first moment, and every session's state after a restart). So
-`fakes.pressable()` -- and the `any_disabled`/`all_disabled` keys of the
-interaction snapshot -- leave those three out, while `fakes.playable()` keeps
-them for the tests that are about them. Without that split, "a press does not
-grey the controls out" quietly becomes "there was something to replay".
+**Saying which button was pressed rides on that same edit.** Every press now
+writes one line of `content` -- `Pressed A.`, `Pressed ⬅️.`, `Waited.` --
+and the tests in the "Which button was pressed" section of
+`test_cog_session.py` check that it reaches the message, that a real notice
+and the resumed line still beat it, and that the next press replaces it. The
+per-console wording is a table over all eight consoles in `test_view.py`
+(`PRESS_LINES`), held against the `Button` entries in `retro/systems.py` --
+which is the point, since the RetroPad field a button maps to is frequently
+not what the console calls it (a Genesis `C` is RetroPad `a`).
+
+Two controls are allowed to be greyed out at any moment, because each of them
+can have nothing to do: **×3** on a clip too short for two taps, and **Undo**
+with an empty history (which is every session's first moment, and every
+session's state after a restart). So `fakes.pressable()` -- and the
+`any_disabled`/`all_disabled` keys of the interaction snapshot -- leave those
+two out, while `fakes.playable()` keeps them for the tests that are about
+them. Without that split, "a press does not grey the controls out" quietly
+becomes "there was something to undo".
 
 The matching statement for the *content* of a clip is
 `test_one_clip_carries_on_from_the_last_with_no_frames_lost` in
@@ -129,9 +135,12 @@ container it was written for is not the cog's own: discord.py keeps every
 persistent view in a store keyed by message id, filled by `Client.add_view`
 *and* by every send or edit that carries a view, and emptied by nothing
 except `View.stop()` -- there is no `bot.remove_view`. So every game a
-channel plays used to leave a whole `RetroView`, replay buffer included,
-reachable for the life of the process. `Retro._release_view` is the fix and
-these tests are the proof; they fail if it is taken out.
+channel plays used to leave a whole `RetroView` reachable for the life of the
+process -- and in those days each one held a replay buffer of up to 8 MiB,
+which is what made it worth chasing. `Retro._release_view` is the fix and
+these tests are the proof; they fail if it is taken out. Section 2 of that
+file is now "one clip per session, and none after it is discarded", which is
+the same shape against a much smaller number.
 
 Two conventions in there worth knowing:
 
@@ -194,6 +203,13 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
   the picture (all three of which *are* exactly the emulated machine) and
   allows the state itself `STATE_SLACK` bytes of difference. Four out of
   182,530, measured.
+* **`FakeEmulator.reset()` is a power cycle, not test bookkeeping.** The
+  fake's frame counter *is* its machine state (its save state carries it), so
+  `reset()` puts it back to zero and leaves `sram` alone, exactly as
+  `retro_reset` does to a real cartridge. What used to be called
+  `FakeEmulator.reset()` -- forget every instance, clear the per-test
+  settings -- is `FakeEmulator.reset_all()`, because a classmethod of that
+  name would shadow the real method on every instance.
 * `FakeConfirm` answers Red's `ConfirmView` for the commands that ask before
   destroying something: set `FakeConfirm.reset(answer=False)` to press No, and
   read `FakeConfirm.asked` to prove the question was put at all. `FakeUser(...,

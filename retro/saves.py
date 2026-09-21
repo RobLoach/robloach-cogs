@@ -960,6 +960,11 @@ class SavesMixin(MixinMeta):
         title screen with the cartridge's battery save in place, so the player
         can load their own save from inside the game.
 
+        **This is not `[p]retroreset`**, which touches no file at all: that
+        one reboots the game that is running right now, as if you had flipped
+        its power switch. This one deletes a save state *file* on disk, and
+        works on any game this channel has played.
+
         Use `[p]retrosaves delete` instead to wipe the in-game save too.
 
         Only the person who started the game, moderators (Manage Messages) and

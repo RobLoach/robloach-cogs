@@ -75,6 +75,21 @@ def anmf(data):
     return durations, loop
 
 
+def clip_frames_of(payload, Image):
+    """Every picture of a clip, as RGB images.
+
+    Opened with Pillow here rather than through the emulator module: nothing
+    in the cog reads a clip back any more (that went with the Replay button's
+    stitching), so reading one is a test's own business.
+    """
+    clip = Image.open(io.BytesIO(payload))
+    out = []
+    for index in range(clip.n_frames):
+        clip.seek(index)
+        out.append(clip.convert("RGB"))
+    return out
+
+
 def frame_hashes(payload, Image):
     clip = Image.open(io.BytesIO(payload))
     out = []
@@ -85,6 +100,11 @@ def frame_hashes(payload, Image):
 
 
 # -- 1. Every console boots and records a clip --------------------------------
+
+#: RETRO_MEMORY_SYSTEM_RAM: the console's own work RAM, which is the emulated
+#: machine itself rather than a serialization of it. See STATE_SLACK in
+#: test_saves_roundtrip.py for why a save state is not the thing to compare.
+RETRO_MEMORY_SYSTEM_RAM = 2
 
 CASES = [
     ("gb", "gambatte", "ucity.gbc", "right"),
@@ -110,7 +130,9 @@ def test_a_console_boots_and_records_a_playable_clip(
     assert clip[:4] == b"RIFF" and clip[8:12] == b"WEBP", clip[:12]
     picture = image.open(io.BytesIO(clip))
     assert getattr(picture, "n_frames", 1) > 1, "the clip is not animated"
-    # loop=1 means "play through once", which is what Replay exists for.
+    # loop=1 means "play through once and hold the last frame", which is what
+    # makes the picture left in the channel the state the next press continues
+    # from -- and keeps a busy channel from flickering.
     assert picture.info.get("loop") == 1
     assert picture.size == emulator.output_size()
     assert len(clip) < 10 * 1024 * 1024, "over Discord's free attachment limit"
@@ -512,8 +534,10 @@ def test_a_static_screen_collapses_to_a_still_that_is_still_a_clip(
     libwebp merges identical consecutive frames, and when *every* captured
     picture is the same it writes a plain still WebP with no animation chunks
     in it at all. That is fine -- Discord shows it, and it costs a few dozen
-    bytes -- but it means the file no longer says how long the clip was, which
-    is what decode_clip's fallback and concatenate_clips' `seconds` exist for.
+    bytes -- but it means the file no longer says how long the clip was. That
+    cost something while the Replay button stitched buffered clips back
+    together and had to know how long each one stood for; now that a clip is
+    only ever posted on its own, nothing reads a clip's timing back at all.
     Far more likely at a one second clip than it was at four.
     """
     emulator = emu(gambatte, ucity)
@@ -526,19 +550,9 @@ def test_a_static_screen_collapses_to_a_still_that_is_still_a_clip(
     assert getattr(picture, "n_frames", 1) == 1, "uCity's boot is not static"
     assert anmf(data)[0] == [], "a still has no frame timings to read"
     assert 0 < len(data) < 4096, len(data)
-
-    # Nothing divides by zero, and no frame is left with no duration at all.
-    decoded, decoded_durations = E.decode_clip(data)
-    assert len(decoded) == 1 and decoded_durations == [1]
-    _, told = E.decode_clip(data, 200)
-    assert told == [200], "a caller that knows the length can say so"
-
-    # And it still stitches, with the session's own lengths standing in for
-    # the timing the file does not have.
-    stitched, covered = E.concatenate_clips([data, data])
-    assert len(stitched) > 0 and covered == pytest.approx(0.002)
-    stitched, covered = E.concatenate_clips([data, data], seconds=[0.2, 0.2])
-    assert len(stitched) > 0 and covered == pytest.approx(0.4)
+    # Still a picture Discord will show, and still the picture the next press
+    # carries on from, which is all a clip has to be.
+    assert frame_hashes(data, image) == [frame_hashes(data, image)[0]]
 
 
 def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gambatte, ucity):
@@ -555,7 +569,7 @@ def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gam
     assert hashes[0] != hashes[1], "the first two frames are duplicates"
 
 
-def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, gambatte, ucity):
+def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, image, gambatte, ucity):
     """The other half of "seamless movement", proved against a real core.
 
     A clip's pictures are every ``step``-th emulated frame *plus the last
@@ -580,8 +594,8 @@ def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, gambatte, uc
     # load_state runs a frame of its own, so both the recordings and the
     # reference below start from the same place: the state plus one frame.
     emulator.load_state(state)
-    first = E.decode_clip(emulator.record(frames))[0]
-    second = E.decode_clip(emulator.record(frames))[0]
+    first = clip_frames_of(emulator.record(frames), image)
+    second = clip_frames_of(emulator.record(frames), image)
 
     emulator.load_state(state)
     reference = []
@@ -1182,148 +1196,162 @@ def test_a_battery_save_round_trips_and_survives_a_cold_boot(emu, gambatte, ucit
     assert fresh.save_sram() == kept, "and it is still there once the game has run"
 
 
-# -- 12. Stitching clips back together (the Replay button) --------------------
+# -- 12. Resetting a running core ----------------------------------------------
 #
-# Replay decodes the session's buffered clips and re-encodes them as one
-# animation. It runs on real video, so the interesting questions are whether
-# the timeline survives the round trip and how long the round trip takes.
+# libretro's retro_reset, i.e. the power switch, which is what `[p]retroreset`
+# goes through. Two halves to it, and both of them are claims about a real
+# machine rather than about our code: the console goes back to its boot state,
+# and the cartridge's battery memory does not.
 
 
-def test_buffered_clips_stitch_back_into_one_animation(emu, image, gambatte, ucity):
+#: How many bytes of a Game Boy's 32 KiB of work RAM may differ between a
+#: machine that was reset and one that cold-booted.
+#:
+#: Not zero, and that is the hardware rather than a bug: ``retro_reset`` is
+#: the reset line, not the power rail, and a Game Boy's work RAM is not
+#: cleared by it -- so any byte the boot code does not write keeps whatever
+#: the game that was running left there. Measured on uCity under Gambatte:
+#: five bytes of 32,768 (indices 1022, 1347-1348 and 4078-4079), against 147
+#: that differ between mid-play and a boot. So the difference this allows is
+#: thirty times smaller than the difference it is distinguishing, the reset
+#: is *stable* (resetting twice gives the same RAM byte for byte), and the
+#: picture -- which is the thing a player sees -- is identical.
+RESET_RAM_SLACK = 16
+
+
+def work_ram(emulator):
+    """The console's own RAM: the emulated machine, not a serialization of it."""
+    memory = emulator._session.core.get_memory(RETRO_MEMORY_SYSTEM_RAM)
+    assert memory is not None, "this core exposes no system RAM"
+    return bytes(memory)
+
+
+def differing_bytes(left, right):
+    assert len(left) == len(right), (len(left), len(right))
+    return sum(1 for a, b in zip(left, right, strict=True) if a != b)
+
+
+def test_a_reset_puts_a_real_machine_back_to_its_boot_state(emu, gambatte, ucity):
+    """The claim `[p]retroreset` rests on, against the core itself.
+
+    Held to the machine rather than to the bytes of a save state: see the
+    STATE_SLACK note in test_saves_roundtrip.py for why a state is not quite
+    a pure function of the emulated console. Work RAM is, bar the bytes a
+    reset leaves alone; see RESET_RAM_SLACK.
+    """
     emulator = emu(gambatte, ucity)
-    emulator.advance(emulator.frames_for_seconds(3))
-    frames = emulator.frames_for_seconds(4)
-    clips = [emulator.record(frames, presses=[("start", 0, 10)]) for _ in range(4)]
+    boot_frames = emulator.frames_for_seconds(3)
+    emulator.advance(boot_frames)
+    booted = work_ram(emulator)
 
-    stitched, seconds = E.concatenate_clips(clips)
+    # Play for a while, so there is something to lose.
+    for _ in range(4):
+        emulator.record(emulator.clip_frames(0.4), presses=[("start", 0, 8)])
+    mid_game = work_ram(emulator)
+    moved = differing_bytes(mid_game, booted)
+    assert moved > RESET_RAM_SLACK * 4, (
+        f"the game only moved {moved} bytes on, so this proves nothing"
+    )
 
-    assert stitched[:4] == b"RIFF" and stitched[8:12] == b"WEBP"
-    durations, loop = anmf(stitched)
-    assert loop == 1, "a replay plays through once, like every other clip"
-    # 16 seconds of footage, trimmed to the 15 second window.
-    assert 14.0 <= seconds <= E.REPLAY_SECONDS + 0.5, seconds
-    assert abs(sum(durations) / 1000.0 - seconds) < 0.1
+    emulator.reset()
+    emulator.advance(boot_frames)
+    after = work_ram(emulator)
 
-    # The last frame of the replay is the last frame of the newest clip: a
-    # replay always ends on the moment the player just played.
-    assert frame_hashes(stitched, image)[-1] == frame_hashes(clips[-1], image)[-1]
+    # Back at the boot, and a long way from where the play had reached.
+    assert differing_bytes(after, booted) <= RESET_RAM_SLACK
+    assert differing_bytes(after, mid_game) > RESET_RAM_SLACK * 4
 
-
-def test_a_stitched_replay_is_trimmed_from_the_oldest_end(emu, image, gambatte, ucity):
-    # The clips are deliberately short: what is under test is *which end* the
-    # trim comes off, which is the same question at 0.4 seconds a clip as at
-    # two, and a WebP encode is the most expensive thing in this file. The
-    # budget is half the footage, so the trim has to bite either way.
-    emulator = emu(gambatte, ucity)
-    emulator.advance(emulator.frames_for_seconds(3))
-    frames = emulator.frames_for_seconds(0.4)
-    clips = [emulator.record(frames) for _ in range(3)]
-
-    _, full = E.concatenate_clips(clips, max_seconds=100)
-    short, seconds = E.concatenate_clips(clips, max_seconds=0.6)
-    assert seconds <= 0.8 < full
-    # It is the *newest* 0.6 seconds, so the end still matches.
-    assert frame_hashes(short, image)[-1] == frame_hashes(clips[-1], image)[-1]
-    # And it really did drop something, rather than the budget being generous
-    # enough to keep the lot.
-    assert len(frame_hashes(short, image)) < len(frame_hashes(clips[-1], image)) * 3
+    # And it is stable: a second reset lands on exactly the same machine, so
+    # the bytes above are RAM a reset does not touch rather than noise.
+    emulator.reset()
+    emulator.advance(boot_frames)
+    assert work_ram(emulator) == after
 
 
-def test_one_clip_longer_than_the_window_is_trimmed_by_frame(emu, gambatte, ucity):
-    # "Longer than the window" is relative to max_seconds, which is passed in
-    # here, so one second against a 0.3 second budget tests exactly what six
-    # seconds against two did -- for a sixth of the encoding.
-    emulator = emu(gambatte, ucity)
-    emulator.advance(emulator.frames_for_seconds(3))
-    long_clip = emulator.record(emulator.frames_for_seconds(1.0))
-    _, full = E.concatenate_clips([long_clip], max_seconds=100)
-    _, seconds = E.concatenate_clips([long_clip], max_seconds=0.3)
-    assert full > 0.5, "the single clip is not longer than the window any more"
-    assert seconds <= 0.5
-
-
-def test_the_frame_cap_bounds_the_work(emu, gambatte, ucity):
-    emulator = emu(gambatte, ucity)
-    emulator.advance(emulator.frames_for_seconds(3))
-    clips = [emulator.record(emulator.frames_for_seconds(0.5)) for _ in range(2)]
-    uncapped, _ = E.concatenate_clips(clips, max_seconds=100, max_frames=1000)
-    stitched, _ = E.concatenate_clips(clips, max_seconds=100, max_frames=10)
-    durations, _ = anmf(stitched)
-    # The cap has to actually be doing something: without this the test would
-    # pass just as well on footage that never reached ten frames.
-    assert len(anmf(uncapped)[0]) > 10, "there was nothing for the cap to cut"
-    assert len(durations) <= 10
-
-
-def test_a_resolution_change_ends_the_replay_rather_than_corrupting_it(
+def test_a_reset_matches_a_freshly_loaded_core_and_its_picture(
     emu, image, gambatte, ucity
 ):
-    # Animation formats have one size for the whole file, and the SNES really
-    # does change resolution mid-session, so an older clip of another size
-    # must be dropped rather than stretched or crashed on.
+    """The same claim from the other side: a reset really is a new boot.
+
+    The reference is a second instance of the same core loading the same ROM
+    from scratch, which is the most that can be asked of "as if you had
+    flipped the power switch". The *picture* is byte-identical -- it is what
+    the player is shown, and it is what the cog posts -- and the machine is
+    compared as a distance rather than for equality, because the handful of
+    work RAM bytes a reset leaves behind (RESET_RAM_SLACK) are exactly the
+    ones that carry whatever the previous game happened to write there, so
+    how many of them differ depends on how much was played.
+    """
     emulator = emu(gambatte, ucity)
-    emulator.advance(emulator.frames_for_seconds(3))
-    normal = emulator.record(emulator.frames_for_seconds(0.4))
-    small = E.encode_animation(
-        [image.new("RGB", (16, 16)) for _ in range(3)], 67, "WEBP"
-    )
-    stitched, _ = E.concatenate_clips([small, normal])
-    assert image.open(io.BytesIO(stitched)).size == image.open(io.BytesIO(normal)).size
-    assert len(frame_hashes(stitched, image)) == len(frame_hashes(normal, image))
+    boot_frames = emulator.frames_for_seconds(3)
+    emulator.advance(boot_frames)
+    for _ in range(3):
+        emulator.record(emulator.clip_frames(0.4), presses=[("a", 0, 8)])
+    played = frame_hashes(emulator.record(emulator.clip_frames(0.4)), image)[-1]
+    played_machine = work_ram(emulator)
+
+    emulator.reset()
+    emulator.advance(boot_frames)
+    reset_picture = frame_hashes(emulator.record(emulator.clip_frames(0.4)), image)[-1]
+    reset_machine = work_ram(emulator)
+
+    # A brand new core, the same ROM, the same boot: one core at a time, so
+    # the one above is stopped by the `emu` fixture building this one.
+    fresh = emu(gambatte, ucity)
+    fresh.advance(boot_frames)
+    fresh_picture = frame_hashes(fresh.record(fresh.clip_frames(0.4)), image)[-1]
+    fresh_machine = work_ram(fresh)
+
+    assert reset_picture != played, "the reset left the game mid-play"
+    assert reset_picture == fresh_picture, "a reset is not a fresh boot"
+    # An order of magnitude closer to a fresh boot than the play it replaced:
+    # about 20 bytes of 32,768 against about 150.
+    near = differing_bytes(reset_machine, fresh_machine)
+    far = differing_bytes(played_machine, fresh_machine)
+    assert near * 5 < far, (near, far)
 
 
-def test_an_unreadable_clip_in_the_buffer_costs_only_the_older_footage(
-    emu, gambatte, ucity
+def test_a_reset_keeps_the_cartridge_s_battery_save(emu, gambatte, ucity):
+    """Resetting a console has never wiped a save file, and this must not.
+
+    ``retro_reset`` does not reallocate the RETRO_MEMORY_SAVE_RAM region, so
+    the player's own in-game save survives -- which is the whole distinction
+    between `[p]retroreset` and `[p]retrosaves delete`.
+    """
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(2))
+    saved = bytes((index * 7 + 3) % 251 for index in range(emulator.sram_size))
+    assert saved, "uCity's cartridge reports no battery at all"
+    assert emulator.load_sram(saved) is True
+
+    emulator.reset()
+    emulator.advance(emulator.frames_for_seconds(1))
+
+    assert emulator.save_sram() == saved, "the reset wiped the in-game save"
+    assert emulator.sram_size == len(saved)
+
+
+def test_resetting_a_core_that_is_not_running_is_refused(emu, gambatte, ucity):
+    emulator = E.RetroEmulator(gambatte, ucity)
+    with pytest.raises(E.EmulatorError, match="not running"):
+        emulator.reset()
+
+
+def test_a_clip_recorded_straight_after_a_reset_is_not_a_stale_frame(
+    emu, image, gambatte, ucity
 ):
+    """reset() runs a frame, for the same reason load_state() does.
+
+    Without it the video driver still holds the picture from before the
+    reset, and the clip the channel is shown would open on the game that was
+    just thrown away.
+    """
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    good = emulator.record(emulator.frames_for_seconds(0.4))
-    stitched, seconds = E.concatenate_clips([b"not a clip at all", good])
-    assert stitched[:4] == b"RIFF"
-    assert seconds > 0
+    for _ in range(3):
+        emulator.record(emulator.clip_frames(0.4), presses=[("start", 0, 8)])
+    before = frame_hashes(emulator.screenshot(), image)[0]
 
-
-def test_a_buffer_of_nothing_but_rubbish_raises(emu):
-    with pytest.raises(E.EmulatorError):
-        E.concatenate_clips([b"nope", b"also nope"])
-    with pytest.raises(E.EmulatorError):
-        E.concatenate_clips([])
-
-
-def test_gif_clips_stitch_too(emu, gambatte, ucity):
-    emulator = emu(gambatte, ucity)
-    emulator.advance(emulator.frames_for_seconds(3))
-    clips = [
-        emulator.record(emulator.frames_for_seconds(0.4), clip_format="GIF")
-        for _ in range(2)
-    ]
-    stitched, seconds = E.concatenate_clips(clips, clip_format="GIF")
-    assert stitched[:6] in (b"GIF87a", b"GIF89a")
-    assert seconds > 0
-
-
-def test_stitching_fifteen_seconds_is_quick_enough_to_do_on_a_button_press(
-    emu, gambatte, ucity
-):
-    """The number the feature lives or dies on; see REPLAY_SECONDS."""
-    import time
-
-    emulator = emu(gambatte, ucity)
-    emulator.advance(emulator.frames_for_seconds(3))
-    clips = [
-        emulator.record(emulator.frames_for_seconds(4), presses=[("start", 0, 10)])
-        for _ in range(4)
-    ]
-
-    started = time.perf_counter()
-    stitched, seconds = E.concatenate_clips(clips)
-    elapsed = time.perf_counter() - started
-
-    # Eight seconds is the point at which a Discord button press stops feeling
-    # like it worked. Real footage measures well under two on the machine this
-    # was written on; the margin is for slower hardware, not for a change that
-    # makes this ten times more expensive.
-    assert elapsed < 8.0, f"{elapsed:.2f}s to stitch {seconds:.1f}s of footage"
-    # And it has to be postable: Discord's floor for a bot attachment is
-    # 10 MiB, and this must stay nowhere near it.
-    assert len(stitched) < 8 * 1024 * 1024, len(stitched)
+    emulator.reset()
+    opening = frame_hashes(emulator.record(emulator.clip_frames(0.4)), image)[0]
+    assert opening != before, "the clip opened on the picture from before the reset"

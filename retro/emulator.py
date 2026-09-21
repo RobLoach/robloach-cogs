@@ -10,10 +10,10 @@ Supports both the SessionBuilder API of libretro.py <= 0.6.x (the newest
 release available on Python 3.11, which Red-DiscordBot requires) and the
 Session constructor API of libretro.py >= 0.7.
 
-The clip arithmetic, the animation encoder/decoder and the fast frame grab
-live next door in retro/clips.py, which needs no libretro at all; every one
-of their names is re-exported here, so importing them from this module
-still works and still gets the same objects.
+The clip arithmetic, the animation encoder and the fast frame grab live next
+door in retro/clips.py, which needs no libretro at all; every one of their
+names is re-exported here, so importing them from this module still works
+and still gets the same objects.
 """
 
 import io
@@ -36,14 +36,10 @@ try:
         GIF_COLORS,
         MAX_CLIP_SCALE,
         MAX_CLIP_SECONDS,
-        MAX_REPLAY_BYTES,
-        MAX_REPLAY_CLIPS,
-        MAX_REPLAY_FRAMES,
         MIN_AFTERMATH_FRAMES,
         MIN_CLIP_FRAMES,
         MIN_CLIP_SECONDS,
         MIN_CLIP_WIDTH,
-        REPLAY_SECONDS,
         WEBP_METHOD,
         WEBP_MINIMIZE_SIZE,
         EmulatorError,
@@ -57,8 +53,6 @@ try:
         clip_frame_count,
         clip_scale,
         clip_size,
-        concatenate_clips,
-        decode_clip,
         describe_seconds,
         encode_animation,
         fast_frame_image,
@@ -83,14 +77,10 @@ except ImportError:  # pragma: no cover - `python retro/emulator.py`, see _main
         GIF_COLORS,
         MAX_CLIP_SCALE,
         MAX_CLIP_SECONDS,
-        MAX_REPLAY_BYTES,
-        MAX_REPLAY_CLIPS,
-        MAX_REPLAY_FRAMES,
         MIN_AFTERMATH_FRAMES,
         MIN_CLIP_FRAMES,
         MIN_CLIP_SECONDS,
         MIN_CLIP_WIDTH,
-        REPLAY_SECONDS,
         WEBP_METHOD,
         WEBP_MINIMIZE_SIZE,
         EmulatorError,
@@ -104,8 +94,6 @@ except ImportError:  # pragma: no cover - `python retro/emulator.py`, see _main
         clip_frame_count,
         clip_scale,
         clip_size,
-        concatenate_clips,
-        decode_clip,
         describe_seconds,
         encode_animation,
         fast_frame_image,
@@ -129,10 +117,6 @@ __all__ = [
     "MIN_AFTERMATH_FRAMES",
     "MIN_CLIP_WIDTH",
     "MAX_CLIP_SCALE",
-    "REPLAY_SECONDS",
-    "MAX_REPLAY_FRAMES",
-    "MAX_REPLAY_CLIPS",
-    "MAX_REPLAY_BYTES",
     "CLIP_FORMATS",
     "DEFAULT_CLIP_FORMAT",
     "MAX_SRAM_SIZE",
@@ -144,8 +128,6 @@ __all__ = [
     "clip_frame_count",
     "clip_scale",
     "clip_size",
-    "concatenate_clips",
-    "decode_clip",
     "describe_definitions",
     "describe_seconds",
     "encode_animation",
@@ -816,6 +798,31 @@ class RetroEmulator:
         finally:
             self._pressed = frozenset()
         self.advance(release_frames)
+
+    def reset(self) -> None:
+        """
+        Reboot the machine: libretro's ``retro_reset``, i.e. the power switch.
+
+        The cartridge stays in and its battery memory stays put -- resetting a
+        console has never wiped a save file, and ``retro_reset`` does not
+        reallocate the save RAM region -- so what this throws away is the
+        *moment*, not the player's in-game save. An emulator test holds the
+        real core to both halves of that.
+
+        A frame is run afterwards for the same reason :meth:`load_state` runs
+        one: the video driver still holds the picture from before the reset,
+        so a screenshot or a clip taken immediately would open on a stale
+        frame.
+
+        Blocking, like everything else here, so callers run it in a worker
+        thread. Raises EmulatorError if the core is not running or refuses.
+        """
+        self._require_started()
+        try:
+            self._session.reset()
+        except Exception as exc:
+            raise EmulatorError(f"The core could not be reset: {exc}") from exc
+        self.advance(1)
 
     # -- Save states --------------------------------------------------------
 

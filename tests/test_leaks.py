@@ -11,8 +11,9 @@ Three kinds of proof are used:
 
 * a counted container (``len(...)`` before and after);
 * ``weakref`` plus ``gc.collect()``, for "is this object really released";
-* adding up the bytes every reachable session is holding, for the replay
-  buffers, which are where the megabytes actually are.
+* adding up the bytes every reachable session is holding, which used to be
+  where the megabytes actually were (a replay buffer of up to 8 MiB apiece,
+  before the Replay button was removed) and is now one clip each.
 
 Nothing here needs a real core or the network. The one thing it does need is
 the *real* discord.py view store, because the leak that motivated this file
@@ -148,9 +149,9 @@ async def test_a_retired_view_is_released_by_discord_py(retro, store):
     Every game posts a new message and every message's view is registered
     with discord.py, keyed by message id. A channel that plays ten games
     leaves ten messages behind, and before this was fixed all ten views --
-    each holding its replay buffer of up to MAX_REPLAY_BYTES -- stayed
-    reachable from ViewStore for the life of the process, because nothing
-    ever called View.stop().
+    each holding a clip and a stack of save states, and in those days a
+    replay buffer of up to 8 MiB besides -- stayed reachable from ViewStore
+    for the life of the process, because nothing ever called View.stop().
 
     Note that ViewStore.add_view *merges* into any dispatch table already
     registered for the same message id (discord/ui/view.py:944), so putting
@@ -286,75 +287,70 @@ async def test_forgetting_a_retired_record_releases_its_view(retro, store):
     assert not alive, f"{len(alive)} of 8 forgotten Resume buttons are still reachable"
 
 
-# -- 2. The replay buffer ------------------------------------------------------
+# -- 2. The clip a session holds -----------------------------------------------
+#
+# This section used to be about the replay buffer, which was the one thing in
+# a session big enough to matter: up to MAX_REPLAY_BYTES -- 8 MiB -- of
+# footage apiece, bounded by a count cap, a byte cap and a seconds cap that
+# all had to be enforced as clips arrived. Removing the Replay button removed
+# all of it. What a session holds now is the single clip that is on its
+# message, so the tests are the same shape against a much smaller number:
+# one clip, and none at all once the session is discarded.
 
 
-async def test_the_replay_byte_cap_is_enforced_as_clips_arrive(retro):
-    """
-    Not only at stitch time: the buffer itself has to stay under the cap.
+async def test_a_session_holds_one_clip_however_long_it_is_played(retro):
+    """No container to grow: the newest clip replaces the last one.
 
-    MAX_REPLAY_CLIPS can be 76 (REPLAY_SECONDS / MIN_CLIP_SECONDS), so a
-    count cap alone would allow 76 clips of whatever size the encoder
-    produced.
+    The buffer this replaces kept fifteen seconds of footage, which at the
+    0.2s clip floor was 76 clips (MAX_REPLAY_CLIPS) and needed a byte cap of
+    its own to bound. Sixty presses here would have filled it.
     """
     await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9640, "replaycap")
+    view, _, _ = await retro.posted_game(9640, "oneclip")
     view.clip_seconds = retro.clipsmod.MIN_CLIP_SECONDS
 
-    chunk = b"x" * (512 * 1024)
-    sizes = []
+    held, clips = [], []
     for _ in range(60):
-        view.remember_clip(chunk)
-        sizes.append(sum(len(data) for data, _ in view.clips))
+        await view._press(retro.interaction(view, message=view.message), "a")
+        held.append(len(view.last_clip or b""))
+        clips.append(view.last_clip)
 
-    assert max(sizes) <= retro.clipsmod.MAX_REPLAY_BYTES, max(sizes)
-    assert len(view.clips) <= retro.clipsmod.MAX_REPLAY_CLIPS
-    # 60 x 512 KiB is 30 MiB offered; the cap must have thrown most of it out.
-    assert sizes[-1] < 30 * 1024 * 1024 // 2
-
-
-async def test_one_clip_bigger_than_the_whole_cap_is_still_kept(retro):
-    """The documented exception, pinned so it cannot become accidental."""
-    await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(9641, "oneclip")
-    huge = b"y" * (retro.clipsmod.MAX_REPLAY_BYTES + 1024)
-    view.remember_clip(huge)
-    assert len(view.clips) == 1, "a replay is never emptied to nothing"
-    view.remember_clip(b"z" * 1024)
-    assert sum(len(d) for d, _ in view.clips) <= len(huge), "the huge clip was dropped"
+    # Sixty clips recorded, all of them different, and the session is holding
+    # exactly the last one: no growth at all across the sixty presses.
+    assert len(set(clips)) == 60, "the fake produced the same clip twice"
+    assert view.last_clip == clips[-1]
+    assert max(held) < 64 * 1024, max(held)
+    assert not hasattr(view, "clips"), "the replay buffer came back"
 
 
-async def test_a_discarded_session_does_not_keep_its_clips(retro, store):
+async def test_a_discarded_session_does_not_keep_its_clip(retro, store):
     """
-    The 8 MiB is what makes a retained view expensive.
-
     Freeing it where the session is discarded means that even if something
-    else does hold the view (a stale reference in a traceback, say) the
-    footage is not what is held.
+    else does hold the view (a stale reference in a traceback, say) the clip
+    is not what is held. It was 8 MiB of footage before Replay was removed,
+    which is what made a retained view expensive.
     """
     await retro.install_cores("gambatte")
     view, ctx, _ = await retro.posted_game(9642, "clipdrop")
     for _ in range(4):
-        view.remember_clip(b"q" * (256 * 1024))
-    assert view.clips
+        await view._press(retro.interaction(view, message=view.message), "a")
+    assert view.last_clip
 
     await retro.cog._retire(view, "replaced")
-    assert not view.clips, "a retired session kept its replay footage"
+    assert view.last_clip is None, "a retired session kept its clip"
 
 
 async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro, store):
     """
-    The megabytes, counted rather than inferred.
+    The bytes, counted rather than inferred.
 
-    A replay buffer is the one thing in a session big enough to matter: up
-    to MAX_REPLAY_BYTES apiece. This plays thirty games across ten channels,
-    fills each one's buffer, and adds up the footage still reachable from
-    the cog and from discord.py at the end. With the views retained it grew
-    with every game; now it is bounded by the channels that still have a
-    live session.
+    This plays thirty games across ten channels, presses buttons in each, and
+    adds up the clip bytes still reachable from the cog and from discord.py at
+    the end. With the views retained it grew with every game; now it is
+    bounded by the channels that still have a live session -- and by one clip
+    each rather than by MAX_REPLAY_BYTES each.
     """
     await retro.install_cores("gambatte")
-    chunk = b"f" * (256 * 1024)
 
     def footage():
         views = list(retro.cog.sessions.values())
@@ -365,8 +361,7 @@ async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro
             if id(view) in seen:
                 continue
             seen.add(id(view))
-            for data, _ in getattr(view, "clips", ()) or ():
-                total += len(data)
+            total += len(getattr(view, "last_clip", None) or b"")
         return total
 
     held = []
@@ -376,16 +371,18 @@ async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro
         view = await retro.start_game(ctx, name=f"footage{index}")
         retro.cog._register_view(view)
         for _ in range(8):
-            view.remember_clip(chunk)
-        assert view.clips
+            await view._press(retro.interaction(view, message=view.message), "a")
+        assert view.last_clip
         await retro.cog._retire(view, "replaced")
         retro.cog.sessions.pop(channel.id, None)
         held.append(footage())
         del view, ctx
 
     assert held[-1] == 0, f"footage retained after every game was retired: {held}"
-    assert max(held) <= retro.clipsmod.MAX_REPLAY_BYTES, (
-        f"more than one session's worth of footage was held at once: {max(held)}"
+    # One session's clip at most, which is a few kilobytes -- not the eight
+    # megabytes a single session's replay buffer was allowed to reach.
+    assert max(held) < 64 * 1024, (
+        f"more than one clip's worth of footage was held at once: {max(held)}"
     )
 
 
@@ -554,7 +551,7 @@ async def test_a_cancelled_start_still_frees_the_core(retro, monkeypatch):
     """
     await retro.install_cores("gambatte")
     fake = retro.fakes["RetroEmulator"]
-    fake.reset()
+    fake.reset_all()
 
     async def boot_then_cancel(self, ctx, emulator, *args, **kwargs):
         emulator.start()
@@ -586,7 +583,7 @@ async def test_a_cancelled_wake_still_frees_the_core(retro, monkeypatch):
     view, _, _ = await retro.posted_game(9801, "wakecancel")
     await retro.cog.hibernate(view, None)
     fake = retro.fakes["RetroEmulator"]
-    fake.reset()
+    fake.reset_all()
 
     def boot_then_cancel(emulator, progress, slug):
         emulator.start()
@@ -614,7 +611,7 @@ async def test_a_cancelled_resume_still_frees_the_core(retro, monkeypatch):
     assert retired is not None
 
     fake = retro.fakes["RetroEmulator"]
-    fake.reset()
+    fake.reset_all()
 
     def boot_then_cancel(self, emulator, progress=None):
         emulator.start()
@@ -636,7 +633,7 @@ async def test_many_starts_and_stops_leave_no_emulator_running(retro):
     """The ordinary path, repeated, as a backstop for all of the above."""
     await retro.install_cores("gambatte")
     fake = retro.fakes["RetroEmulator"]
-    fake.reset()
+    fake.reset_all()
     for index in range(12):
         view, _, channel = await retro.posted_game(9810 + index, f"churn{index}")
         await retro.cog.hibernate(view, None)
@@ -704,7 +701,7 @@ async def test_a_session_keeps_no_image_or_memoryview_after_a_clip(retro):
             elif type(value).__module__.startswith("PIL"):
                 held[f"{type(owner).__name__}.{name}"] = type(value).__name__
     assert not held, held
-    assert view.clips and all(isinstance(data, bytes) for data, _ in view.clips)
+    assert isinstance(view.last_clip, bytes) and view.last_clip
 
 
 # -- 7. The core option definitions cache --------------------------------------
