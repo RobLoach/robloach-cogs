@@ -25,6 +25,15 @@ jobs:
   # driven against fakes, and the property tests. No cores, no ROMs, no
   # network -- this is the job that should fail first when something is
   # wrong, and it takes well under a minute.
+  #
+  # requirements-dev.txt installs libretro.py here even though no core is
+  # loaded, which is what lets tests/test_frame_grab.py run: it drives a real
+  # ArrayVideoDriver with synthetic frames and asserts the cog's fast frame
+  # grab is byte-identical to libretro.py's own screenshot(). The fast grab
+  # reads private attributes, so a libretro.py release that renames or
+  # relays them has to fail *here*, in seconds, rather than silently making
+  # every clip a hundred times slower to record. That is also why the
+  # dependency is unpinned.
   fast:
     runs-on: ubuntu-latest
     steps:

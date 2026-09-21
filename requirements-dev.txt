@@ -17,6 +17,11 @@ pytest-xdist>=3.0
 # guard's tests stand down without it, and security tests must not be able
 # to skip themselves quietly.
 aiohttp
+# libretro.py is also what lets tests/test_frame_grab.py run in the *fast*
+# suite, with no core and no ROM: it is the guard that a libretro.py release
+# has not moved the private framebuffer attributes retro/emulator.py's fast
+# frame grab reads. Dropping it here would not fail anything -- the tests
+# would quietly skip -- so don't.
 libretro.py
 pillow
 discord.py

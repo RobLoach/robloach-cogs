@@ -129,6 +129,99 @@ def test_a_game_boy_screenshot_is_exactly_320x288(assets, emu, image, gambatte, 
     assert len(picture.getcolors(maxcolors=1 << 24)) >= 3
 
 
+# -- 1b. The fast frame grab, against the cores themselves --------------------
+#
+# retro.emulator.fast_frame_image decodes the video driver's framebuffer with
+# Pillow rather than letting libretro.py convert it a pixel at a time, which
+# is ~100x faster and reaches into libretro.py's privates to do it. The
+# synthetic cover -- every pixel format, every rotation, every guard -- is in
+# tests/test_frame_grab.py and runs in the fast suite. These two are the same
+# assertion against whatever real cores this machine has: a core whose
+# framebuffer is laid out in a way the tables above did not expect would show
+# up here and nowhere else.
+
+#: (core, ROM) for every core here that some available ROM will boot. mgba,
+#: nestopia and quicknes are not cores systems.py recommends, so they are
+#: only tested on a machine that happens to have them.
+GRAB_CASES = [
+    ("gambatte", "ucity.gbc"),
+    ("gambatte", "dmg-acid2.gb"),
+    ("gambatte", "pokemon.gb"),
+    ("mgba", "ucity.gbc"),
+    ("fceumm", "nestest.nes"),
+    ("nestopia", "nestest.nes"),
+    ("quicknes", "nestest.nes"),
+    ("snes9x", "snes_rotzoom.sfc"),
+]
+
+
+@pytest.mark.parametrize(
+    "core, rom_name", GRAB_CASES, ids=[f"{c}-{r}" for c, r in GRAB_CASES]
+)
+def test_the_fast_frame_grab_is_byte_identical_on_a_real_core(assets, emu, image, core, rom_name):
+    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
+    emulator.advance(emulator.frames_for_seconds(2))
+    driver = emulator._video
+
+    for index in range(24):
+        # A held button, so the frames differ from each other and the
+        # comparison is not made twenty-four times over one still picture.
+        emulator._pressed = frozenset({"a"})
+        emulator.advance(3)
+        emulator._pressed = frozenset()
+
+        fast = E.fast_frame_image(driver, image)
+        assert fast is not None, f"{core} fell back to the slow grab"
+        shot = driver.screenshot()
+        official = image.frombuffer(
+            "RGBA", (shot.width, shot.height), bytes(shot.data), "raw", "RGBA", 0, 1
+        ).convert("RGB")
+        assert fast.size == official.size, index
+        assert fast.tobytes() == official.tobytes(), f"{core} frame {index} differs"
+        assert E.fast_frame_size(driver) == (shot.width, shot.height)
+
+    assert driver._pixel_format.name in E.FAST_RAW_MODES
+
+
+def test_a_recorded_clip_is_the_same_whichever_grab_made_it(emu, gambatte, ucity, monkeypatch):
+    # End to end rather than frame by frame: the same recording, once with
+    # the fast grab and once with it refusing to run, has to come out as the
+    # same bytes -- same pictures, same upscale, same encode.
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(2))
+    state = emulator.save_state()
+    presses = [("right", 0, emulator.frames_for_ms(400))]
+
+    # Restored before *both* recordings, not just the second: a Game Boy that
+    # has run two seconds and one that has been rewound to the same point are
+    # not quite in the same state (the audio timing differs), which is enough
+    # to change a byte of the clip.
+    emulator.load_state(state)
+    fast_clip = emulator.record(emulator.clip_frames(1.0), presses=presses)
+
+    monkeypatch.setattr(E, "fast_frame_image", lambda driver, Image: None)
+    emulator.load_state(state)
+    slow_clip = emulator.record(emulator.clip_frames(1.0), presses=presses)
+
+    assert fast_clip == slow_clip
+
+
+def test_recording_converts_one_frame_per_picture_and_no_more(emu, gambatte, ucity):
+    # output_size() used to pay for a whole screenshot() to read the frame
+    # height off it, so fifteen pictures cost sixteen conversions. Nothing in
+    # a recording should reach the slow path at all now.
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(2))
+    calls = []
+    original = type(emulator)._screenshot
+    try:
+        type(emulator)._screenshot = lambda self: (calls.append(1), original(self))[1]
+        emulator.record(emulator.clip_frames(1.0))
+    finally:
+        type(emulator)._screenshot = original
+    assert calls == [], f"{len(calls)} pixel-by-pixel conversions in one recording"
+
+
 # -- 2. Frame arithmetic ------------------------------------------------------
 
 

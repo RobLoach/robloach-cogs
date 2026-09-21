@@ -158,6 +158,11 @@ MIN_AFTERMATH_FRAMES = 1
 # 20 seconds at CLIP_FPS and keeps even that ceiling inside single digits,
 # while 15 seconds of real footage costs well under two.
 #
+# Every encode figure above is now an overestimate: they were taken with
+# libwebp's minimize_size on, and it has since been measured as pure cost and
+# switched off (see WEBP_MINIMIZE_SIZE), which took 25-30% off every encode
+# here. The ceiling this bounds only got lower.
+#
 # 300 frames is also more than fifteen seconds needs at *any* clip length,
 # which is what makes the seconds the binding cap rather than the frames: a
 # clip contributes CLIP_FPS pictures per second of footage however it is
@@ -207,10 +212,72 @@ DOUBLE_UP_TO_HEIGHT = 256
 # clip 175 KiB against 1.52 MiB -- while being pixel-exact rather than
 # quantized down to 64 colours. It costs about 0.9s more to encode.
 #
+# Re-measured at the current defaults (see WEBP_METHOD below) on a 4 second
+# clip, the gap is the same shape: 24.4 KiB against a 53.2 KiB GIF on a
+# moving Game Boy screen, and 248 KiB against 998 KiB on the SNES. WebP costs
+# 0.15s more on the Game Boy and 1.3s more on the SNES, which is the price of
+# being exact.
+#
 # GIF is kept as a fallback for anywhere animated WebP is not welcome. It is
 # never selected automatically.
 CLIP_FORMATS = ("WEBP", "GIF")
 DEFAULT_CLIP_FORMAT = "WEBP"
+
+# How hard libwebp is told to work. These are not exposed as settings: they
+# are a speed/size trade with one right answer, and the answer is measured
+# rather than guessed. Every combination below is *lossless*, so none of this
+# costs a single pixel of fidelity.
+#
+# Measured on a Raspberry Pi 5, three kinds of real content at three clip
+# lengths, best of three runs each (bytes / encode ms):
+#
+#                       method=0              method=1
+#                    min=T      min=F      min=T      min=F
+#   Game Boy, mostly still (uCity, 2 distinct pictures)
+#     0.5s        1140/10     1140/7      588/12      588/8
+#     1s          1140/16     1140/12     588/17      588/10
+#     4s          1594/50     1650/31    1016/52     1056/42
+#   Game Boy, real motion (Pokemon title screen, every picture distinct)
+#     0.5s      10128/32    11218/19    5380/55     6408/33
+#     1s        15448/52    19538/40    9550/110   11248/79
+#     4s        30892/133   40176/132  21552/232   25058/177
+#   Super Nintendo, rotozoom with a direction held (597x448, all distinct)
+#     0.5s      19290/129   27536/93   14870/248   22276/143
+#     1s        40012/251   57750/181  31012/477   47232/342
+#     4s       219540/1231 303988/907 172004/2313 253682/1863
+#
+# minimize_size is switched off. It costs 30-40% more encode time on every
+# clip and buys nothing where bytes could ever matter:
+#
+#   * on a still screen it saves 0% (the encoder has already merged the
+#     identical pictures into one);
+#   * on real motion it saves 15-34%, of a file that is 6-47 KiB at the
+#     default clip length -- under 1% of the 8 MiB this cog assumes it may
+#     attach;
+#   * on the pathological case, 240 frames of pure 4x4 noise, it saves
+#     *0.0%* (12.59 MiB either way) and still costs 4.3 seconds. The one
+#     input big enough to be rejected by Discord is the one input
+#     minimize_size cannot shrink, so it is not what keeps clips postable --
+#     `Retro._send_clip` handling an over-limit attachment is.
+#
+# That is also why there is no "minimize_size above N seconds" rule: the
+# longer clips are the ones whose bytes are least compressible, so a
+# threshold would spend the most time in the case with the least to gain.
+#
+# method stays at 1. On a Game Boy -- the console this cog is played on most,
+# and the only one whose frames are small -- method=1 is both *smaller* and
+# *faster* than method=0 on a still screen, and 38-43% smaller for 2x the
+# time on a moving one. method=0 is only a clear time win on large busy
+# frames (the SNES row: 181ms against 342ms at 1s) and it pays 22% more bytes
+# for it on every clip from every console. method>=5 was measured earlier at
+# 20-370x the time for no measurable saving, and method=6 takes minutes.
+#
+# quality is a no-op here and is left at 100 for clarity: in lossless mode
+# libwebp reads it as an effort dial, and dropping it to 75 or 50 produced
+# byte-identical Game Boy clips and *larger* SNES ones (45,662 against 40,012
+# at method=0) for no useful time saving.
+WEBP_METHOD = 1
+WEBP_MINIMIZE_SIZE = False
 
 # GIF has no lossless mode, so the fallback path quantizes first. The consoles
 # here have small palettes, so this is very nearly lossless for them.
@@ -231,6 +298,208 @@ MAX_SRAM_SIZE = 1024 * 1024
 def clip_extension(clip_format: str = DEFAULT_CLIP_FORMAT) -> str:
     """``"WEBP"`` -> ``".webp"``."""
     return f".{str(clip_format).lower()}"
+
+
+# -- Grabbing a frame ---------------------------------------------------------
+#
+# libretro.py's ArrayVideoDriver.screenshot() converts the core's native
+# framebuffer into RGBA in a *per-pixel Python loop*: 23,040 iterations for a
+# 160x144 Game Boy frame, 21ms of the ~55ms a captured picture used to cost on
+# a Raspberry Pi 5. A one second clip is fifteen pictures, so that loop was
+# 41% of the whole recording.
+#
+# Pillow can do exactly the same conversion in C, because every pixel format
+# libretro defines is one Pillow already has a raw decoder for. Decoding the
+# driver's buffer in place -- with the driver's own pitch as the stride, so
+# the padding cores leave at the end of each row is skipped rather than
+# copied -- is ~100x faster (0.17ms against 21ms on gambatte) and, with the
+# lookup table below, byte-for-byte identical to what screenshot() returns.
+#
+# This reaches into ArrayVideoDriver's private attributes, which is a hazard:
+# libretro.py is free to rename any of them. Every access is therefore
+# guarded and the official screenshot() is still there as the fallback, so a
+# libretro.py that has moved on gets slow rather than broken. The
+# pixel-identity tests in tests/test_emulator.py are what would notice.
+
+#: libretro pixel format -> the Pillow raw decoder that reads it. libretro's
+#: names describe the channel order in a little-endian *word*, Pillow's
+#: describe it in memory, which is why they look reversed: RGB565's low byte
+#: holds blue, so in byte order it is "BGR;16".
+FAST_RAW_MODES = {
+    "RGB565": "BGR;16",
+    "XRGB8888": "BGRX",
+    "RGB1555": "BGR;15",
+}
+
+#: Rotation -> the Pillow transpose that reproduces libretro.py's own
+#: rotation of the same name, or None when no transpose is needed.
+#:
+#: Rotation.NINETY is deliberately absent: libretro.py 0.6.0 computes its
+#: starting offset as ``(width - 4) * height * 4`` where a 90 degree rotation
+#: needs ``(width - 1) * ...``, so its output is shifted by three rows and
+#: wraps. That is a bug in libretro.py, but fixing it here would change what
+#: the cog posts for a rotated core, so a 90 degree rotation takes the
+#: official path and keeps the bug. Rotation.ONE_EIGHTY and TWO_SEVENTY are
+#: proved identical to it (see tests/test_emulator.py).
+FAST_ROTATIONS = {
+    "NONE": None,
+    "ONE_EIGHTY": "ROTATE_180",
+    "TWO_SEVENTY": "ROTATE_270",
+}
+
+
+def _channel_expansion_table(bits: int) -> list:
+    """
+    One channel's 8-bit values, remapped from Pillow's rounding to libretro's.
+
+    A 5- or 6-bit channel has to be stretched to 8 bits, and the two
+    implementations disagree by a hair: Pillow scales (``c * 255 // hi``)
+    while libretro.py replicates the high bits (``c << (8 - bits) | c >> ...``).
+    On a 5-bit channel that is a difference of at most 1 on 21 of the 32
+    possible values -- invisible, but not *identical*, and identical is what
+    makes a cheap regression test possible.
+
+    Only the values a decoded channel can actually hold are remapped; the rest
+    of the table is the identity, so applying it to a channel that was already
+    8 bits would do nothing.
+    """
+    high = (1 << bits) - 1
+    table = list(range(256))
+    for value in range(high + 1):
+        table[value * 255 // high] = (value << (8 - bits)) | (value >> (2 * bits - 8))
+    return table
+
+
+#: pixel format -> a 768 entry Image.point() table (R, then G, then B), or
+#: None for a format that needs no correction. XRGB8888 is already 8 bits per
+#: channel, so Pillow's decoder copies the bytes through untouched.
+FAST_POINT_TABLES = {
+    "RGB565": (
+        _channel_expansion_table(5) + _channel_expansion_table(6) + _channel_expansion_table(5)
+    ),
+    "RGB1555": _channel_expansion_table(5) * 3,
+    "XRGB8888": None,
+}
+
+#: Reasons the fast grab has already been logged as unavailable, so a core
+#: that cannot use it says so once instead of once per frame (fifteen times a
+#: clip, several clips a minute).
+_SLOW_GRAB_LOGGED: set = set()
+
+
+def _note_slow_frame_grab(reason: str) -> None:
+    """Log, once per reason per process, that the fast frame grab stood down."""
+    if reason not in _SLOW_GRAB_LOGGED:
+        _SLOW_GRAB_LOGGED.add(reason)
+        log.debug(
+            "Reading the video driver's framebuffer directly is not possible (%s); "
+            "falling back to libretro.py's own screenshot(), which is slower.",
+            reason,
+        )
+
+
+def fast_frame_image(driver, Image):
+    """
+    A video driver's current frame as an RGB image, or None to use screenshot().
+
+    None means "nothing here is wrong, but this frame is not one we know how
+    to read": a driver that is not an ArrayVideoDriver, a pixel format or
+    rotation not in the tables above, a framebuffer shorter than the
+    dimensions claim, or a libretro.py that has renamed an attribute. Every
+    one of those is a fallback rather than an error.
+    """
+    frame = getattr(driver, "_frame", None)
+    if frame is None:
+        return None
+    width = getattr(driver, "_last_width", None)
+    height = getattr(driver, "_last_height", None)
+    pitch = getattr(driver, "_last_pitch", None)
+    if not isinstance(width, int) or not isinstance(height, int) or not isinstance(pitch, int):
+        # Before the first video refresh these are all None, which is the one
+        # case that is completely normal and not worth a log line.
+        return None
+    if width <= 0 or height <= 0 or pitch <= 0:
+        return None
+
+    pixel_format = getattr(driver, "_pixel_format", None)
+    raw_mode = FAST_RAW_MODES.get(getattr(pixel_format, "name", None))
+    if raw_mode is None:
+        _note_slow_frame_grab(f"pixel format {getattr(pixel_format, 'name', pixel_format)!r}")
+        return None
+    if pitch < width * getattr(pixel_format, "bytes_per_pixel", 0):
+        _note_slow_frame_grab(f"a pitch of {pitch} is too small for {width} pixels")
+        return None
+
+    rotation = getattr(driver, "_rotation", None)
+    rotation_name = getattr(rotation, "name", None)
+    if rotation_name not in FAST_ROTATIONS:
+        _note_slow_frame_grab(f"rotation {rotation_name or rotation!r}")
+        return None
+    transpose = FAST_ROTATIONS[rotation_name]
+
+    # A memoryview rather than bytes(frame[:n]): the array slice would copy
+    # the buffer and bytes() would copy it again, and Pillow's raw decoder is
+    # happy to read the driver's own memory. 0.17ms -> 0.05ms on a NES frame.
+    # It is released before returning: ArrayVideoDriver replaces its array
+    # rather than resizing it, so an exported view cannot actually block a
+    # refresh, but a view on someone else's buffer is not a thing to leave
+    # lying around.
+    buffer = None
+    try:
+        buffer = memoryview(frame)
+        if buffer.itemsize != 1:
+            _note_slow_frame_grab(f"a framebuffer of {buffer.itemsize}-byte items")
+            return None
+        wanted = pitch * height
+        if buffer.nbytes < wanted:
+            _note_slow_frame_grab(f"a {buffer.nbytes} byte framebuffer where {wanted} was needed")
+            return None
+        image = Image.frombuffer("RGB", (width, height), buffer[:wanted], "raw", raw_mode, pitch, 1)
+        table = FAST_POINT_TABLES[pixel_format.name]
+        if table is not None:
+            # A C loop over the whole image, ~0.02ms, and what makes this
+            # exactly equal to screenshot() rather than merely equivalent.
+            image = image.point(table)
+        if transpose is not None:
+            image = image.transpose(getattr(Image.Transpose, transpose))
+        return image
+    except Exception as exc:  # a Pillow without one of these raw decoders
+        _note_slow_frame_grab(f"Pillow could not decode {raw_mode!r} ({exc})")
+        return None
+    finally:
+        if buffer is not None:
+            try:
+                buffer.release()
+            except BufferError:  # something is still holding a slice of it
+                pass
+
+
+def fast_frame_size(driver):
+    """
+    A video driver's frame size, without converting a single pixel.
+
+    ``output_size()`` only ever wanted the height, and paid for a full
+    screenshot() to get it -- which is why recording fifteen pictures used to
+    convert sixteen frames. The width and height are swapped for a sideways
+    rotation, exactly as screenshot() does it.
+    """
+    width = getattr(driver, "_last_width", None)
+    height = getattr(driver, "_last_height", None)
+    if not isinstance(width, int) or not isinstance(height, int):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    rotation = getattr(driver, "_rotation", None)
+    rotation_name = getattr(rotation, "name", None)
+    if rotation_name in ("NINETY", "TWO_SEVENTY"):
+        # Sideways: the picture is as tall as the frame is wide. This covers
+        # NINETY even though fast_frame_image does not, because the *size* of
+        # a 90 degree rotation is right even where libretro.py's pixels are
+        # not.
+        return height, width
+    if rotation_name in ("NONE", "ONE_EIGHTY"):
+        return width, height
+    return None
 
 
 # -- Clip arithmetic ----------------------------------------------------------
@@ -863,8 +1132,8 @@ class RetroEmulator:
         if ratio > 0.0:
             return ratio
         try:
-            shot = self._video.screenshot()
-            return shot.width / shot.height
+            width, height = self._frame_size()
+            return width / height
         except Exception:
             return 4 / 3
 
@@ -1166,6 +1435,20 @@ class RetroEmulator:
             raise EmulatorError("No video frame is available yet.")
         return shot
 
+    def _frame_size(self) -> "tuple":
+        """
+        The core's own frame size in pixels, cheaply if that is possible.
+
+        :func:`fast_frame_size` reads it off the video driver; the fallback is
+        a full screenshot(), which is also what raises EmulatorError when the
+        core has not rendered anything yet.
+        """
+        size = fast_frame_size(self._video)
+        if size is not None:
+            return size
+        shot = self._screenshot()
+        return shot.width, shot.height
+
     def output_size(self, scale: int = 2) -> "tuple":
         """
         The size a frame should be shown at, in pixels.
@@ -1176,9 +1459,9 @@ class RetroEmulator:
         A Game Boy's pixels are square, so 160x144 lands on exactly 320x288.
         """
         self._require_started()
-        shot = self._screenshot()
-        factor = scale if shot.height <= DOUBLE_UP_TO_HEIGHT else 1
-        height = max(1, shot.height * max(1, factor))
+        _, frame_height = self._frame_size()
+        factor = scale if frame_height <= DOUBLE_UP_TO_HEIGHT else 1
+        height = max(1, frame_height * max(1, factor))
         width = max(1, round(height * self.aspect_ratio))
         return width, height
 
@@ -1186,10 +1469,13 @@ class RetroEmulator:
         """
         Grab the current screen as a Pillow image.
 
-        ArrayVideoDriver.screenshot() converts the core's native pixel format
-        (RGB565/XRGB8888/RGB1555) into an RGBA byte buffer, so Pillow can read
-        it directly. The image is resized with nearest-neighbor so it stays
-        crisp pixel art rather than a blurry upscale.
+        The core's native pixel format (RGB565/XRGB8888/RGB1555) is decoded
+        straight out of the video driver's framebuffer by Pillow -- see
+        :func:`fast_frame_image` -- and only if that is not possible does
+        ArrayVideoDriver.screenshot() convert it a pixel at a time. Both
+        produce the same bytes. The image is then resized with
+        nearest-neighbor so it stays crisp pixel art rather than a blurry
+        upscale.
 
         ``size`` pins the output to an exact size. :meth:`record` uses it so
         that a core which changes resolution part-way through a clip (the SNES
@@ -1197,10 +1483,12 @@ class RetroEmulator:
         two different sizes, which no animation format allows.
         """
         Image = self._pillow()
-        shot = self._screenshot()
-        image = Image.frombuffer(
-            "RGBA", (shot.width, shot.height), bytes(shot.data), "raw", "RGBA", 0, 1
-        ).convert("RGB")
+        image = fast_frame_image(self._video, Image)
+        if image is None:
+            shot = self._screenshot()
+            image = Image.frombuffer(
+                "RGBA", (shot.width, shot.height), bytes(shot.data), "raw", "RGBA", 0, 1
+            ).convert("RGB")
         if colors:
             # Quantizing before the resize is a quarter of the work at 2x,
             # and a nearest-neighbor resize of a P-mode image keeps the
@@ -1367,12 +1655,11 @@ def encode_animation(images, duration_ms, clip_format: str = DEFAULT_CLIP_FORMAT
                 # a busy channel with flickering.
                 loop=1,
                 lossless=True,
+                # See WEBP_METHOD and WEBP_MINIMIZE_SIZE, which carry the
+                # measurements these three numbers were chosen from.
                 quality=100,
-                # method=1 is the sweet spot: method>=5 costs 20-370x the
-                # time for no measurable saving, and method=6 takes
-                # minutes. minimize_size is worth ~20% on this content.
-                method=1,
-                minimize_size=True,
+                method=WEBP_METHOD,
+                minimize_size=WEBP_MINIMIZE_SIZE,
             )
         else:
             # GIF durations are stored in centiseconds, so round to 10ms
