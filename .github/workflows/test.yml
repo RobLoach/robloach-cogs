@@ -61,7 +61,16 @@ jobs:
       - name: Import the cog
         # retro.Retro is the module the cog class lives in; it was called
         # retro.RetroCog before the class was renamed to Retro.
-        run: python -c "import retro, retro.Retro, retro.RetroView, retro.systems, retro.archives; print(retro.Retro.Retro.__name__)"
+        # `retro.Retro` is the cog class re-exported by retro/__init__.py, so
+        # the module of the same name is imported through importlib.
+        run: |
+          python -c "
+          import importlib, retro
+          for name in ('retro.Retro', 'retro.RetroView', 'retro.systems', 'retro.archives'):
+              importlib.import_module(name)
+          assert retro.Retro.__name__ == 'Retro', retro.Retro.__name__
+          print('cog class:', retro.Retro.__name__)
+          "
       - name: Run the fast tests against the real Red
         run: pytest -m "not emulator and not network" --durations=10
 
