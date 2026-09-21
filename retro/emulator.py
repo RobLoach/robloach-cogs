@@ -182,8 +182,8 @@ BUTTONS = (
 )
 
 # The smallest file worth handing to a core. This is a sanity floor, not a
-# header check: the consoles here range from 2 KiB Atari 2600 carts upwards,
-# and every core does its own validation anyway. Anything under this is a
+# header check: the consoles here range from 8 KiB NES carts upwards, and
+# every core does its own validation anyway. Anything under this is a
 # truncated download or an error page.
 MIN_ROM_SIZE = 1024
 

@@ -249,10 +249,11 @@ def test_short_keys_only_lose_a_prefix_that_is_really_there(retro):
 
 def test_the_reset_sentinel_is_not_something_a_core_would_offer(retro):
     # `[p]retroset coreoptions <core> <key> reset` puts a core's default
-    # back, so the sentinel must not also be a real value. "default" and
-    # "none" are both out already (mednafen_wswan offers the first, snes9x
-    # and genesis_plus_gx the second); test_buildbot.py checks every shipped
-    # core against this.
+    # back, so the sentinel must not also be a real value. "none" is out
+    # because snes9x and genesis_plus_gx both offer it, "off" because mGBA
+    # does and "disabled" because most of them do; "default" is unused by the
+    # cores installed today but is exactly the word a new core would reach
+    # for. tests/test_emulator.py checks every shipped core against this.
     assert retro.cogmod.OPTION_RESET == "reset"
     assert retro.cogmod.OPTION_RESET not in ("default", "none", "off", "disabled")
 

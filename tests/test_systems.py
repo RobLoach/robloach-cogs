@@ -75,7 +75,6 @@ EXPECTED_BUTTONS = {
         },
     ),
     "sms": ("genesis_plus_gx", {"1": "b", "2": "a", "Pause": "start"}),
-    "atari2600": ("stella2014", {"Fire": "b", "Select": "select", "Reset": "start"}),
     "pce": (
         "mednafen_pce_fast",
         {
@@ -83,12 +82,7 @@ EXPECTED_BUTTONS = {
             "Select": "select", "Run": "start",
         },
     ),
-    "wswan": ("mednafen_wswan", {"A": "a", "B": "b", "Start": "start", "Rotate": "select"}),
     "ngp": ("mednafen_ngp", {"A": "b", "B": "a", "Option": "start"}),
-    "vb": (
-        "mednafen_vb",
-        {"A": "a", "B": "b", "L": "l", "R": "r", "Start": "start", "Select": "select"},
-    ),
 }
 
 
@@ -258,8 +252,8 @@ def test_every_extension_is_claimed_by_exactly_one_console():
     "extension, key",
     [
         ("gb", "gb"), ("gbc", "gb"), ("nes", "nes"), ("sfc", "snes"), ("smc", "snes"),
-        ("md", "genesis"), ("sms", "sms"), ("gg", "sms"), ("a26", "atari2600"),
-        ("pce", "pce"), ("ws", "wswan"), ("ngp", "ngp"), ("vb", "vb"), ("gba", "gba"),
+        ("md", "genesis"), ("sms", "sms"), ("gg", "sms"), ("sg", "sms"),
+        ("pce", "pce"), ("ngp", "ngp"), ("npc", "ngp"), ("gba", "gba"),
     ],
 )
 def test_extension_picks_the_right_console(extension, key):
@@ -267,7 +261,13 @@ def test_extension_picks_the_right_console(extension, key):
     assert found is not None and found.key == key
 
 
-@pytest.mark.parametrize("extension", ["bin", "cue", "iso", "chd", "fds", "m3u", "zip", "txt"])
+# ".a26", ".ws" and ".vb" belonged to the Atari 2600, WonderSwan and Virtual
+# Boy, which were dropped; nothing may quietly claim them on the way out.
+@pytest.mark.parametrize(
+    "extension",
+    ["bin", "cue", "iso", "chd", "fds", "m3u", "zip", "txt", "a26", "mvc", "ws", "wsc",
+     "pc2", "vb", "vboy"],
+)
 def test_an_unsupported_extension_resolves_to_nothing(extension):
     assert S.system_for_extension(extension) is None
 
@@ -281,8 +281,8 @@ def test_extension_lookup_ignores_case_and_a_leading_dot():
 # -- 5. Cores -----------------------------------------------------------------
 
 WANT_CORES = {
-    "gambatte", "mgba", "fceumm", "snes9x", "genesis_plus_gx", "stella2014",
-    "mednafen_wswan", "mednafen_ngp", "mednafen_pce_fast", "mednafen_vb",
+    "gambatte", "mgba", "fceumm", "snes9x", "genesis_plus_gx",
+    "mednafen_ngp", "mednafen_pce_fast",
 }
 
 
@@ -290,7 +290,14 @@ def test_exactly_the_recommended_core_set_is_shipped():
     assert set(S.CORES) == WANT_CORES
 
 
-@pytest.mark.parametrize("core", ["nestopia", "mesen", "sameboy"])
+# stella2014, mednafen_wswan and mednafen_vb were shipped once and removed:
+# the WonderSwan asks for a 90 degree rotation, which libretro.py renders as
+# a destroyed picture, and the Virtual Boy needs two d-pads. See the module
+# docstring in retro/systems.py.
+@pytest.mark.parametrize(
+    "core",
+    ["nestopia", "mesen", "sameboy", "stella2014", "mednafen_wswan", "mednafen_vb"],
+)
 def test_a_core_we_deliberately_do_not_ship_is_absent(core):
     assert core not in S.CORES
 

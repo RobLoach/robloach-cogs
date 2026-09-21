@@ -129,6 +129,109 @@ def test_a_game_boy_screenshot_is_exactly_320x288(assets, emu, image, gambatte, 
     assert len(picture.getcolors(maxcolors=1 << 24)) >= 3
 
 
+# -- 1a. No shipped core asks for a screen rotation ---------------------------
+#
+# libretro.py's 90 degree rotation is broken -- it starts at (width - 4)
+# instead of (width - 1), so the picture comes back with its rows shifted and
+# partly overwritten, on 0.6.0 and on 0.11.1 alike. There is no correct path
+# for it: the fast grab in retro/clips.py declines, and the "official"
+# screenshot() path it falls back to is the broken one. See
+# test_libretro_s_ninety_degree_rotation_is_still_broken_upstream in
+# tests/test_frame_grab.py, which pins the bug itself.
+#
+# The cog's answer is not to handle rotation but to ship no console that asks
+# for one: the WonderSwan (mednafen_wswan) was dropped for exactly this, since
+# a good half of its library is played with the console turned on its side and
+# the core says so. This is the check that keeps that true, so that adding a
+# core which rotates has to be a deliberate decision rather than a silently
+# mangled clip.
+
+#: core -> a ROM in the assets directory that will boot it. A core with no
+#: bootable ROM here cannot be checked and is skipped; the aggregate test
+#: below refuses to let *every* core skip.
+ROTATION_CASES = {
+    "gambatte": "ucity.gbc",
+    "mgba": "ucity.gbc",
+    "fceumm": "nestest.nes",
+    "snes9x": "snes_rotzoom.sfc",
+}
+
+
+def booted_rotation(emulator):
+    """The rotation a booted core has asked its video driver for."""
+    rotation = getattr(emulator._video, "_rotation", None)
+    assert rotation is not None, "the video driver stopped reporting a rotation"
+    return getattr(rotation, "name", rotation)
+
+
+@pytest.mark.parametrize("core", sorted(S.CORES))
+def test_no_shipped_core_asks_for_a_screen_rotation(assets, emu, core):
+    rom_name = ROTATION_CASES.get(core)
+    if rom_name is None:
+        pytest.skip(f"no ROM here boots {core}, so its rotation cannot be read")
+    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
+    # A core may not set its rotation until it has drawn something, so give
+    # it a second of play before believing the answer.
+    emulator.advance(emulator.frames_for_seconds(1))
+
+    assert booted_rotation(emulator) == "NONE", (
+        f"{core} asks for a {booted_rotation(emulator)} rotation. libretro.py "
+        "renders a 90 degree rotation as a destroyed picture and the cog has "
+        "no path that survives it -- see the comment above this test before "
+        "shipping this core."
+    )
+    # And the fast grab really is willing to take its frames, which is the
+    # same statement from the other side.
+    assert emulator._video._rotation.name in E.FAST_ROTATIONS
+
+
+def test_the_rotation_check_actually_ran_on_something(assets):
+    """
+    A guard the *coverage* of which cannot quietly rot away.
+
+    A machine with no assets is an honest skip, like everything else in this
+    file. A machine that has the cores and still cannot boot two of them is
+    not: it means ROTATION_CASES has fallen behind the core list and the
+    check above is passing by skipping.
+    """
+    present = [core for core in S.CORES if assets.core(core)]
+    if len(present) < 2:
+        pytest.skip(f"only {len(present)} of {len(S.CORES)} cores are in RETRO_TEST_ASSETS")
+    bootable = [
+        core
+        for core in present
+        if ROTATION_CASES.get(core) and assets.rom(ROTATION_CASES[core])
+    ]
+    assert len(bootable) >= 2, (
+        f"{len(present)} cores are installed but only {bootable} can be "
+        "booted, so the rotation guard proved almost nothing. Add an entry to "
+        "ROTATION_CASES (and a ROM to tests/fetch_assets.py) for the rest."
+    )
+
+
+def test_a_rotating_core_would_be_caught_rather_than_posted(emu, image, gambatte, ucity):
+    """
+    The check above is only worth something if a rotation is really fatal.
+
+    Gambatte does not rotate, so the rotation is forced onto its driver here
+    and the frame grab is asked for a picture. The fast path must decline
+    (retro/clips.py refuses NINETY on purpose) rather than hand back
+    something that looks like a frame.
+    """
+    from libretro import Rotation
+
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(1))
+    upright = E.fast_frame_image(emulator._video, image)
+    assert upright is not None, "the unrotated frame should use the fast path"
+
+    emulator._video._rotation = Rotation.NINETY
+    assert E.fast_frame_image(emulator._video, image) is None
+    # The size is still answered, because a sideways size is right even where
+    # libretro.py's pixels are not.
+    assert E.fast_frame_size(emulator._video) == (upright.height, upright.width)
+
+
 # -- 1b. The fast frame grab, against the cores themselves --------------------
 #
 # retro.emulator.fast_frame_image decodes the video driver's framebuffer with
@@ -629,27 +732,50 @@ def test_the_core_is_given_our_system_directory(emu, gambatte, ucity, tmp_path):
     assert "libretro.py-" not in (emulator.system_directory or "")
 
 
+def environment_driver(session):
+    """
+    The object libretro.py dispatches RETRO_ENVIRONMENT_* calls on.
+
+    Two shapes, both of which this cog supports: libretro.py 0.6.x hangs a
+    separate driver off ``Session._environment``, while 0.7+ made the Session
+    *be* its own CompositeEnvironmentDriver. Either way the method that
+    answers GET_SYSTEM_DIRECTORY is ``_get_system_directory`` on the object's
+    type, and the dispatch table looks it up on ``self`` at call time, so
+    replacing it on the class really is seen.
+    """
+    for candidate in (getattr(session, "_environment", None), session):
+        if candidate is None:
+            continue
+        if getattr(type(candidate), "_get_system_directory", None) is not None:
+            return candidate
+    return None
+
+
 def test_the_core_really_asks_for_the_system_directory(emu, gambatte, ucity, tmp_path):
-    # Reaches into libretro.py's internals, which differ between releases:
-    # 0.6.x keeps the driver on Session._environment and dispatches through
-    # _get_system_directory. Where that shape is not there the public
-    # assertion above still holds, so this skips rather than fails.
+    # Reaches into libretro.py's internals, which moved between releases --
+    # see environment_driver() above. This used to skip on anything newer
+    # than 0.6.x, which quietly stopped testing anything at all on the
+    # release people actually install; if it ever has to skip again, that is
+    # a libretro.py change worth failing over rather than shrugging at.
     system_dir = tmp_path / "bios" / "system"
     probe = emu(gambatte, ucity, system_dir=system_dir)
-    environment = getattr(probe._session, "_environment", None)
-    real_get = (
-        getattr(type(environment), "_get_system_directory", None)
-        if environment is not None
-        else None
+    environment = environment_driver(probe._session)
+    assert environment is not None, (
+        "no _get_system_directory anywhere on this libretro.py's session; the "
+        "environment dispatch has been rearranged again and retro/emulator.py "
+        "needs re-reading, not this test relaxing"
     )
-    if real_get is None:
-        pytest.skip("this libretro.py has another internal shape")
     environment_type = type(environment)
+    real_get = environment_type._get_system_directory
     observed = []
 
     def spy(self, dir_ptr):
         ok = real_get(self, dir_ptr)
-        observed.append(bytes(dir_ptr[0]) if ok and dir_ptr[0] else None)
+        value = dir_ptr[0] if ok and dir_ptr[0] else None
+        # 0.6.x hands back bytes, 0.11.x a str.
+        if isinstance(value, bytes):
+            value = value.decode()
+        observed.append(value)
         return ok
 
     probe.stop()
@@ -662,7 +788,7 @@ def test_the_core_really_asks_for_the_system_directory(emu, gambatte, ucity, tmp
         environment_type._get_system_directory = real_get
 
     assert observed, "the core never asked for the system directory"
-    assert all(value == str(system_dir).encode() for value in observed), observed[:3]
+    assert all(value == str(system_dir) for value in observed), observed[:3]
 
 
 def test_a_file_left_in_the_system_directory_survives_a_session(emu, gambatte, ucity, tmp_path):
@@ -710,13 +836,19 @@ def test_the_audio_buffer_is_drained_between_clips(emu, gambatte, ucity):
     emulator = emu(gambatte, ucity)
     assert emulator._audio_buffer is not None, "the audio buffer was not found"
 
+    # Four short clips rather than four long ones: what is under test is that
+    # the buffer is empty *again* after each one, which does not get any truer
+    # with more frames in between -- and the frames are WebP encodes.
     lengths = []
     for _ in range(4):
-        emulator.record(90)
+        emulator.record(24)
         lengths.append(len(emulator._session.audio.buffer))
     assert lengths == [0, 0, 0, 0], lengths
 
-    emulator.advance(600)
+    # advance() has to drain too, not just record(). The control below runs
+    # the same 120 frames with the drain disabled, so the two numbers are
+    # directly comparable: same input, opposite outcome.
+    emulator.advance(120)
     assert len(emulator._session.audio.buffer) == 0
 
     # Without the drain it would be ~176 KiB per emulated second.
@@ -852,8 +984,8 @@ def test_a_live_fceumm_session_reports_the_options_the_probe_could_not(assets, e
 def test_no_core_uses_the_reset_sentinel_as_a_real_value(assets, core):
     # `[p]retroset coreoptions <core> <key> reset` puts a core's default
     # back, so the sentinel must not also be something a core accepts.
-    # "default" and "none" are both out already (mednafen_wswan offers the
-    # first, snes9x and genesis_plus_gx the second).
+    # "none" is out because snes9x and genesis_plus_gx both offer it, "off"
+    # because mGBA does and "disabled" because most of them do.
     definitions = E.probe_core_options(assets.need_core(core))
     clash = [
         key
@@ -996,32 +1128,48 @@ def test_buffered_clips_stitch_back_into_one_animation(emu, image, gambatte, uci
 
 
 def test_a_stitched_replay_is_trimmed_from_the_oldest_end(emu, image, gambatte, ucity):
+    # The clips are deliberately short: what is under test is *which end* the
+    # trim comes off, which is the same question at 0.4 seconds a clip as at
+    # two, and a WebP encode is the most expensive thing in this file. The
+    # budget is half the footage, so the trim has to bite either way.
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    frames = emulator.frames_for_seconds(2)
+    frames = emulator.frames_for_seconds(0.4)
     clips = [emulator.record(frames) for _ in range(3)]
 
     _, full = E.concatenate_clips(clips, max_seconds=100)
-    short, seconds = E.concatenate_clips(clips, max_seconds=3)
-    assert seconds <= 3.5 < full
-    # It is the *newest* five seconds, so the end still matches.
+    short, seconds = E.concatenate_clips(clips, max_seconds=0.6)
+    assert seconds <= 0.8 < full
+    # It is the *newest* 0.6 seconds, so the end still matches.
     assert frame_hashes(short, image)[-1] == frame_hashes(clips[-1], image)[-1]
+    # And it really did drop something, rather than the budget being generous
+    # enough to keep the lot.
+    assert len(frame_hashes(short, image)) < len(frame_hashes(clips[-1], image)) * 3
 
 
 def test_one_clip_longer_than_the_window_is_trimmed_by_frame(emu, gambatte, ucity):
+    # "Longer than the window" is relative to max_seconds, which is passed in
+    # here, so one second against a 0.3 second budget tests exactly what six
+    # seconds against two did -- for a sixth of the encoding.
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    long_clip = emulator.record(emulator.frames_for_seconds(6))
-    _, seconds = E.concatenate_clips([long_clip], max_seconds=2)
-    assert seconds <= 2.5
+    long_clip = emulator.record(emulator.frames_for_seconds(1.0))
+    _, full = E.concatenate_clips([long_clip], max_seconds=100)
+    _, seconds = E.concatenate_clips([long_clip], max_seconds=0.3)
+    assert full > 0.5, "the single clip is not longer than the window any more"
+    assert seconds <= 0.5
 
 
 def test_the_frame_cap_bounds_the_work(emu, gambatte, ucity):
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    clips = [emulator.record(emulator.frames_for_seconds(2)) for _ in range(2)]
+    clips = [emulator.record(emulator.frames_for_seconds(0.5)) for _ in range(2)]
+    uncapped, _ = E.concatenate_clips(clips, max_seconds=100, max_frames=1000)
     stitched, _ = E.concatenate_clips(clips, max_seconds=100, max_frames=10)
     durations, _ = anmf(stitched)
+    # The cap has to actually be doing something: without this the test would
+    # pass just as well on footage that never reached ten frames.
+    assert len(anmf(uncapped)[0]) > 10, "there was nothing for the cap to cut"
     assert len(durations) <= 10
 
 
@@ -1033,7 +1181,7 @@ def test_a_resolution_change_ends_the_replay_rather_than_corrupting_it(
     # must be dropped rather than stretched or crashed on.
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    normal = emulator.record(emulator.frames_for_seconds(2))
+    normal = emulator.record(emulator.frames_for_seconds(0.4))
     small = E.encode_animation(
         [image.new("RGB", (16, 16)) for _ in range(3)], 67, "WEBP"
     )
@@ -1047,7 +1195,7 @@ def test_an_unreadable_clip_in_the_buffer_costs_only_the_older_footage(
 ):
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
-    good = emulator.record(emulator.frames_for_seconds(2))
+    good = emulator.record(emulator.frames_for_seconds(0.4))
     stitched, seconds = E.concatenate_clips([b"not a clip at all", good])
     assert stitched[:4] == b"RIFF"
     assert seconds > 0
@@ -1064,7 +1212,7 @@ def test_gif_clips_stitch_too(emu, gambatte, ucity):
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
     clips = [
-        emulator.record(emulator.frames_for_seconds(2), clip_format="GIF")
+        emulator.record(emulator.frames_for_seconds(0.4), clip_format="GIF")
         for _ in range(2)
     ]
     stitched, seconds = E.concatenate_clips(clips, clip_format="GIF")

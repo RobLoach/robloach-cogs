@@ -6,8 +6,8 @@ animated clip of the next second of gameplay, so you see the game react
 instead of a still frame. Anyone in the channel can play, making it a fun
 social feature.
 
-Eleven consoles are supported out of the box, from the Atari 2600 to the Super
-Nintendo. Emulation is provided by
+Eight consoles are supported out of the box, from the Nintendo Entertainment
+System to the Game Boy Advance. Emulation is provided by
 [libretro.py](https://github.com/JesseTG/libretro.py) running cores from the
 [libretro buildbot](https://buildbot.libretro.com).
 
@@ -28,7 +28,7 @@ Install and load the cog:
 [p]load retro
 ```
 
-The emulator cores (about 5 MiB for all eleven consoles, none of which need a
+The emulator cores (about 4.5 MiB for all eight consoles, none of which need a
 BIOS) start downloading in the background as soon as the cog loads. To do it
 now, or to check on it:
 
@@ -101,7 +101,7 @@ password-protected archive gets a plain explanation rather than a stack trace.
 ## Consoles
 
 The console is chosen from the ROM's file extension. Every core is BIOS-free —
-nothing but the ROM is needed — and the whole set is about 5 MiB.
+nothing but the ROM is needed — and the whole set is about 4.5 MiB.
 
 | Console | Core | File extensions |
 | --- | --- | --- |
@@ -111,23 +111,22 @@ nothing but the ROM is needed — and the whole set is about 5 MiB.
 | Super Nintendo | `snes9x` | `.smc` `.sfc` `.swc` `.fig` `.bs` `.st` |
 | Sega Genesis / Mega Drive | `genesis_plus_gx` | `.md` `.mdx` `.smd` `.gen` `.68k` `.sgd` |
 | Sega Master System / Game Gear | `genesis_plus_gx` | `.sms` `.gg` `.sg` |
-| Atari 2600 | `stella2014` | `.a26` `.mvc` |
 | PC Engine / TurboGrafx-16 | `mednafen_pce_fast` | `.pce` |
-| WonderSwan | `mednafen_wswan` | `.ws` `.wsc` `.pc2` |
 | Neo Geo Pocket | `mednafen_ngp` | `.ngp` `.ngc` `.ngpc` `.npc` |
-| Virtual Boy | `mednafen_vb` | `.vb` `.vboy` |
 
-`.bin` is deliberately not accepted: three of these consoles claim it, so there
-is no way to tell them apart. Rename an Atari 2600 ROM to `.a26` instead. CD
-formats (`.cue`, `.iso`, `.chd`) and Famicom Disk System images (`.fds`) are not
-supported, because they need disc images or a BIOS. ROMs are capped at 32 MiB.
-A `.zip` containing any of the above is unpacked automatically.
+`.bin` is deliberately not accepted: it is the one extension that says nothing
+about which console a ROM is for — Mega Drive ROMs, Atari cartridges, raw CD
+tracks and BIOS dumps are all `.bin` — so a Genesis ROM has to be renamed to
+`.md` instead. CD formats (`.cue`, `.iso`, `.chd`) and Famicom Disk System
+images (`.fds`) are not supported, because they need disc images or a BIOS.
+ROMs are capped at 32 MiB. A `.zip` containing any of the above is unpacked
+automatically.
 
 Each console shows its own controls, with the names printed on its own
-controller: the Genesis gets **A B C** (and **X Y Z** and **Mode**), the Atari
-2600 gets **Fire**, **Select** and **Reset**, the PC Engine gets **I** through
-**VI** and **Run**, and the Neo Geo Pocket's **A** and **B** are the right way
-round rather than swapped.
+controller: the Genesis gets **A B C** (and **X Y Z** and **Mode**), the Master
+System gets **1**, **2** and **Pause**, the PC Engine gets **I** through **VI**
+and **Run**, and the Neo Geo Pocket's **A** and **B** are the right way round
+rather than swapped.
 
 ## The controller
 
@@ -143,8 +142,8 @@ Start  Select   ⏩ Wait   A ×3   🔁 Replay
 ```
 
 Consoles with more buttons grow upwards and sideways into the same shape — the
-Game Boy Advance and Virtual Boy put **L** and **R** on the top row where the
-shoulder buttons really are, the Super Nintendo adds a **Y X / B A** block, and
+Game Boy Advance puts **L** and **R** on the top row where the shoulder
+buttons really are, the Super Nintendo adds a **Y X / B A** block, and
 the six-button Genesis and PC Engine keep their real two-by-three face cluster:
 
 ```
@@ -563,9 +562,8 @@ Discord routes a click on a message this cog has already posted).
 - [libretro](https://www.libretro.com/) and the RetroArch buildbot
 - The [Gambatte](https://github.com/libretro/gambatte-libretro),
   [mGBA](https://github.com/libretro/mgba), [FCEUmm](https://github.com/libretro/libretro-fceumm),
-  [Snes9x](https://github.com/libretro/snes9x), [Genesis Plus GX](https://github.com/libretro/Genesis-Plus-GX),
-  [Stella](https://github.com/libretro/stella2014-libretro) and
-  [Mednafen](https://github.com/libretro/beetle-wswan-libretro) core teams
+  [Snes9x](https://github.com/libretro/snes9x), [Genesis Plus GX](https://github.com/libretro/Genesis-Plus-GX)
+  and [Mednafen](https://github.com/libretro/beetle-pce-fast-libretro) core teams
 - [retrobrews](https://retrobrews.github.io/), for collecting the homebrew
 - [µCity](https://github.com/AntonioND/ucity) by Antonio Niño Díaz, the worked
   example throughout these docs

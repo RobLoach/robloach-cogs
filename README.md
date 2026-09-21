@@ -20,8 +20,9 @@ Experimental Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-Disco
 
 ```
 pip install -r requirements-dev.txt
-pytest -m "not emulator"    # the fast suite, about a second
-pytest                      # everything this machine can run
+pytest                      # the fast suite, which is the default: a few seconds
+pytest -m emulator          # the real-core half
+pytest -m "not network"     # everything this machine can run
 ruff check .
 ```
 

@@ -9,6 +9,22 @@ own without discord.py or Red installed.
 Every core listed here is BIOS-free (it boots a game with nothing but the ROM)
 and is published for linux/x86_64, linux/aarch64, macOS and Windows on the
 libretro buildbot.
+
+Two further conditions a new console has to meet, both learned the hard way:
+
+* **It must not ask for a screen rotation.** libretro.py's software video
+  driver rotates a frame by 90 degrees from the wrong starting offset --
+  ``(width - 4) * height`` where ``(width - 1) * height`` is meant -- so a
+  core that calls ``RETRO_ENVIRONMENT_SET_ROTATION`` with 90 degrees gets a
+  picture whose rows are cyclically shifted and partly overwritten, on both
+  libretro.py 0.6.0 and 0.11.1. There is no fast path and no slow path that
+  survives it, so the WonderSwan (``mednafen_wswan``), which rotates for a
+  good half of its library, is deliberately absent. An emulator test asserts
+  that no core here reports a rotation after boot.
+* **Its controls must fit one d-pad and the grid below.** The Virtual Boy
+  (``mednafen_vb``) is out because its defining control scheme is *two*
+  d-pads -- its own input descriptors are "Left D-Pad Up" and "Right D-Pad
+  Up" and so on -- which this layout cannot express.
 """
 
 import sys
@@ -52,9 +68,9 @@ class Button(typing.NamedTuple):
     """One controller button as the player sees it.
 
     ``label`` is the console's own name for the button (Genesis calls its
-    face buttons A/B/C, the PC Engine calls them I/II, the 2600 calls its one
-    button Fire); ``field`` is the RetroPad field the libretro core actually
-    reads, which is frequently something else entirely.
+    face buttons A/B/C, the PC Engine calls them I/II, the Master System
+    numbers them 1 and 2); ``field`` is the RetroPad field the libretro core
+    actually reads, which is frequently something else entirely.
 
     ``label`` may be empty, in which case the button shows nothing but its
     ``emoji``: the d-pad is four arrows and nothing else. Discord accepts a
@@ -274,7 +290,7 @@ def _face(label: str, field: str) -> Button:
 #                         Start  Select  [Wait  A x3  Replay]
 #
 #   Game Boy Advance      ·  ⬆  L  R                 14 components, 3 rows
-#   / Virtual Boy         ⬅  ⬇  ➡  B  A
+#                         ⬅  ⬇  ➡  B  A
 #                         Start  Select  [Wait  A x3  Replay]
 #
 #   Super Nintendo        ·  ⬆  L  R                 19 components, 4 rows
@@ -295,14 +311,6 @@ def _face(label: str, field: str) -> Button:
 #   Master System         ·  ⬆                       11 components, 3 rows
 #                         ⬅  ⬇  ➡  1  2
 #                         Pause  [Wait  1 x3  Replay]
-#
-#   Atari 2600            ·  ⬆                       11 components, 3 rows
-#                         ⬅  ⬇  ➡  Fire
-#                         Select  Reset  [Wait  Fire x3  Replay]
-#
-#   WonderSwan            ·  ⬆                       12 components, 3 rows
-#                         ⬅  ⬇  ➡  B  A
-#                         Start  Rotate  [Wait  A x3  Replay]
 #
 #   Neo Geo Pocket        ·  ⬆                       11 components, 3 rows
 #                         ⬅  ⬇  ➡  A  B
@@ -363,9 +371,18 @@ class System(typing.NamedTuple):
         return found.label
 
 
-# Extensions we never claim. ".bin" is claimed by three different cores,
-# ".fds" needs Nintendo's disksys.rom BIOS, and the disc-image formats all
-# need a CD image plus (usually) a console BIOS.
+# Extensions we never claim. ".fds" needs Nintendo's disksys.rom BIOS, and
+# the disc-image formats all need a CD image plus (usually) a console BIOS.
+#
+# ".bin" used to be excluded because three of the cores here claimed it
+# (stella2014, mednafen_vb and genesis_plus_gx); with the first two gone only
+# genesis_plus_gx claims it, so it is no longer ambiguous *within this set*.
+# It stays out anyway, because the ambiguity was never really about our core
+# list: ".bin" is the one extension that carries no console information at
+# all. An Atari 2600 cartridge, a Mega Drive ROM, a Virtual Boy ROM, a raw CD
+# track and a BIOS dump are all ".bin" in the wild, so accepting it would
+# mean silently loading somebody's PlayStation disc track as a Mega Drive
+# game. Genesis ROMs should be named ".md" instead.
 AMBIGUOUS_EXTENSIONS = frozenset(
     {"bin", "cue", "iso", "chd", "toc", "m3u", "ccd", "img", "fds"}
 )
@@ -461,22 +478,6 @@ SYSTEMS: typing.Tuple[System, ...] = (
         confirm="b",
     ),
     System(
-        key="atari2600",
-        name="Atari 2600",
-        core="stella2014",
-        # ".bin" is the 2600's usual extension but three cores claim it, so
-        # players have to rename to .a26.
-        extensions=("a26", "mvc"),
-        # Select and Reset are switches on the console itself, not on the
-        # joystick, so they sit on the bottom row with the other controls.
-        rows=(
-            (SPACER, UP),
-            (LEFT, DOWN, RIGHT, _face("Fire", "b")),
-            (Button("Select", "select"), Button("Reset", "start")),
-        ),
-        confirm="b",
-    ),
-    System(
         key="pce",
         name="PC Engine",
         core="mednafen_pce_fast",
@@ -495,20 +496,6 @@ SYSTEMS: typing.Tuple[System, ...] = (
         confirm="b",
     ),
     System(
-        key="wswan",
-        name="WonderSwan",
-        core="mednafen_wswan",
-        extensions=("ws", "wsc", "pc2"),
-        # The WonderSwan is played held either way up, so the core puts
-        # "rotate the screen" on RetroPad select rather than a real button.
-        rows=(
-            (SPACER, UP),
-            (LEFT, DOWN, RIGHT, _face("B", "b"), _face("A", "a")),
-            (Button("Start", "start"), Button("Rotate", "select")),
-        ),
-        confirm="a",
-    ),
-    System(
         key="ngp",
         name="Neo Geo Pocket",
         core="mednafen_ngp",
@@ -521,20 +508,6 @@ SYSTEMS: typing.Tuple[System, ...] = (
             (Button("Option", "start"),),
         ),
         confirm="b",
-    ),
-    System(
-        key="vb",
-        name="Virtual Boy",
-        core="mednafen_vb",
-        extensions=("vb", "vboy"),
-        # The Virtual Boy has two d-pads; only the left one is wired up here,
-        # so it is laid out exactly like a Game Boy Advance.
-        rows=(
-            (SPACER, UP, _face("L", "l"), _face("R", "r")),
-            (LEFT, DOWN, RIGHT, _face("B", "b"), _face("A", "a")),
-            (Button("Start", "start"), Button("Select", "select")),
-        ),
-        confirm="a",
     ),
 )
 

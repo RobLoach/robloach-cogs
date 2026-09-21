@@ -265,13 +265,24 @@ FAST_RAW_MODES = {
 #: Rotation -> the Pillow transpose that reproduces libretro.py's own
 #: rotation of the same name, or None when no transpose is needed.
 #:
-#: Rotation.NINETY is deliberately absent: libretro.py 0.6.0 computes its
-#: starting offset as ``(width - 4) * height * 4`` where a 90 degree rotation
-#: needs ``(width - 1) * ...``, so its output is shifted by three rows and
-#: wraps. That is a bug in libretro.py, but fixing it here would change what
-#: the cog posts for a rotated core, so a 90 degree rotation takes the
-#: official path and keeps the bug. Rotation.ONE_EIGHTY and TWO_SEVENTY are
-#: proved identical to it (see tests/test_emulator.py).
+#: Rotation.NINETY is deliberately absent, and is a special case: libretro.py
+#: computes its starting offset as ``(width - 4) * height * 4`` where a 90
+#: degree rotation needs ``(width - 1) * ...``, so the output rows come out
+#: cyclically shifted by three and the three that wrap round land on negative
+#: offsets and overwrite the bottom of the picture. It is the same line of
+#: code, and the same bug, in libretro.py 0.6.0 and 0.11.1.
+#:
+#: So there is no correct path for a 90 degree rotation at all -- the slow
+#: official path is the broken one. Reproducing the bug in Pillow is not
+#: worth it and silently *fixing* it here would mean the fast and slow grabs
+#: of the same frame disagreed, so the fast path stands down and the frame
+#: goes through screenshot(). No console in systems.py asks for a rotation
+#: (there is an emulator test for that, and the WonderSwan was dropped
+#: because it did), so this is a guard against a future core rather than
+#: something a player can hit today.
+#:
+#: Rotation.ONE_EIGHTY and TWO_SEVENTY are correct upstream and are proved
+#: byte-identical to it (see tests/test_frame_grab.py).
 FAST_ROTATIONS = {
     "NONE": None,
     "ONE_EIGHTY": "ROTATE_180",
@@ -312,15 +323,32 @@ FAST_POINT_TABLES = {
     "XRGB8888": None,
 }
 
+#: How many distinct reasons to remember having logged.
+#:
+#: Most of the reasons below are drawn from a fixed set -- the pixel formats
+#: and rotations libretro defines -- but two of them interpolate the frame
+#: geometry the *core* chose ("a pitch of N is too small for M pixels", "an N
+#: byte framebuffer where M was needed"). A core that changes geometry
+#: mid-game while on the slow path could therefore mint a new string
+#: indefinitely, and this is a module-level set in a process that runs for
+#: months. The cap turns that into a duplicate log line, which is all this
+#: set was ever protecting against.
+MAX_SLOW_GRAB_REASONS = 64
+
 #: Reasons the fast grab has already been logged as unavailable, so a core
 #: that cannot use it says so once instead of once per frame (fifteen times a
-#: clip, several clips a minute).
+#: clip, several clips a minute). Bounded by MAX_SLOW_GRAB_REASONS.
 _SLOW_GRAB_LOGGED: set = set()
 
 
 def _note_slow_frame_grab(reason: str) -> None:
     """Log, once per reason per process, that the fast frame grab stood down."""
     if reason not in _SLOW_GRAB_LOGGED:
+        if len(_SLOW_GRAB_LOGGED) >= MAX_SLOW_GRAB_REASONS:
+            # Something is generating reasons rather than hitting one, so
+            # start again rather than growing. The worst this costs is that a
+            # reason already reported is reported a second time.
+            _SLOW_GRAB_LOGGED.clear()
         _SLOW_GRAB_LOGGED.add(reason)
         log.debug(
             "Reading the video driver's framebuffer directly is not possible (%s); "

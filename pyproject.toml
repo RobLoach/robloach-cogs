@@ -9,7 +9,20 @@
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
-addopts = "--strict-markers --strict-config -ra"
+# A plain `pytest` is the thing a developer runs twenty times an hour, so it
+# is the *fast* suite by default: no real libretro core, no ROM, no network.
+# That is a few seconds rather than half a minute.
+#
+# A command-line `-m` replaces this one (pytest's `-m` takes a single value,
+# and the command line is applied after addopts), which is what makes
+#
+#     pytest -m emulator                  the real-core half
+#     pytest -m "not network"             everything this machine can run
+#     pytest -m network                   the buildbot check, with opt-in
+#
+# work, and why the CI jobs in .github/workflows/test.yml -- which all pass
+# their own `-m` -- are unaffected. See tests/README.md.
+addopts = "--strict-markers --strict-config -ra -m \"not emulator and not network\""
 # The cog is async from end to end (commands, button callbacks, the idle
 # task), so every `async def test_` is run without decorating each one.
 asyncio_mode = "auto"

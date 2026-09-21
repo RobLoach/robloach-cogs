@@ -37,7 +37,7 @@ log = logging.getLogger("red.robloach.retro")
 
 BUILDBOT = "https://buildbot.libretro.com/nightly"
 
-# The core downloads fetch eleven files from one host in a row.
+# The core downloads fetch every core in CORES from one host in a row.
 CORE_DOWNLOAD_TIMEOUT_SECONDS = 300
 
 # How long to wait before the automatic core download is allowed to try
@@ -47,9 +47,12 @@ AUTO_DOWNLOAD_COOLDOWN_SECONDS = 6 * 60 * 60
 
 # The value that clears a core option override and puts the core's own default
 # back. It has to be a word no core uses as a real value, or setting it would
-# be ambiguous: "default" is out (mednafen_wswan offers it) and so is "none"
-# (snes9x and genesis_plus_gx both use it), but no option in any of the eleven
-# cores this cog installs offers "reset".
+# be ambiguous. "none" is out because snes9x and genesis_plus_gx both offer
+# it, "off" because mGBA does and "disabled" because most of them do;
+# "default" happens to be unused by the cores installed today, but it is
+# exactly the word a core added tomorrow would reach for. No option in any of
+# the cores this cog installs offers "reset", and an emulator test keeps
+# checking that.
 OPTION_RESET = "reset"
 
 # How many of an option's allowed values one line of `[p]retroset coreoptions

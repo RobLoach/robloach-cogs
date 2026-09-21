@@ -30,7 +30,7 @@ MAX_CACHED_GAMES_PER_CHANNEL = 5
 
 # -- The disk budget -----------------------------------------------------------
 #
-# Everything this cog stores lives under one directory: the cores (about 5 MiB
+# Everything this cog stores lives under one directory: the cores (about 4.5 MiB
 # for the lot), the cached ROMs (up to 32 MiB each, five per channel), the save
 # states and battery saves with one previous generation each, and any BIOS
 # files the owner has installed. The per-channel ROM cache bounds one channel;

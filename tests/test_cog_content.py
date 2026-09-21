@@ -106,7 +106,10 @@ async def test_downloading_everything_reports_what_installed_and_what_failed(ret
     assert set(buildbot) == set(retro.sysmod.CORES)
     assert set(cores) == set(retro.sysmod.CORES) - {"snes9x"}
     report = " ".join(str(s) for s in ctx.sent[-3:])
-    assert "Installed 9 core(s)" in report
+    # Everything but snes9x, which the fake buildbot 404s. Derived rather
+    # than written out, so adding or dropping a console does not need this
+    # number edited.
+    assert f"Installed {len(retro.sysmod.CORES) - 1} core(s)" in report
     assert "KiB in total" in report
     assert "snes9x" in report and "404" in report
     assert all(Path(p).is_file() for p in cores.values())

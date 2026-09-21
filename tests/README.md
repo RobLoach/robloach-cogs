@@ -2,16 +2,26 @@
 
 ```bash
 pip install -r ../requirements-dev.txt
-pytest                      # everything the machine can run
-pytest -m "not emulator"    # the fast half: a few seconds
-pytest -m emulator          # real cores and real ROMs: about a minute
+pytest                      # the fast suite, which is the default: ~6s
+pytest -m emulator          # real cores and real ROMs: ~21s, or ~12s with -n 2
+pytest -m "not network"     # both of the above, i.e. everything this machine can run
+pytest -m network           # the buildbot check; also needs RETRO_TEST_NETWORK=1
 ```
+
+**A plain `pytest` is the fast suite.** `pyproject.toml` puts
+`-m "not emulator and not network"` in `addopts`, because running the tests
+is something you do twenty times an hour and the real-core half costs five
+times as much as the rest put together. A `-m` on the command line replaces
+that one (pytest's `-m` holds a single value and the command line is applied
+after `addopts`), so each line above means exactly what it says -- and the
+jobs in `.github/workflows/test.yml`, which all pass their own `-m`, still
+run everything between them.
 
 `pytest` works on a bare checkout. Anything it cannot run -- a missing core,
 no `libretro.py`, no `discord.py` -- **skips** with a reason rather than
 failing.
 
-## The two halves
+## The three halves
 
 | | what it covers | needs |
 | --- | --- | --- |
@@ -19,9 +29,20 @@ failing.
 | `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), stitched replays, save states, battery saves, core options, BIOS directory, and the save export/import round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` also wants `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
-`pytest -m emulator -n 2` halves the slow half (about 64s to 34s here). It
+`pytest -m emulator -n 2` roughly halves the slow half (21s to 12s here). It
 has to be `-n`, i.e. separate processes: one libretro core may be loaded per
 process. The fast suite is *slower* under `-n`, so it is left serial.
+
+Almost all of the slow half is Pillow encoding real WebP, so the clips the
+tests record are deliberately as short as the assertion allows -- a test
+about *which end* a replay is trimmed from proves the same thing with 0.4
+second clips as with two second ones. The tests that are genuinely about
+length keep it: `test_a_clip_plays_for_as_long_as_it_emulated` runs at every
+clip length up to four seconds, `test_buffered_clips_stitch_back_into_one_animation`
+records sixteen seconds so the fifteen second window has something to trim,
+and `test_stitching_fifteen_seconds_is_quick_enough_to_do_on_a_button_press`
+has to keep stitching a real fifteen seconds or it is measuring nothing.
+Don't shorten those three.
 
 `-m redbot` marks the few tests that need the real Red-DiscordBot (command
 permission metadata, the assembled cog's `__cog_commands__`, and the two
@@ -59,6 +80,26 @@ Two consequences for the tests:
 `tests/test_mixins.py` also pins the command surface and the Config keys:
 both are already on other people's disks, so a command or a settings key
 that a refactor quietly drops is their data gone.
+
+## What the cog holds on to
+
+`tests/test_leaks.py` is the file for "after N of these have come and gone,
+is N still in memory?". It is in the fast suite and needs no core. The
+container it was written for is not the cog's own: discord.py keeps every
+persistent view in a store keyed by message id, filled by `Client.add_view`
+*and* by every send or edit that carries a view, and emptied by nothing
+except `View.stop()` -- there is no `bot.remove_view`. So every game a
+channel plays used to leave a whole `RetroView`, replay buffer included,
+reachable for the life of the process. `Retro._release_view` is the fix and
+these tests are the proof; they fail if it is taken out.
+
+Two conventions in there worth knowing:
+
+* the fake bot is given a **real** `discord.ui.view.ViewStore`, because a
+  fake of the container under test can only ever agree with itself;
+* `drop_the_test_doubles(env)` clears what `tests/fakes.py` recorded before
+  the `weakref` check, because `FakeMessage` keeps the kwargs it was sent
+  with (view included) and a real `discord.Message` does not.
 
 ## Getting the cores and ROMs
 

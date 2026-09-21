@@ -388,11 +388,14 @@ class Retro(
                 log.exception("Failed to hibernate a Libretro session on unload.")
             # The buttons stay enabled on the message so the game can be
             # resumed after a reload, but this now-orphaned view object must
-            # not answer them; cog_load builds fresh ones.
+            # not answer them; cog_load builds fresh ones and re-registers
+            # them for the same message.
             view.closed = True
+            self._release_view(view)
         self.sessions.clear()
         for retired in self.retired.values():
             retired.alive = False
+            self._release_view(retired)
         self.retired.clear()
 
     # -- Red's end-user data API --------------------------------------------
@@ -573,7 +576,18 @@ class Retro(
             # and it has to survive a restart: that is the whole point of it,
             # since a retired message can sit in a channel for weeks before
             # anybody wants the game back.
-            for key, retired_record in (data.get("retired") or {}).items():
+            # Newest first and capped, so the in-memory dictionary is bounded
+            # by MAX_RETIRED_PER_CHANNEL whatever is on disk. _remember_retired
+            # trims as it writes, but a store written by another version of
+            # the cog (or left behind by a Config write that failed halfway)
+            # must not be able to fill memory on load.
+            stored = (data.get("retired") or {}).items()
+            newest = sorted(
+                stored,
+                key=lambda pair: float((pair[1] or {}).get("last_active") or 0.0),
+                reverse=True,
+            )
+            for key, retired_record in newest[:MAX_RETIRED_PER_CHANNEL]:
                 try:
                     retired_record = dict(retired_record)
                     retired_record.setdefault("channel_id", channel_id)
@@ -603,6 +617,10 @@ class Retro(
         existing = self.retired.pop(message_id, None)
         if existing is not None:
             existing.alive = False
+            # Before the new one is registered, or remove_view would take
+            # the new view's entry out of discord.py's table with the old
+            # one's; see _release_view.
+            self._release_view(existing)
         view = RetiredView(self, record)
         self.retired[message_id] = view
         try:
@@ -642,6 +660,7 @@ class Retro(
                     stale = self.retired.pop(int(oldest), None)
                     if stale is not None:
                         stale.alive = False
+                        self._release_view(stale)
                     log.debug(
                         "Forgot the Resume button for %s in channel %s.",
                         (dropped or {}).get("game_name"),
@@ -658,6 +677,7 @@ class Retro(
         view = self.retired.pop(int(message_id), None)
         if view is not None:
             view.alive = False
+            self._release_view(view)
         try:
             async with self.config.channel_from_id(int(channel_id)).retired() as retired:
                 retired.pop(str(int(message_id)), None)
@@ -690,6 +710,7 @@ class Retro(
             view = self.retired.pop(message_id, None)
             if view is not None:
                 view.alive = False
+                self._release_view(view)
 
     def _register_view(self, view: RetroView) -> None:
         """
@@ -707,6 +728,68 @@ class Retro(
                 "Could not register the Libretro controls for message %s",
                 view.message_id,
             )
+
+    @staticmethod
+    def _release_view(view) -> None:
+        """
+        Give a view the cog has finished with back to discord.py.
+
+        This is the counterpart to _register_view, and it has to exist
+        because a Discord bot runs for months. discord.py keeps every
+        persistent view in a store keyed by message id -- filled by
+        ``Client.add_view`` and by *every* send or edit that carries a view,
+        and emptied by nothing except ``ViewStore.remove_view`` -- and the
+        only public way to reach that is ``View.stop()``. There is no
+        ``bot.remove_view``.
+
+        So without this, a channel that plays twenty games leaves twenty
+        RetroViews reachable for the life of the process, each one holding
+        its replay buffer of up to MAX_REPLAY_BYTES. Marking them ``closed``
+        (which is still done, and still what answers a click that arrives in
+        the gap) stops them acting; it does not let go of them.
+
+        The replay buffer is emptied here as well as handed over, because it
+        is the expensive part: a stray reference to the view from somewhere
+        unexpected should cost a few kilobytes of object, not eight
+        megabytes of footage.
+
+        Call this *before* registering a replacement view on the same
+        message: remove_view unconditionally drops that message id from
+        discord.py's synced-view table (discord/ui/view.py:986), so the other
+        order would take the new view's entry with it.
+
+        Never raises: it is on every discard path, including cog_unload.
+        """
+        clips = getattr(view, "clips", None)
+        if clips is not None:
+            try:
+                clips.clear()
+            except Exception:  # pragma: no cover - a deque cannot fail here
+                log.debug("Could not empty a replay buffer.", exc_info=True)
+        try:
+            view.stop()
+        except Exception:
+            log.debug("Could not release a Retro view.", exc_info=True)
+
+    @staticmethod
+    def _free_emulator(emulator: typing.Optional[RetroEmulator]) -> None:
+        """
+        Free a core synchronously, for paths that must not await.
+
+        The ordinary paths free a core in a worker thread, because unloading
+        one takes long enough to be worth keeping off the event loop. That is
+        not available while a task is being cancelled: awaiting anything
+        there can raise CancelledError again and abandon the core half-freed,
+        and a leaked libretro core is not merely memory -- only one may be
+        loaded at a time (MAX_LIVE_EMULATORS), so the cog stops working
+        altogether. A few milliseconds on the loop is the cheaper mistake.
+        """
+        if emulator is None:
+            return
+        try:
+            emulator.stop()
+        except Exception:
+            log.exception("Could not free a libretro core.")
 
     async def _save_record(self, view: RetroView) -> None:
         """Write the session record. Never raises: it is on every save path."""
@@ -766,12 +849,28 @@ class Retro(
         record = view.to_record()
         view.closed = True
         message = await view.resolve_message()
-        retired = self._arm_retired(record) if message is not None else None
-        if retired is None:
+        if message is None:
             # No message to put a button on, so there is nothing to resume
             # from; leave the view inert and say nothing more about it.
+            # refresh() has nothing to edit either, so releasing the view
+            # here cannot be undone by a later edit re-registering it.
             view.retire()
             await view.refresh(reason)
+            self._release_view(view)
+            return
+        # Hand these controls back to discord.py *before* the Resume button
+        # takes the message over; see _release_view for why the order
+        # matters. This message now belongs to `retired`.
+        self._release_view(view)
+        retired = self._arm_retired(record)
+        if retired is None:
+            # The record carries no message id, so there is nothing to put a
+            # Resume button on. refresh() edits the message it does have,
+            # which re-registers this view with discord.py, so release it
+            # again afterwards rather than before.
+            view.retire()
+            await view.refresh(reason)
+            self._release_view(view)
             return
         await self._remember_retired(record)
         try:
@@ -862,6 +961,15 @@ class Retro(
                 # One core at a time, here as everywhere else.
                 await self._evict_locked(exclude=view)
                 clip = await asyncio.to_thread(view._boot, emulator, progress)
+        except asyncio.CancelledError:
+            # A reload or shutdown landing on the boot. Nothing is awaited
+            # from here (see _free_emulator) and there is nothing to report
+            # to: the interaction is going away with the task. The Resume
+            # button is left as it is, which is also how the message looks.
+            self._free_emulator(emulator)
+            view.closed = True
+            self._release_view(view)
+            raise
         except Exception as error:
             log.warning(
                 "Could not resume %s in channel %s: %s", view.slug, channel_id, error
@@ -871,6 +979,7 @@ class Retro(
             except Exception:
                 log.exception("Could not stop a failed resume's emulator.")
             view.closed = True
+            self._release_view(view)
             # Put the Resume button back so the click was not destructive.
             self._arm_retired(record)
             await self._restore_retired_message(interaction, retired, record, error)
@@ -1001,17 +1110,33 @@ class Retro(
             options=await self._core_options(view.core),
         )
 
+        # Three ways out, and the core has to be accounted for in all of
+        # them: handed to the view, freed in a thread after an ordinary
+        # failure, or -- the case `except Exception` missed -- freed on the
+        # spot when the task is cancelled. CancelledError is not an
+        # Exception, and a core left loaded spends the one
+        # MAX_LIVE_EMULATORS slot for the life of the process.
+        settled = False
         try:
             # The same restore chain a fresh start runs, from the same
             # function, so waking and starting cannot drift apart.
             view.boot_outcome = await asyncio.to_thread(
                 restore_into, emulator, progress, view.slug
             )
+            self._settle_boot(view, progress, None)
+            view.emulator = emulator
+            settled = True
         except Exception:
+            # A core that will not take the state, or will not boot. Freed in
+            # a thread, as everywhere else on a path that can still await.
             await asyncio.to_thread(emulator.stop)
+            settled = True
             raise
-        self._settle_boot(view, progress, None)
-        view.emulator = emulator
+        finally:
+            if not settled:
+                # Only a BaseException reaches here: cancellation, or the
+                # interpreter shutting down. Nothing may be awaited.
+                self._free_emulator(emulator)
         await self._learn_options(view.core, emulator)
 
     def _saved_progress(
@@ -1217,6 +1342,47 @@ class Retro(
             await asyncio.to_thread(self._write_atomic, path, data, True)
         except OSError:
             log.warning("Could not write the Libretro state %s", path, exc_info=True)
+            return False
+        return True
+
+    def _write_state_now(
+        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
+    ) -> bool:
+        """
+        The same two writes as :meth:`_write_state`, without awaiting.
+
+        For cancellation handlers only. A task that is being cancelled cannot
+        rely on ``await`` -- the next one may raise CancelledError straight
+        back out and leave the core loaded and the progress unwritten -- so
+        this does both writes on the calling thread. It is a few milliseconds
+        of blocking on a path that is already tearing down.
+
+        Never raises, for the same reason _write_state does not.
+        """
+        emulator = emulator if emulator is not None else view.emulator
+        if emulator is None or not emulator.started:
+            return False
+        # SRAM first, as in _write_state: it is the copy that survives a core
+        # update, so if only one of the two gets written it should be this.
+        try:
+            sram = emulator.save_sram()
+            if sram:
+                self._write_atomic(self._sram_path(view.channel_id, view.slug), sram, True)
+        except Exception:
+            log.warning(
+                "Could not write the battery save for %s while shutting down.",
+                view.slug,
+                exc_info=True,
+            )
+        try:
+            data = emulator.save_state()
+            self._write_atomic(self._state_path(view.channel_id, view.slug), data, True)
+        except Exception:
+            log.warning(
+                "Could not write the save state for %s while shutting down.",
+                view.slug,
+                exc_info=True,
+            )
             return False
         return True
 
@@ -1716,6 +1882,7 @@ class Retro(
             log.exception("Could not stop the emulator of an abandoned session.")
         view.emulator = None
         view.closed = True
+        self._release_view(view)
 
     # -- Rate limiting ------------------------------------------------------
     #
@@ -2046,6 +2213,21 @@ class Retro(
             await self._abandon_session(ctx, view, emulator)
             await self._safe_send(ctx, self._http_error_message(error))
             return
+        except asyncio.CancelledError:
+            # `[p]unload retro`, a bot shutdown or a cancelled command task,
+            # arriving while the core is booting or the message is being
+            # sent. Exception does not cover this, and the core is already
+            # loaded: without freeing it here, MAX_LIVE_EMULATORS is spent
+            # for the life of the process. Nothing is awaited on the way out
+            # -- a cancelled task cannot rely on that -- so the state is
+            # written and the core freed synchronously.
+            self.sessions.pop(getattr(ctx.channel, "id", view.channel_id), None)
+            self._write_state_now(view, emulator)
+            self._free_emulator(emulator)
+            view.emulator = None
+            view.closed = True
+            self._release_view(view)
+            raise
         except Exception:
             await self._abandon_session(ctx, view, emulator)
             raise
@@ -2129,7 +2311,7 @@ class Retro(
         dropped in by hand is picked up too, as long as it keeps its buildbot
         filename (`snes9x_libretro.so`, `gambatte_libretro.dll`).
 
-        The whole set is about 5 MiB. None of these cores need a BIOS file.
+        The whole set is about 4.5 MiB. None of these cores need a BIOS file.
         For one that does, see `[p]retroset bios`.
 
         **Examples:**

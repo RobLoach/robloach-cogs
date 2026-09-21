@@ -184,13 +184,106 @@ def test_the_fast_grab_ignores_the_padding_at_the_end_of_each_row(pixel_format):
 
 
 def test_a_ninety_degree_rotation_falls_back_rather_than_guessing():
-    # libretro.py 0.6.0 starts a 90 degree rotation at (width - 4) rather
-    # than (width - 1), so its output is shifted by three rows and wraps.
-    # Reproducing that is not worth it and silently fixing it would change
-    # what the cog posts, so the official path keeps the frame.
+    # libretro.py starts a 90 degree rotation at (width - 4) rather than
+    # (width - 1), so its output is shifted by three rows and wraps. See
+    # test_libretro_s_ninety_degree_rotation_is_still_broken_upstream below
+    # for the proof. Reproducing that is not worth it and silently fixing it
+    # would make the fast and slow grabs of one frame disagree, so the
+    # official path keeps the frame.
     driver = make_driver(PixelFormat.RGB565, Rotation.NINETY)
     assert C.fast_frame_image(driver, Image) is None
     assert any("NINETY" in reason for reason in C._SLOW_GRAB_LOGGED)
+
+
+def rotation_source_map(rotation, width=8, height=4):
+    """
+    Where each pixel of ``driver.screenshot()`` came from in the frame.
+
+    The frame is filled so that every pixel encodes its own ``(x, y)``: in
+    XRGB8888 the red channel carries x and the green channel carries y. The
+    returned grid is that ``(x, y)`` per output pixel, so a rotation can be
+    checked as a permutation rather than by eyeballing an image.
+    """
+    payload = bytearray()
+    for y in range(height):
+        for x in range(width):
+            payload += bytes((0, y, x, 0))  # XRGB8888 is B, G, R, X in memory
+    data = bytes(payload)
+
+    driver = ArrayVideoDriver()
+    driver._pixel_format = PixelFormat.XRGB8888
+    driver._rotation = rotation
+    driver._frame = array("B", data)
+    driver.refresh(memoryview(data), width, height, width * 4)
+
+    shot = driver.screenshot()
+    raw = bytes(shot.data)  # RGBA out of screenshot()
+    return [
+        [
+            (raw[(row * shot.width + col) * 4], raw[(row * shot.width + col) * 4 + 1])
+            for col in range(shot.width)
+        ]
+        for row in range(shot.height)
+    ]
+
+
+def test_libretro_s_own_rotations_are_correct_except_for_ninety():
+    """
+    The three rotations the fast path *does* claim really are rotations.
+
+    This is the other half of FAST_ROTATIONS: the fast grab is asserted
+    byte-identical to screenshot() above, which is only worth anything if
+    screenshot() is itself right.
+    """
+    width, height = 8, 4
+    upright = [[(x, y) for x in range(width)] for y in range(height)]
+
+    assert rotation_source_map(Rotation.NONE) == upright
+    # 180: both axes reversed, same shape.
+    assert rotation_source_map(Rotation.ONE_EIGHTY) == [
+        list(reversed(row)) for row in reversed(upright)
+    ]
+    # 270: sideways, so height x width, and out[row][col] == in[row][H-1-col].
+    assert rotation_source_map(Rotation.TWO_SEVENTY) == [
+        [(x, height - 1 - y) for y in range(height)] for x in range(width)
+    ]
+
+
+def test_libretro_s_ninety_degree_rotation_is_still_broken_upstream():
+    """
+    Why the WonderSwan is not in systems.py, pinned as an executable fact.
+
+    ``ArrayVideoDriver.screenshot()`` computes a 90 degree rotation's starting
+    byte offset as ``(width - 4) * height * 4`` where ``(width - 1) * ...`` is
+    what "start at the last column" means. The ``- 4`` is a byte count in a
+    place that wants a pixel count, so the output rows come out cyclically
+    shifted by three and the three that wrap round land on negative offsets
+    and overwrite the bottom of the picture. It is the same line, and the same
+    bug, in libretro.py 0.6.0 and 0.11.1.
+
+    A rotated core therefore has no good path at all: the fast grab stands
+    down and the "official" slow path is the broken one. That is why
+    ``mednafen_wswan`` was dropped rather than given a Rotate button, and why
+    tests/test_emulator.py checks that no core still shipped asks for one.
+
+    If libretro.py ever fixes this, this test fails -- which is the point.
+    Then NINETY can join FAST_ROTATIONS as "ROTATE_90" and the WonderSwan can
+    be reconsidered.
+    """
+    width, height = 8, 4
+    got = rotation_source_map(Rotation.NINETY, width, height)
+    correct = [[(width - 1 - x, y) for y in range(height)] for x in range(width)]
+
+    assert [len(row) for row in got] == [height] * width, "the size is at least right"
+    assert got != correct, "libretro.py's 90 degree rotation was fixed upstream"
+
+    # Precisely how it is wrong: the rows are the correct rows, rotated left
+    # by three, and the three that wrapped round are corrupt.
+    assert got[: width - 3] == correct[3:], "the shift is no longer exactly three rows"
+    assert got[0] == [(width - 4, y) for y in range(height)]
+    # The bottom three rows are not any row of the correct picture.
+    for row in got[width - 3 :]:
+        assert row not in correct, row
 
 
 # -- 3. The guards --------------------------------------------------------------
