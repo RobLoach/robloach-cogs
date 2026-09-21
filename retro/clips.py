@@ -329,6 +329,36 @@ def _note_slow_frame_grab(reason: str) -> None:
         )
 
 
+def _frame_dimensions(driver) -> typing.Optional[typing.Tuple[int, int, int]]:
+    """
+    ``(width, height, pitch)`` of the driver's last frame, or None.
+
+    libretro.py <= 0.6.x keeps these as three attributes; 0.7+ replaced them
+    with a single ``_frame_dims`` namedtuple. Both are read here so the fast
+    path applies on either, and anything else falls back.
+    """
+    dims = getattr(driver, "_frame_dims", None)
+    if dims is not None:
+        values = (
+            getattr(dims, "width", None),
+            getattr(dims, "height", None),
+            getattr(dims, "pitch", None),
+        )
+    else:
+        values = (
+            getattr(driver, "_last_width", None),
+            getattr(driver, "_last_height", None),
+            getattr(driver, "_last_pitch", None),
+        )
+    if not all(isinstance(value, int) for value in values):
+        # Before the first video refresh these are all None, which is the one
+        # case that is completely normal and not worth a log line.
+        return None
+    if not all(value > 0 for value in values):
+        return None
+    return typing.cast(typing.Tuple[int, int, int], values)
+
+
 def fast_frame_image(driver, Image):
     """
     A video driver's current frame as an RGB image, or None to use screenshot().
@@ -342,15 +372,10 @@ def fast_frame_image(driver, Image):
     frame = getattr(driver, "_frame", None)
     if frame is None:
         return None
-    width = getattr(driver, "_last_width", None)
-    height = getattr(driver, "_last_height", None)
-    pitch = getattr(driver, "_last_pitch", None)
-    if not isinstance(width, int) or not isinstance(height, int) or not isinstance(pitch, int):
-        # Before the first video refresh these are all None, which is the one
-        # case that is completely normal and not worth a log line.
+    dimensions = _frame_dimensions(driver)
+    if dimensions is None:
         return None
-    if width <= 0 or height <= 0 or pitch <= 0:
-        return None
+    width, height, pitch = dimensions
 
     pixel_format = getattr(driver, "_pixel_format", None)
     raw_mode = FAST_RAW_MODES.get(getattr(pixel_format, "name", None))
@@ -414,12 +439,10 @@ def fast_frame_size(driver):
     convert sixteen frames. The width and height are swapped for a sideways
     rotation, exactly as screenshot() does it.
     """
-    width = getattr(driver, "_last_width", None)
-    height = getattr(driver, "_last_height", None)
-    if not isinstance(width, int) or not isinstance(height, int):
+    dimensions = _frame_dimensions(driver)
+    if dimensions is None:
         return None
-    if width <= 0 or height <= 0:
-        return None
+    width, height, _pitch = dimensions
     rotation = getattr(driver, "_rotation", None)
     rotation_name = getattr(rotation, "name", None)
     if rotation_name in ("NINETY", "TWO_SEVENTY"):

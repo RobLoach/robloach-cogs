@@ -104,15 +104,36 @@ def test_the_expansion_table_is_the_identity_everywhere_else():
             assert table[value] == value, value
 
 
-def test_the_tables_cover_every_pixel_format_libretro_defines():
-    # A new pixel format in libretro.py must show up as a *fallback*, not as
-    # a wrong picture, so this is really a check that the keys line up.
+def test_the_tables_name_only_formats_libretro_really_has():
+    """
+    The tables must not invent a format, and must cover the three every
+    console here actually uses.
+
+    A format the tables do not know (libretro.py 0.11 added XRGB2101010 and
+    HDR10_2101010) has to come out as a *fallback* rather than a wrong
+    picture -- that is asserted below, not here. So this is deliberately a
+    subset check: a new HDR format upstream is not a reason for this suite
+    to fail.
+    """
     names = {f.name for f in PixelFormat}
-    assert set(C.FAST_RAW_MODES) == names
-    assert set(C.FAST_POINT_TABLES) == names
+    assert set(C.FAST_RAW_MODES) <= names, "the tables name a format libretro does not define"
+    assert set(C.FAST_POINT_TABLES) <= names
+    assert set(C.FAST_RAW_MODES) == set(C.FAST_POINT_TABLES), "the two tables disagree"
+    for name in ("RGB565", "XRGB8888", "RGB1555"):
+        assert name in C.FAST_RAW_MODES, f"{name} is used by the bundled cores"
     assert C.FAST_POINT_TABLES["XRGB8888"] is None, "8 bits a channel needs no expansion"
     for name in ("RGB565", "RGB1555"):
         assert len(C.FAST_POINT_TABLES[name]) == 768, "one 256 entry run per channel"
+
+
+def test_a_pixel_format_the_tables_do_not_know_falls_back():
+    """The HDR formats, and anything else libretro adds later."""
+    unknown = [f for f in PixelFormat if f.name not in C.FAST_RAW_MODES]
+    if not unknown:  # pragma: no cover - only on an older libretro.py
+        pytest.skip("this libretro.py has no format the tables lack")
+    for pixel_format in unknown:
+        driver = make_driver(pixel_format, Rotation.NONE)
+        assert C.fast_frame_image(driver, Image) is None, pixel_format.name
 
 
 # -- 2. Pixel identity ----------------------------------------------------------
@@ -201,11 +222,34 @@ def test_an_unknown_pixel_format_falls_back():
     assert any("RGB10A2" in reason for reason in C._SLOW_GRAB_LOGGED)
 
 
+# libretro.py <= 0.6.x exposes the frame size as three attributes; 0.7+
+# replaced them with a single `_frame_dims` namedtuple. The guard tests below
+# have to poke at whichever the installed version really uses, or they would
+# "pass" by deleting an attribute the code never reads.
+def set_dimensions(driver, width, height, pitch):
+    """Force the driver's reported frame size, on either layout."""
+    dims = getattr(driver, "_frame_dims", None)
+    if dims is not None:
+        # A dataclass in 0.11, so build a fresh one rather than _replace().
+        driver._frame_dims = type(dims)(width=width, height=height, pitch=pitch)
+    else:
+        driver._last_width, driver._last_height, driver._last_pitch = width, height, pitch
+
+
+def dimension_attributes(driver):
+    """The attribute names this libretro.py keeps the frame size in."""
+    if getattr(driver, "_frame_dims", None) is not None:
+        return ("_frame_dims",)
+    return ("_last_width", "_last_height", "_last_pitch")
+
+
 def test_a_renamed_private_attribute_falls_back():
     # The whole hazard of this optimisation in one test: libretro.py is free
     # to rename any of these, and when it does the cog must get slow, not
     # wrong.
-    for attribute in ("_frame", "_last_width", "_last_height", "_last_pitch", "_pixel_format"):
+    probe = make_driver(PixelFormat.RGB565)
+    attributes = ("_frame", "_pixel_format") + dimension_attributes(probe)
+    for attribute in attributes:
         driver = make_driver(PixelFormat.RGB565)
         assert C.fast_frame_image(driver, Image) is not None, attribute
         delattr(driver, attribute)
@@ -221,7 +265,7 @@ def test_a_framebuffer_shorter_than_the_frame_falls_back():
 
 def test_a_pitch_too_small_for_the_width_falls_back():
     driver = make_driver(PixelFormat.RGB565)
-    driver._last_pitch = WIDTH  # half of what RGB565 needs
+    set_dimensions(driver, WIDTH, HEIGHT, WIDTH)  # half of what RGB565 needs
     assert C.fast_frame_image(driver, Image) is None
     assert any("too small" in reason for reason in C._SLOW_GRAB_LOGGED)
 
@@ -229,7 +273,7 @@ def test_a_pitch_too_small_for_the_width_falls_back():
 def test_a_zero_sized_frame_declines():
     for width, height, pitch in ((0, HEIGHT, 44), (WIDTH, 0, 44), (WIDTH, HEIGHT, 0)):
         driver = make_driver(PixelFormat.RGB565)
-        driver._last_width, driver._last_height, driver._last_pitch = width, height, pitch
+        set_dimensions(driver, width, height, pitch)
         assert C.fast_frame_image(driver, Image) is None
 
 
