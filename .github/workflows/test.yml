@@ -58,8 +58,10 @@ jobs:
           cache-dependency-path: requirements-dev.txt
       - name: Install Red-DiscordBot and the test tools
         run: pip install Red-DiscordBot pytest pytest-asyncio hypothesis pillow
-      - name: Import the cogs
-        run: python -c "import retro.RetroCog, retro.RetroView, retro.systems, retro.archives"
+      - name: Import the cog
+        # retro.Retro is the module the cog class lives in; it was called
+        # retro.RetroCog before the class was renamed to Retro.
+        run: python -c "import retro, retro.Retro, retro.RetroView, retro.systems, retro.archives; print(retro.Retro.Retro.__name__)"
       - name: Run the fast tests against the real Red
         run: pytest -m "not emulator and not network" --durations=10
 

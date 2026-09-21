@@ -1,6 +1,6 @@
 """Stand-ins for Discord, Red's Config, and the emulator.
 
-The cog tests drive the *real* RetroCog and the *real* RetroView (real
+The cog tests drive the *real* Retro and the *real* RetroView (real
 discord.py View machinery, real component payloads) against these. Only the
 three things a unit test cannot have are faked:
 
@@ -24,13 +24,40 @@ from pathlib import Path
 
 import discord
 
-from retro.emulator import EmulatorError
+from retro.emulator import EmulatorError, encode_animation
 
 # A stand-in ROM: big enough to pass the cog's MIN_ROM_SIZE, not a zip, and
 # not an HTML error page. The cog never looks at a ROM's contents, and the
 # fake emulator never runs it, so no real game is needed for these tests.
 ROM_BYTES = bytes(range(256)) * 512          # 128 KiB, like a GBC cartridge
 NES_BYTES = b"NES\x1a" + bytes(range(256)) * 96  # 24 KiB, with an iNES header
+
+try:
+    from PIL import Image
+
+    HAS_PILLOW = True
+except ImportError:  # pragma: no cover - Pillow is in requirements-dev
+    Image = None
+    HAS_PILLOW = False
+
+#: Frames per clip in the animations FakeEmulator produces. Small enough to
+#: be free, more than one so a stitched replay really has to concatenate.
+FAKE_CLIP_FRAMES = 3
+#: Each frame's duration, so `FAKE_CLIP_FRAMES * FAKE_FRAME_MS` milliseconds
+#: is one clip's worth of "footage" as far as the replay code is concerned.
+FAKE_FRAME_MS = 1000
+
+
+def _tiny_animation(seed, clip_format="WEBP", frames=FAKE_CLIP_FRAMES, size=(8, 8)):
+    """A real, minimal animated clip that decodes back to ``frames`` frames."""
+    images = []
+    for index in range(frames):
+        image = Image.new("RGB", size)
+        # Every frame different, so the encoder cannot merge them into one and
+        # the decoded frame count is exactly what went in.
+        image.putpixel((0, 0), ((seed + index) % 251, index % 241, 7))
+        images.append(image)
+    return encode_animation(images, FAKE_FRAME_MS, clip_format)
 
 
 class FakeEmulator:
@@ -111,6 +138,13 @@ class FakeEmulator:
         self.last_presses = list(presses or ())
         self.last_format = clip_format
         self.frame += frames or 300
+        if HAS_PILLOW:
+            # A real, tiny animation rather than a sentinel: the Replay button
+            # decodes its buffered clips and stitches them back together, and
+            # a test of that against made-up bytes would only ever exercise
+            # the error path. The frame count is the emulated frame number, so
+            # one clip is still distinguishable from another.
+            return _tiny_animation(self.frame, clip_format)
         return b"RIFF\0\0\0\0WEBPVP8X" + f"frame={self.frame}".encode().ljust(58, b"\0")
 
     def screenshot(self, scale=2):
@@ -206,15 +240,31 @@ class FakeValue:
 
 
 class FakeScope:
-    def __init__(self, store):
+    def __init__(self, store, defaults=None):
         self.store = store
+        self.defaults = defaults or {}
 
     def __getattr__(self, name):
-        return FakeValue(self.store, name, None)
+        if name in ("store", "defaults"):
+            raise AttributeError(name)
+        default = self.defaults.get(name)
+        if isinstance(default, dict):
+            default = dict(default)
+        return FakeValue(self.store, name, default)
 
 
 class FakeConfig:
-    def __init__(self):
+    """One cog-name's worth of Red's Config, in memory.
+
+    Red keys every stored value by the cog's *class name*, which is exactly
+    what the RetroCog -> Retro rename changes, so these are handed out of a
+    registry keyed the same way (see :class:`FakeConfigFactory`). A handle
+    fetched under the old name really does see a different store, which is
+    what makes the migration testable at all.
+    """
+
+    def __init__(self, cog_name="Retro"):
+        self.cog_name = cog_name
         self.globals = {}
         self.channels = {}
         self._global_defaults = {}
@@ -234,8 +284,24 @@ class FakeConfig:
             default = dict(default)
         return FakeValue(self.globals, name, default)
 
+    async def all(self):
+        """Registered defaults with whatever has been stored on top, as Red does."""
+        merged = {
+            key: dict(value) if isinstance(value, dict) else value
+            for key, value in self._global_defaults.items()
+        }
+        merged.update(
+            {
+                key: dict(value) if isinstance(value, dict) else value
+                for key, value in self.globals.items()
+            }
+        )
+        return merged
+
     def channel_from_id(self, channel_id):
-        return FakeScope(self.channels.setdefault(int(channel_id), {}))
+        return FakeScope(
+            self.channels.setdefault(int(channel_id), {}), self._channel_defaults
+        )
 
     async def all_channels(self):
         out = {}
@@ -244,6 +310,35 @@ class FakeConfig:
             merged.update(data)
             out[channel_id] = merged
         return out
+
+
+class FakeConfigFactory:
+    """Red's ``Config.get_conf``, handing out one store per cog name."""
+
+    def __init__(self, default_name="Retro"):
+        self.stores = {}
+        self.default_name = default_name
+        #: Set to raise from get_conf, for the "Config is unavailable" path.
+        self.broken = None
+
+    def get_conf(self, cog_instance, identifier=None, force_registration=False, cog_name=None):
+        if self.broken is not None:
+            raise self.broken
+        if cog_name is None:
+            cog_name = (
+                type(cog_instance).__name__
+                if cog_instance is not None
+                else self.default_name
+            )
+        return self.stores.setdefault(cog_name, FakeConfig(cog_name))
+
+    def store(self, cog_name):
+        """The store for one cog name, created if it does not exist yet."""
+        return self.stores.setdefault(cog_name, FakeConfig(cog_name))
+
+    def forget(self, cog_name):
+        """Throw one name's store away, so the next cog built sees nothing."""
+        self.stores.pop(cog_name, None)
 
 
 # -- Discord ------------------------------------------------------------------
@@ -362,6 +457,9 @@ class FakeResponse:
         self.interaction = interaction
         self.done = False
 
+    def is_done(self):
+        return self.done
+
     async def edit_message(self, **kwargs):
         if self.done:
             raise RuntimeError("InteractionResponded")
@@ -422,7 +520,15 @@ class FakeInteraction:
                 {"code": 50035, "message": "Invalid Form Body"},
             )
         self.log.append(("edit_original_response", self.snapshot(kwargs)))
-        return self.view.message or FakeMessage(None)
+        # The edited view may not be the one the interaction was raised on: a
+        # Resume click hands the message over to a freshly built RetroView.
+        edited = kwargs.get("view") or self.view
+        return (
+            getattr(edited, "message", None)
+            or getattr(self.view, "message", None)
+            or self.message
+            or FakeMessage(None)
+        )
 
     def kinds(self):
         return [kind for kind, _ in self.log]
@@ -499,18 +605,24 @@ def zip_of(entries):
 
 
 class RetroEnv:
-    """A RetroCog wired to the fakes above, with the helpers tests need."""
+    """A Retro wired to the fakes above, with the helpers tests need."""
 
     def __init__(self, tmp_path, monkeypatch):
         import retro  # noqa: F401  (imports the package, and therefore Red)
 
-        self.cogmod = sys.modules["retro.RetroCog"]
+        self.cogmod = sys.modules["retro.Retro"]
         self.viewmod = sys.modules["retro.RetroView"]
         self.sysmod = sys.modules["retro.systems"]
-        self.data = Path(tmp_path) / "cogdata"
+        # Laid out the way Red lays it out: one folder per cog *class name*
+        # under a shared root. That is what makes the RetroCog -> Retro data
+        # move a real move in these tests rather than a no-op.
+        self.cogs_root = Path(tmp_path) / "cogs"
+        self.data = self.cogs_root / "Retro"
         self.data.mkdir(parents=True, exist_ok=True)
-        # Stand-in core files: the cog only ever checks that the path exists
-        # and what the filename says the core is.
+        self.legacy_data = self.cogs_root / self.cogmod.LEGACY_COG_NAME
+        # Stand-in core files somewhere the cog does not manage, so the
+        # recorded-path branch of core lookup is exercised too. The cog only
+        # ever checks that the path exists and what the filename says it is.
         self.cores_dir = Path(tmp_path) / "cores"
         self.cores_dir.mkdir(parents=True, exist_ok=True)
         for core in self.sysmod.CORES:
@@ -518,20 +630,44 @@ class RetroEnv:
         (self.cores_dir / "nestopia_libretro.so").write_bytes(b"\x7fELF not ours")
 
         FakeEmulator.reset()
-        monkeypatch.setattr(self.cogmod, "cog_data_path", lambda cog: self.data)
+        self.configs = FakeConfigFactory()
+        monkeypatch.setattr(self.cogmod, "cog_data_path", self._cog_data_path)
         monkeypatch.setattr(
-            self.cogmod, "Config", types.SimpleNamespace(get_conf=lambda *a, **k: FakeConfig())
+            self.cogmod,
+            "Config",
+            types.SimpleNamespace(get_conf=self.configs.get_conf),
         )
         monkeypatch.setattr(self.cogmod, "RetroEmulator", FakeEmulator)
         monkeypatch.setattr(self.cogmod, "SimpleMenu", FakeMenu)
 
         self.cog, self.bot = self.make_cog()
 
+    def _cog_data_path(self, cog_instance=None, raw_name=None):
+        """Red's cog_data_path: <root>/<class name>, created on the way out."""
+        name = raw_name or (
+            type(cog_instance).__name__ if cog_instance is not None else "Retro"
+        )
+        path = self.cogs_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     # -- building blocks
-    def make_cog(self):
-        """Another cog on the same fakes, for restart and migration tests."""
+    def make_cog(self, fresh_config=False):
+        """Another cog on the same fakes, for restart and migration tests.
+
+        By default it shares the stored settings, which is what a reload or a
+        bot restart looks like. ``fresh_config=True`` throws the new
+        namespace's store away first, which is what a *pre-rename* install
+        looks like from the new cog's point of view.
+        """
+        if fresh_config:
+            self.configs.forget("Retro")
         bot = FakeBot()
-        return self.cogmod.RetroCog(bot), bot
+        return self.cogmod.Retro(bot), bot
+
+    def legacy_store(self):
+        """The Config store the cog had when its class was called RetroCog."""
+        return self.configs.store(self.cogmod.LEGACY_COG_NAME)
 
     def core_path(self, core):
         return str(self.cores_dir / f"{core}_libretro.so")

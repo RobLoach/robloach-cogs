@@ -15,16 +15,17 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, zip handling, the whole cog driven against fakes, property tests | nothing (more of it runs with `discord.py` installed) |
-| `-m emulator` | real libretro cores: clips, timing, save states, battery saves, core options, BIOS directory | `libretro.py`, Pillow, cores and ROMs |
+| fast | console tables, button layouts, emoji, zip handling, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes, property tests | nothing (more of it runs with `discord.py` installed; the stitched-replay tests want Pillow) |
+| `-m emulator` | real libretro cores: clips, timing, stitched replays, save states, battery saves, core options, BIOS directory | `libretro.py`, Pillow, cores and ROMs |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
-`pytest -m emulator -n 2` halves the slow half (40s to 22s here). It has to
-be `-n`, i.e. separate processes: one libretro core may be loaded per
+`pytest -m emulator -n 2` halves the slow half (about 75s to 39s here). It
+has to be `-n`, i.e. separate processes: one libretro core may be loaded per
 process. The fast suite is *slower* under `-n`, so it is left serial.
 
 `-m redbot` marks the few tests that need the real Red-DiscordBot (command
-permission metadata). Everything else runs against `tests/stubs/redbot`,
+permission metadata, and the two `Config`/`cog_data_path` escape hatches the
+data migration rests on). Everything else runs against `tests/stubs/redbot`,
 which is used automatically when Red is not installed -- Red is a large
 dependency and a controller layout does not need a database.
 
@@ -57,8 +58,15 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
 * Put it where it belongs: `test_systems.py` and `test_archives.py` import
   nothing but the standard library (they load the module under test
   directly, via `tests/loader.py`); `test_view.py` and `test_cog_*.py` use
-  the `retro` fixture, which is a real `RetroCog` wired to the fakes in
-  `tests/fakes.py`; `test_emulator.py` is for things that need a real core.
+  the `retro` fixture, which is a real `Retro` wired to the fakes in
+  `tests/fakes.py`; `test_migration.py` and `test_resume.py` use the same
+  fixture for the data migration and the Resume button; `test_emulator.py` is
+  for things that need a real core.
+* The fakes lay the data directory out the way Red does -- one folder per cog
+  *class name* under `tmp_path/cogs/` -- so `retro.data` is `.../cogs/Retro`
+  and `retro.legacy_data` is `.../cogs/RetroCog`. `Config` is likewise handed
+  out per cog name, so a handle fetched under the old name really does see a
+  different store.
 * Anything slow or core-driven gets `pytest.mark.emulator`, and asks for
   its assets through the `assets` fixture (`assets.need_core("gambatte")`,
   `assets.need_rom("ucity.gbc")`) so it skips instead of failing.

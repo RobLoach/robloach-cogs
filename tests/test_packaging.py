@@ -110,3 +110,72 @@ def test_pytest_markers_are_registered():
     config = (REPO_ROOT / "pyproject.toml").read_text()
     for marker in ("emulator:", "slow:", "network:", "redbot:"):
         assert marker in config, marker
+
+
+# -- The documentation says what the cog does ---------------------------------
+#
+# Cheap checks, but each one corresponds to a change that had a README section
+# describing the *old* behaviour until somebody remembered to update it.
+
+COG_README = (REPO_ROOT / "retro" / "README.md").read_text()
+COG_INFO = json.loads((REPO_ROOT / "retro" / "info.json").read_text())
+COG_SOURCE = (REPO_ROOT / "retro" / "Retro.py").read_text()
+
+
+def test_the_cog_module_is_named_after_its_class():
+    assert (REPO_ROOT / "retro" / "Retro.py").is_file()
+    assert not (REPO_ROOT / "retro" / "RetroCog.py").exists()
+    assert "class Retro(commands.Cog)" in COG_SOURCE
+    init = (REPO_ROOT / "retro" / "__init__.py").read_text()
+    assert "from .Retro import Retro" in init
+    assert "RetroCog" not in init
+
+
+def test_the_readme_documents_the_rename_and_its_migration():
+    assert "Upgrading from an earlier version" in COG_README
+    assert "RetroCog" in COG_README
+    assert "cog list" in COG_README
+
+
+def test_no_documentation_still_offers_retroset_core():
+    # The command is gone; the README may explain that it is gone, but must
+    # not present it as something to run.
+    for line in COG_README.splitlines():
+        if line.startswith("- `[p]retroset core <path>"):
+            raise AssertionError(line)
+    assert "[p]retroset core <path>` command for pointing" in COG_README
+
+
+def test_the_readme_describes_the_fifteen_second_replay():
+    assert "Replay** shows the last **15 seconds" in COG_README
+    assert "memory only" in COG_README
+
+
+def test_the_readme_describes_the_resume_button():
+    assert "Resume" in COG_README
+    assert "after a bot restart" in COG_README
+
+
+def test_the_readme_describes_unpacking_a_whole_bios_zip():
+    assert "installs everything in it" in COG_README
+    assert "dc/dc_boot.bin" in COG_README
+
+
+@pytest.mark.parametrize("phrase", ["Replay", "Resume", "detected automatically"])
+def test_info_json_describes_the_new_behaviour(phrase):
+    assert phrase in COG_INFO["description"], phrase
+
+
+def test_the_end_user_data_statement_mentions_what_is_now_stored():
+    statement = COG_INFO["end_user_data_statement"]
+    assert "Resume" in statement
+    assert "memory only" in statement
+
+
+def test_the_load_bearing_constants_are_still_in_the_source():
+    # Both are baked into data that already exists; see their comments.
+    assert 'CUSTOM_ID_PREFIX = "libretro"' in (
+        REPO_ROOT / "retro" / "RetroView.py"
+    ).read_text()
+    assert "114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121" in COG_SOURCE
+    assert 'LEGACY_COG_NAME = "RetroCog"' in COG_SOURCE

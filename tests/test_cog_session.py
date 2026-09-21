@@ -1,6 +1,6 @@
 """A session's whole life: start, press, sleep, wake, restart, stop.
 
-The real RetroCog and the real RetroView, driven against the fakes in
+The real Retro and the real RetroView, driven against the fakes in
 tests/fakes.py. Nothing here needs a libretro core.
 """
 
@@ -41,7 +41,7 @@ async def test_an_already_configured_value_survives_a_new_default(retro):
 async def test_retroset_cliplength_reports_and_clamps(retro):
     channel = retro.channel(8051)
     ctx = retro.context(channel)
-    cliplength = retro.cogmod.RetroCog.retroset_cliplength.callback
+    cliplength = retro.cogmod.Retro.retroset_cliplength.callback
 
     await cliplength(retro.cog, ctx, 4)
     assert await retro.cog.config.clip_seconds() == 4
@@ -85,7 +85,7 @@ async def test_with_no_cores_at_all_the_user_is_told_to_download_them(retro):
     channel = retro.channel(8100)
     ctx = retro.context(channel)
     await retro.cog.config.cores.set({})
-    await retro.cogmod.RetroCog.retro.callback(retro.cog, ctx, game="https://example.com/x.gb")
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="https://example.com/x.gb")
     assert "retroset download" in ctx.said()
 
 
@@ -94,7 +94,7 @@ async def test_a_missing_core_is_named_by_console_and_download_command(retro):
     ctx = retro.context(channel)
     await retro.install_cores("gambatte")
     retro.serve("nestest.nes", NES_BYTES)
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/nestest.nes"
     )
     said = ctx.said()
@@ -108,7 +108,7 @@ async def test_an_unknown_extension_lists_what_is_supported(retro):
     ctx = retro.context(channel)
     await retro.install_cores("gambatte")
     retro.serve("movie.mp4", b"x" * 4096)
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/movie.mp4"
     )
     said = ctx.said()
@@ -121,7 +121,7 @@ async def test_a_nes_rom_starts_the_nes_on_the_fceumm_core(retro):
     ctx = retro.context(channel)
     await retro.install_cores("gambatte", "fceumm")
     retro.serve("nestest.nes", NES_BYTES)
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/nestest.nes"
     )
     view = retro.cog.sessions.get(channel.id)
@@ -140,7 +140,7 @@ async def test_a_restored_record_keeps_its_console_and_core(retro):
     ctx = retro.context(channel)
     await retro.install_cores("gambatte", "fceumm")
     retro.serve("nestest.nes", NES_BYTES)
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/nestest.nes"
     )
     record = retro.cog.config.channels[channel.id]["session"]
@@ -297,7 +297,7 @@ async def test_a_press_reaches_the_emulator_as_a_webp_clip_schedule(retro, held)
 
 async def test_retroset_hold_stores_clamps_and_reaches_live_sessions(retro, held):
     view, ctx, _ = held
-    hold_cmd = retro.cogmod.RetroCog.retroset_hold.callback
+    hold_cmd = retro.cogmod.Retro.retroset_hold.callback
 
     await hold_cmd(retro.cog, ctx, 450)
     assert await retro.cog.config.hold_ms() == 450
@@ -363,10 +363,10 @@ async def test_a_press_edit_carries_one_clip_and_no_embed(retro):
 async def test_playing_needs_no_embed_links_permission(retro):
     # The clip is a plain attachment and the controls are buttons, so the
     # play loop must not ask for Embed Links. One owner-only command does.
-    play = {name for name, on in retro.cogmod.RetroCog.retro.requires.bot_perms if on}
+    play = {name for name, on in retro.cogmod.Retro.retro.requires.bot_perms if on}
     assert play == {"attach_files"}
     settings = {
-        name for name, on in retro.cogmod.RetroCog.retroset_settings.requires.bot_perms if on
+        name for name, on in retro.cogmod.Retro.retroset_settings.requires.bot_perms if on
     }
     assert settings == {"embed_links"}
 
@@ -466,10 +466,10 @@ async def test_two_simultaneous_presses_produce_exactly_one_clip(retro):
 # -- Replay -------------------------------------------------------------------
 
 
-async def test_replay_re_uploads_the_cached_clip(retro):
+async def test_replay_re_uploads_the_only_cached_clip(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9020, "replayme")
-    await view._press(retro.interaction(view, message=view.message), "a")
+    assert len(view.clips) == 1, "the boot clip is the whole buffer so far"
 
     interaction = retro.interaction(view, message=view.message)
     await retro.control(view, "replay").callback(interaction)
@@ -477,18 +477,120 @@ async def test_replay_re_uploads_the_cached_clip(retro):
     assert kind == "response.edit_message"
     assert snap["n_attachments"] == 1
     assert snap["filenames"][0].endswith(".webp")
-    assert not snap["any_disabled"], "replay leaves the buttons alone"
+    assert not snap["any_disabled"], "a one-clip replay leaves the buttons alone"
 
 
-async def test_replay_with_an_empty_cache_whispers_instead(retro):
+async def test_replay_stitches_the_last_few_clips_into_one(retro):
+    pytest.importorskip("PIL", reason="stitching clips back together needs Pillow")
+    from .fakes import FAKE_CLIP_FRAMES
+
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9022, "stitched")
+    for _ in range(2):
+        await view._press(retro.interaction(view, message=view.message), "a")
+    assert len(view.clips) == 3
+
+    interaction = retro.interaction(view, message=view.message)
+    await retro.control(view, "replay").callback(interaction)
+
+    kinds = interaction.kinds()
+    assert kinds[0] == "response.edit_message", "the controls grey out first"
+    assert interaction.log[0][1]["all_disabled"]
+    assert "seconds together" in (interaction.log[0][1]["content"] or "")
+    final = interaction.log[-1][1]
+    assert final["n_attachments"] == 1
+    assert not final["any_disabled"]
+    assert "replayed" in (final["content"] or "")
+
+    # The result really is all three clips, end to end and in order, and the
+    # buffer itself is left alone -- a replay is not a new clip.
+    from retro.emulator import concatenate_clips, decode_clip
+
+    stitched, seconds = concatenate_clips([data for data, _ in view.clips])
+    frames, _ = decode_clip(stitched)
+    assert len(frames) == 3 * FAKE_CLIP_FRAMES
+    assert seconds == pytest.approx(9.0)
+    last_frame, _ = decode_clip(view.clips[-1][0])
+    assert frames[-1].tobytes() == last_frame[-1].tobytes(), (
+        "the newest footage is at the end"
+    )
+    assert len(view.clips) == 3
+
+
+async def test_a_stitched_replay_is_bounded_by_seconds(retro):
+    pytest.importorskip("PIL", reason="stitching clips back together needs Pillow")
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9023, "bounded")
+    for _ in range(10):
+        await view._press(retro.interaction(view, message=view.message), "a")
+
+    # Four-second clips, fifteen seconds of replay: four clips, never eleven.
+    assert view.buffered_seconds <= retro.viewmod.REPLAY_SECONDS
+    assert len(view.clips) <= retro.cogmod.REPLAY_SECONDS / view.clip_seconds + 1
+    assert sum(len(data) for data, _ in view.clips) <= retro.viewmod.MAX_REPLAY_BYTES
+
+
+async def test_the_replay_button_says_how_much_it_will_replay(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9024, "labelled")
+    button = retro.control(view, "replay")
+    assert button.label == "Replay", "one clip, nothing extra to promise"
+    assert not button.disabled
+
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert button.label == f"Replay {round(view.buffered_seconds)}s"
+    assert not button.disabled
+
+
+async def test_the_replay_button_is_dead_and_says_so_with_an_empty_buffer(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9021, "nocache")
     view.last_clip = None
+    button = retro.control(view, "replay")
+    assert button.disabled and button.label == "Replay"
+
     interaction = retro.interaction(view, message=view.message)
-    await retro.control(view, "replay").callback(interaction)
+    await button.callback(interaction)
     kind, snap = interaction.log[0]
     assert kind == "response.send_message"
     assert snap["ephemeral"] is True
+    assert "memory" in (snap["content"] or "")
+
+
+async def test_a_restored_session_has_a_dead_replay_button(retro):
+    # The buffer is memory only, so a message that survived a restart has
+    # nothing to replay and must not pretend otherwise.
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9025, "afterboot")
+    await retro.cog.hibernate(view, None)
+
+    cog2, bot2 = retro.make_cog()
+    bot2.channels[channel.id] = channel
+    await cog2._restore_sessions()
+    restored = cog2.sessions[channel.id]
+    button = next(
+        c for c in restored.children
+        if c.custom_id == f"{retro.viewmod.CUSTOM_ID_PREFIX}:replay"
+    )
+    assert button.disabled and not restored.clips
+
+
+async def test_a_replay_that_cannot_be_stitched_falls_back_to_the_last_clip(
+    retro, monkeypatch
+):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9026, "brokenstitch")
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("no encoder here")
+
+    monkeypatch.setattr(retro.viewmod, "concatenate_clips", boom)
+    interaction = retro.interaction(view, message=view.message)
+    await retro.control(view, "replay").callback(interaction)
+    final = interaction.log[-1][1]
+    assert final["n_attachments"] == 1, "the game is fine; show what we have"
+    assert not final["any_disabled"]
 
 
 # -- Hibernate and resume -----------------------------------------------------
@@ -591,9 +693,9 @@ async def test_a_session_whose_core_was_removed_says_which_one(retro):
 async def test_saved_games_can_be_added_listed_and_removed(retro):
     channel = retro.channel(9060)
     ctx = retro.context(channel)
-    add = retro.cogmod.RetroCog.retroset_game_add.callback
-    remove = retro.cogmod.RetroCog.retroset_game_remove.callback
-    listing = retro.cogmod.RetroCog.retroset_game_list.callback
+    add = retro.cogmod.Retro.retroset_game_add.callback
+    remove = retro.cogmod.Retro.retroset_game_remove.callback
+    listing = retro.cogmod.Retro.retroset_game_list.callback
 
     await listing(retro.cog, ctx)
     assert "No games are saved" in ctx.sent[-1]
@@ -609,7 +711,7 @@ async def test_a_preset_name_resolves_to_its_url_and_then_resumes(retro):
     await retro.install_cores("gambatte")
     channel = retro.channel(9061)
     ctx = retro.context(channel)
-    await retro.cogmod.RetroCog.retroset_game_add.callback(
+    await retro.cogmod.Retro.retroset_game_add.callback(
         retro.cog, ctx, "ucity", "https://example.com/ucity.gbc"
     )
 
@@ -620,7 +722,7 @@ async def test_a_preset_name_resolves_to_its_url_and_then_resumes(retro):
         return "ucity.gbc", ROM_BYTES
 
     retro.cog._fetch_rom = fetch
-    play = retro.cogmod.RetroCog.retro.callback
+    play = retro.cogmod.Retro.retro.callback
 
     await play(retro.cog, ctx, game="ucity")
     assert seen == ["https://example.com/ucity.gbc"]
@@ -646,13 +748,22 @@ async def test_a_different_game_replaces_the_session_and_retires_the_old_one(ret
     old_slug = old.slug
 
     retro.serve("otherga.gbc", ROM_BYTES)
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/otherga.gbc"
     )
     new = retro.cog.sessions.get(channel.id)
     assert new is not None and new is not old and new.slug != old_slug
     assert retro.cog._state_path(channel.id, old_slug).is_file()
-    assert all(getattr(c, "disabled", False) for c in old.children)
+
+    # The old message keeps exactly one working button: Resume.
+    retired = retro.cog.retired[old.message_id]
+    assert [child.custom_id for child in retired.children] == [
+        f"{retro.viewmod.CUSTOM_ID_PREFIX}:resume"
+    ]
+    assert retired.record["slug"] == old_slug
+    edit = old.message.edits[-1]
+    assert edit["view"] is retired
+    assert "Resume" in edit["content"]
 
     stale = retro.interaction(old, message=old.message)
     await old._press(stale, "a")
@@ -667,7 +778,7 @@ async def test_the_no_argument_help_mentions_presets_and_every_console(retro):
     channel = retro.channel(9070)
     ctx = retro.context(channel)
     await retro.install_cores("gambatte")
-    await retro.cogmod.RetroCog.retro.callback(retro.cog, ctx, game=None)
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game=None)
     said = ctx.said()
     assert "by name" in said or "retroset game" in said
     assert "Game Boy" in said
@@ -682,7 +793,7 @@ async def test_retrostop_saves_frees_and_keeps_the_session(retro):
     view, ctx, channel = await retro.posted_game(9080, "stopme")
     emulator = view.emulator
 
-    await retro.cogmod.RetroCog.retrostop.callback(retro.cog, ctx)
+    await retro.cogmod.Retro.retrostop.callback(retro.cog, ctx)
     assert view.emulator is None and not emulator.started
     assert retro.cog._state_path(channel.id, view.slug).is_file()
     assert retro.cog.sessions.get(channel.id) is view
@@ -704,7 +815,7 @@ async def test_retrostop_saves_the_game_even_if_the_message_explodes(retro):
     view.refresh = boom
     state = retro.cog._state_path(channel.id, view.slug)
     state.unlink(missing_ok=True)
-    await retro.cogmod.RetroCog.retrostop.callback(retro.cog, ctx)
+    await retro.cogmod.Retro.retrostop.callback(retro.cog, ctx)
     assert not emulator.started
     assert state.is_file()
 

@@ -37,6 +37,19 @@ now, or to check on it:
 [p]retroset settings
 ```
 
+**There is nothing to configure.** Cores are *detected*, not registered: the
+cog scans its own `cores` folder every time it needs one, so a core that is
+simply there — downloaded by `[p]retroset download`, fetched automatically on
+load, or dropped in by hand while the bot was off — is playable immediately, as
+long as it keeps its buildbot filename (`snes9x_libretro.so`,
+`gambatte_libretro.dll`). `[p]retroset settings` prints the folder.
+
+There used to be a `[p]retroset core <path>` command for pointing the cog at a
+core by hand, and it is gone. A path recorded by it (or by hand, for a core
+that lives somewhere else entirely, such as a RetroArch install) is still
+honoured, and `[p]retroset settings` marks such a core as coming from
+elsewhere.
+
 Then play. Any of these works:
 
 ```
@@ -60,7 +73,6 @@ can start it by name:
 - `[p]retrostop` saves the game and puts it to sleep. The controls keep working — pressing any button wakes it up again. There is no Stop button under the screen; this command is how a game is stopped.
 - `[p]retroset download` (owner) downloads every supported core for your platform from the [libretro buildbot](https://buildbot.libretro.com). `[p]retroset download <core>` fetches or refreshes just one.
 - `[p]retroset autodownload [true|false]` (owner) controls whether missing cores are fetched automatically when the cog loads. On by default.
-- `[p]retroset core <path>` (owner) points the cog at a libretro core that is already on the machine. The console is read from the filename, so keep the buildbot name (`snes9x_libretro.so`).
 - `[p]retroset game add|remove|list` (owner) manages the games anyone can start by name.
 - `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below.
 - `[p]retroset bios add|list|remove` (owner) manages BIOS files for cores that need one. See below.
@@ -230,8 +242,28 @@ saved and put to sleep, and both channels are told so. Waking back up takes
 about 25ms, so nobody notices.
 
 Starting a *different* game in a channel banks the current game's progress and
-switches. Starting the same one again just resumes it. Each game a channel
-plays keeps its own save, so you can switch back and forth.
+switches. Each game a channel plays keeps its own save, so you can switch back
+and forth freely.
+
+**Starting a game again always picks up its save.** Whether the game is still
+the channel's (in which case its existing message is simply brought back), or
+was replaced five games ago, running `[p]retro <name>` restores that channel's
+save state for it rather than cold-booting over the top — the same save
+state → battery save → fresh chain a sleeping game is woken with, and a plain
+one-line notice when the state could not be used.
+
+**A replaced game keeps a Resume button.** When a channel moves on, the old
+message's controls are swapped for a single **▶️ Resume**, and its text says so:
+
+> Replaced by **µCity**. **Pokemon** was saved — press Resume to come back to it.
+
+Pressing it starts that game again in that channel, right on that message: the
+game it replaces is saved and retired in turn (and gets a Resume button of its
+own), anything live elsewhere is hibernated first, and the save state comes
+back. It keeps working after a bot restart, because what it needs is stored
+rather than held in memory. A channel keeps the five most recent of them; if
+the ROM cache for one has since been pruned, the button says so instead of
+failing, and the game's save is still there for `[p]retro <name>` to pick up.
 
 ### Battery saves, as insurance
 
@@ -247,9 +279,9 @@ moment, mid-jump if that is where you were. If the state is missing or the
 core has since been updated and rejects it, the game is booted fresh with the
 battery save poured back in, and the channel is told:
 
-> This game's save state could not be used (the emulator core was updated), so
-> it started from the title screen — but your in-game save survived. Load it
-> from the game's own menu to carry on.
+> This game's save state could not be used (most likely the emulator core was
+> updated), so it started from the title screen — but your in-game save
+> survived. Load it from the game's own menu to carry on.
 
 Plenty of cartridges have no battery at all — nestest, dmg-acid2, most
 puzzle games. That is normal, not a failure: nothing is written, no empty file
@@ -261,7 +293,23 @@ is told the game simply started over.
 Each press records the next four seconds (configurable with
 `[p]retroset cliplength`) and posts them as a lossless animated WebP. The clip
 plays through once and stops rather than looping forever, so a busy channel
-isn't full of flickering images — press **Replay** to watch the last clip again.
+isn't full of flickering images.
+
+**Replay** shows the last **15 seconds**, not just the last clip. Each session
+keeps its most recent clips in memory, and pressing Replay decodes them and
+stitches them into one animation, oldest first, ending on the moment you just
+played. The button says how much it holds — `Replay 12s` — so it never promises
+more than it has. Measured on a Raspberry Pi 5, stitching 16 seconds of real
+Game Boy footage costs 0.4–1.3 seconds and about 40–130 KiB; the hard ceiling
+is 300 frames, which keeps even a pathological, fully-changing SNES picture
+under seven seconds.
+
+The buffer is **memory only**. That is a deliberate trade: clips are worthless
+the moment the session moves on, and writing them would multiply the cog's
+storage by the number of channels for a button most people press once. So after
+a bot restart there is nothing to replay yet, and the button is greyed out and
+says so until the next press refills it.
+
 The controls grey out the moment you press a button and come back when the new
 clip is ready, so you can tell the bot heard you.
 
@@ -301,20 +349,85 @@ This cog keeps one inside its own data folder and points every core at it;
 `[p]retroset settings` shows the path and lists what is in it.
 
 ```
-[p]retroset bios add <filename>          (with the file attached)
+[p]retroset bios add                     (with a file or a .zip attached)
+[p]retroset bios add <url>
+[p]retroset bios add <filename>          (with the file attached, renaming it)
 [p]retroset bios add <filename> <url>
 [p]retroset bios list
 [p]retroset bios remove <filename>
 ```
 
-`<filename>` is the exact name the core looks for, so it has to match what that
-core documents. A `.zip` is unpacked: a member matching `<filename>` wins,
-otherwise the only file inside is used. Filenames are validated — no folders, no
-traversal — and the file is capped at 16 MiB.
+**A `.zip` installs everything in it.** Firmware is usually distributed as a
+set rather than a single file, so every member of the archive is unpacked into
+the system directory, and the folders it had inside the archive are kept:
+
+```
+firmware.zip
+├── some_bios.bin      →  <system>/some_bios.bin
+└── dc/
+    ├── dc_boot.bin    →  <system>/dc/dc_boot.bin
+    └── dc_flash.bin   →  <system>/dc/dc_flash.bin
+```
+
+That layout is deliberate. The system directory is the *root* a core is handed,
+and cores disagree about what is in it: most ask for a bare filename at the top
+(`disksys.rom`, `scph5501.bin`), but a good few ask for a subfolder of it
+(`dc/dc_boot.bin`, `np2kai/FONT.ROM`). Keeping the archive's own layout is the
+only thing that satisfies both, and it is the layout firmware sets already come
+in. If a core wants a file somewhere else, unzip it yourself and add that one
+file — with `<filename>` if it also has to be renamed.
+
+The reply says how many files were installed and how many bytes, and lists a
+sample of their paths. `[p]retroset bios list` shows everything, subfolders
+included, and `[p]retroset bios remove` takes the path exactly as listed.
+
+`<filename>` is optional and only means anything for a single file: it is the
+exact name the core looks for, so it has to match what that core documents.
+Leave it off and the file keeps its own name. A zip holding exactly one file
+plus a `<filename>` still renames it, the way it always did.
+
+Every path out of an archive is **validated, never rewritten**: absolute paths,
+`..`, more than four folders deep, dotfiles, `__MACOSX/`, symlinks, device
+nodes and anything outside a small character set are refused and counted, not
+mangled into a name the core would never look for. Nothing is ever unpacked
+using `ZipFile.extract`; members are read into memory and written to paths this
+cog chose. One archive is capped at 64 MiB compressed, 64 MiB uncompressed, 250
+files, and 16 MiB per file.
 
 **This cog ships no firmware, never downloads any on its own, and names none.**
 Console BIOS images are copyrighted; supplying a copy you are entitled to use is
 entirely up to you.
+
+## Upgrading from an earlier version
+
+The cog's Python class used to be called `RetroCog` and is now simply `Retro`,
+which is the name that appears in `[p]help` and `[p]cog list`. Red derives
+**both** of a cog's storage locations from that class name — `Config` keys
+every setting and session by it, and the data folder is `<data>/cogs/<class
+name>/ ` — so the rename would otherwise have orphaned every downloaded core,
+cached ROM, save state, battery save, BIOS file, saved game and live session.
+
+It does not. The first time the renamed cog loads it migrates itself:
+
+- the old `RetroCog` data folder's contents are moved into the new `Retro`
+  one, entry by entry, so an interrupted move simply finishes next time;
+- any recorded core path that pointed into the old folder is repointed, once
+  the file is really at the other end of it;
+- the old settings and every channel's session record are copied across, but
+  **only** if the new namespace has never been written to, so a copy can never
+  overwrite something newer;
+- a marker is stored so none of it ever runs twice.
+
+Anything that cannot be done is logged and skipped rather than raised: a
+read-only disk or an unavailable Config costs the migration, never the cog
+load, and the old data is left exactly where it is so it can be moved by hand.
+If both folders already have the same thing in them, the new one wins and the
+old copy is left alone with a line in the log saying so.
+
+Two things deliberately did **not** change, because both are baked into things
+that already exist: the `Config` identifier integer (which keys all the stored
+data) and the `libretro` prefix on every button's `custom_id` (which is how
+Discord routes a click on a message this cog has already posted).
 
 ## Credits
 

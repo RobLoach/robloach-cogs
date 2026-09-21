@@ -65,7 +65,7 @@ async def options(retro):
     await retro.install_cores("gambatte", "fceumm")
     await retro.cog.config.core_options.set({})
     await retro.cog.config.core_option_definitions.set({})
-    return retro.cogmod.RetroCog.retroset_coreoptions.callback
+    return retro.cogmod.Retro.retroset_coreoptions.callback
 
 
 # -- The overview -------------------------------------------------------------
@@ -231,7 +231,7 @@ def test_a_core_prefix_is_never_assumed_when_nothing_is_known(retro):
 
 def test_effective_values_fall_back_exactly_as_libretro_does(retro):
     colorization = GAMBATTE_DEFS["gambatte_gb_colorization"]
-    cog = retro.cogmod.RetroCog
+    cog = retro.cogmod.Retro
     assert cog._option_default(colorization) == "disabled"
     assert cog._effective_value(colorization, None) == "disabled"
     assert cog._effective_value(colorization, "GBC") == "GBC"
@@ -242,7 +242,7 @@ def test_effective_values_fall_back_exactly_as_libretro_does(retro):
 
 
 def test_short_keys_only_lose_a_prefix_that_is_really_there(retro):
-    cog = retro.cogmod.RetroCog
+    cog = retro.cogmod.Retro
     assert cog._short_key("gambatte", "gambatte_gb_colorization") == "gb_colorization"
     assert cog._short_key("fceumm", "ngp_language") == "ngp_language"
 
@@ -380,7 +380,7 @@ async def test_the_settings_embed_summarises_the_overrides(retro, options, monke
     await options(retro.cog, ctx, core="fceumm", key="fceumm_region", value="PAL")
 
     ctx2 = retro.context(retro.channel(9725))
-    await retro.cogmod.RetroCog.retroset_settings.callback(retro.cog, ctx2)
+    await retro.cogmod.Retro.retroset_settings.callback(retro.cog, ctx2)
     fields = {field.name: field.value for field in ctx2.sent[-1]["embed"].fields}
     assert "Core options" in fields, list(fields)
     assert "fceumm_region" in fields["Core options"]

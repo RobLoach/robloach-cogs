@@ -42,10 +42,10 @@ def test_every_recommended_core_is_published_for_linux_x86_64(core, tmp_path):
 
 
 def test_the_buildbot_url_is_built_for_this_platform():
-    pytest.importorskip("discord", reason="RetroCog builds the URL")
-    from retro.RetroCog import RetroCog
+    pytest.importorskip("discord", reason="Retro builds the URL")
+    from retro.Retro import Retro
 
-    built = RetroCog._buildbot_url("gambatte")
+    built = Retro._buildbot_url("gambatte")
     assert built is not None, "this platform has no buildbot mapping"
     url, filename = built
     assert url.startswith("https://buildbot.libretro.com/nightly/")

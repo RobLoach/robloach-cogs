@@ -3,6 +3,7 @@ import io
 import logging
 import platform
 import re
+import shutil
 import sys
 import time
 import typing
@@ -24,6 +25,7 @@ from .emulator import (
     MAX_CLIP_SECONDS,
     MIN_CLIP_SECONDS,
     MIN_ROM_SIZE,
+    REPLAY_SECONDS,
     EmulatorError,
     RetroEmulator,
     probe_core_options,
@@ -35,13 +37,14 @@ from .RetroView import (
     MAX_HOLD_MS,
     MIN_HOLD_MS,
     SAVE_STATE_EVERY_PRESSES,
+    RetiredView,
     RetroView,
 )
 from .systems import (
     CORES,
     SYSTEMS,
+    core_filename,
     core_name_from_filename,
-    extensions_for_core,
     system_for_core,
     system_for_extension,
 )
@@ -108,12 +111,102 @@ MAX_LISTED_VALUES = 8
 # How long the paginated core option listing stays clickable.
 OPTION_MENU_TIMEOUT = 180.0
 
+# The class used to be called RetroCog, and Red derives BOTH of this cog's
+# storage locations from the class name: Config.get_conf() keys every setting
+# and session by type(self).__name__, and cog_data_path() puts the data
+# directory under it. Renaming the class to `Retro` therefore moves every
+# downloaded core, cached ROM, save state, battery save and BIOS file, and
+# every stored setting, out from under the running bot -- unless the old ones
+# are brought across, which is what _migrate_legacy_namespace() does.
+#
+# This constant is the old name and must never change; the migration is keyed
+# on it. (The Config *identifier* integer and RetroView.CUSTOM_ID_PREFIX are
+# load-bearing for the same reason and are likewise frozen; see their own
+# comments.)
+LEGACY_COG_NAME = "RetroCog"
+
+# Red's default (JSON) Config driver keeps a cog's stored settings in a file
+# called this, *inside* that cog's own data directory -- so the data directory
+# and the Config namespace are not two separate places on disk after all. It is
+# therefore excluded from the file move below and migrated by reading it
+# through a Config handle instead, which is the only way that also works for
+# the Postgres driver, where no such file exists.
+CONFIG_STORE_FILENAME = "settings.json"
+
+# How many retired messages one channel keeps a working Resume button on.
+# Matches MAX_CACHED_GAMES_PER_CHANNEL, because a Resume button for a game
+# whose ROM has been pruned can only apologise.
+MAX_RETIRED_PER_CHANNEL = MAX_CACHED_GAMES_PER_CHANNEL
+
+# Firmware sets are distributed as a zip of several files, sometimes with a
+# folder per console. These cap what one `[p]retroset bios add` will unpack:
+# the archive itself, any single file inside it, everything inside it
+# together, and how many files that may be.
+MAX_BIOS_ARCHIVE_SIZE = 64 * 1024 * 1024
+MAX_BIOS_ARCHIVE_SIZE_LABEL = "64 MiB"
+MAX_BIOS_TOTAL_SIZE = 64 * 1024 * 1024
+MAX_BIOS_FILES = 250
+
+# How many of the installed files `[p]retroset bios add` names in its reply
+# before it stops listing and starts counting.
+MAX_LISTED_BIOS_FILES = 12
+
+#: The cog's global settings and their defaults. A module constant rather than
+#: a literal inside register_global() because the migration below has to be
+#: able to tell an untouched configuration from a real one.
+DEFAULT_GLOBALS: typing.Dict[str, typing.Any] = {
+    # Kept only so an install from before multi-console support can be
+    # migrated into `cores` on load; nothing reads it afterwards.
+    "core_path": "",
+    # core name -> path on disk, e.g. {"gambatte": "/.../gambatte_libretro.so"}
+    # Only needed for a core outside the managed directory now: cores that
+    # live in it are found by scanning, so this is a record rather than the
+    # source of truth. See _installed_cores().
+    "cores": {},
+    "session_timeout_minutes": DEFAULT_TIMEOUT_MINUTES,
+    "clip_seconds": CLIP_SECONDS,
+    "hold_ms": DEFAULT_HOLD_MS,
+    "games": {},
+    # Fetch whatever cores are missing shortly after the cog loads, so a fresh
+    # install can play something without the owner having to find
+    # `[p]retroset download` first.
+    "auto_download_cores": True,
+    # When that last ran, so a reload loop cannot hammer the buildbot.
+    "auto_download_attempted_at": 0.0,
+    # core name -> {option key: value}: the owner's overrides, applied before
+    # the core initialises every time it is loaded.
+    # e.g. {"gambatte": {"gambatte_gb_colorization": "GBC"}}
+    "core_options": {},
+    # core name -> {option key: {"desc", "info", "default", "values"}}: what
+    # each core has told us about its own settings, so they can be listed
+    # without loading that core. Filled in by the ROM-less probe and extended
+    # every time a real session starts, which is how a core like FCEUmm --
+    # which registers nothing until a game is loaded -- ever becomes listable.
+    # See _definitions_for().
+    "core_option_definitions": {},
+    # Set once the RetroCog -> Retro move has been done, so it never runs a
+    # second time and cannot undo a later change by copying stale data over it.
+    "legacy_namespace_migrated": False,
+}
+
+#: The per-channel settings and their defaults.
+DEFAULT_CHANNEL: typing.Dict[str, typing.Any] = {
+    # A session outlives its emulator, so the record of one lives here and is
+    # reloaded when the cog (or the whole bot) starts again.
+    "session": None,
+    # str(message_id) -> session record, for messages whose game has been
+    # replaced by another one. They keep a Resume button, which has to keep
+    # working across a restart, so what it needs to restart the game is stored
+    # rather than held in memory. See _retire() and resume_retired().
+    "retired": {},
+}
+
 
 class DownloadError(RuntimeError):
     """A download failed for a reason the person who asked should be told."""
 
 
-class RetroCog(commands.Cog):
+class Retro(commands.Cog):
     """
     Play retro console games together in Discord, emulated with libretro.
     """
@@ -130,46 +223,31 @@ class RetroCog(commands.Cog):
             identifier=114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121,
             force_registration=True
         )
-        self.config.register_global(
-            # Kept only so an install from before multi-console support can be
-            # migrated into `cores` on load; nothing reads it afterwards.
-            core_path="",
-            # core name -> path on disk, e.g. {"gambatte": "/.../gambatte_libretro.so"}
-            cores={},
-            session_timeout_minutes=DEFAULT_TIMEOUT_MINUTES,
-            clip_seconds=CLIP_SECONDS,
-            hold_ms=DEFAULT_HOLD_MS,
-            games={},
-            # Fetch whatever cores are missing shortly after the cog loads, so
-            # a fresh install can play something without the owner having to
-            # find `[p]retroset download` first.
-            auto_download_cores=True,
-            # When that last ran, so a reload loop cannot hammer the buildbot.
-            auto_download_attempted_at=0.0,
-            # core name -> {option key: value}: the owner's overrides, applied
-            # before the core initialises every time it is loaded.
-            # e.g. {"gambatte": {"gambatte_gb_colorization": "GBC"}}
-            core_options={},
-            # core name -> {option key: {"desc", "info", "default", "values"}}:
-            # what each core has told us about its own settings, so they can
-            # be listed without loading that core. Filled in by the ROM-less
-            # probe and extended every time a real session starts, which is
-            # how a core like FCEUmm -- which registers nothing until a game
-            # is loaded -- ever becomes listable. See _definitions_for().
-            core_option_definitions={},
-        )
-        # A session outlives its emulator, so the record of one lives here
-        # and is reloaded when the cog (or the whole bot) starts again.
-        self.config.register_channel(
-            session=None
-        )
+        self.config.register_global(**DEFAULT_GLOBALS)
+        self.config.register_channel(**DEFAULT_CHANNEL)
         self.sessions: typing.Dict[int, RetroView] = {}
+        # message id -> the single Resume button left on a retired message.
+        self.retired: typing.Dict[int, RetiredView] = {}
         # Serializes every core operation across all channels.
         self.emulator_lock: asyncio.Lock = asyncio.Lock()
         self._idle_task: typing.Optional[asyncio.Task] = None
         self._download_task: typing.Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
+        # First, before anything reads a setting or touches the data folder:
+        # on an install that predates the rename, both of those live under the
+        # old class name until this has run.
+        try:
+            await self._migrate_legacy_namespace()
+        except Exception:
+            # Never fatal. A cog that will not load is worse than a cog that
+            # comes up looking like a fresh install, and the old data is still
+            # sitting there untouched to be retried or moved by hand.
+            log.exception(
+                "Failed to migrate the Retro cog's data from its old "
+                "%s namespace. The old data has been left alone.",
+                LEGACY_COG_NAME,
+            )
         try:
             await self._migrate_core_path()
         except Exception:
@@ -204,6 +282,290 @@ class RetroCog(commands.Cog):
             # not answer them; cog_load builds fresh ones.
             view.closed = True
         self.sessions.clear()
+        for retired in self.retired.values():
+            retired.alive = False
+        self.retired.clear()
+
+    # -- The RetroCog -> Retro rename ---------------------------------------
+    #
+    # Red gives a cog two places to keep things, and names both of them after
+    # the cog's Python class:
+    #
+    #   * Config.get_conf(self, ...) uses type(self).__name__ as the cog name
+    #     that keys every stored setting and every channel's session record;
+    #   * cog_data_path(self) returns <bot data>/cogs/<class name>/, which is
+    #     where this cog puts downloaded cores, cached ROMs, save states,
+    #     battery saves and the libretro system (BIOS) directory.
+    #
+    # Renaming the class from RetroCog to Retro therefore points both of them
+    # somewhere empty. Both have an explicit escape hatch -- Config.get_conf's
+    # cog_name= and cog_data_path's raw_name= -- so the old locations can
+    # still be read, which is what makes a one-off migration possible.
+    #
+    # The migration is not clever. It moves the data directory's contents
+    # entry by entry (so an interrupted run simply finishes next time),
+    # rewrites any stored core path that pointed into the old directory,
+    # copies the old settings across only when the new namespace has never
+    # been written to, and records that it is done. Every step is wrapped: a
+    # read-only disk or a Config that will not answer must cost the migration,
+    # not the cog.
+
+    def _legacy_data_dir(self) -> Path:
+        """
+        Where this cog's files lived when the class was called RetroCog.
+
+        Derived from the current directory's parent rather than by asking for
+        it: ``cog_data_path(raw_name=...)`` *creates* the directory it names,
+        and conjuring an empty RetroCog folder on every fresh install just to
+        discover it is empty would be silly.
+        """
+        return cog_data_path(self).parent / LEGACY_COG_NAME
+
+    def _legacy_config(self) -> Config:
+        """
+        A handle on the settings stored under the old cog name.
+
+        ``force_registration`` is off and nothing is registered on it, so
+        ``all()`` returns exactly what is on disk with no defaults mixed in --
+        which is how "this install has old data" is told from "it does not".
+        """
+        return Config.get_conf(
+            None,
+            identifier=114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121,
+            cog_name=LEGACY_COG_NAME,
+            force_registration=False,
+        )
+
+    async def _migrate_legacy_namespace(self) -> None:
+        """Bring a pre-rename install's files and settings across. Once."""
+        try:
+            if await self.config.legacy_namespace_migrated():
+                return
+        except Exception:
+            log.exception("Could not read the Retro migration marker.")
+            return
+
+        # Read before anything is moved, since moving can remove the folder.
+        # It is also the one reliable "was this cog ever run under the old
+        # name?" signal: every code path that touches storage goes through
+        # cog_data_path(), which creates the folder. Without it, merely asking
+        # Config about the old name would conjure an empty folder (and, with
+        # the JSON driver, an empty settings.json) on every fresh install.
+        try:
+            had_legacy = self._legacy_data_dir().is_dir()
+        except OSError:
+            had_legacy = False
+
+        moved = await asyncio.to_thread(self._migrate_data_directory)
+        copied = await self._migrate_config() if had_legacy else 0
+        # After the copy, not before: the paths that need rewriting are the
+        # ones the copy has just brought across.
+        await self._rewrite_core_paths()
+
+        try:
+            await self.config.legacy_namespace_migrated.set(True)
+        except Exception:
+            # Harmless: the migration is idempotent. Moving runs out of things
+            # to move, and the config copy refuses to run once the new
+            # namespace has anything in it.
+            log.exception("Could not record that the Retro migration ran.")
+        if moved or copied:
+            log.info(
+                "Migrated the Retro cog out of its old %s namespace: %s file(s) "
+                "or folder(s) moved, %s setting(s) copied.",
+                LEGACY_COG_NAME,
+                moved,
+                copied,
+            )
+
+    def _migrate_data_directory(self) -> int:
+        """
+        Move the old data directory's contents into the new one. Blocking.
+
+        Returns how many top-level entries were moved. Works entry by entry
+        rather than moving the directory whole, which is what makes it safe to
+        run again after an interrupted attempt, and lets an entry that already
+        exists in the new location win instead of being clobbered.
+        """
+        try:
+            new_dir = cog_data_path(self)
+            old_dir = self._legacy_data_dir()
+        except Exception:
+            log.exception("Could not work out where the Retro data folders are.")
+            return 0
+        if not old_dir.is_dir() or old_dir.resolve() == new_dir.resolve():
+            return 0
+
+        moved = 0
+        kept = []
+        try:
+            entries = sorted(old_dir.iterdir())
+        except OSError:
+            log.warning(
+                "Could not read the old %s data folder at %s.",
+                LEGACY_COG_NAME,
+                old_dir,
+                exc_info=True,
+            )
+            return 0
+        for entry in entries:
+            if entry.name == CONFIG_STORE_FILENAME:
+                # Not a file of ours: it is the JSON driver's copy of the old
+                # namespace's *settings*, which _migrate_config() reads
+                # properly through Config. Moving it would drop it on top of
+                # the new namespace's own store.
+                continue
+            target = new_dir / entry.name
+            if target.exists():
+                # Both namespaces have this. The new one is what the cog has
+                # been running on, so it wins; the old copy is left where it
+                # is rather than merged, deleted or renamed over.
+                kept.append(entry.name)
+                continue
+            try:
+                shutil.move(str(entry), str(target))
+                moved += 1
+            except (OSError, shutil.Error):
+                log.warning(
+                    "Could not move %s into the Retro data folder; it has "
+                    "been left where it is.",
+                    entry,
+                    exc_info=True,
+                )
+        if kept:
+            log.warning(
+                "The new Retro data folder already had %s, so the copies in "
+                "%s were left alone. Delete that folder once you are happy.",
+                humanize_list([f"`{name}`" for name in kept]),
+                old_dir,
+            )
+        try:
+            # Only ever removes an empty directory, so nothing can be lost
+            # here even if something above went wrong. A folder holding
+            # nothing but the old settings file is left standing on purpose:
+            # the settings have been *copied*, not moved, so it is a free
+            # backup, and the log line below says it can go.
+            old_dir.rmdir()
+        except OSError:
+            if not kept and old_dir.is_dir():
+                log.info(
+                    "Everything was moved out of %s; what is left there is a "
+                    "backup copy of the old settings and can be deleted.",
+                    old_dir,
+                )
+        return moved
+
+    async def _rewrite_core_paths(self) -> None:
+        """
+        Point stored core paths at the folder the cores were just moved to.
+
+        The only absolute paths this cog stores are the installed cores'.
+        Everything else is a bare filename resolved against the data directory
+        at the time of use (ROMs, save states, battery saves, BIOS files), so
+        it follows the move on its own.
+
+        A path is only rewritten once the file is really at the other end of
+        it: if the move could not happen (a read-only disk, say), the old
+        path is still the working one and pointing away from it would break a
+        core that is otherwise fine.
+        """
+        try:
+            old_dir = self._legacy_data_dir().resolve()
+        except Exception:
+            return
+        new_dir = cog_data_path(self)
+        try:
+            async with self.config.cores() as cores:
+                for name, raw in list(cores.items()):
+                    try:
+                        relative = Path(raw).resolve().relative_to(old_dir)
+                        moved_to = new_dir / relative
+                        if not moved_to.is_file():
+                            continue
+                    except (OSError, ValueError):
+                        continue
+                    cores[name] = str(moved_to)
+                    log.info(
+                        "Repointed the %s core at %s after the data move.",
+                        name,
+                        cores[name],
+                    )
+        except Exception:
+            log.exception("Could not repoint the stored core paths.")
+
+    async def _migrate_config(self) -> int:
+        """
+        Copy settings and sessions out of the old cog name's namespace.
+
+        Only when the new one is untouched: an install that has already been
+        written to under the new name is the newer truth, and pouring a stale
+        copy over it would undo whatever has been done since. Returns how many
+        top-level values were copied.
+        """
+        try:
+            current = await self.config.all()
+        except Exception:
+            log.exception("Could not read the Retro settings.")
+            return 0
+        try:
+            channels = await self.config.all_channels()
+        except Exception:
+            channels = {}
+        if channels or any(
+            current.get(key) != value for key, value in DEFAULT_GLOBALS.items()
+        ):
+            log.info(
+                "The Retro cog already has settings of its own, so the older "
+                "%s ones were left alone.",
+                LEGACY_COG_NAME,
+            )
+            return 0
+
+        try:
+            legacy = self._legacy_config()
+            old_globals = await legacy.all()
+            old_channels = await legacy.all_channels()
+        except Exception:
+            log.exception(
+                "Could not read the old %s settings; carrying on without them.",
+                LEGACY_COG_NAME,
+            )
+            return 0
+
+        copied = 0
+        for key, value in (old_globals or {}).items():
+            if key not in DEFAULT_GLOBALS:
+                # A setting this version no longer has. Leave it behind rather
+                # than writing an unregistered key into the new namespace.
+                continue
+            try:
+                await getattr(self.config, key).set(value)
+                copied += 1
+            except Exception:
+                log.warning(
+                    "Could not copy the %s setting across from %s.",
+                    key,
+                    LEGACY_COG_NAME,
+                    exc_info=True,
+                )
+        for channel_id, data in (old_channels or {}).items():
+            for key, value in (data or {}).items():
+                if key not in DEFAULT_CHANNEL:
+                    continue
+                try:
+                    await getattr(
+                        self.config.channel_from_id(int(channel_id)), key
+                    ).set(value)
+                    copied += 1
+                except Exception:
+                    log.warning(
+                        "Could not copy channel %s's %s across from %s.",
+                        channel_id,
+                        key,
+                        LEGACY_COG_NAME,
+                        exc_info=True,
+                    )
+        return copied
 
     # -- Cores --------------------------------------------------------------
 
@@ -223,21 +585,84 @@ class RetroCog(commands.Cog):
         await self.config.core_path.set("")
         log.info("Migrated the old Libretro core setting to the %s core.", name)
 
-    async def _installed_cores(self) -> typing.Dict[str, Path]:
-        """Every configured core whose file is still on disk."""
+    # Cores are found, not configured. The managed cores directory is scanned
+    # on every lookup, so a core that is simply *there* -- downloaded by
+    # `[p]retroset download`, fetched automatically on load, or dropped in by
+    # hand while the bot was off -- is playable without anybody having to
+    # register it. There used to be a `[p]retroset core <path>` command for
+    # that and there is not any more.
+    #
+    # The `cores` setting is still read first, because it is the only way to
+    # use a core that lives somewhere else entirely (a RetroArch install, say)
+    # and because installs made before this change have it filled in. It is
+    # still written by the downloader, so an owner can see where a core came
+    # from, but nothing depends on it being there.
+
+    def _scan_cores_dir(self) -> typing.Dict[str, Path]:
+        """Every core this cog knows sitting in the managed cores directory."""
         found: typing.Dict[str, Path] = {}
-        for name, raw in (await self.config.cores()).items():
-            path = Path(raw)
-            if path.is_file():
-                found[name] = path
+        try:
+            entries = sorted(self._cores_dir().iterdir())
+        except OSError:
+            log.warning("Could not read the Retro cores directory.", exc_info=True)
+            return found
+        for path in entries:
+            name = core_name_from_filename(path.name)
+            if name is None or name in found:
+                continue
+            try:
+                if not path.is_file():
+                    continue
+            except OSError:
+                continue
+            found[name] = path
+        return found
+
+    async def _installed_cores(self) -> typing.Dict[str, Path]:
+        """Every core that can actually be loaded right now, however it got there."""
+        found: typing.Dict[str, Path] = {}
+        try:
+            configured = await self.config.cores()
+        except Exception:
+            log.exception("Could not read the recorded Retro core paths.")
+            configured = {}
+        for name, raw in (configured or {}).items():
+            if name not in CORES or not raw:
+                continue
+            try:
+                path = Path(raw)
+                if path.is_file():
+                    found[name] = path
+            except OSError:
+                continue
+        for name, path in self._scan_cores_dir().items():
+            found.setdefault(name, path)
         return found
 
     async def _core_path(self, core: str) -> typing.Optional[Path]:
-        raw = (await self.config.cores()).get(core)
-        if not raw:
-            return None
-        path = Path(raw)
-        return path if path.is_file() else None
+        """Where to load one core from, or None if it is not installed."""
+        try:
+            raw = (await self.config.cores()).get(core)
+        except Exception:
+            raw = None
+        if raw:
+            path = Path(raw)
+            try:
+                if path.is_file():
+                    return path
+            except OSError:
+                pass
+        # Not recorded, recorded wrongly, or recorded at a path that has since
+        # gone: look where the cog puts them. The exact filename first, since
+        # that is what both download paths write, then a scan for a core built
+        # for another platform's suffix.
+        candidate = self._cores_dir() / core_filename(core)
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+        return self._scan_cores_dir().get(core)
 
     def _cores_dir(self) -> Path:
         return self._data_dir("cores")
@@ -513,23 +938,141 @@ class RetroCog(commands.Cog):
         hold_ms = await self.config.hold_ms()
         for channel_id, data in (await self.config.all_channels()).items():
             record = data.get("session")
-            if not record:
-                continue
-            record.setdefault("channel_id", channel_id)
-            try:
-                view = RetroView.from_record(
-                    self, record, timeout_minutes, clip_seconds, hold_ms
-                )
-            except Exception:
-                log.exception(
-                    "Ignoring an unreadable Libretro session record for channel %s",
-                    channel_id,
-                )
-                continue
-            self.sessions[channel_id] = view
-            self._register_view(view)
-        if self.sessions:
-            log.info("Restored %s hibernated Libretro session(s).", len(self.sessions))
+            if record:
+                record.setdefault("channel_id", channel_id)
+                try:
+                    view = RetroView.from_record(
+                        self, record, timeout_minutes, clip_seconds, hold_ms
+                    )
+                except Exception:
+                    log.exception(
+                        "Ignoring an unreadable Libretro session record for channel %s",
+                        channel_id,
+                    )
+                else:
+                    self.sessions[channel_id] = view
+                    self._register_view(view)
+            # Messages whose game was replaced keep a single Resume button,
+            # and it has to survive a restart: that is the whole point of it,
+            # since a retired message can sit in a channel for weeks before
+            # anybody wants the game back.
+            for key, retired_record in (data.get("retired") or {}).items():
+                try:
+                    retired_record = dict(retired_record)
+                    retired_record.setdefault("channel_id", channel_id)
+                    retired_record.setdefault("message_id", int(key))
+                    self._arm_retired(retired_record)
+                except Exception:
+                    log.exception(
+                        "Ignoring an unreadable retired Retro record for "
+                        "channel %s, message %s",
+                        channel_id,
+                        key,
+                    )
+        if self.sessions or self.retired:
+            log.info(
+                "Restored %s hibernated Libretro session(s) and %s Resume "
+                "button(s).",
+                len(self.sessions),
+                len(self.retired),
+            )
+
+    def _arm_retired(self, record: dict) -> typing.Optional[RetiredView]:
+        """Give one retired message a working Resume button."""
+        message_id = record.get("message_id")
+        if not message_id:
+            return None
+        message_id = int(message_id)
+        existing = self.retired.pop(message_id, None)
+        if existing is not None:
+            existing.alive = False
+        view = RetiredView(self, record)
+        self.retired[message_id] = view
+        try:
+            self.bot.add_view(view, message_id=message_id)
+        except Exception:
+            log.exception(
+                "Could not register the Resume button for message %s", message_id
+            )
+        return view
+
+    async def _remember_retired(self, record: dict) -> None:
+        """
+        Store what a Resume button needs, and forget the oldest ones.
+
+        Bounded per channel for the same reason the ROM cache is: a channel
+        that works through a pile of games would otherwise accumulate a
+        Config entry per message forever, and a Resume button whose ROM has
+        been pruned can only apologise anyway.
+        """
+        channel_id = int(record.get("channel_id") or 0)
+        message_id = record.get("message_id")
+        if not channel_id or not message_id:
+            return
+        try:
+            async with self.config.channel_from_id(channel_id).retired() as retired:
+                retired[str(int(message_id))] = dict(record)
+                while len(retired) > MAX_RETIRED_PER_CHANNEL:
+                    # Oldest by last_active, which is when the game was last
+                    # actually played rather than when it was retired.
+                    oldest = min(
+                        retired,
+                        key=lambda key: float(
+                            (retired[key] or {}).get("last_active") or 0.0
+                        ),
+                    )
+                    dropped = retired.pop(oldest)
+                    stale = self.retired.pop(int(oldest), None)
+                    if stale is not None:
+                        stale.alive = False
+                    log.debug(
+                        "Forgot the Resume button for %s in channel %s.",
+                        (dropped or {}).get("game_name"),
+                        channel_id,
+                    )
+        except Exception:
+            log.exception(
+                "Could not store the retired Retro session for channel %s.",
+                channel_id,
+            )
+
+    async def _forget_retired(self, channel_id: int, message_id: int) -> None:
+        """Drop one retired record, on the way to putting it back in service."""
+        view = self.retired.pop(int(message_id), None)
+        if view is not None:
+            view.alive = False
+        try:
+            async with self.config.channel_from_id(int(channel_id)).retired() as retired:
+                retired.pop(str(int(message_id)), None)
+        except Exception:
+            log.exception(
+                "Could not forget the retired Retro session %s.", message_id
+            )
+
+    async def _forget_retired_slug(self, channel_id: int, slug: str) -> None:
+        """
+        Drop any Resume button for a game that has just been started again.
+
+        Two messages offering to resume the same game in the same channel
+        would fight over one save state, so the older one stands down as soon
+        as the game comes back some other way. A click on it after this says
+        so rather than starting a second copy; see RetiredView._resume.
+        """
+        stale: typing.List[int] = []
+        try:
+            async with self.config.channel_from_id(int(channel_id)).retired() as retired:
+                for key, record in list(retired.items()):
+                    if (record or {}).get("slug") == slug:
+                        retired.pop(key, None)
+                        stale.append(int(key))
+        except Exception:
+            log.exception(
+                "Could not tidy the retired Retro records for channel %s.", channel_id
+            )
+        for message_id in stale:
+            view = self.retired.pop(message_id, None)
+            if view is not None:
+                view.alive = False
 
     def _register_view(self, view: RetroView) -> None:
         """
@@ -586,19 +1129,28 @@ class RetroCog(commands.Cog):
         return self._data_dir("system")
 
     def _bios_files(self) -> typing.List[typing.Tuple[str, int]]:
-        """(filename, size) for everything the owner has put in the system directory."""
+        """
+        (relative path, size) for everything in the system directory.
+
+        Walks subfolders, because a firmware set unpacked from a zip keeps the
+        folders it had inside it -- some cores look for their firmware in one
+        (``dc/dc_boot.bin``) rather than at the root.
+        """
+        root = self._system_dir()
+        found: typing.List[typing.Tuple[str, int]] = []
         try:
-            entries = sorted(self._system_dir().iterdir(), key=lambda p: p.name.lower())
+            entries = sorted(root.rglob("*"))
         except OSError:
             log.warning("Could not read the Retro system directory.", exc_info=True)
             return []
-        found = []
         for path in entries:
             try:
-                if path.is_file():
-                    found.append((path.name, path.stat().st_size))
-            except OSError:
+                if not path.is_file():
+                    continue
+                found.append((path.relative_to(root).as_posix(), path.stat().st_size))
+            except (OSError, ValueError):
                 continue
+        found.sort(key=lambda entry: entry[0].lower())
         return found
 
     @staticmethod
@@ -619,9 +1171,29 @@ class RetroCog(commands.Cog):
             return None
         if name.startswith("."):
             return None
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ +-]{0,63}", name):
+        if not archives.SAFE_COMPONENT.fullmatch(name):
             return None
         return name
+
+    def _bios_path(self, filename: str) -> typing.Optional[Path]:
+        """
+        Resolve one entry of ``[p]retroset bios list`` to a path, or None.
+
+        Accepts a subfolder, since the listing shows them, but every component
+        is validated and the result is checked against the system directory,
+        so nothing typed here can name a file outside it.
+        """
+        relative = archives.safe_member_path(str(filename).strip().strip('"').strip("'"))
+        if relative is None:
+            return None
+        root = self._system_dir().resolve()
+        try:
+            target = (root / relative).resolve()
+        except OSError:
+            return None
+        if root not in target.parents:
+            return None
+        return target
 
     def _rom_path(self, rom_filename: str) -> typing.Optional[Path]:
         if not rom_filename:
@@ -721,16 +1293,200 @@ class RetroCog(commands.Cog):
 
     async def _retire(self, view: RetroView, reason: str) -> None:
         """
-        Save a session and take its message out of service for good.
+        Save a session and swap its controls for a single Resume button.
 
-        Unlike hibernating, the controls are greyed out: this message is no
-        longer the channel's game, and letting it wake its emulator back up
-        would run two cores at once.
+        The message is no longer the channel's game, so its controls cannot
+        stay live: pressing one would wake a second libretro core, and only
+        one may be loaded at a time. But the game is not gone either -- its
+        ROM, save state and battery save are all still cached under the
+        channel's id -- so the message keeps one button that starts it again
+        here, through the ordinary start path. See RetiredView.
         """
         async with self.emulator_lock:
             await self._hibernate_locked(view, None)
-        view.retire()
-        await view.refresh(reason)
+        record = view.to_record()
+        view.closed = True
+        message = await view.resolve_message()
+        retired = self._arm_retired(record) if message is not None else None
+        if retired is None:
+            # No message to put a button on, so there is nothing to resume
+            # from; leave the view inert and say nothing more about it.
+            view.retire()
+            await view.refresh(reason)
+            return
+        await self._remember_retired(record)
+        try:
+            await message.edit(content=reason, view=retired)
+        except discord.HTTPException:
+            log.warning(
+                "Could not put a Resume button on the retired Retro message "
+                "in channel %s.",
+                view.channel_id,
+                exc_info=True,
+            )
+
+    async def resume_retired(self, retired: RetiredView, interaction) -> None:
+        """
+        Start a retired message's game again, in its own channel.
+
+        Called from the Resume button. This goes through exactly the same
+        gates a `[p]retro <name>` would: whatever else is live is saved and
+        hibernated first (only one core at a time), the channel's current game
+        -- if it has one -- is retired and gets a Resume button of its own,
+        and the game comes back from its save state, then its battery save,
+        then from the beginning.
+
+        The message being clicked is the one that is brought back to life, so
+        the game reappears where it was rather than as a new post further down
+        the channel.
+        """
+        record = dict(retired.record)
+        channel_id = int(record.get("channel_id") or retired.channel_id or 0)
+        game_name = record.get("game_name") or "that game"
+
+        rom_path = self._rom_path(record.get("rom_filename") or "")
+        if rom_path is None or not rom_path.is_file():
+            # The cache is bounded, so a game a channel has not touched in a
+            # while really can be gone. Say so; the save state is very
+            # probably still there, so starting it again by name will pick it
+            # back up (see _start_session).
+            await self._whisper_interaction(
+                interaction,
+                f"The cached ROM for **{game_name}** has been cleaned up, so "
+                "this button cannot start it. Start it again with "
+                f"`[p]retro <name or url>` \N{EM DASH} its save is still here, "
+                "and it will pick up where it left off.",
+            )
+            return
+
+        core = record.get("core") or ""
+        core_path = await self._core_path(core)
+        if core_path is None:
+            await self._whisper_interaction(
+                interaction,
+                f"The emulator core **{game_name}** needs (`{core}`) is not "
+                "installed any more, so it cannot be started.",
+            )
+            return
+
+        try:
+            await interaction.response.edit_message(
+                content=f"Starting **{game_name}** again\N{HORIZONTAL ELLIPSIS}",
+                view=retired,
+            )
+        except discord.HTTPException:
+            log.warning("Could not acknowledge a Resume click.", exc_info=True)
+
+        view = RetroView.from_record(
+            self,
+            record,
+            await self.config.session_timeout_minutes(),
+            await self.config.clip_seconds(),
+            await self.config.hold_ms(),
+        )
+        message_id = int(retired.message_id or getattr(interaction.message, "id", 0) or 0)
+        view.message_id = message_id or None
+        view.message = getattr(interaction, "message", None)
+
+        state, sram, notice = self._saved_progress(channel_id, view.slug)
+        emulator = RetroEmulator(
+            core_path,
+            rom_path,
+            system_dir=self._system_dir(),
+            options=await self._core_options(view.core),
+        )
+        # Booted *before* anything is taken away from the channel, so a core
+        # that will not come up costs nothing: whatever was playing is merely
+        # hibernated (which its own buttons undo) rather than retired.
+        try:
+            async with self.emulator_lock:
+                # One core at a time, here as everywhere else.
+                await self._evict_locked(exclude=view)
+                clip = await asyncio.to_thread(view._boot, emulator, state, sram)
+        except Exception as error:
+            log.warning(
+                "Could not resume %s in channel %s: %s", view.slug, channel_id, error
+            )
+            try:
+                await asyncio.to_thread(emulator.stop)
+            except Exception:
+                log.exception("Could not stop a failed resume's emulator.")
+            view.closed = True
+            # Put the Resume button back so the click was not destructive.
+            self._arm_retired(record)
+            await self._restore_retired_message(interaction, retired, record, error)
+            return
+
+        # It is up, so the channel really does change hands now. The game it
+        # replaces is retired exactly as starting a different game by name
+        # would retire it, and gets a Resume button of its own.
+        previous = self.sessions.get(channel_id)
+        if previous is not None and previous is not view:
+            await self._retire(
+                previous,
+                f"Replaced by **{game_name}**. **{previous.game_name}** was "
+                "saved \N{EM DASH} press Resume to come back to it.",
+            )
+            self.sessions.pop(channel_id, None)
+        self.sessions[channel_id] = view
+
+        view.emulator = emulator
+        view.last_clip = clip
+        view.touch()
+        self._settle_boot(view, state, notice)
+        await self._forget_retired(channel_id, message_id)
+        await self._forget_retired_slug(channel_id, view.slug)
+        try:
+            view.message = await interaction.edit_original_response(
+                content=view._content(),
+                attachments=[view._clip_file(clip)],
+                view=view,
+            )
+        except discord.HTTPException as error:
+            log.exception(
+                "Discord rejected the resumed Retro message in channel %s.",
+                channel_id,
+            )
+            await self._whisper_interaction(interaction, self._http_error_message(error))
+        # Whatever happened to the message, the session is real and this
+        # message now drives it, so route its clicks here from now on.
+        self._register_view(view)
+        await self._learn_options(view.core, emulator)
+        await self._save_record(view)
+
+    async def _restore_retired_message(
+        self,
+        interaction,
+        retired: RetiredView,
+        record: dict,
+        error: BaseException,
+    ) -> None:
+        """Put a failed Resume back the way it was, and say what went wrong."""
+        reason = self._friendly_error(error) or "The game could not be started."
+        try:
+            await interaction.edit_original_response(
+                content=(
+                    f"**{record.get('game_name') or 'That game'}** could not "
+                    f"be started: {reason}"
+                ),
+                view=self.retired.get(int(retired.message_id or 0)) or retired,
+            )
+        except discord.HTTPException:
+            log.warning("Could not report a failed Resume.", exc_info=True)
+
+    @staticmethod
+    async def _whisper_interaction(interaction, message: str) -> None:
+        """Tell only the person who clicked, whether or not we have replied."""
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(message, ephemeral=True)
+                return
+        except Exception:
+            log.debug("Could not answer an interaction directly.", exc_info=True)
+        try:
+            await interaction.followup.send(message, ephemeral=True)
+        except Exception:
+            log.debug("Could not deliver an interaction notice.", exc_info=True)
 
     async def _hibernate_locked(
         self, view: RetroView, reason: typing.Optional[str] = None
@@ -831,20 +1587,88 @@ class RetroCog(commands.Cog):
         view.emulator = emulator
         await self._learn_options(view.core, emulator)
 
+    def _saved_progress(
+        self, channel_id: int, slug: str
+    ) -> typing.Tuple[typing.Optional[bytes], typing.Optional[bytes], typing.Optional[str]]:
+        """
+        What this channel already has saved for one game.
+
+        Returns ``(save state, battery save, the line to say if it all works)``.
+        Read on every start, not only on a wake: a channel that played this
+        game before -- even weeks and several other games ago -- has its
+        progress cached under the same key, and booting over the top of it
+        would quietly throw the player's game away.
+        """
+        state: typing.Optional[bytes] = None
+        path = self._state_path(channel_id, slug)
+        try:
+            if path.is_file():
+                state = path.read_bytes() or None
+        except OSError:
+            log.warning("Could not read the Libretro save state %s", path, exc_info=True)
+        sram = self._read_sram(channel_id, slug)
+        if state:
+            notice = "Picked up from where this channel left off."
+        elif sram:
+            notice = (
+                "Started from the title screen with this channel's in-game "
+                "save already in place \N{EM DASH} load it from the game's own "
+                "menu to carry on."
+            )
+        else:
+            notice = None
+        return state, sram, notice
+
+    def _settle_boot(
+        self,
+        view: RetroView,
+        state: typing.Optional[bytes],
+        notice: typing.Optional[str],
+    ) -> None:
+        """
+        Say how a boot went, and throw away a save state that did not work.
+
+        The counterpart of the same handling in :meth:`_wake_locked`: a save
+        state is tied to the exact build of the core that wrote it, so a core
+        update invalidates every one on disk. That should cost the exact
+        moment, never the session and never the player's own in-game save.
+        """
+        outcome = getattr(view, "boot_outcome", "fresh")
+        if state and outcome != "state":
+            try:
+                self._state_path(view.channel_id, view.slug).unlink(missing_ok=True)
+            except OSError:
+                pass
+            view.notice = self._cold_boot_notice(outcome == "sram")
+            log.info(
+                "Cold-booted %s after an unusable save state; battery save %s.",
+                view.slug,
+                "restored" if outcome == "sram" else "not available",
+            )
+            return
+        if outcome == "state":
+            view.notice = notice
+        elif outcome == "sram":
+            view.notice = notice or (
+                "Started from the title screen with this channel's in-game "
+                "save already in place."
+            )
+
     @staticmethod
     def _cold_boot_notice(sram_restored: bool) -> str:
         """What to tell the channel when a save state could not be used."""
         if sram_restored:
             return (
-                "This game's save state could not be used (the emulator core "
-                "was updated), so it started from the title screen \N{EM DASH} "
-                "but your in-game save survived. Load it from the game's own "
-                "menu to carry on."
+                "This game's save state could not be used (most likely the "
+                "emulator core was updated), so it started from the title "
+                "screen \N{EM DASH} but your in-game save survived. Load it "
+                "from the game's own menu to carry on."
             )
         return (
-            "This game's save state could not be used (the emulator core was "
-            "updated), so it started over from the beginning. This game keeps "
-            "no in-game save, so there was nothing else to restore."
+            "This game's save state could not be used (most likely the "
+            "emulator core was updated), so it started over from the "
+            "beginning. This game keeps no in-game save, so there was nothing "
+            "else to restore."
         )
 
     async def _evict_locked(
@@ -1207,9 +2031,17 @@ class RetroCog(commands.Cog):
         try:
             async with self.config.cores() as cores:
                 cores[core] = str(core_path)
-        except Exception as error:
-            log.exception("Could not record the %s core in the config.", core)
-            return False, 0, f"could not be recorded in the settings: {error}"
+        except Exception:
+            # Not fatal any more: the file is on disk in the cog's own cores
+            # folder, and that folder is scanned on every lookup, so the core
+            # is playable whether or not the settings remember it.
+            log.warning(
+                "Could not record where the %s core was installed; it will "
+                "still be found by scanning %s.",
+                core,
+                core_path.parent,
+                exc_info=True,
+            )
         return True, len(data), "installed"
 
     async def _download_bytes(
@@ -1660,8 +2492,8 @@ class RetroCog(commands.Cog):
         if existing is not None:
             await self._retire(
                 existing,
-                f"Replaced by **{game_name}**. This game was saved; start it "
-                "again by name to carry on.",
+                f"Replaced by **{game_name}**. **{existing.game_name}** was "
+                "saved \N{EM DASH} press Resume to come back to it.",
             )
             self.sessions.pop(ctx.channel.id, None)
 
@@ -1717,6 +2549,14 @@ class RetroCog(commands.Cog):
         )
         self.sessions[ctx.channel.id] = view
 
+        # This channel may well have played this game before -- five minutes
+        # ago or a month and six games ago -- in which case its progress is
+        # still cached under the same key. Starting it again picks that up
+        # rather than booting over the top of it. Same fallback chain as
+        # waking a hibernated session: save state, then the cartridge's
+        # battery save, then the beginning.
+        state, sram, restored_notice = self._saved_progress(ctx.channel.id, slug)
+
         emulator = RetroEmulator(
             core_path,
             rom_path,
@@ -1735,7 +2575,15 @@ class RetroCog(commands.Cog):
                         # A courtesy message: if Discord refuses it, the game
                         # should still start.
                         await self._safe_send(ctx, notice)
-                    await view.start(ctx, emulator)
+                    await view.start(
+                        ctx,
+                        emulator,
+                        state,
+                        sram,
+                        on_booted=lambda booted: self._settle_boot(
+                            booted, state, restored_notice
+                        ),
+                    )
         except EmulatorError as error:
             await self._abandon_session(ctx, view, emulator)
             await self._safe_send(ctx, f"The game could not be started: {error}")
@@ -1757,6 +2605,9 @@ class RetroCog(commands.Cog):
         except Exception:
             await self._abandon_session(ctx, view, emulator)
             raise
+        # This game is live on a new message now, so any older message still
+        # offering to resume it stands down.
+        await self._forget_retired_slug(ctx.channel.id, slug)
         # A core that declares nothing until a ROM is loaded (FCEUmm declares
         # all 44 of its options only now) has just told us what it offers, so
         # write that down while it is in front of us.
@@ -1816,40 +2667,6 @@ class RetroCog(commands.Cog):
         Configure the Retro cog.
         """
 
-    @retroset.command(name="core")
-    async def retroset_core(self, ctx: commands.Context, *, path: str) -> None:
-        """
-        Point the cog at a libretro core that is already on this machine.
-
-        The console is worked out from the filename, so the file has to keep
-        its buildbot name (`snes9x_libretro.so`, `gambatte_libretro.dll`, and
-        so on). Most people should use `[p]retroset download` instead.
-
-        **Examples:**
-        - `[p]retroset core /opt/retroarch/cores/snes9x_libretro.so`
-
-        **Arguments:**
-        - `<path>` - The full path to the core file.
-        """
-        core_path = Path(path.strip().strip('"'))
-        if not core_path.is_file():
-            await ctx.send(f"No file found at `{core_path}`.")
-            return
-        core = core_name_from_filename(core_path.name)
-        if core is None:
-            known = humanize_list([f"`{name}`" for name in sorted(CORES)])
-            await ctx.send(
-                f"`{core_path.name}` is not a core this cog knows how to use. "
-                f"The supported cores are: {known}."
-            )
-            return
-        async with self.config.cores() as cores:
-            cores[core] = str(core_path)
-        await ctx.send(
-            f"The `{core}` core ({CORES[core]}) is now set to `{core_path}`. "
-            f"It plays {humanize_list([f'`{e}`' for e in extensions_for_core(core)])}."
-        )
-
     @retroset.command(name="download")
     async def retroset_download(
         self, ctx: commands.Context, core: typing.Optional[str] = None
@@ -1863,7 +2680,10 @@ class RetroCog(commands.Cog):
         and replaces it if it is already there.
 
         This also happens by itself when the cog loads; see
-        `[p]retroset autodownload`.
+        `[p]retroset autodownload`. There is nothing to configure either way:
+        the cog finds whatever cores are in its own cores folder, so one
+        dropped in by hand is picked up too, as long as it keeps its buildbot
+        filename (`snes9x_libretro.so`, `gambatte_libretro.dll`).
 
         The whole set is about 5 MiB. None of these cores need a BIOS file.
         For one that does, see `[p]retroset bios`.
@@ -1902,8 +2722,10 @@ class RetroCog(commands.Cog):
         if self._buildbot_url(wanted[0]) is None:
             await ctx.send(
                 "There is no libretro buildbot build for this platform. "
-                "Download the cores manually and point the cog at each one "
-                f"with `{ctx.clean_prefix}retroset core <path>`."
+                "Download the cores yourself and drop them into "
+                f"`{self._cores_dir()}` under their usual names "
+                f"(`{core_filename('gambatte')}` and so on); the cog picks up "
+                "whatever is in there."
             )
             return
 
@@ -2483,6 +3305,10 @@ class RetroCog(commands.Cog):
         Cores look for it in the frontend's *system directory*, which this cog
         keeps inside its data folder; `[p]retroset settings` shows where.
 
+        Most cores want a bare file at the top of that directory, but a few
+        want theirs in a subfolder of it, so a `.zip` is unpacked with its own
+        folders intact and every file in it is installed.
+
         **Nothing is downloaded or suggested for you.** This cog ships no
         firmware, will never fetch any on its own, and names none: console
         BIOS images are copyrighted, and it is up to you to supply a copy you
@@ -2492,105 +3318,72 @@ class RetroCog(commands.Cog):
 
     @retroset_bios.command(name="add")
     async def retroset_bios_add(
-        self, ctx: commands.Context, filename: str, url: typing.Optional[str] = None
+        self,
+        ctx: commands.Context,
+        filename: typing.Optional[str] = None,
+        url: typing.Optional[str] = None,
     ) -> None:
         """
-        Put a BIOS file you supply into the system directory.
+        Put BIOS files you supply into the system directory.
 
-        Pass a direct URL, or attach the file to your message and leave the
-        URL off. `<filename>` is the exact name the core will look for, so it
-        has to match what that core documents. A `.zip` is unpacked for you: a
-        member whose name matches `<filename>` wins, otherwise the only file
-        inside is used.
+        Attach the file to your message, or pass a direct URL. A `.zip` is
+        unpacked for you and **every** file in it is installed, keeping the
+        folders it had inside the archive, because a firmware set is usually
+        several files and some cores want theirs in a subfolder.
+
+        `<filename>` is optional and only means anything for a single file: it
+        is the exact name the core will look for, so it has to match what that
+        core documents. Leave it off and the file keeps its own name.
 
         Only add firmware you are entitled to use. This cog does not provide
         any and cannot tell you where to find it.
 
         **Examples:**
+        - `[p]retroset bios add` (with a file or a `.zip` attached)
+        - `[p]retroset bios add https://example.com/firmware.zip`
         - `[p]retroset bios add somesystem_bios.bin` (with the file attached)
-        - `[p]retroset bios add somesystem_bios.bin https://example.com/bios.zip`
+        - `[p]retroset bios add somesystem_bios.bin https://example.com/bios.bin`
 
         **Arguments:**
-        - `<filename>` - The exact filename the core expects.
+        - `[filename]` - The exact filename one core expects, if you need to rename it.
         - `[url]` - A direct link to the file, if you are not attaching it.
         """
-        name = self._bios_name(filename)
+        # `bios add <url>` has to work, and so does the older
+        # `bios add <name> [url]`, so a first argument that is obviously a URL
+        # is treated as one rather than as a (hopeless) filename.
+        if url is None and filename and filename.lower().startswith(("http://", "https://")):
+            filename, url = None, filename
+
+        name: typing.Optional[str] = None
+        if filename:
+            name = self._bios_name(filename)
+            if name is None:
+                await ctx.send(
+                    "That is not a usable filename. Give the bare name the "
+                    "core looks for, with no folders in it, for example "
+                    "`somesystem_bios.bin` \N{EM DASH} or leave it off "
+                    "entirely and the file keeps its own name."
+                )
+                return
+
+        fetched = await self._fetch_bios(ctx, name, url)
+        if fetched is None:
+            return
+        source, data = fetched
+
+        if archives.is_zip(data) or str(source).lower().endswith(".zip"):
+            await self._install_bios_archive(ctx, source, data, name)
+            return
+
+        name = name or self._bios_name(Path(str(source)).name)
         if name is None:
             await ctx.send(
-                "That is not a usable filename. Give the bare name the core "
-                "looks for, with no folders in it, for example "
-                "`somesystem_bios.bin`."
+                f"`{Path(str(source)).name}` is not a usable filename. Say "
+                "what the core should see it as: `"
+                f"{ctx.clean_prefix}retroset bios add <filename>"
+                f"{' <url>' if url else ''}`."
             )
             return
-
-        if url:
-            try:
-                source, data = await self._download_bytes(
-                    url, MAX_BIOS_SIZE, MAX_BIOS_SIZE_LABEL, "BIOS file"
-                )
-            except DownloadError as error:
-                await ctx.send(str(error))
-                return
-        elif ctx.message.attachments:
-            attachment = ctx.message.attachments[0]
-            if attachment.size > MAX_BIOS_SIZE:
-                await ctx.send(
-                    f"That BIOS file is bigger than the {MAX_BIOS_SIZE_LABEL} limit."
-                )
-                return
-            try:
-                source, data = attachment.filename, await attachment.read()
-            except discord.HTTPException as error:
-                log.warning("Could not read a Retro BIOS attachment.", exc_info=True)
-                await ctx.send(f"The attached file could not be downloaded: {error}")
-                return
-        else:
-            await ctx.send(
-                "Attach the BIOS file to your message, or pass a direct URL "
-                f"after the filename: `{ctx.clean_prefix}retroset bios add "
-                f"{name} <url>`."
-            )
-            return
-
-        note = ""
-        if archives.is_zip(data) or str(source).lower().endswith(".zip"):
-            wanted = name.lower()
-            try:
-                found = await asyncio.to_thread(
-                    archives.extract,
-                    data,
-                    # Prefer the exact name the core wants; fall back to
-                    # whatever single file the archive holds.
-                    accept=lambda member: Path(member).name.lower() == wanted,
-                    max_size=MAX_BIOS_SIZE,
-                    what="BIOS file",
-                )
-            except archives.NoSupportedMember as error:
-                if len(error.members) == 1:
-                    try:
-                        found = await asyncio.to_thread(
-                            archives.extract,
-                            data,
-                            accept=lambda member: True,
-                            max_size=MAX_BIOS_SIZE,
-                            what="BIOS file",
-                        )
-                    except archives.ArchiveError as inner:
-                        await ctx.send(f"That zip could not be used: {inner}")
-                        return
-                else:
-                    await ctx.send(
-                        f"That zip has no file called `{name}` in it. It "
-                        f"contains: {archives.describe_members(error.members)}. "
-                        "Name one of those, or unzip it yourself."
-                    )
-                    return
-            except archives.ArchiveError as error:
-                await ctx.send(f"That zip could not be read: {error}")
-                return
-            data = found.data
-            note = f" (unpacked from `{found.name}` in the zip)"
-
         if not data:
             await ctx.send("That file is empty.")
             return
@@ -2609,10 +3402,179 @@ class RetroCog(commands.Cog):
             return
         log.info("Installed the BIOS file %s (%s bytes).", name, len(data))
         await ctx.send(
-            f"Stored `{name}` ({len(data):,} bytes){note} in the system "
-            f"directory. Cores will find it from now on. See "
+            f"Stored `{name}` ({len(data):,} bytes) in the system directory. "
+            f"Cores will find it from now on. See "
             f"`{ctx.clean_prefix}retroset bios list`."
         )
+
+    async def _fetch_bios(
+        self,
+        ctx: commands.Context,
+        name: typing.Optional[str],
+        url: typing.Optional[str],
+    ) -> typing.Optional[typing.Tuple[str, bytes]]:
+        """(source name, bytes) from the URL or attachment, or None on error."""
+        if url:
+            try:
+                return await self._download_bytes(
+                    url,
+                    MAX_BIOS_ARCHIVE_SIZE,
+                    MAX_BIOS_ARCHIVE_SIZE_LABEL,
+                    "BIOS file",
+                )
+            except DownloadError as error:
+                await self._safe_send(ctx, str(error))
+                return None
+        if ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+            if attachment.size > MAX_BIOS_ARCHIVE_SIZE:
+                await self._safe_send(
+                    ctx,
+                    "That file is bigger than the "
+                    f"{MAX_BIOS_ARCHIVE_SIZE_LABEL} limit.",
+                )
+                return None
+            try:
+                return attachment.filename, await attachment.read()
+            except discord.HTTPException as error:
+                log.warning("Could not read a Retro BIOS attachment.", exc_info=True)
+                await self._safe_send(
+                    ctx, f"The attached file could not be downloaded: {error}"
+                )
+                return None
+        await self._safe_send(
+            ctx,
+            "Attach the BIOS file (or a `.zip` of them) to your message, or "
+            f"pass a direct URL: `{ctx.clean_prefix}retroset bios add "
+            f"{name or '<url>'}{' <url>' if name else ''}`.",
+        )
+        return None
+
+    async def _install_bios_archive(
+        self,
+        ctx: commands.Context,
+        source: str,
+        data: bytes,
+        name: typing.Optional[str],
+    ) -> None:
+        """
+        Unpack a whole firmware archive into the system directory.
+
+        On where things land: libretro's *system directory* is the one folder
+        a core is handed, and cores disagree about what is in it. Most ask for
+        a bare filename at its root (`disksys.rom`, `scph5501.bin`); a good
+        few ask for a subfolder of it (`dc/dc_boot.bin`, `np2kai/FONT.ROM`,
+        `Mupen64plus/*`). So the archive's own layout is preserved, relative
+        to the system directory, which is the layout every firmware set is
+        packaged in and the only one that can satisfy both kinds of core. Each
+        path component is validated (never rewritten) first: cores look for an
+        exact filename, so a name that cannot be stored truthfully is refused
+        rather than mangled into one the core will never ask for.
+        """
+        try:
+            unpacked = await asyncio.to_thread(
+                archives.extract_all,
+                data,
+                max_total_size=MAX_BIOS_TOTAL_SIZE,
+                max_file_size=MAX_BIOS_SIZE,
+                max_files=MAX_BIOS_FILES,
+                what="BIOS file",
+            )
+        except archives.NoSupportedMember as error:
+            await self._safe_send(ctx, f"`{source}`: {error}")
+            return
+        except archives.ArchiveError as error:
+            await self._safe_send(ctx, f"That zip could not be read: {error}")
+            return
+        except Exception:
+            log.exception("Unpacking the BIOS zip %s failed unexpectedly.", source)
+            await self._safe_send(ctx, f"`{source}` could not be unpacked.")
+            return
+
+        renamed = ""
+        files = list(unpacked.files)
+        if name and len(files) == 1:
+            # One file in the zip and a name was given: the old behaviour,
+            # which is how somebody puts `bios.bin` in as `scph5501.bin`.
+            if files[0].path != name:
+                renamed = f" `{files[0].member}` was stored as `{name}`."
+            files = [files[0]._replace(path=name)]
+        elif name:
+            renamed = (
+                f" The `{name}` you named was ignored: a zip of "
+                f"{len(files)} files keeps its own names."
+            )
+
+        try:
+            written, total = await asyncio.to_thread(self._write_bios_files, files)
+        except OSError as error:
+            log.warning("Could not unpack a BIOS archive.", exc_info=True)
+            await self._safe_send(
+                ctx,
+                f"The files could not be saved: {error}. The bot may be out "
+                "of disk space.",
+            )
+            return
+
+        if not written:
+            await self._safe_send(
+                ctx, f"Nothing from `{source}` could be written to disk."
+            )
+            return
+        log.info(
+            "Installed %s BIOS file(s) from %s (%s bytes).", len(written), source, total
+        )
+
+        listed = ", ".join(f"`{path}`" for path in written[:MAX_LISTED_BIOS_FILES])
+        if len(written) > MAX_LISTED_BIOS_FILES:
+            listed += f", and {len(written) - MAX_LISTED_BIOS_FILES} more"
+        lines = [
+            f"Installed **{len(written)}** file(s) from `{source}`, "
+            f"{total:,} bytes in total, into the system directory: {listed}."
+            + renamed
+        ]
+        if unpacked.skipped:
+            lines.append(
+                f"{len(unpacked.skipped)} entr(y/ies) in the zip were skipped: "
+                "an unusable name, a symlink, an empty file, or one over the "
+                f"{MAX_BIOS_SIZE_LABEL} per-file limit."
+            )
+        lines.append(
+            "Folders inside the zip were kept, since some cores look for "
+            "their firmware in one. See "
+            f"`{ctx.clean_prefix}retroset bios list`."
+        )
+        for page in pagify("\n".join(lines)):
+            await self._safe_send(ctx, page)
+
+    def _write_bios_files(
+        self, files: typing.Sequence["archives.ExtractedFile"]
+    ) -> typing.Tuple[typing.List[str], int]:
+        """
+        Write unpacked firmware into the system directory. Blocking.
+
+        Every path has already been validated by ``archives.safe_member_path``,
+        but the result is checked against the system directory once more
+        before anything is written: this is the last line between an archive
+        and the bot's filesystem, and it costs nothing.
+        """
+        root = self._system_dir().resolve()
+        written: typing.List[str] = []
+        total = 0
+        for entry in files:
+            target = (root / entry.path).resolve()
+            if target != root and root not in target.parents:
+                log.error(
+                    "Refusing to write %r from a BIOS archive: it resolves "
+                    "outside the system directory.",
+                    entry.member,
+                )
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._write_atomic(target, entry.data)
+            written.append(entry.path)
+            total += len(entry.data)
+        return written, total
 
     @retroset_bios.command(name="list")
     async def retroset_bios_list(self, ctx: commands.Context) -> None:
@@ -2628,11 +3590,16 @@ class RetroCog(commands.Cog):
             await ctx.send(
                 f"No BIOS files are installed. The system directory is "
                 f"`{directory}`; add a file you are entitled to use with "
-                f"`{ctx.clean_prefix}retroset bios add <filename>`. Every "
-                "core this cog installs by default works without one."
+                f"`{ctx.clean_prefix}retroset bios add`. Every core this cog "
+                "installs by default works without one."
             )
             return
-        lines = [f"System directory: `{directory}`", ""]
+        total = sum(size for _, size in files)
+        lines = [
+            f"System directory: `{directory}`",
+            f"{len(files)} file(s), {total:,} bytes.",
+            "",
+        ]
         lines.extend(f"- `{name}` ({size:,} bytes)" for name, size in files)
         for page in pagify("\n".join(lines)):
             await ctx.send(page)
@@ -2642,17 +3609,24 @@ class RetroCog(commands.Cog):
         """
         Delete a BIOS file from the system directory.
 
+        Give the name exactly as `[p]retroset bios list` shows it, including
+        the folder if it is in one.
+
         **Examples:**
         - `[p]retroset bios remove somesystem_bios.bin`
+        - `[p]retroset bios remove somesystem/bios.bin`
 
         **Arguments:**
         - `<filename>` - The file to delete, as shown by `[p]retroset bios list`.
         """
-        name = self._bios_name(filename)
-        if name is None:
-            await ctx.send("That is not a usable filename.")
+        target = self._bios_path(filename)
+        if target is None:
+            await ctx.send(
+                "That is not a usable filename. Give it exactly as "
+                f"`{ctx.clean_prefix}retroset bios list` shows it."
+            )
             return
-        target = self._system_dir() / name
+        name = filename.strip().strip('"').strip("'")
         try:
             if not target.is_file():
                 await ctx.send(
@@ -2661,6 +3635,16 @@ class RetroCog(commands.Cog):
                 )
                 return
             target.unlink()
+            # Take the folder with it if that was the last thing in it, so
+            # removing a firmware set does not leave an empty tree behind.
+            parent = target.parent
+            root = self._system_dir().resolve()
+            while parent != root and root in parent.parents:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
         except OSError as error:
             log.warning("Could not delete the BIOS file %s", target, exc_info=True)
             await ctx.send(f"`{name}` could not be deleted: {error}")
@@ -2723,24 +3707,30 @@ class RetroCog(commands.Cog):
         - `[p]retroset settings`
         """
         installed = await self._installed_cores()
-        configured = await self.config.cores()
+        cores_dir = self._cores_dir()
         embed = discord.Embed(
             title="Retro Settings",
             colour=await ctx.embed_colour(),
         )
 
-        if not configured:
+        if not installed:
             cores_value = (
-                "None installed. Run "
-                f"`{ctx.clean_prefix}retroset download` to get them."
+                f"None installed. Run `{ctx.clean_prefix}retroset download` "
+                f"to get them, or drop them into `{cores_dir}` yourself."
             )
         else:
             entries = []
             for name in sorted(CORES):
-                if name in installed:
-                    entries.append(f"\N{WHITE HEAVY CHECK MARK} `{name}` - {CORES[name]}")
-                elif name in configured:
-                    entries.append(f"\N{WARNING SIGN}\N{VARIATION SELECTOR-16} `{name}` - file missing")
+                if name not in installed:
+                    continue
+                path = installed[name]
+                # Say so when a core is being used from outside the folder the
+                # cog manages, since that one is not something `[p]retroset
+                # download` will ever replace.
+                elsewhere = "" if path.parent == cores_dir else f" (from `{path.parent}`)"
+                entries.append(
+                    f"\N{WHITE HEAVY CHECK MARK} `{name}` - {CORES[name]}{elsewhere}"
+                )
             missing = len(CORES) - len(installed)
             if missing > 0:
                 entries.append(
@@ -2750,7 +3740,7 @@ class RetroCog(commands.Cog):
             cores_value = "\n".join(entries)[:1024]
         embed.add_field(
             name=f"Cores ({len(installed)}/{len(CORES)} installed)",
-            value=cores_value,
+            value=f"`{cores_dir}`\n{cores_value}"[:1024],
             inline=False,
         )
 
@@ -2818,7 +3808,11 @@ class RetroCog(commands.Cog):
         clip_seconds = await self.config.clip_seconds()
         embed.add_field(
             name="Clip length",
-            value=f"{clip_seconds} seconds of play per button press",
+            value=(
+                f"{clip_seconds} seconds of play per button press. Replay "
+                f"stitches the last {REPLAY_SECONDS} seconds back together "
+                "from clips kept in memory, so a restart empties it."
+            ),
             inline=False,
         )
         hold_ms = await self.config.hold_ms()

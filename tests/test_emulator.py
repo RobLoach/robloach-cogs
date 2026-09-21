@@ -775,3 +775,134 @@ def test_a_battery_save_round_trips_and_survives_a_cold_boot(emu, gambatte, ucit
     assert fresh.load_sram(kept) is True
     fresh.advance(120)
     assert fresh.save_sram() == kept, "and it is still there once the game has run"
+
+
+# -- 12. Stitching clips back together (the Replay button) --------------------
+#
+# Replay decodes the session's buffered clips and re-encodes them as one
+# animation. It runs on real video, so the interesting questions are whether
+# the timeline survives the round trip and how long the round trip takes.
+
+
+def test_buffered_clips_stitch_back_into_one_animation(emu, image, gambatte, ucity):
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    frames = emulator.frames_for_seconds(4)
+    clips = [emulator.record(frames, presses=[("start", 0, 10)]) for _ in range(4)]
+
+    stitched, seconds = E.concatenate_clips(clips)
+
+    assert stitched[:4] == b"RIFF" and stitched[8:12] == b"WEBP"
+    durations, loop = anmf(stitched)
+    assert loop == 1, "a replay plays through once, like every other clip"
+    # 16 seconds of footage, trimmed to the 15 second window.
+    assert 14.0 <= seconds <= E.REPLAY_SECONDS + 0.5, seconds
+    assert abs(sum(durations) / 1000.0 - seconds) < 0.1
+
+    # The last frame of the replay is the last frame of the newest clip: a
+    # replay always ends on the moment the player just played.
+    assert frame_hashes(stitched, image)[-1] == frame_hashes(clips[-1], image)[-1]
+
+
+def test_a_stitched_replay_is_trimmed_from_the_oldest_end(emu, image, gambatte, ucity):
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    frames = emulator.frames_for_seconds(2)
+    clips = [emulator.record(frames) for _ in range(3)]
+
+    _, full = E.concatenate_clips(clips, max_seconds=100)
+    short, seconds = E.concatenate_clips(clips, max_seconds=3)
+    assert seconds <= 3.5 < full
+    # It is the *newest* five seconds, so the end still matches.
+    assert frame_hashes(short, image)[-1] == frame_hashes(clips[-1], image)[-1]
+
+
+def test_one_clip_longer_than_the_window_is_trimmed_by_frame(emu, gambatte, ucity):
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    long_clip = emulator.record(emulator.frames_for_seconds(6))
+    _, seconds = E.concatenate_clips([long_clip], max_seconds=2)
+    assert seconds <= 2.5
+
+
+def test_the_frame_cap_bounds_the_work(emu, gambatte, ucity):
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    clips = [emulator.record(emulator.frames_for_seconds(2)) for _ in range(2)]
+    stitched, _ = E.concatenate_clips(clips, max_seconds=100, max_frames=10)
+    durations, _ = anmf(stitched)
+    assert len(durations) <= 10
+
+
+def test_a_resolution_change_ends_the_replay_rather_than_corrupting_it(
+    emu, image, gambatte, ucity
+):
+    # Animation formats have one size for the whole file, and the SNES really
+    # does change resolution mid-session, so an older clip of another size
+    # must be dropped rather than stretched or crashed on.
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    normal = emulator.record(emulator.frames_for_seconds(2))
+    small = E.encode_animation(
+        [image.new("RGB", (16, 16)) for _ in range(3)], 67, "WEBP"
+    )
+    stitched, _ = E.concatenate_clips([small, normal])
+    assert image.open(io.BytesIO(stitched)).size == image.open(io.BytesIO(normal)).size
+    assert len(frame_hashes(stitched, image)) == len(frame_hashes(normal, image))
+
+
+def test_an_unreadable_clip_in_the_buffer_costs_only_the_older_footage(
+    emu, gambatte, ucity
+):
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    good = emulator.record(emulator.frames_for_seconds(2))
+    stitched, seconds = E.concatenate_clips([b"not a clip at all", good])
+    assert stitched[:4] == b"RIFF"
+    assert seconds > 0
+
+
+def test_a_buffer_of_nothing_but_rubbish_raises(emu):
+    with pytest.raises(E.EmulatorError):
+        E.concatenate_clips([b"nope", b"also nope"])
+    with pytest.raises(E.EmulatorError):
+        E.concatenate_clips([])
+
+
+def test_gif_clips_stitch_too(emu, gambatte, ucity):
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    clips = [
+        emulator.record(emulator.frames_for_seconds(2), clip_format="GIF")
+        for _ in range(2)
+    ]
+    stitched, seconds = E.concatenate_clips(clips, clip_format="GIF")
+    assert stitched[:6] in (b"GIF87a", b"GIF89a")
+    assert seconds > 0
+
+
+def test_stitching_fifteen_seconds_is_quick_enough_to_do_on_a_button_press(
+    emu, gambatte, ucity
+):
+    """The number the feature lives or dies on; see REPLAY_SECONDS."""
+    import time
+
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    clips = [
+        emulator.record(emulator.frames_for_seconds(4), presses=[("start", 0, 10)])
+        for _ in range(4)
+    ]
+
+    started = time.perf_counter()
+    stitched, seconds = E.concatenate_clips(clips)
+    elapsed = time.perf_counter() - started
+
+    # Eight seconds is the point at which a Discord button press stops feeling
+    # like it worked. Real footage measures well under two on the machine this
+    # was written on; the margin is for slower hardware, not for a change that
+    # makes this ten times more expensive.
+    assert elapsed < 8.0, f"{elapsed:.2f}s to stitch {seconds:.1f}s of footage"
+    # And it has to be postable: Discord's floor for a bot attachment is
+    # 10 MiB, and this must stay nowhere near it.
+    assert len(stitched) < 8 * 1024 * 1024, len(stitched)

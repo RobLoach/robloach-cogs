@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import io
 import logging
 import re
@@ -12,9 +13,14 @@ from redbot.core import commands
 from .emulator import (
     CLIP_SECONDS,
     DEFAULT_CLIP_FORMAT,
+    MAX_REPLAY_BYTES,
+    MAX_REPLAY_CLIPS,
+    MAX_REPLAY_FRAMES,
+    REPLAY_SECONDS,
     EmulatorError,
     RetroEmulator,
     clip_extension,
+    concatenate_clips,
 )
 from .systems import (
     CONTROL_BUTTONS,
@@ -23,6 +29,7 @@ from .systems import (
     MAX_COMPONENTS,
     MAX_LAYOUT_ROWS,
     REPLAY_EMOJI,
+    RESUME_EMOJI,
     SYSTEMS,
     WAIT_EMOJI,
     System,
@@ -157,6 +164,16 @@ class _RepeatButton(discord.ui.Button):
 
 
 class _ReplayButton(discord.ui.Button):
+    """
+    Play the last few clips back as one animation.
+
+    The label is rewritten every time the buffer changes (see
+    :meth:`RetroView._update_replay_label`), because the buffer is memory-only:
+    a message that survived a bot restart really can have nothing to replay,
+    and a button that says "Replay 15s" when it holds nothing is a lie. The
+    custom_id never changes, so Discord keeps routing clicks to it.
+    """
+
     def __init__(self, row: int) -> None:
         super().__init__(
             label="Replay",
@@ -168,6 +185,83 @@ class _ReplayButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await self.view._replay(interaction)
+
+
+class _ResumeButton(discord.ui.Button):
+    """The only control left on a message whose game has been replaced."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Resume",
+            emoji=RESUME_EMOJI,
+            style=discord.ButtonStyle.success,
+            row=0,
+            custom_id=f"{CUSTOM_ID_PREFIX}:resume",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.view._resume(interaction)
+
+
+class RetiredView(discord.ui.View):
+    """
+    What is left on a message after its channel moved on to another game.
+
+    The game itself is not gone: its ROM, save state and battery save are all
+    still cached under the channel's id, so this message keeps one button that
+    starts it again right here. It is a persistent view with a fixed custom_id
+    and a record in Config, so the button still works after a bot restart --
+    which is the whole point, since a retired message can sit in a channel for
+    weeks.
+
+    The live controls cannot simply be left enabled instead: only one libretro
+    core may be loaded at a time, so waking this session must go through the
+    cog's start path (which hibernates whatever else is playing) rather than
+    through a button that assumes it is still the channel's game.
+    """
+
+    def __init__(self, cog: commands.Cog, record: dict) -> None:
+        super().__init__(timeout=None)
+        self.cog: commands.Cog = cog
+        self.record: dict = dict(record)
+        self.channel_id: int = int(record.get("channel_id") or 0)
+        self.message_id: typing.Optional[int] = record.get("message_id")
+        self.game_name: str = record.get("game_name") or "that game"
+        # Cleared when the cog takes this message back into service, so a
+        # stale click routed by discord.py's per-message view store (which
+        # keeps old custom_ids around after a new view is registered for the
+        # same message) cannot start the game a second time.
+        self.alive: bool = True
+        self.lock: asyncio.Lock = asyncio.Lock()
+        self.add_item(_ResumeButton())
+
+    async def _resume(self, interaction: discord.Interaction) -> None:
+        if self.lock.locked():
+            # Already working on somebody else's click. Acknowledge it so
+            # Discord does not show "interaction failed", and say nothing.
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                log.debug("Could not acknowledge a repeat Resume click.", exc_info=True)
+            return
+        if not self.alive:
+            # This message has been superseded: either this very button has
+            # already brought the game back, or it was started again some
+            # other way. Either way there is a newer message for it, and
+            # starting a second copy would have two of them fighting over one
+            # save state. discord.py still routes clicks here, because
+            # registering a new view for a message keeps the old custom_ids.
+            try:
+                await interaction.response.send_message(
+                    f"**{self.game_name}** has already been started again \N{EM DASH} "
+                    "look for its newer message in this channel.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                log.debug("Could not answer a stale Resume click.", exc_info=True)
+            return
+        async with self.lock:
+            await self.cog.resume_retired(self, interaction)
 
 
 class _SpacerButton(discord.ui.Button):
@@ -251,8 +345,13 @@ class RetroView(discord.ui.View):
 
         # The live emulator, or None while hibernated.
         self.emulator: typing.Optional[RetroEmulator] = None
-        # The most recent clip, kept in memory so Replay can re-post it.
-        self.last_clip: typing.Optional[bytes] = None
+        # The most recent clips, oldest first, so Replay can stitch the last
+        # REPLAY_SECONDS back together. Memory only and deliberately so: these
+        # are hundreds of kilobytes each, they are worthless the moment the
+        # session moves on, and writing them to disk would multiply the cog's
+        # storage by the number of channels for a button nobody presses twice.
+        # A bot restart therefore empties it, and Replay says so.
+        self.clips: typing.Deque[typing.Tuple[bytes, float]] = collections.deque()
         self.press_count: int = 0
         self.last_active: float = time.time()
         # Set when this session is replaced or the cog goes away, so an old
@@ -266,9 +365,15 @@ class RetroView(discord.ui.View):
         # lands with the clip it explains, and is cleared as it is shown.
         self.notice: typing.Optional[str] = None
 
+        # How the last boot went: "state" (the exact moment came back), "sram"
+        # (the cartridge's battery save came back but the moment did not) or
+        # "fresh" (nothing to restore). Read by the cog after start().
+        self.boot_outcome: str = "fresh"
+
         self.message: typing.Optional[discord.Message] = None
         self.lock: asyncio.Lock = asyncio.Lock()
         self._build_controls()
+        self._update_replay_label()
 
     # -- Layout -------------------------------------------------------------
 
@@ -402,6 +507,84 @@ class RetroView(discord.ui.View):
     def touch(self) -> None:
         self.last_active = time.time()
 
+    # -- The replay buffer --------------------------------------------------
+
+    @property
+    def last_clip(self) -> typing.Optional[bytes]:
+        """The clip currently on the message, or None if there isn't one."""
+        return self.clips[-1][0] if self.clips else None
+
+    @last_clip.setter
+    def last_clip(self, data: typing.Optional[bytes]) -> None:
+        if data is None:
+            self.clips.clear()
+            self._update_replay_label()
+        else:
+            self.remember_clip(data)
+
+    @property
+    def buffered_seconds(self) -> float:
+        """How much footage Replay would actually show, in seconds."""
+        return min(float(REPLAY_SECONDS), sum(seconds for _, seconds in self.clips))
+
+    def remember_clip(self, data: bytes) -> None:
+        """Add a freshly recorded clip to the replay buffer."""
+        if not data:
+            return
+        self.clips.append((bytes(data), float(self.clip_seconds)))
+        self._trim_clips()
+        self._update_replay_label()
+
+    def _trim_clips(self) -> None:
+        """
+        Drop the oldest clips until the buffer fits all three of its bounds.
+
+        Seconds is the bound that normally applies; the count and the byte cap
+        are backstops, for a one-second clip length (which would otherwise
+        buffer fifteen clips) and for a game that somehow encodes enormous
+        ones. The clip that straddles the fifteen-second edge is kept, because
+        :func:`concatenate_clips` trims it frame by frame.
+        """
+        while len(self.clips) > MAX_REPLAY_CLIPS:
+            self.clips.popleft()
+        while len(self.clips) > 1 and sum(len(d) for d, _ in self.clips) > MAX_REPLAY_BYTES:
+            self.clips.popleft()
+        covered = 0.0
+        keep = 0
+        for _, seconds in reversed(self.clips):
+            keep += 1
+            covered += seconds
+            if covered >= REPLAY_SECONDS:
+                break
+        while len(self.clips) > keep:
+            self.clips.popleft()
+
+    def _update_replay_label(self) -> None:
+        """
+        Make the Replay button say what it would actually replay.
+
+        The buffer only lives in memory, so a message that survived a restart
+        has nothing to replay at all; the button is greyed out until the next
+        press rather than claiming otherwise. With more than one clip buffered
+        it says how many seconds it will show, since that is the thing the
+        player cannot otherwise know. The custom_id never changes, so none of
+        this affects how Discord routes a click.
+        """
+        button = next(
+            (child for child in self.children if isinstance(child, _ReplayButton)), None
+        )
+        if button is None:
+            return
+        if not self.clips:
+            button.label = "Replay"
+            button.disabled = True
+        elif len(self.clips) == 1:
+            button.label = "Replay"
+            button.disabled = False
+        else:
+            button.label = f"Replay {round(self.buffered_seconds)}s"
+            button.disabled = False
+
     @staticmethod
     def _screen_filename(game_name: str, clip_format: str = DEFAULT_CLIP_FORMAT) -> str:
         """A stable, Discord-safe attachment name for this session's clips."""
@@ -415,6 +598,10 @@ class RetroView(discord.ui.View):
                 continue
             if hasattr(child, "disabled"):
                 child.disabled = disabled
+        if not disabled:
+            # Replay is the one control that can have nothing to do; it comes
+            # back only if there is something in the buffer.
+            self._update_replay_label()
 
     # -- Messages -----------------------------------------------------------
 
@@ -487,13 +674,36 @@ class RetroView(discord.ui.View):
 
     # -- Starting -----------------------------------------------------------
 
-    async def start(self, ctx: commands.Context, emulator: RetroEmulator) -> discord.Message:
-        """Boot the emulator and post the first clip with the controls."""
+    async def start(
+        self,
+        ctx: commands.Context,
+        emulator: RetroEmulator,
+        state: typing.Optional[bytes] = None,
+        sram: typing.Optional[bytes] = None,
+        on_booted: typing.Optional[typing.Callable[["RetroView"], None]] = None,
+    ) -> discord.Message:
+        """
+        Boot the emulator and post the first clip with the controls.
+
+        ``state`` and ``sram`` are this channel's saved progress for this game,
+        if it has played it before. Starting a game the channel already has a
+        save for picks up where it left off rather than cold-booting over the
+        top of it, which is the same state -> SRAM -> fresh chain a hibernated
+        session is woken with.
+
+        ``on_booted`` is called once the core is up and :attr:`boot_outcome`
+        says how much of the game came back with it, and *before* the message
+        goes out -- which is what lets the cog put the sentence explaining the
+        restore on the very message the first clip arrives on, rather than in
+        a second one after it.
+        """
         self.starter_id = ctx.author.id
-        clip = await asyncio.to_thread(self._boot, emulator)
+        clip = await asyncio.to_thread(self._boot, emulator, state, sram)
         self.emulator = emulator
         self.last_clip = clip
         self.touch()
+        if on_booted is not None:
+            on_booted(self)
         self.message = await ctx.send(
             self._content(),
             file=self._clip_file(clip),
@@ -507,9 +717,40 @@ class RetroView(discord.ui.View):
         """How many emulated frames one clip covers on this console."""
         return emulator.frames_for_seconds(self.clip_seconds)
 
-    def _boot(self, emulator: RetroEmulator) -> bytes:
+    def _boot(
+        self,
+        emulator: RetroEmulator,
+        state: typing.Optional[bytes] = None,
+        sram: typing.Optional[bytes] = None,
+    ) -> bytes:
+        """
+        Bring a game up, restoring as much of it as is restorable.
+
+        Sets :attr:`boot_outcome` to what actually happened, which is what the
+        cog reads to decide whether to say anything and whether to throw the
+        save state away. Runs in a worker thread.
+        """
         emulator.start()
-        # Get past the boot logo first, then record the opening of the game.
+        if state:
+            try:
+                emulator.load_state(state)
+                self.boot_outcome = "state"
+                return self._record(emulator, None)
+            except EmulatorError as error:
+                # A state from a different build of the core, or a truncated
+                # file. That should cost the exact moment, not the game and
+                # not the player's own in-game save.
+                log.warning(
+                    "Discarding an unusable Libretro save state for %s: %s",
+                    self.slug,
+                    error,
+                )
+        # Cold boot. The core only allocates the cartridge's save memory once
+        # it has loaded the game, so the battery save goes in after start(),
+        # and the boot frames run afterwards so the game reaches its own title
+        # screen with the save already in place.
+        restored = bool(sram) and emulator.load_sram(sram)
+        self.boot_outcome = "sram" if restored else "fresh"
         emulator.advance(emulator.frames_for_seconds(BOOT_SECONDS))
         return self._record(emulator, None)
 
@@ -668,34 +909,97 @@ class RetroView(discord.ui.View):
             log.warning("Failed to report a Libretro failure.", exc_info=True)
 
     async def _replay(self, interaction: discord.Interaction) -> None:
-        """Re-post the last clip so it animates again."""
+        """
+        Play the last few clips back as one animation.
+
+        Re-uploading bytes creates a new attachment, and Discord plays a
+        freshly loaded clip from the start; the clips are encoded to run
+        through exactly once, so re-uploading is the only way to see one twice.
+
+        With one clip buffered that is all this does, and it stays a single
+        instant edit. With more, the buffered clips are decoded and stitched
+        into one animation covering the last REPLAY_SECONDS -- a second or so
+        of work on a real game, so the controls grey out while it happens the
+        same way they do for a press.
+        """
         if self.closed or self.lock.locked():
             await self._silent_ack(interaction)
             return
-        if self.last_clip is None:
-            # Clips only live in memory, so a restart loses the last one.
+        if not self.clips:
+            # The buffer only lives in memory, so a restart empties it.
             await interaction.response.send_message(
-                "That clip is no longer in memory. Press a button to record "
-                "a new one.",
+                "There is nothing to replay: this game's clips are kept in "
+                "memory only, and the bot has restarted since the last one. "
+                "Press a button to record one.",
                 ephemeral=True,
             )
             return
-        # Re-uploading the same bytes creates a new attachment, and Discord
-        # plays a freshly loaded clip from the start. The clips are encoded to
-        # play through exactly once, so this is the only way to see it twice.
-        try:
-            await interaction.response.edit_message(
-                content=self._content(),
-                attachments=[self._clip_file(self.last_clip)],
-                view=self,
+        if len(self.clips) == 1:
+            try:
+                await interaction.response.edit_message(
+                    content=self._content(),
+                    attachments=[self._clip_file(self.last_clip)],
+                    view=self,
+                )
+            except discord.HTTPException:
+                log.exception(
+                    "Failed to replay the Libretro clip in channel %s.", self.channel_id
+                )
+                await self._whisper(
+                    interaction, "Discord would not accept that clip again."
+                )
+            return
+
+        async with self.lock:
+            clips = [data for data, _ in self.clips]
+            self._set_disabled(True)
+            try:
+                await interaction.response.edit_message(
+                    content=self._content(
+                        f"Putting the last {round(self.buffered_seconds)} "
+                        "seconds together\N{HORIZONTAL ELLIPSIS}"
+                    ),
+                    view=self,
+                )
+            except discord.HTTPException:
+                log.warning("Could not grey out the controls to replay.", exc_info=True)
+            try:
+                clip, seconds = await asyncio.to_thread(
+                    concatenate_clips,
+                    clips,
+                    max_seconds=REPLAY_SECONDS,
+                    max_frames=MAX_REPLAY_FRAMES,
+                    clip_format=self.clip_format,
+                )
+            except Exception as error:
+                # Stitching is a nicety on top of a game that is running
+                # perfectly well, so a failure falls back to the single clip
+                # the old Replay button would have shown.
+                log.warning(
+                    "Could not stitch the replay for channel %s: %s",
+                    self.channel_id,
+                    error,
+                )
+                clip, seconds = self.last_clip, 0.0
+            self._set_disabled(False)
+            note = (
+                None
+                if not seconds
+                else f"The last {round(seconds)} seconds, replayed."
             )
-        except discord.HTTPException:
-            log.exception(
-                "Failed to replay the Libretro clip in channel %s.", self.channel_id
-            )
-            await self._whisper(
-                interaction, "Discord would not accept that clip again."
-            )
+            try:
+                self.message = await interaction.edit_original_response(
+                    content=self._content(note),
+                    attachments=[self._clip_file(clip)],
+                    view=self,
+                )
+            except discord.HTTPException:
+                log.exception(
+                    "Failed to replay the Libretro clip in channel %s.", self.channel_id
+                )
+                await self._whisper(
+                    interaction, "Discord would not accept that clip again."
+                )
 
     async def can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
         """

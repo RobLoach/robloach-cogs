@@ -81,14 +81,14 @@ def buildbot(retro, monkeypatch):
 
 async def test_an_unknown_core_name_is_refused(retro, buildbot):
     ctx = retro.context(retro.channel(8500))
-    await retro.cogmod.RetroCog.retroset_download.callback(retro.cog, ctx, "nestopia")
+    await retro.cogmod.Retro.retroset_download.callback(retro.cog, ctx, "nestopia")
     assert "not a core this cog knows" in str(ctx.sent[-1])
 
 
 async def test_downloading_everything_reports_what_installed_and_what_failed(retro, buildbot):
     ctx = retro.context(retro.channel(8501))
     await retro.cog.config.cores.set({})
-    await retro.cogmod.RetroCog.retroset_download.callback(retro.cog, ctx, None)
+    await retro.cogmod.Retro.retroset_download.callback(retro.cog, ctx, None)
 
     cores = await retro.cog.config.cores()
     assert set(buildbot) == set(retro.sysmod.CORES)
@@ -103,7 +103,7 @@ async def test_downloading_everything_reports_what_installed_and_what_failed(ret
 async def test_re_running_the_download_only_retries_what_is_missing(retro, buildbot):
     ctx = retro.context(retro.channel(8502))
     await retro.cog.config.cores.set({})
-    download = retro.cogmod.RetroCog.retroset_download.callback
+    download = retro.cogmod.Retro.retroset_download.callback
     await download(retro.cog, ctx, None)
 
     buildbot.clear()
@@ -115,7 +115,7 @@ async def test_re_running_the_download_only_retries_what_is_missing(retro, build
 async def test_naming_one_core_re_downloads_it_even_when_present(retro, buildbot):
     ctx = retro.context(retro.channel(8503))
     await retro.cog.config.cores.set({})
-    download = retro.cogmod.RetroCog.retroset_download.callback
+    download = retro.cogmod.Retro.retroset_download.callback
     await download(retro.cog, ctx, None)
 
     buildbot.clear()
@@ -129,7 +129,7 @@ async def test_naming_one_core_re_downloads_it_even_when_present(retro, buildbot
 async def test_a_complete_install_downloads_nothing_and_says_so(retro, buildbot):
     ctx = retro.context(retro.channel(8504))
     await retro.cog.config.cores.set({})
-    download = retro.cogmod.RetroCog.retroset_download.callback
+    download = retro.cogmod.Retro.retroset_download.callback
     await download(retro.cog, ctx, None)
     async with retro.cog.config.cores() as cores:
         cores["snes9x"] = str(retro.cog._cores_dir() / "snes9x_libretro.so")
@@ -177,29 +177,78 @@ async def test_a_fresh_install_migrates_nothing(retro):
     assert await cog.config.cores() == {}
 
 
-# -- retroset core / settings -------------------------------------------------
+# -- Core detection / settings ------------------------------------------------
 
 
-async def test_retroset_core_validates_the_path_and_the_core(retro):
-    ctx = retro.context(retro.channel(8600))
-    core_cmd = retro.cogmod.RetroCog.retroset_core.callback
+async def test_there_is_no_way_to_set_a_core_path_by_hand(retro):
+    # Cores are detected, not configured. `[p]retroset core <path>` is gone.
+    assert not hasattr(retro.cogmod.Retro, "retroset_core")
+    source = (Path(retro.cogmod.__file__)).read_text()
+    assert 'name="core"' not in source
 
-    await core_cmd(retro.cog, ctx, path="/definitely/not/here.so")
-    assert "No file found" in ctx.sent[-1]
 
-    await core_cmd(retro.cog, ctx, path=str(retro.cores_dir / "nestopia_libretro.so"))
-    assert "not a core this cog knows" in ctx.sent[-1]
+async def test_a_core_in_the_managed_directory_is_found_without_any_config(retro):
+    assert await retro.cog._installed_cores() == {}
+    dropped = retro.cog._cores_dir() / "gambatte_libretro.so"
+    dropped.write_bytes(b"\x7fELF dropped in by hand")
 
-    await core_cmd(retro.cog, ctx, path=retro.core_path("snes9x"))
-    assert "`snes9x`" in ctx.sent[-1]
-    assert ".sfc" in ctx.sent[-1], "the reply lists what it can now play"
-    assert (await retro.cog.config.cores())["snes9x"].endswith("snes9x_libretro.so")
+    installed = await retro.cog._installed_cores()
+    assert installed == {"gambatte": dropped}
+    assert await retro.cog._core_path("gambatte") == dropped
+    assert await retro.cog.config.cores() == {}, "nothing was written to settings"
+
+
+async def test_a_file_in_the_cores_directory_that_is_not_a_core_is_ignored(retro):
+    (retro.cog._cores_dir() / "nestopia_libretro.so").write_bytes(b"\x7fELF")
+    (retro.cog._cores_dir() / "notes.txt").write_text("hello")
+    (retro.cog._cores_dir() / "subdir").mkdir()
+    assert await retro.cog._installed_cores() == {}
+
+
+async def test_a_recorded_path_outside_the_managed_directory_still_works(retro):
+    # The old `cores` setting is still honoured, which is what an install made
+    # before core detection existed relies on.
+    await retro.install_cores("snes9x")
+    installed = await retro.cog._installed_cores()
+    assert installed["snes9x"] == Path(retro.core_path("snes9x"))
+
+
+async def test_a_recorded_path_that_has_gone_falls_back_to_the_directory(retro):
+    await retro.cog.config.cores.set({"gambatte": "/nowhere/gambatte_libretro.so"})
+    assert await retro.cog._core_path("gambatte") is None
+    assert await retro.cog._installed_cores() == {}
+
+    real = retro.cog._cores_dir() / "gambatte_libretro.so"
+    real.write_bytes(b"\x7fELF")
+    assert await retro.cog._core_path("gambatte") == real
+    assert (await retro.cog._installed_cores())["gambatte"] == real
+
+
+async def test_a_game_starts_from_a_core_that_was_only_ever_detected(retro):
+    (retro.cog._cores_dir() / "gambatte_libretro.so").write_bytes(b"\x7fELF")
+    channel = retro.channel(8602)
+    ctx = retro.context(channel)
+    retro.serve("detected.gbc", ROM_BYTES)
+    await retro.cogmod.Retro.retro.callback(
+        retro.cog, ctx, game="https://example.com/detected.gbc"
+    )
+    view = retro.cog.sessions.get(channel.id)
+    assert view is not None and view.live
+
+
+async def test_an_unreadable_cores_directory_is_survivable(retro, monkeypatch):
+    def boom(self):
+        raise OSError("no")
+
+    monkeypatch.setattr(Path, "iterdir", boom)
+    assert retro.cog._scan_cores_dir() == {}
+    assert await retro.cog._installed_cores() == {}
 
 
 async def test_the_settings_embed_describes_the_whole_install(retro):
     ctx = retro.context(retro.channel(8601))
     await retro.install_cores("gambatte")
-    await retro.cogmod.RetroCog.retroset_settings.callback(retro.cog, ctx)
+    await retro.cogmod.Retro.retroset_settings.callback(retro.cog, ctx)
 
     embed = ctx.sent[-1]["embed"]
     names = [field.name for field in embed.fields]
@@ -225,7 +274,7 @@ async def test_an_oversized_attachment_is_refused_with_the_real_limit(retro):
     channel = retro.channel(9008)
     oversized = FakeAttachment(retro.cogmod.MAX_ROM_SIZE + 1, filename="attached.gb")
     ctx = retro.context(channel, attachments=[oversized])
-    assert await retro.cogmod.RetroCog._fetch_rom(retro.cog, ctx, None) is None
+    assert await retro.cogmod.Retro._fetch_rom(retro.cog, ctx, None) is None
     assert "32 MiB" in ctx.sent[-1]
 
 
@@ -233,7 +282,7 @@ async def test_a_twelve_mib_snes_rom_is_accepted(retro):
     ctx = retro.context(
         retro.channel(9009), attachments=[FakeAttachment(12 * 1024 * 1024, "big.sfc")]
     )
-    got = await retro.cogmod.RetroCog._fetch_rom(retro.cog, ctx, None)
+    got = await retro.cogmod.Retro._fetch_rom(retro.cog, ctx, None)
     assert got is not None and got[0] == "big.sfc"
 
 
@@ -241,7 +290,7 @@ async def test_an_html_error_page_is_caught_before_the_emulator_sees_it(retro):
     await retro.install_cores("gambatte")
     ctx = retro.context(retro.channel(9010))
     retro.serve("page.gb", b"<!DOCTYPE html><html>nope</html>")
-    await retro.cogmod.RetroCog.retro.callback(retro.cog, ctx, game="https://example.com/page.gb")
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="https://example.com/page.gb")
     assert "web page" in ctx.sent[-1]
     assert "Game Boy" not in ctx.sent[-1], "the message is not console specific"
 
@@ -250,7 +299,7 @@ async def test_a_file_too_small_to_be_a_rom_is_caught(retro):
     await retro.install_cores("gambatte")
     ctx = retro.context(retro.channel(9011))
     retro.serve("tiny.gb", b"\0" * 64)
-    await retro.cogmod.RetroCog.retro.callback(retro.cog, ctx, game="https://example.com/tiny.gb")
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="https://example.com/tiny.gb")
     assert "too small" in ctx.sent[-1]
 
 
@@ -262,7 +311,7 @@ async def test_a_zipped_rom_starts_a_game_named_after_the_rom(retro):
     channel = retro.channel(9300)
     ctx = retro.context(channel)
     retro.serve("ucity.zip", zip_of([("ucity.gbc", ROM_BYTES)]))
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/ucity.zip"
     )
 
@@ -279,7 +328,7 @@ async def test_a_zip_is_spotted_by_its_magic_not_its_name(retro):
     channel = retro.channel(9301)
     ctx = retro.context(channel)
     retro.serve("mystery.bin", zip_of([("inside.nes", NES_BYTES)]))
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/mystery.bin"
     )
     view = retro.cog.sessions.get(channel.id)
@@ -294,7 +343,7 @@ async def test_several_roms_in_a_zip_pick_the_first_and_say_which(retro):
         "pack.zip",
         zip_of([("zzz.gbc", ROM_BYTES), ("aaa.nes", NES_BYTES), ("readme.txt", b"hello" * 50)]),
     )
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/pack.zip"
     )
     view = retro.cog.sessions.get(channel.id)
@@ -308,7 +357,7 @@ async def test_a_rom_in_a_nested_folder_is_found_and_flattened(retro):
     channel = retro.channel(9303)
     ctx = retro.context(channel)
     retro.serve("deep.zip", zip_of([("release/v1/game.gbc", ROM_BYTES)]))
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/deep.zip"
     )
     view = retro.cog.sessions.get(channel.id)
@@ -321,7 +370,7 @@ async def test_a_zip_with_nothing_playable_is_refused_with_a_listing(retro):
     channel = retro.channel(9304)
     ctx = retro.context(channel)
     retro.serve("docs.zip", zip_of([("readme.txt", b"x" * 99), ("art.png", b"y" * 99)]))
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/docs.zip"
     )
     said = ctx.said()
@@ -336,7 +385,7 @@ async def test_a_zip_bomb_is_refused_on_its_metadata(retro):
     channel = retro.channel(9305)
     ctx = retro.context(channel)
     retro.serve("bomb.zip", zip_of([("huge.gb", b"\0" * (retro.cogmod.MAX_ROM_SIZE + 1))]))
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/bomb.zip"
     )
     assert "limit" in ctx.said()
@@ -348,7 +397,7 @@ async def test_a_corrupt_zip_is_refused_without_a_traceback(retro):
     channel = retro.channel(9306)
     ctx = retro.context(channel)
     retro.serve("broken.zip", b"PK\x03\x04" + b"\x00" * 4000)
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/broken.zip"
     )
     assert "zip" in ctx.said().lower()
@@ -363,7 +412,7 @@ async def test_a_password_protected_zip_is_refused(retro):
     locked[locked.find(b"PK\x03\x04") + 6] |= 0x01
     locked[locked.find(b"PK\x01\x02") + 8] |= 0x01
     retro.serve("locked.zip", bytes(locked))
-    await retro.cogmod.RetroCog.retro.callback(
+    await retro.cogmod.Retro.retro.callback(
         retro.cog, ctx, game="https://example.com/locked.zip"
     )
     assert "password-protected" in ctx.said()
@@ -374,7 +423,7 @@ async def test_an_attached_zip_works_end_to_end(retro):
     payload = zip_of([("attached.gbc", ROM_BYTES)])
     channel = retro.channel(9308)
     ctx = retro.context(channel, attachments=[FakeAttachment(payload, "game.zip")])
-    await retro.cogmod.RetroCog.retro.callback(retro.cog, ctx, game=None)
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game=None)
     view = retro.cog.sessions.get(channel.id)
     assert view is not None and view.live, ctx.said()
     assert view.game_name == "attached"
@@ -385,7 +434,7 @@ async def test_a_plain_unzipped_rom_is_unaffected(retro):
     channel = retro.channel(9309)
     ctx = retro.context(channel)
     retro.serve("raw.gbc", ROM_BYTES)
-    await retro.cogmod.RetroCog.retro.callback(retro.cog, ctx, game="https://example.com/raw.gbc")
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="https://example.com/raw.gbc")
     assert retro.cog.sessions.get(channel.id) is not None
 
 
@@ -397,9 +446,9 @@ def bios(retro):
     """The BIOS commands plus a channel to run them in."""
     channel = retro.channel(9400)
     return types.SimpleNamespace(
-        add=retro.cogmod.RetroCog.retroset_bios_add.callback,
-        listing=retro.cogmod.RetroCog.retroset_bios_list.callback,
-        remove=retro.cogmod.RetroCog.retroset_bios_remove.callback,
+        add=retro.cogmod.Retro.retroset_bios_add.callback,
+        listing=retro.cogmod.Retro.retroset_bios_list.callback,
+        remove=retro.cogmod.Retro.retroset_bios_remove.callback,
         channel=channel,
         directory=retro.cog._system_dir(),
     )
@@ -425,13 +474,32 @@ async def test_adding_with_nothing_attached_explains_itself(retro, bios):
 
 @pytest.mark.parametrize(
     "filename",
-    ["../../etc/passwd", "/etc/passwd", "..\\..\\evil.bin", ".hidden", "", "a" * 80, "weird;name.bin"],
+    ["../../etc/passwd", "/etc/passwd", "..\\..\\evil.bin", ".hidden", "a" * 80, "weird;name.bin"],
 )
 async def test_a_dangerous_bios_filename_is_refused(retro, bios, filename):
     ctx = retro.context(bios.channel)
     await bios.add(retro.cog, ctx, filename, "https://example.com/x.bin")
     assert "not a usable filename" in ctx.sent[-1], (filename, ctx.sent[-1])
     assert not (retro.data / "passwd").exists()
+
+
+async def test_a_url_on_its_own_needs_no_filename(retro, bios):
+    async def fake_download(url, max_size, label, what="file"):
+        return "console_bios.bin", b"\x77" * 64
+
+    retro.cog._download_bytes = fake_download
+    ctx = retro.context(bios.channel)
+    # `[p]retroset bios add <url>`: the first argument is the URL, not a name.
+    await bios.add(retro.cog, ctx, "https://example.com/console_bios.bin", None)
+    assert (bios.directory / "console_bios.bin").read_bytes() == b"\x77" * 64
+
+
+async def test_an_attachment_on_its_own_keeps_its_own_name(retro, bios):
+    ctx = retro.context(
+        bios.channel, attachments=[FakeAttachment(b"\x88" * 32, "kept_bios.bin")]
+    )
+    await bios.add(retro.cog, ctx, None, None)
+    assert (bios.directory / "kept_bios.bin").read_bytes() == b"\x88" * 32
 
 
 async def test_an_attached_bios_is_stored_byte_for_byte(retro, bios):
@@ -444,28 +512,140 @@ async def test_an_attached_bios_is_stored_byte_for_byte(retro, bios):
     assert "thing_bios.bin" in ctx.sent[-1] and "2,048" in ctx.sent[-1]
 
 
-async def test_a_bios_is_unpacked_from_a_zip_by_name(retro, bios):
-    zipped = zip_of([("readme.txt", b"hi" * 40), ("firmware/other_bios.bin", b"\x11" * 512)])
+async def test_every_file_in_a_bios_zip_is_installed(retro, bios):
+    # A firmware set: several files, one of them in a folder, plus the junk
+    # a Mac puts in every archive it makes.
+    zipped = zip_of(
+        [
+            ("readme.txt", b"hi" * 40),
+            ("other_bios.bin", b"\x11" * 512),
+            ("dc/dc_boot.bin", b"\x22" * 256),
+            ("dc/dc_flash.bin", b"\x33" * 128),
+            ("__MACOSX/._other_bios.bin", b"junk"),
+            (".DS_Store", b"junk"),
+        ]
+    )
     ctx = retro.context(bios.channel, attachments=[FakeAttachment(zipped, "pack.zip")])
-    await bios.add(retro.cog, ctx, "other_bios.bin", None)
+    await bios.add(retro.cog, ctx, None, None)
+
     assert (bios.directory / "other_bios.bin").read_bytes() == b"\x11" * 512
-    assert "unpacked from" in ctx.sent[-1]
+    assert (bios.directory / "readme.txt").is_file()
+    # Folders are kept: some cores look for their firmware in one.
+    assert (bios.directory / "dc" / "dc_boot.bin").read_bytes() == b"\x22" * 256
+    assert (bios.directory / "dc" / "dc_flash.bin").read_bytes() == b"\x33" * 128
+    # Archive noise never lands.
+    assert not (bios.directory / "__MACOSX").exists()
+    assert not (bios.directory / ".DS_Store").exists()
+
+    said = ctx.sent[-1]
+    assert "**4**" in said, said
+    assert f"{512 + 80 + 256 + 128:,} bytes" in said
+    assert "dc/dc_boot.bin" in said
 
 
-async def test_a_single_file_zip_is_used_whatever_it_is_called(retro, bios):
+async def test_a_zip_of_many_files_reports_and_lists_a_sample(retro, bios):
+    entries = [(f"f{index:03d}.bin", bytes([index % 256]) * 16) for index in range(40)]
+    ctx = retro.context(
+        bios.channel, attachments=[FakeAttachment(zip_of(entries), "many.zip")]
+    )
+    await bios.add(retro.cog, ctx, None, None)
+    said = " ".join(str(part) for part in ctx.sent)
+    assert "**40**" in said
+    assert f"and {40 - retro.cogmod.MAX_LISTED_BIOS_FILES} more" in said
+    assert len(list(bios.directory.glob("f*.bin"))) == 40
+
+
+async def test_a_single_file_zip_still_takes_the_name_it_was_given(retro, bios):
     solo = zip_of([("whatever.rom", b"\x22" * 256)])
     ctx = retro.context(bios.channel, attachments=[FakeAttachment(solo, "solo.zip")])
     await bios.add(retro.cog, ctx, "renamed_bios.bin", None)
     assert (bios.directory / "renamed_bios.bin").read_bytes() == b"\x22" * 256
+    assert "stored as" in ctx.sent[-1]
 
 
-async def test_an_ambiguous_zip_is_refused_with_its_members(retro, bios):
-    confusing = zip_of([("a.rom", b"\x33" * 64), ("b.rom", b"\x44" * 64)])
-    ctx = retro.context(bios.channel, attachments=[FakeAttachment(confusing, "many.zip")])
+async def test_a_name_given_for_a_multi_file_zip_is_ignored_out_loud(retro, bios):
+    pack = zip_of([("a.rom", b"\x33" * 64), ("b.rom", b"\x44" * 64)])
+    ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "many.zip")])
     await bios.add(retro.cog, ctx, "nope_bios.bin", None)
-    assert "no file called" in ctx.sent[-1]
-    assert "a.rom" in ctx.sent[-1] and "b.rom" in ctx.sent[-1]
+    assert "was ignored" in ctx.sent[-1]
+    assert (bios.directory / "a.rom").is_file()
+    assert (bios.directory / "b.rom").is_file()
     assert not (bios.directory / "nope_bios.bin").exists()
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "../escape.bin",
+        "/etc/passwd",
+        "..\\..\\evil.bin",
+        "a/../../b.bin",
+        "deep/er/and/deeper/still/too_deep.bin",
+    ],
+)
+async def test_a_zip_member_that_would_escape_is_skipped(retro, bios, member, tmp_path):
+    pack = zip_of([(member, b"\x99" * 32), ("good_bios.bin", b"\xaa" * 32)])
+    ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "evil.zip")])
+    await bios.add(retro.cog, ctx, None, None)
+
+    assert (bios.directory / "good_bios.bin").read_bytes() == b"\xaa" * 32
+    assert "skipped" in ctx.sent[-1]
+    # Nothing landed outside the system directory, at any depth.
+    inside = {p.name for p in bios.directory.rglob("*") if p.is_file()}
+    assert inside == {"good_bios.bin"}, inside
+    assert not (retro.data / "escape.bin").exists()
+    assert not (retro.cogs_root / "evil.bin").exists()
+
+
+async def test_a_symlink_in_a_bios_zip_is_never_written(retro, bios):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        info = zipfile.ZipInfo("link_bios.bin")
+        info.create_system = 3  # Unix
+        info.external_attr = (0o120777 << 16)  # S_IFLNK
+        archive.writestr(info, "/etc/passwd")
+        archive.writestr("real_bios.bin", b"\xbb" * 32)
+    ctx = retro.context(bios.channel, attachments=[FakeAttachment(buf.getvalue(), "l.zip")])
+    await bios.add(retro.cog, ctx, None, None)
+
+    assert (bios.directory / "real_bios.bin").read_bytes() == b"\xbb" * 32
+    assert not (bios.directory / "link_bios.bin").exists()
+    assert "skipped" in ctx.sent[-1]
+
+
+async def test_a_zip_with_nothing_usable_says_so(retro, bios):
+    pack = zip_of([("../nope.bin", b"x" * 16), (".hidden", b"y" * 16)])
+    ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "bad.zip")])
+    await bios.add(retro.cog, ctx, None, None)
+    assert "no BIOS file this bot can use" in ctx.sent[-1], ctx.sent[-1]
+
+
+async def test_a_bios_zip_that_unpacks_too_large_is_refused(retro, bios, monkeypatch):
+    monkeypatch.setattr(retro.cogmod, "MAX_BIOS_TOTAL_SIZE", 1024)
+    pack = zip_of([(f"f{i}.bin", b"\x01" * 512) for i in range(4)])
+    ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "big.zip")])
+    await bios.add(retro.cog, ctx, None, None)
+    assert "limit" in ctx.sent[-1]
+    assert not list(bios.directory.glob("f*.bin"))
+
+
+async def test_too_many_files_in_a_bios_zip_is_refused(retro, bios, monkeypatch):
+    monkeypatch.setattr(retro.cogmod, "MAX_BIOS_FILES", 3)
+    pack = zip_of([(f"f{i}.bin", b"\x01" * 8) for i in range(6)])
+    ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "lots.zip")])
+    await bios.add(retro.cog, ctx, None, None)
+    assert "more than the 3" in ctx.sent[-1]
+    assert not list(bios.directory.glob("f*.bin"))
+
+
+async def test_a_file_in_a_zip_over_the_per_file_limit_is_skipped(retro, bios, monkeypatch):
+    monkeypatch.setattr(retro.cogmod, "MAX_BIOS_SIZE", 256)
+    pack = zip_of([("huge.bin", b"\x01" * 4096), ("small_bios.bin", b"\x02" * 64)])
+    ctx = retro.context(bios.channel, attachments=[FakeAttachment(pack, "mixed.zip")])
+    await bios.add(retro.cog, ctx, None, None)
+    assert (bios.directory / "small_bios.bin").is_file()
+    assert not (bios.directory / "huge.bin").exists()
+    assert "skipped" in ctx.sent[-1]
 
 
 async def test_an_oversized_or_empty_bios_is_refused(retro, bios):
@@ -526,7 +706,7 @@ async def test_the_settings_embed_lists_the_installed_bios_files(retro, bios):
     ctx = retro.context(bios.channel, attachments=[FakeAttachment(b"\x11" * 512, "o.bin")])
     await bios.add(retro.cog, ctx, "other_bios.bin", None)
     ctx2 = retro.context(bios.channel)
-    await retro.cogmod.RetroCog.retroset_settings.callback(retro.cog, ctx2)
+    await retro.cogmod.Retro.retroset_settings.callback(retro.cog, ctx2)
     values = " ".join(field.value for field in ctx2.sent[-1]["embed"].fields)
     assert str(bios.directory) in values
     assert "other_bios.bin" in values
@@ -661,7 +841,7 @@ async def test_cog_load_survives_a_doomed_download_task(retro):
 
 async def test_the_autodownload_toggle_reports_and_clears_the_cooldown(retro):
     ctx = retro.context(retro.channel(9500))
-    toggle = retro.cogmod.RetroCog.retroset_autodownload.callback
+    toggle = retro.cogmod.Retro.retroset_autodownload.callback
 
     await toggle(retro.cog, ctx, None)
     assert "**on**" in ctx.sent[-1]

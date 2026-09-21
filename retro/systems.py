@@ -34,6 +34,7 @@ __all__ = [
     "is_spacer",
     "WAIT_EMOJI",
     "REPLAY_EMOJI",
+    "RESUME_EMOJI",
     "EMOJI_CODEPOINTS",
     "all_button_emoji",
     "emoji_problem",
@@ -134,16 +135,20 @@ EMOJI_CODEPOINTS: typing.Dict[int, bool] = {
     0x2B05: True,   # LEFTWARDS BLACK ARROW
     0x27A1: True,   # BLACK RIGHTWARDS ARROW
     0x23E9: False,  # BLACK RIGHT-POINTING DOUBLE TRIANGLE
+    0x25B6: True,   # BLACK RIGHT-POINTING TRIANGLE
     0x1F501: False,  # CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS
 }
 
 VARIATION_SELECTOR_16 = "\N{VARIATION SELECTOR-16}"
 
-# The two buttons every console's controls end with. They live here rather
-# than in RetroView so that validate_emoji() sees every emoji the cog can
-# render without importing discord.py.
+# The buttons that are not part of any console's controller: the two every
+# console's controls end with, and the single one left on a message whose game
+# has been replaced. They live here rather than in RetroView so that
+# validate_emoji() sees every emoji the cog can render without importing
+# discord.py.
 WAIT_EMOJI = "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE}"
 REPLAY_EMOJI = "\N{CLOCKWISE RIGHTWARDS AND LEFTWARDS OPEN CIRCLE ARROWS}"
+RESUME_EMOJI = "\N{BLACK RIGHT-POINTING TRIANGLE}\N{VARIATION SELECTOR-16}"
 
 
 def emoji_problem(emoji: str) -> typing.Optional[str]:
@@ -189,7 +194,7 @@ def emoji_problem(emoji: str) -> typing.Optional[str]:
 
 def all_button_emoji() -> typing.Tuple[str, ...]:
     """Every emoji the cog can put on a button, deduplicated and sorted."""
-    found = {WAIT_EMOJI, REPLAY_EMOJI}
+    found = {WAIT_EMOJI, REPLAY_EMOJI, RESUME_EMOJI}
     for button in DPAD:
         if button.emoji:
             found.add(button.emoji)

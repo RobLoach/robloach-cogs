@@ -15,12 +15,12 @@ import pytest
 from .loader import load_standalone
 
 pytest.importorskip("hypothesis", reason="the property tests need Hypothesis")
-pytest.importorskip("discord", reason="RetroCog's helpers need discord.py")
+pytest.importorskip("discord", reason="Retro's helpers need discord.py")
 
 from hypothesis import assume, given, settings  # noqa: E402
 from hypothesis import strategies as st  # noqa: E402
 
-from retro.RetroCog import RetroCog  # noqa: E402
+from retro.Retro import Retro  # noqa: E402
 
 A = load_standalone("retro_archives_for_properties", "archives.py")
 
@@ -39,7 +39,7 @@ NASTY = st.text(
 
 @given(NASTY)
 def test_a_slug_is_always_usable_as_part_of_a_filename(name):
-    slug = RetroCog._slug(name)
+    slug = Retro._slug(name)
     assert slug, "a slug is never empty"
     assert len(slug) <= 48
     assert re.fullmatch(r"[a-z0-9_-]+", slug), slug
@@ -49,7 +49,7 @@ def test_a_slug_is_always_usable_as_part_of_a_filename(name):
 
 @given(NASTY)
 def test_a_slug_is_lower_case_and_stable(name):
-    assert RetroCog._slug(name) == RetroCog._slug(name.upper()).lower()
+    assert Retro._slug(name) == Retro._slug(name.upper()).lower()
 
 
 # -- Sanitised filenames: a ROM is cached under one ---------------------------
@@ -57,7 +57,7 @@ def test_a_slug_is_lower_case_and_stable(name):
 
 @given(NASTY)
 def test_a_sanitized_filename_cannot_escape_the_rom_cache(name):
-    safe = RetroCog._sanitize_filename(name)
+    safe = Retro._sanitize_filename(name)
     assert safe
     assert len(safe) <= 64
     assert "/" not in safe and "\\" not in safe
@@ -69,7 +69,7 @@ def test_a_sanitized_filename_cannot_escape_the_rom_cache(name):
 def test_a_sanitized_extension_is_lower_case(name):
     # libretro.py 0.6.x matches the extension against the core's
     # valid_extensions case-sensitively, so ".GB" must become ".gb".
-    safe = RetroCog._sanitize_filename(name)
+    safe = Retro._sanitize_filename(name)
     _, dot, suffix = safe.rpartition(".")
     if dot and suffix:
         assert suffix == suffix.lower(), safe
@@ -77,7 +77,7 @@ def test_a_sanitized_extension_is_lower_case(name):
 
 @given(st.sampled_from(["game.GB", "GAME.GBC", "x.SfC", "rom.NES"]))
 def test_a_known_rom_name_keeps_its_stem_and_lowers_its_extension(name):
-    safe = RetroCog._sanitize_filename(name)
+    safe = Retro._sanitize_filename(name)
     assert safe == name.rsplit(".", 1)[0] + "." + name.rsplit(".", 1)[1].lower()
 
 
@@ -86,7 +86,7 @@ def test_a_known_rom_name_keeps_its_stem_and_lowers_its_extension(name):
 
 @given(NASTY)
 def test_a_bios_name_is_either_refused_or_completely_safe(name):
-    safe = RetroCog._bios_name(name)
+    safe = Retro._bios_name(name)
     if safe is None:
         return
     assert "/" not in safe and "\\" not in safe and "\x00" not in safe
@@ -99,7 +99,7 @@ def test_a_bios_name_is_either_refused_or_completely_safe(name):
 def test_an_ordinary_bios_name_is_accepted_verbatim(name):
     # Cores want an exact filename, so a name that is already safe must come
     # back unchanged rather than rewritten.
-    assert RetroCog._bios_name(name) == name
+    assert Retro._bios_name(name) == name
 
 
 # -- Archive member selection -------------------------------------------------
@@ -157,7 +157,7 @@ def test_the_exact_key_always_resolves_to_itself(keys, data):
         f"gambatte_{key}": {"default": "a", "values": [["a", "A"]]} for key in keys
     }
     wanted = "gambatte_" + data.draw(st.sampled_from(keys))
-    resolved, error = RetroCog._resolve_option_key("gambatte", definitions, wanted, "!")
+    resolved, error = Retro._resolve_option_key("gambatte", definitions, wanted, "!")
     assert resolved == wanted and error is None
 
 
@@ -167,7 +167,7 @@ def test_a_key_is_never_silently_resolved_to_the_wrong_option(keys, data):
         f"gambatte_{key}": {"default": "a", "values": [["a", "A"]]} for key in keys
     }
     typed = data.draw(st.sampled_from(keys))
-    resolved, error = RetroCog._resolve_option_key("gambatte", definitions, typed, "!")
+    resolved, error = Retro._resolve_option_key("gambatte", definitions, typed, "!")
     # Either it refuses, or what it picked really is an option this core has
     # and really does end with what was typed.
     assert resolved is None or (resolved in definitions and resolved.endswith(typed))
@@ -177,7 +177,7 @@ def test_a_key_is_never_silently_resolved_to_the_wrong_option(keys, data):
 @given(st.text(alphabet=string.printable, max_size=30))
 def test_resolving_never_raises_whatever_is_typed(typed):
     definitions = {"gambatte_gb_colorization": {"default": "a", "values": [["a", "A"]]}}
-    resolved, error = RetroCog._resolve_option_key("gambatte", definitions, typed, "!")
+    resolved, error = Retro._resolve_option_key("gambatte", definitions, typed, "!")
     assert resolved is None or resolved in definitions
 
 

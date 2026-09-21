@@ -2,10 +2,10 @@
 
 Three things have to be arranged before any test in here can import the cog:
 
-* the repository root goes on ``sys.path``, so ``import retro.RetroCog``
+* the repository root goes on ``sys.path``, so ``import retro.Retro``
   works from a bare checkout with nothing installed;
 * ``redbot`` has to be importable, because ``retro/__init__.py`` and
-  ``retro/RetroCog.py`` import it at module level. The real Red is used when
+  ``retro/Retro.py`` import it at module level. The real Red is used when
   it is installed and ``tests/stubs`` is used when it is not;
 * the emulator tests need real libretro cores and real ROMs, which are far
   too large (and, for the cores, far too platform-specific) to commit. They
@@ -149,7 +149,7 @@ def dmg_acid2(assets):
 
 @pytest.fixture
 def retro(tmp_path, monkeypatch):
-    """A RetroCog running on fake Discord, fake Config and a fake emulator.
+    """A Retro running on fake Discord, fake Config and a fake emulator.
 
     Everything it touches lives under ``tmp_path``, so tests never share a
     data directory and can run in any order.

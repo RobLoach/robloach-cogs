@@ -27,12 +27,19 @@ __all__ = [
     "CLIP_FPS",
     "MIN_CLIP_SECONDS",
     "MAX_CLIP_SECONDS",
+    "REPLAY_SECONDS",
+    "MAX_REPLAY_FRAMES",
+    "MAX_REPLAY_CLIPS",
+    "MAX_REPLAY_BYTES",
     "CLIP_FORMATS",
     "DEFAULT_CLIP_FORMAT",
     "MAX_SRAM_SIZE",
     "RETRO_MEMORY_SAVE_RAM",
     "clip_extension",
+    "concatenate_clips",
+    "decode_clip",
     "describe_definitions",
+    "encode_animation",
     "probe_core_options",
 ]
 
@@ -89,6 +96,33 @@ CLIP_FPS = 15
 # Bounds for the configurable clip length.
 MIN_CLIP_SECONDS = 1
 MAX_CLIP_SECONDS = 15
+
+# How much footage the Replay button stitches back together, and the hard
+# frame cap that bounds how long doing so can possibly take.
+#
+# Measured on the machine this was written on (a Raspberry Pi 5), decoding and
+# re-encoding four buffered clips into one animation:
+#
+#     content                                frames   decode  encode   total
+#     uCity title screen (Game Boy)              87     0.04s   1.28s   1.32s
+#     Pokemon intro, real motion (Game Boy)     115     0.04s   0.36s   0.39s
+#     nestest (NES)                               8     0.01s   0.04s   0.05s
+#     synthetic worst case, 320x288             240     0.13s   3.29s   3.41s
+#     synthetic worst case, 512x448             240     0.35s   6.60s   6.95s
+#
+# The synthetic rows are every 4x4 block of every frame changing every frame,
+# which no real game does; they are there to show the ceiling. 300 frames is
+# 20 seconds at CLIP_FPS and keeps even that ceiling inside single digits,
+# while 15 seconds of real footage costs well under two.
+REPLAY_SECONDS = 15
+MAX_REPLAY_FRAMES = 300
+
+# How many clips one session keeps in memory to replay, and how many bytes of
+# them. The buffer is memory-only and per session, so it is deliberately small:
+# a Game Boy clip is 1-170 KiB and a busy SNES one about 50 KiB, so the byte
+# cap is only a backstop against a pathological game.
+MAX_REPLAY_CLIPS = 8
+MAX_REPLAY_BYTES = 8 * 1024 * 1024
 
 # Frames taller than this are shown at 1x; anything smaller is doubled. The
 # SNES switches to a 512x478 interlaced mode mid-game, and doubling *that*
@@ -1087,50 +1121,200 @@ class RetroEmulator:
     @staticmethod
     def _encode(images, duration_ms: int, clip_format: str) -> bytes:
         """Turn a list of same-sized Pillow images into one animation."""
-        buffer = io.BytesIO()
-        try:
-            if clip_format == "WEBP":
-                images[0].save(
-                    buffer,
-                    format="WEBP",
-                    save_all=True,
-                    append_images=images[1:],
-                    duration=duration_ms,
-                    # loop=1 plays the clip through exactly once, matching
-                    # the Replay button; loop=0 would mean "forever" and fill
-                    # a busy channel with flickering.
-                    loop=1,
-                    lossless=True,
-                    quality=100,
-                    # method=1 is the sweet spot: method>=5 costs 20-370x the
-                    # time for no measurable saving, and method=6 takes
-                    # minutes. minimize_size is worth ~20% on this content.
-                    method=1,
-                    minimize_size=True,
-                )
+        return encode_animation(images, duration_ms, clip_format)
+
+
+# -- Clips, after the fact ----------------------------------------------------
+#
+# Everything below works on encoded clips rather than on a running core, so it
+# is importable and testable with nothing but Pillow. It is what the Replay
+# button uses to stitch the last few clips back into one animation.
+
+
+def _pillow():
+    """Import Pillow, turning a missing dependency into an EmulatorError."""
+    try:
+        from PIL import Image
+    except Exception as exc:  # ImportError or a broken install
+        raise EmulatorError(f"Pillow could not be loaded: {exc}") from exc
+    return Image
+
+
+def encode_animation(images, duration_ms, clip_format: str = DEFAULT_CLIP_FORMAT) -> bytes:
+    """
+    Turn a list of same-sized Pillow images into one animation.
+
+    ``duration_ms`` is either one duration for every frame or a list with one
+    entry per frame, which is what stitching several clips together needs:
+    Pillow's own encoder collapses runs of identical frames and adds their
+    durations together, so a clip read back out does not have a uniform frame
+    time any more.
+    """
+    buffer = io.BytesIO()
+    if isinstance(duration_ms, (list, tuple)):
+        durations = [max(1, int(value)) for value in duration_ms]
+    else:
+        durations = max(1, int(duration_ms))
+    try:
+        if clip_format == "WEBP":
+            images[0].save(
+                buffer,
+                format="WEBP",
+                save_all=True,
+                append_images=images[1:],
+                duration=durations,
+                # loop=1 plays the clip through exactly once, matching
+                # the Replay button; loop=0 would mean "forever" and fill
+                # a busy channel with flickering.
+                loop=1,
+                lossless=True,
+                quality=100,
+                # method=1 is the sweet spot: method>=5 costs 20-370x the
+                # time for no measurable saving, and method=6 takes
+                # minutes. minimize_size is worth ~20% on this content.
+                method=1,
+                minimize_size=True,
+            )
+        else:
+            # GIF durations are stored in centiseconds, so round to 10ms
+            # here instead of letting the encoder truncate and play the
+            # clip too fast. This is the one place the clip's timing is
+            # not exact: 67ms a frame becomes 70ms, so a GIF plays about
+            # 4.5% slower than the game did. WebP has millisecond frame
+            # durations and does not need this. No loop= argument on
+            # purpose: Pillow only writes the looping extension when one
+            # is given.
+            #
+            # optimize=True made these GIFs 16-40% *bigger* (the frames
+            # are already palette images), as well as slower.
+            if isinstance(durations, list):
+                rounded = [max(10, round(value / 10) * 10) for value in durations]
             else:
-                # GIF durations are stored in centiseconds, so round to 10ms
-                # here instead of letting the encoder truncate and play the
-                # clip too fast. This is the one place the clip's timing is
-                # not exact: 67ms a frame becomes 70ms, so a GIF plays about
-                # 4.5% slower than the game did. WebP has millisecond frame
-                # durations and does not need this. No loop= argument on
-                # purpose: Pillow only writes the looping extension when one
-                # is given.
-                #
-                # optimize=True made these GIFs 16-40% *bigger* (the frames
-                # are already palette images), as well as slower.
-                images[0].save(
-                    buffer,
-                    format="GIF",
-                    save_all=True,
-                    append_images=images[1:],
-                    duration=max(10, round(duration_ms / 10) * 10),
-                    optimize=False,
-                )
-        except Exception as exc:
-            raise EmulatorError(f"The clip could not be encoded: {exc}") from exc
-        return buffer.getvalue()
+                rounded = max(10, round(durations / 10) * 10)
+            images[0].save(
+                buffer,
+                format="GIF",
+                save_all=True,
+                append_images=images[1:],
+                duration=rounded,
+                optimize=False,
+            )
+    except Exception as exc:
+        raise EmulatorError(f"The clip could not be encoded: {exc}") from exc
+    return buffer.getvalue()
+
+
+def decode_clip(data: bytes) -> typing.Tuple[list, typing.List[int]]:
+    """
+    Read one encoded clip back into ``(frames, per-frame durations in ms)``.
+
+    Durations come from the file rather than being assumed, because the
+    encoder merges identical consecutive frames: a clip of a title screen that
+    went in as sixty 67ms frames comes back out as two frames of 67ms and
+    3948ms, and re-encoding it with a flat 67ms would play it forty times too
+    fast.
+    """
+    Image = _pillow()
+    try:
+        image = Image.open(io.BytesIO(bytes(data)))
+        frames = []
+        durations = []
+        for index in range(max(1, int(getattr(image, "n_frames", 1)))):
+            image.seek(index)
+            frames.append(image.convert("RGB"))
+            durations.append(max(1, int(image.info.get("duration") or 1)))
+    except EmulatorError:
+        raise
+    except Exception as exc:
+        raise EmulatorError(f"A clip could not be read back: {exc}") from exc
+    if not frames:
+        raise EmulatorError("A clip had no frames in it.")
+    return frames, durations
+
+
+def concatenate_clips(
+    clips: typing.Sequence[bytes],
+    *,
+    max_seconds: float = REPLAY_SECONDS,
+    max_frames: int = MAX_REPLAY_FRAMES,
+    clip_format: str = DEFAULT_CLIP_FORMAT,
+) -> typing.Tuple[bytes, float]:
+    """
+    Stitch recent clips into one animation, newest last.
+
+    ``clips`` is oldest-first, the way the session buffered them. The result
+    ends at the newest frame and reaches as far back as the budget allows, so
+    a player who presses Replay always sees the moment they just played and
+    however much of the run-up fits; the oldest footage is what gets dropped.
+    Trimming is per *frame*, not per clip, so a single clip longer than the
+    budget still works.
+
+    Returns ``(encoded bytes, seconds covered)``.
+
+    Three things bound the work, because this decodes and re-encodes real
+    video on the bot's event loop's thread pool:
+
+    * ``max_seconds`` of footage, measured from the clips' own frame timings;
+    * ``max_frames``, which is what actually caps the encoder's runtime;
+    * a resolution change, which ends the run. Animation formats have one size
+      for the whole file, and a SNES switching to its high-resolution mode
+      mid-session really does leave clips of two different sizes in the
+      buffer. The newest size wins and anything older is left out.
+
+    :raises EmulatorError: if nothing could be decoded or the result could not
+        be encoded.
+    """
+    if not clips:
+        raise EmulatorError("There are no clips to replay.")
+    budget_ms = max(1.0, float(max_seconds) * 1000.0)
+    max_frames = max(1, int(max_frames))
+
+    frames: list = []
+    durations: typing.List[int] = []
+    total_ms = 0
+    size = None
+    failures = 0
+    for data in reversed(list(clips)):
+        if total_ms >= budget_ms or len(frames) >= max_frames:
+            break
+        try:
+            clip_frames, clip_durations = decode_clip(data)
+        except EmulatorError:
+            # One unreadable clip in the buffer should cost that clip, not the
+            # replay. Stop here rather than skipping it: the frames are a
+            # timeline, and leaving a hole in the middle would be a lie.
+            failures += 1
+            break
+        if size is None:
+            size = clip_frames[0].size
+        elif clip_frames[0].size != size:
+            break
+        taken: list = []
+        taken_durations: typing.List[int] = []
+        for image, duration in zip(
+            reversed(clip_frames), reversed(clip_durations), strict=False
+        ):
+            if len(frames) + len(taken) >= max_frames:
+                break
+            # The first frame is always taken even if it overruns the budget,
+            # so a replay is never empty.
+            if total_ms + duration > budget_ms and (taken or frames):
+                break
+            taken.append(image)
+            taken_durations.append(duration)
+            total_ms += duration
+        taken.reverse()
+        taken_durations.reverse()
+        frames = taken + frames
+        durations = taken_durations + durations
+
+    if not frames:
+        raise EmulatorError(
+            "None of the buffered clips could be read back."
+            if failures
+            else "There are no clips to replay."
+        )
+    return encode_animation(frames, durations, clip_format), total_ms / 1000.0
 
 
 def _make_log_driver():

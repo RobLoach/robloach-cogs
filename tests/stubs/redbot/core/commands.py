@@ -1,7 +1,7 @@
-"""Just enough of ``redbot.core.commands`` to import and drive RetroCog.
+"""Just enough of ``redbot.core.commands`` to import and drive Retro.
 
 Commands keep their callback, which is how the tests invoke them
-(``RetroCog.retro.callback(cog, ctx, ...)``); everything else a decorator
+(``Retro.retro.callback(cog, ctx, ...)``); everything else a decorator
 would normally attach (checks, permissions, cooldowns) is discarded. A test
 that needs the real metadata is marked ``redbot``.
 """

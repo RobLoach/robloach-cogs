@@ -37,7 +37,7 @@ BUILDBOT = "https://buildbot.libretro.com/nightly"
 
 
 def buildbot_directory():
-    """The buildbot path for this machine, matching RetroCog._buildbot_url."""
+    """The buildbot path for this machine, matching Retro._buildbot_url."""
     machine = platform.machine().lower()
     if sys.platform.startswith("linux"):
         arch = {

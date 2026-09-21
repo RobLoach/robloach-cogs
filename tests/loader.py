@@ -1,6 +1,6 @@
 """Load a single cog module without importing the ``retro`` package.
 
-``retro/__init__.py`` imports Red, and ``retro/RetroCog.py`` imports discord.
+``retro/__init__.py`` imports Red, and ``retro/Retro.py`` imports discord.
 ``systems.py`` and ``archives.py`` deliberately import nothing but the
 standard library, so the tests that cover them load the files directly and
 run anywhere Python does.

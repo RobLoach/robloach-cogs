@@ -332,9 +332,11 @@ def test_validate_emoji_returns_every_renderable_emoji():
     assert S.validate_emoji() == S.all_button_emoji()
 
 
-def test_the_emoji_set_is_exactly_the_six_the_cog_renders():
-    # Four arrows, Wait and Replay. The Stop button, and its U+23F9, are gone.
-    assert len(S.all_button_emoji()) == 6, S.all_button_emoji()
+def test_the_emoji_set_is_exactly_the_seven_the_cog_renders():
+    # Four arrows, Wait, Replay and the Resume button a retired message keeps.
+    # The Stop button, and its U+23F9, are gone.
+    assert len(S.all_button_emoji()) == 7, S.all_button_emoji()
+    assert S.RESUME_EMOJI in S.all_button_emoji()
 
 
 def test_no_stop_emoji_survives_anywhere():

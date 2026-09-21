@@ -1,14 +1,16 @@
 """
-Reading a single file out of a ``.zip`` archive, safely.
+Reading files out of a ``.zip`` archive, safely.
 
 Homebrew ROMs and console firmware are almost always distributed zipped, so
-the cog accepts a ``.zip`` wherever it accepts a raw file and pulls the one
-member it needs out of it.
+the cog accepts a ``.zip`` wherever it accepts a raw file. There are two ways
+in: :func:`extract` pulls out the single member the caller wants (a ROM), and
+:func:`extract_all` unpacks a whole archive (a BIOS set, which is usually
+several files and sometimes a folder or two of them).
 
-Nothing here ever calls :meth:`zipfile.ZipFile.extract`: the member is read
-into memory and the caller writes it under a filename it chose itself, so an
+Nothing here ever calls :meth:`zipfile.ZipFile.extract`: members are read into
+memory and the caller writes them under paths *this module* validated, so an
 archive containing ``../../.ssh/authorized_keys`` cannot escape anywhere. The
-uncompressed size is checked against the caller's cap *before* the member is
+uncompressed size is checked against the caller's cap *before* a member is
 read, and the read itself is capped too, because ``ZipInfo.file_size`` is
 attacker-controlled metadata that a zip bomb is free to lie about.
 
@@ -17,6 +19,8 @@ without discord.py or Red-DiscordBot installed.
 """
 
 import io
+import re
+import stat
 import typing
 import zipfile
 
@@ -24,10 +28,15 @@ __all__ = [
     "ArchiveError",
     "NoSupportedMember",
     "Extracted",
+    "ExtractedFile",
+    "ExtractedArchive",
     "ZIP_MAGIC",
+    "MAX_MEMBER_DEPTH",
     "is_zip",
     "describe_members",
+    "safe_member_path",
     "extract",
+    "extract_all",
 ]
 
 # The local file header every non-empty zip starts with. An empty archive
@@ -40,6 +49,19 @@ MAX_LISTED_MEMBERS = 8
 
 # Archive noise that is never the file anyone wanted.
 JUNK_PREFIXES = ("__MACOSX/", "__macosx/")
+
+# How many folders deep a member may sit before it is refused. Real firmware
+# sets nest one or two deep at most (``dc/dc_boot.bin``, ``np2kai/FONT.ROM``);
+# anything past this is either a mistake or someone being clever.
+MAX_MEMBER_DEPTH = 4
+
+# What one path component may be called. This *validates* rather than
+# rewrites, because a core asks its frontend for an exact filename
+# (``disksys.rom``, ``scph5501.bin``) and silently storing a file under a
+# mangled name would produce a BIOS the core can never find -- worse than
+# refusing it and saying so. The leading character must be alphanumeric, which
+# is also what keeps dotfiles and ``..`` out.
+SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ +-]{0,63}")
 
 
 class ArchiveError(Exception):
@@ -56,6 +78,31 @@ class NoSupportedMember(ArchiveError):
     def __init__(self, message: str, members: typing.Sequence[str] = ()) -> None:
         super().__init__(message)
         self.members: typing.Tuple[str, ...] = tuple(members)
+
+
+class ExtractedFile(typing.NamedTuple):
+    """One file unpacked by :func:`extract_all`."""
+
+    #: The relative path to write it to, with forward slashes. Every component
+    #: has been validated by :func:`safe_member_path`, so joining this onto a
+    #: directory cannot leave that directory.
+    path: str
+    #: The member's own name inside the archive, for reporting only.
+    member: str
+    data: bytes
+
+
+class ExtractedArchive(typing.NamedTuple):
+    """Everything usable :func:`extract_all` found in one archive."""
+
+    files: typing.Tuple[ExtractedFile, ...]
+    #: Members that were refused (unsafe name, symlink, device node, too big),
+    #: so the caller can say how many were left behind.
+    skipped: typing.Tuple[str, ...]
+    #: Every file member, sorted, whether it was taken or not.
+    members: typing.Tuple[str, ...]
+    #: Total uncompressed bytes of ``files``.
+    total_size: int
 
 
 class Extracted(typing.NamedTuple):
@@ -95,6 +142,65 @@ def describe_members(
     if len(members) > limit:
         shown.append(f"and {len(members) - limit} more")
     return ", ".join(shown)
+
+
+def safe_member_path(name: str) -> typing.Optional[str]:
+    """
+    Turn a member's name into a relative path that is safe to join, or None.
+
+    Every component is validated against :data:`SAFE_COMPONENT`, which refuses
+    ``..``, ``.``, empty components, dotfiles, NUL bytes and anything outside a
+    small, boring character set. Both slash flavours are treated as separators,
+    so a Windows-built archive full of ``bios\\dc\\dc_boot.bin`` is handled the
+    same as a Unix one, and an absolute path or a drive letter is refused
+    outright rather than quietly relativised.
+    """
+    raw = str(name).replace("\\", "/")
+    if not raw or "\x00" in raw:
+        return None
+    # Absolute, or a Windows drive/UNC path. ZIP_FILENAME is supposed to be
+    # relative, so anything else is malformed or malicious either way.
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
+        return None
+    parts = [part for part in raw.split("/") if part]
+    if not parts or len(parts) > MAX_MEMBER_DEPTH:
+        return None
+    for part in parts:
+        if not SAFE_COMPONENT.fullmatch(part):
+            return None
+    return "/".join(parts)
+
+
+def _member_mode(info: zipfile.ZipInfo) -> int:
+    """
+    The Unix mode a Unix-built archive recorded for a member, or 0.
+
+    ``create_system`` 3 is Unix; for anything else the high half of
+    ``external_attr`` is not a mode and must not be read as one.
+    """
+    if info.create_system != 3:
+        return 0
+    return (info.external_attr >> 16) & 0xFFFF
+
+
+def _is_regular_file(info: zipfile.ZipInfo) -> bool:
+    """
+    Whether a member is an ordinary file rather than a link or a device.
+
+    zip stores the creating system's mode bits, so a symlink, a fifo, a socket
+    or a device node all survive a round trip through an archive and would be
+    recreated by a naive unpacker. This cog only ever writes bytes it read into
+    memory, so such a member could not become a real symlink here anyway --
+    but writing a symlink's *target path* out as a BIOS file is still nonsense,
+    so they are refused and counted rather than stored.
+    """
+    kind = stat.S_IFMT(_member_mode(info))
+    if not kind:
+        # Permission bits but no file *type*, which is what
+        # ``ZipFile.writestr`` itself writes (0o600 << 16), or no mode at all
+        # from a Windows-built archive. Either way it is an ordinary file.
+        return True
+    return kind == stat.S_IFREG
 
 
 def _open(data: bytes) -> zipfile.ZipFile:
@@ -205,3 +311,117 @@ def extract(
     if not payload:
         raise ArchiveError(f"`{chosen.filename}` inside the zip is empty.")
     return Extracted(chosen.filename, payload, candidates, names)
+
+
+def extract_all(
+    data: bytes,
+    *,
+    max_total_size: int,
+    max_file_size: int,
+    max_files: int,
+    what: str = "file",
+) -> ExtractedArchive:
+    """
+    Unpack every usable member of ``data``, preserving its folder layout.
+
+    Used for firmware sets, which arrive as a handful of files and sometimes a
+    folder per console. Members are returned in sorted order with a validated
+    relative path (see :func:`safe_member_path`); anything unsafe, anything
+    that is not an ordinary file, and anything over ``max_file_size`` is
+    skipped and counted rather than aborting the whole archive, because one
+    stray symlink in an otherwise good BIOS pack should not cost the pack.
+
+    Three separate caps apply, and the *total* one is enforced twice -- once
+    against the archive's own metadata before anything is decompressed, and
+    again against the bytes actually produced, since a zip bomb lies about the
+    first.
+
+    :raises ArchiveError: if the archive cannot be read or busts a cap.
+    :raises NoSupportedMember: if nothing inside could be used.
+    """
+    taken: typing.List[ExtractedFile] = []
+    skipped: typing.List[str] = []
+    total = 0
+
+    with _open(data) as archive:
+        try:
+            infos = archive.infolist()
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error:
+            raise ArchiveError(f"its index could not be read ({error})") from error
+
+        files = sorted(
+            (info for info in infos if not info.is_dir() and not _is_junk(info.filename)),
+            key=lambda info: info.filename,
+        )
+        names = tuple(info.filename for info in files)
+        if not files:
+            raise NoSupportedMember(
+                "the zip has no files in it (only folders, or nothing at all)."
+            )
+        if len(files) > max_files:
+            raise ArchiveError(
+                f"the zip holds {len(files)} files, more than the {max_files} "
+                "this bot will unpack in one go. Unzip it yourself and add the "
+                "files you need."
+            )
+        # The metadata check, before a single byte is decompressed. It is only
+        # a hint -- see the running total below -- but it is what stops a
+        # multi-gigabyte bomb being unpacked at all.
+        claimed = sum(info.file_size for info in files)
+        if claimed > max_total_size:
+            raise ArchiveError(
+                f"the zip unpacks to {_human_size(claimed)}, over the "
+                f"{_human_size(max_total_size)} limit."
+            )
+
+        for info in files:
+            path = safe_member_path(info.filename)
+            if path is None or not _is_regular_file(info):
+                skipped.append(info.filename)
+                continue
+            if info.file_size > max_file_size:
+                skipped.append(info.filename)
+                continue
+            if info.flag_bits & 0x1:
+                raise ArchiveError(
+                    f"`{info.filename}` is password-protected. Unzip it "
+                    "yourself and upload the files inside."
+                )
+            remaining = max_total_size - total
+            try:
+                with archive.open(info) as member:
+                    # +1 so a member that lies about its size is caught by the
+                    # length check rather than being silently truncated.
+                    payload = member.read(min(max_file_size, remaining) + 1)
+            except RuntimeError as error:
+                raise ArchiveError(
+                    f"`{info.filename}` could not be unpacked ({error})."
+                ) from error
+            except (zipfile.BadZipFile, OSError, ValueError, EOFError) as error:
+                raise ArchiveError(
+                    f"`{info.filename}` is corrupt and could not be unpacked "
+                    f"({error})."
+                ) from error
+            if len(payload) > max_file_size:
+                skipped.append(info.filename)
+                continue
+            if total + len(payload) > max_total_size:
+                raise ArchiveError(
+                    f"the zip unpacks to more than the "
+                    f"{_human_size(max_total_size)} limit, whatever it claims."
+                )
+            if not payload:
+                # An empty file is never firmware, and writing one would only
+                # make `bios list` lie about what is installed.
+                skipped.append(info.filename)
+                continue
+            total += len(payload)
+            taken.append(ExtractedFile(path, info.filename, payload))
+
+    if not taken:
+        raise NoSupportedMember(
+            f"the zip contains no {what} this bot can use. It contains: "
+            f"{describe_members(names)}.",
+            names,
+        )
+    return ExtractedArchive(tuple(taken), tuple(skipped), names, total)
