@@ -105,6 +105,61 @@ MIN_CLIP_FRAMES = 6
 # one visible picture rather than one invisible frame.
 MIN_AFTERMATH_FRAMES = 1
 
+# -- The pre-roll: where a clip starts ----------------------------------------
+#
+# A clip's first picture is taken after a single emulated frame (see
+# capture_plan), and one frame after a button goes down almost nothing has
+# happened yet. On a game that animates by itself the first picture is already
+# different from the one the previous clip left in the channel, so the clip
+# visibly moves on. On a game that sits still until it is prodded -- an
+# overworld, a menu, a text box, which is most of what this cog is played --
+# the first picture is *byte-identical* to the previous clip's closing one, so
+# the new clip opens by re-showing a picture the player has already been
+# looking at. That is the "when I click the button, the clip seems to replay a
+# bit from the previous clip" report, and it is the whole reason this constant
+# exists.
+#
+# So before a clip is photographed, the schedule is applied and the core is
+# run *with the press already down* until the picture is no longer the one the
+# previous clip ended on -- at most this many seconds of it. Then the clip is
+# recorded from there, at its full length. Nothing is dropped from the
+# recording: the pre-roll is emulated in front of it, so the clip still plays
+# for exactly as long as the window it photographed emulated, and every frame
+# the pre-roll ran through is a frame the player had already seen (that is the
+# stopping condition). See RetroEmulator.record.
+#
+# Measured on a Raspberry Pi 5 against the real cores at the default 160ms
+# hold, boot + 3 seconds, one button held from frame 0 -- how many emulated
+# frames of the clip are byte-identical to the frame before the press, i.e.
+# how many the pre-roll has to run through before the clip has something new
+# to show:
+#
+#   core / ROM                     button   identical frames   first change
+#   gambatte / uCity               down            0            frame 1
+#   genesis_plus_gx / homebrew     start           0            frame 1
+#   fceumm / nestest (a menu)      start           1            frame 2
+#   fceumm / nestest               down            1            frame 2
+#   snes9x / homebrew              a               3            frame 4
+#   mgba / GBA homebrew            a              10            frame 11
+#   gambatte / dmg-acid2           a          never changes  (bounded out)
+#
+# Ten frames is the worst real case, and it is exactly the hold: that game
+# reacts to the button coming *up*, not going down. 0.25s is 15 frames at
+# 59.73 fps, which clears it by half again, and is a quarter of a default
+# clip -- so on the pathological case (a frozen screen, a paused game, a
+# button the game ignores) at most a quarter of a clip's worth of emulation
+# is spent looking for a change that never comes, and the clip is then
+# recorded from where it is, at full length. That bound is the difference
+# between this and the trim that was rejected before it, which turned a one
+# second clip of a static screen into a 17ms flash.
+#
+# It is deliberately not tied to the configured hold (`[p]retroset hold`
+# reaches 2000ms): the cap is what keeps the worst case cheap, and a hold long
+# enough to outlast it is a hold whose release the player asked to wait for.
+# A game that only reacts after the bound runs out gets today's behaviour --
+# one re-shown picture -- which is the honest failure mode.
+PREROLL_SECONDS = 0.25
+
 # A session used to keep its recent clips in memory so a Replay button could
 # decode and stitch the last fifteen seconds of them back into one animation.
 # That is gone: it was bounded at 8 MiB of footage per session and about 300
@@ -572,6 +627,55 @@ def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     step = capture_step(fps, clip_fps)
     reserved = max(1, int(MIN_AFTERMATH_FRAMES)) - 1
     return max(1, ((frames - 1) // step - reserved) * step)
+
+
+def preroll_budget(
+    fps: float,
+    frames: int,
+    next_press: typing.Optional[int] = None,
+    seconds: float = PREROLL_SECONDS,
+) -> int:
+    """
+    The most emulated frames a clip's pre-roll may run through.
+
+    The pre-roll plays the press out without photographing it, until the
+    picture stops being the one the previous clip left in the channel; this is
+    the ceiling on how far it will look. See PREROLL_SECONDS for the
+    measurements, and :meth:`RetroEmulator.record` for the mechanism.
+
+    Three things cap it, and the smallest wins:
+
+    * **PREROLL_SECONDS**, which is what bounds the pathological case -- a
+      frozen screen, where the picture never changes and the pre-roll runs to
+      the end of its rope on every press;
+    * **the clip itself**, so a 0.2 second clip cannot spend longer looking
+      for a change than it spends showing one;
+    * **``next_press``**, the frame of the schedule the *next* button goes
+      down on (the repeat button's second tap), so a pre-roll can never run
+      through a tap and leave the player a clip with fewer presses in it than
+      they asked for. Passing None means there is no second press to protect.
+      At the default settings it never binds -- the second of three taps is
+      frame 23 of a one second clip and the cap is 15 -- but a short clip with
+      a short hold brings them within a few frames of each other.
+
+    Zero is a legitimate answer and means "photograph the very first frame",
+    i.e. exactly what this did before the pre-roll existed. That is why the
+    seconds are converted here rather than through :func:`frame_count`, whose
+    floor of one frame is right for a clip length and wrong for this.
+    """
+    frames = max(1, int(frames))
+    try:
+        wanted = float(fps) * float(seconds)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(wanted):
+        # A core reporting a nonsense frame rate gets no pre-roll rather than
+        # an unbounded one. See RetroEmulator.fps, which already defaults.
+        return 0
+    budget = min(round(wanted), frames)
+    if next_press is not None:
+        budget = min(budget, int(next_press))
+    return max(0, budget)
 
 
 # -- How big the posted picture is -------------------------------------------

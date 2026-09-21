@@ -144,6 +144,87 @@ def test_input_is_released_before_the_last_picture_is_taken(fps, seconds):
     assert budget < frames
 
 
+# -- Where a clip starts: the pre-roll ----------------------------------------
+#
+# The mechanism is in RetroEmulator.record and is proved against real cores in
+# test_emulator.py; what is here is the bound, which is plain arithmetic.
+
+
+@pytest.mark.parametrize("fps", sorted(FPS.values()))
+@pytest.mark.parametrize("seconds", [0.2, 0.5, 0.8, 1.0, 4.0, 15.0])
+def test_a_preroll_is_bounded_and_never_longer_than_its_own_clip(fps, seconds):
+    """The bound is what makes the pre-roll safe on a screen that never moves.
+
+    A trim of the clip's leading duplicate pictures was rejected because on a
+    frozen screen it wants to trim *everything* and leaves a 17ms flash. The
+    pre-roll cannot do that -- it throws away nothing the clip recorded -- but
+    it can still spend emulation looking for a change that is never coming, so
+    it is capped.
+    """
+    frames = C.clip_frame_count(fps, seconds)
+    budget = C.preroll_budget(fps, frames)
+
+    assert 0 < budget <= frames, (budget, frames)
+    assert budget <= C.frame_count(fps, C.PREROLL_SECONDS)
+    # A quarter of a second is the cap, so at every length a player can
+    # configure past 0.25s the pre-roll is a fraction of the clip rather than
+    # the whole of it.
+    if seconds >= 1.0:
+        assert budget <= frames // 4
+
+
+def test_the_preroll_bound_covers_the_worst_case_that_was_measured():
+    """The numbers behind PREROLL_SECONDS, restated as an assertion.
+
+    The most frames any real core took to show a difference after a press was
+    ten, on a GBA homebrew that reacts to the button coming *up* rather than
+    going down -- which is exactly the default 160ms hold. See PREROLL_SECONDS
+    in retro/clips.py for the whole table. The bound has to clear that, or the
+    case it was written for is the case it misses.
+    """
+    for fps in sorted(FPS.values()):
+        frames = C.clip_frame_count(fps, 1.0)
+        assert C.preroll_budget(fps, frames) >= 10, fps
+    # ...and it clears it with room, rather than sitting exactly on it.
+    assert C.frame_count(FPS["gb"], C.PREROLL_SECONDS) == 15
+    assert 0.2 <= C.PREROLL_SECONDS <= 0.5
+
+
+def test_a_preroll_stops_before_the_next_press_in_the_schedule():
+    """Why preroll_budget takes a ``next_press``.
+
+    The pre-roll runs the schedule out without photographing it, so left
+    unbounded on a screen that does not move it would run straight through the
+    repeat button's second tap and the clip would open after a press the
+    player asked to watch. It stops on that frame instead, which puts the tap
+    in the clip's own first picture.
+    """
+    frames = C.clip_frame_count(FPS["gb"], 1.0)
+    cap = C.preroll_budget(FPS["gb"], frames)
+
+    # The default one second x3 schedule taps at frames 0, 23 and 46, so the
+    # cap bites first and the taps are never in danger.
+    assert C.preroll_budget(FPS["gb"], frames, 23) == cap == 15
+    # A short clip with a short hold brings them together, and then the tap
+    # wins.
+    assert C.preroll_budget(FPS["gb"], frames, 13) == 13
+    assert C.preroll_budget(FPS["gb"], frames, 0) == 0
+    # None means "nothing to protect", which is the ordinary single press.
+    assert C.preroll_budget(FPS["gb"], frames, None) == cap
+
+
+def test_a_preroll_can_be_turned_off_by_arithmetic_alone():
+    """Zero seconds is exactly the behaviour from before the pre-roll existed.
+
+    Not a setting -- there is no ``[p]retroset`` for this -- but it is what the
+    measurements and the before/after tests compare against, so it has to mean
+    "photograph the very first frame" rather than "one frame at least".
+    """
+    frames = C.clip_frame_count(FPS["gb"], 1.0)
+    assert C.preroll_budget(FPS["gb"], frames, seconds=0.0) == 0
+    assert C.preroll_budget(FPS["gb"], frames, 5, seconds=0.0) == 0
+
+
 # -- How big the posted picture is --------------------------------------------
 #
 # (frame width, frame height, the aspect ratio the core reports) -> the size

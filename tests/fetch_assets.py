@@ -71,6 +71,12 @@ ROMS = {
         "a Game Boy Color city builder (MIT); 128 KiB battery save",
         True,
     ),
+    "libbet.gb": (
+        "https://github.com/pinobatch/libbet/releases/download/v0.08/libbet.gb",
+        "Libbet and the Magic Floor (zlib); a static Game Boy screen that "
+        "answers A and ignores everything else",
+        True,
+    ),
     "nestest.nes": (
         "https://raw.githubusercontent.com/christopherpow/nes-test-roms/master/other/nestest.nes",
         "the standard NES CPU test ROM",

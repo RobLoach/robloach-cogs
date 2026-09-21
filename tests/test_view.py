@@ -965,6 +965,42 @@ def test_a_press_is_only_ever_cut_short_by_a_clip_that_cannot_show_it():
     assert 8 < wanted
 
 
+@pytest.mark.parametrize("seconds", [0.2, 0.3, 0.4, 0.5, 0.8, 1.0, 2.0, 4.0, 15.0])
+@pytest.mark.parametrize("hold_ms", [50, 160, 250, 400, 2000])
+def test_a_clip_s_preroll_can_never_swallow_one_of_the_repeat_button_s_taps(
+    seconds, hold_ms
+):
+    """The pre-roll and the repeat button, over every legal setting.
+
+    A clip does not start photographing until the press has visibly done
+    something (see PREROLL_SECONDS in retro/clips.py), and on a screen that
+    never moves that runs to the bound. The bound therefore has to stop short
+    of the *next* tap, or a three-tap clip on a static menu would open after
+    two of the taps had already happened and the player would see fewer
+    presses than the button promised.
+
+    ``record`` hands the frame of the second press to ``preroll_budget``; this
+    is that arithmetic over the whole settings grid.
+    """
+    from retro import emulator as E
+
+    frames = E.clip_frame_count(GB_FPS, seconds)
+    plan = viewmod.press_plan(GB_FPS, seconds, hold_ms, viewmod.REPEAT_TAPS)
+    later = [start for start, _ in plan[1:]]
+    budget = E.preroll_budget(GB_FPS, frames, min(later) if later else None)
+
+    assert 0 <= budget <= frames
+    for start, _hold in plan[1:]:
+        # The pre-roll throws away the first `budget` frames, which are the
+        # schedule's frames 0..budget-1, so a tap on `start` survives exactly
+        # when budget <= start -- and then it lands in the clip's own first
+        # picture rather than in a frame nobody sees.
+        assert budget <= start, (budget, plan)
+    # The first press is always at frame 0 and is always in the pre-roll:
+    # holding it is the whole point, since it is what makes the picture move.
+    assert plan[0][0] == 0
+
+
 def test_the_clip_is_a_webp_attachment(retro):
     view = viewmod.RetroView(
         retro.cog, game_name="My Game!", slug="my-game", rom_filename="x.gb", channel_id=1

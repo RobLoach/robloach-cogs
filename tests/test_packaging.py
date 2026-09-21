@@ -242,9 +242,28 @@ def test_the_readme_states_the_clip_timing_invariant():
     """And the decision behind it; see test_emulator.py for the numbers."""
     assert "**A clip plays for exactly as long as it emulated**" in COG_README
     assert "nothing dropped off either end" in COG_README
-    # The measurement that settled it, and the case it would have destroyed.
-    assert "Trimming that dead lead-in was measured and rejected" in COG_README
+    # The case that settled how the opening of a clip is fixed, and which
+    # would have been destroyed by fixing it the other way.
     assert "17ms flash" in COG_README
+
+
+def test_the_readme_describes_the_clip_preroll_and_its_bound():
+    """The clip-timing section, which twice described the old behaviour.
+
+    It used to say that the dead lead-in stays and that trimming it was
+    rejected -- true right up until the pre-roll replaced it. The invariant
+    above is the one thing about a clip that has to keep being true, so both
+    it and the mechanism that now keeps it have to keep being written down.
+    """
+    assert "**A clip starts where the last one ended.**" in COG_README
+    assert "**The pre-roll is bounded at a quarter of a second**" in COG_README
+    # The two cases the section is an argument about: the game that sits
+    # still and reacts late, and the one that never reacts at all.
+    assert "replay a bit from the previous clip" in COG_README
+    assert "has no pre-roll at all" in COG_README, "Wait, Undo, a boot, a reset"
+    # ...and it must not still claim the lead-in is left alone.
+    assert "So the lead-in stays" not in COG_README
+    assert "test_the_dead_lead_in_is_photographed_rather_than_trimmed" not in COG_README
 
 
 def test_the_readme_describes_resetting_a_game():
