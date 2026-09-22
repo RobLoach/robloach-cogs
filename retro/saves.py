@@ -21,7 +21,7 @@ from redbot.core.utils.views import ConfirmView
 
 from .abc import MixinMeta
 from .emulator import MAX_SRAM_SIZE, EmulatorError, RetroEmulator
-from .RetroView import RetroView
+from .RetroView import RetroView, may_manage
 from .storage import BACKUP_SUFFIX, MAX_CACHED_GAMES_PER_CHANNEL
 from .systems import system_by_key, system_for_extension
 
@@ -434,23 +434,16 @@ class SavesMixin(MixinMeta):
         """
         Whether this person may destroy or replace a save.
 
-        The same three who may `[p]retrosleep` someone else's game (see
-        RetroView.can_stop): whoever started it, anybody who can moderate the
-        channel, and the bot owner. Playing is open to everybody and so are
-        listing, inspecting and exporting -- wiping a channel's progress is
-        not.
+        The same rule, from the same implementation, as `[p]retrosleep` on
+        someone else's game: see :func:`RetroView.may_manage`. Playing is
+        open to everybody and so are listing, inspecting and exporting --
+        wiping a channel's progress is not.
         """
-        author = getattr(ctx, "author", None)
-        if author is None:
-            return False
-        if entry is not None and entry.starter_id and author.id == entry.starter_id:
-            return True
-        # Duck-typed rather than isinstance(discord.Member): a Member has
-        # guild_permissions and a User does not, which is the real question.
-        permissions = getattr(author, "guild_permissions", None)
-        if permissions is not None and getattr(permissions, "manage_messages", False):
-            return True
-        return await self.bot.is_owner(author)
+        return await may_manage(
+            self.bot,
+            getattr(ctx, "author", None),
+            entry.starter_id if entry is not None else None,
+        )
 
     async def _refuse_management(
         self, ctx: commands.Context, entry: SaveInfo, what: str
@@ -511,17 +504,13 @@ class SavesMixin(MixinMeta):
             async with view.lock:
                 await self.hibernate(view, reason)
         except Exception:
-            # And the same belt and braces: a stale view or a message that can
-            # no longer be edited must not leave a core running, because
-            # everything below assumes the files on disk are the only copy.
+            # And the same belt and braces, from the same helper: everything
+            # below assumes the files on disk are the only copy.
             log.exception(
                 "Could not hibernate %s cleanly before changing its saves.",
                 entry.slug,
             )
-            emulator, view.emulator = view.emulator, None
-            if emulator is not None:
-                await self._write_state(view, emulator)
-                await asyncio.to_thread(emulator.stop)
+            await self._force_hibernate(view)
         log.info(
             "Hibernated the live %s session in channel %s before changing its "
             "saves.",

@@ -12,7 +12,13 @@ import pytest
 
 pytest.importorskip("discord", reason="the cog tests need discord.py")
 
-from .fakes import FakeAttachment, FakeConfirm, FakeEmulator, FakeUser  # noqa: E402
+from .fakes import (  # noqa: E402
+    FakeAttachment,
+    FakeConfirm,
+    FakeEmulator,
+    FakeUser,
+    history_is_consistent,
+)
 
 SRAM_BYTES = 8192
 
@@ -77,13 +83,20 @@ def test_only_exporting_asks_discord_for_the_attach_files_permission(retro):
 
 @pytest.mark.redbot
 def test_reds_confirmview_is_the_shape_the_cog_drives_it_as(retro):
+    """The four things `SavesMixin._confirm` uses, read off the class.
+
+    ``inspect.getsource(ConfirmView)`` used to be searched for the string
+    ``"result"``, which is an assertion about how Red happens to have written
+    a private module rather than about what the cog needs.
+    """
     import inspect
 
     from redbot.core.utils.views import ConfirmView
 
     parameters = inspect.signature(ConfirmView.__init__).parameters
     assert "timeout" in parameters and "disable_buttons" in parameters
-    assert hasattr(ConfirmView, "wait") and "result" in inspect.getsource(ConfirmView)
+    assert inspect.iscoroutinefunction(ConfirmView.wait)
+    assert isinstance(getattr(ConfirmView("nobody"), "result", ...), (bool, type(None)))
 
 
 # -- Listing ------------------------------------------------------------------
@@ -453,7 +466,7 @@ async def test_changing_the_saves_takes_the_undo_history_with_them(
     await command(battery, name)(cog, ctx, **kwargs)
 
     assert not view.history, name
-    assert view.history_bytes == 0
+    assert history_is_consistent(view)
     # The button stays clickable -- a click with nothing to undo is answered
     # privately rather than by a dead control. See _UndoButton.
     assert not battery.control(view, "undo").disabled

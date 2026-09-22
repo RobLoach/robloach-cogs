@@ -8,7 +8,11 @@ pieces of scaffolding make that legal:
 
 * :class:`MixinMeta` is what a mixin may assume about the cog it ends up on.
   It is an ABC purely so the annotations have somewhere to live -- nothing
-  here is abstract, and nothing here is implemented either.
+  here is abstract, and nothing here is implemented either. It is the whole
+  contract: a mixin that reaches for something not declared below is a
+  mixin whose requirement nobody wrote down, so anything a mixin starts
+  using has to be added here too. A test holds it to that
+  (tests/test_mixins.py).
 * :class:`CompositeMetaClass` is the metaclass the cog itself is declared
   with. ``commands.Cog`` has ``CogMeta`` and an ABC has ``ABCMeta``, so a
   class that is both needs a metaclass deriving from both. It adds nothing.
@@ -45,11 +49,34 @@ class MixinMeta(ABC):
     #: install message promised is still in flight.
     _download_task: typing.Optional[asyncio.Task]
     #: Drops the session and Resume-button records that pointed at a cached
-    #: ROM which has just been deleted, keeping the saves. Implemented on the
-    #: cog itself (retro/Retro.py) and called by the disk budget after it
-    #: prunes (retro/storage.py), which is the one place a mixin reaches back
-    #: into the cog for something that is not storage.
+    #: ROM which has just been deleted, keeping the saves. Called by the disk
+    #: budget after it prunes (retro/storage.py).
     _forget_pruned_roms: typing.Callable[..., typing.Awaitable[None]]
+
+    # -- ...and the rest of what the cog itself provides.
+    #
+    # Everything below is implemented on `Retro` (retro/Retro.py) and called
+    # from a mixin. They are declared here for the same reason the attributes
+    # above are: a requirement that is only visible as a `self.` somewhere in
+    # retro/saves.py is a requirement that can be broken by editing
+    # retro/Retro.py alone.
+
+    #: Save a session's progress, free its core, and leave the controls
+    #: usable. Taken by `[p]retrosaves` before it touches a save on disk
+    #: (retro/saves.py), because a live core holds the authoritative copy.
+    hibernate: typing.Callable[..., typing.Awaitable[None]]
+    #: The same, for a session whose ordinary hibernate raised: it must not
+    #: leave a core loaded. Also retro/saves.py.
+    _force_hibernate: typing.Callable[..., typing.Awaitable[None]]
+    #: Put every *other* live session to sleep, so loading a core here cannot
+    #: make two. Called before a core is loaded for a probe or an option
+    #: change (retro/cores.py) and before a save is inspected with a real
+    #: core (retro/saves.py).
+    _evict_locked: typing.Callable[..., typing.Awaitable[typing.List[typing.Any]]]
+    #: Reply to a command without letting a missing permission raise.
+    _safe_send: typing.Callable[..., typing.Awaitable[typing.Any]]
+    #: Reply with something long enough to need paging.
+    _send_pages: typing.Callable[..., typing.Awaitable[typing.Any]]
 
 
 class CompositeMetaClass(commands.CogMeta, ABCMeta):

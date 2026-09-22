@@ -6,7 +6,7 @@ whole reason the cog keeps both -- an in-game save has to survive a core
 update even when the exact moment cannot.
 """
 
-import time
+import os
 
 import pytest
 
@@ -147,10 +147,14 @@ async def test_pruning_a_game_takes_its_battery_save_with_it(retro):
     channel_id = 9810
     cog = retro.cog
     for index in range(retro.cogmod.MAX_CACHED_GAMES_PER_CHANNEL + 3):
-        (cog._roms_dir() / f"{channel_id}-pruned{index}.gb").write_bytes(b"r")
+        rom = cog._roms_dir() / f"{channel_id}-pruned{index}.gb"
+        rom.write_bytes(b"r")
         cog._state_path(channel_id, f"pruned{index}").write_bytes(b"s")
         cog._sram_path(channel_id, f"pruned{index}").write_bytes(b"b")
-        time.sleep(0.01)
+        # The prune keeps the most recently *used* ROMs, so the order has to
+        # be unambiguous. Stamped rather than slept for: eight hundredths of
+        # a second of wall clock bought nothing a mtime cannot state.
+        os.utime(rom, (1_700_000_000 + index, 1_700_000_000 + index))
 
     cog._prune_cached_games(channel_id, "pruned0")
 

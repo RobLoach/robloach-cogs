@@ -59,6 +59,50 @@ def test_every_mixin_module_exists_and_is_imported():
         assert (REPO_ROOT / "retro" / f"{name.split('.')[-1]}.py").is_file(), name
 
 
+def test_mixinmeta_declares_everything_the_mixins_reach_for(retro):
+    """The contract in retro/abc.py has to be the whole contract.
+
+    `MixinMeta` is annotations and nothing else, so a mixin that reaches for
+    something it does not declare still works -- right up until somebody
+    edits retro/Retro.py and breaks a requirement that was only ever visible
+    as a `self.` two files away. A false contract is worse than none, so this
+    is what keeps it true: everything a mixin reads off `self` that comes
+    from the cog class itself -- rather than from another mixin, from Red, or
+    from discord.py -- has to be declared.
+    """
+    import re
+
+    from retro.abc import MixinMeta
+
+    declared = set(MixinMeta.__annotations__)
+    # Everything `Retro` itself provides: its own class body, plus the
+    # attributes its __init__ sets. A mixin may rely on any of it, and every
+    # one of those reliances is what MixinMeta is for.
+    from retro.Retro import Retro as RetroClass
+
+    cog_owned = set(vars(RetroClass)) | set(vars(retro.cog))
+
+    undeclared = {}
+    for name in ("storage", "cores", "saves", "migration"):
+        source = (REPO_ROOT / "retro" / f"{name}.py").read_text()
+        for attribute in sorted(set(re.findall(r"self\.([_a-zA-Z]\w*)", source))):
+            if attribute in declared or attribute not in cog_owned:
+                continue
+            undeclared.setdefault(attribute, []).append(name)
+    assert not undeclared, (
+        f"these come from the cog class but are not in MixinMeta: {sorted(undeclared)}"
+    )
+    # ...and it is not vacuous: the five things on the cog itself that the
+    # mixins really do call are in there.
+    assert {
+        "hibernate",
+        "_force_hibernate",
+        "_evict_locked",
+        "_safe_send",
+        "_send_pages",
+    } <= declared
+
+
 # -- 2. The surface other people's installs already depend on -----------------
 
 #: Every command the cog publishes, subcommands included. Pinned: a command

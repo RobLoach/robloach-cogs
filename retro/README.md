@@ -83,9 +83,9 @@ can start it by name:
 - `[p]retrosaves delete <game>` wipes both halves of a game's save, after asking.
 - `[p]retroset download` (owner) downloads every supported core for your platform from the [libretro buildbot](https://buildbot.libretro.com). `[p]retroset download <core>` fetches or refreshes just one.
 - `[p]retroset autodownload [true|false]` (owner) controls whether missing cores are fetched automatically when the cog loads. On by default.
-- `[p]retroset game add|remove|list` (owner) manages the games anyone can start by name.
+- `[p]retroset game add <name> <url>`, `[p]retroset game remove <name>` and `[p]retroset game list` (owner) manage the games anyone can start by name.
 - `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below.
-- `[p]retroset bios add|list|remove` (owner) manages BIOS files for cores that need one. See below.
+- `[p]retroset bios add`, `[p]retroset bios list` and `[p]retroset bios remove` (owner) manage BIOS files for cores that need one. See below.
 - `[p]retroset diskbudget [megabytes]` (owner, aliased `disk`/`budget`) caps what the whole cog may use on disk, and with no argument reports what is using it. The default is 1024 MiB; `0` is no limit. **No save is ever deleted to make room** — cached ROMs are, oldest first. A download or save that fails part way through cleans its own half-written file up, and any left behind by a process that was killed outright are swept when the cog next loads, so a failed write cannot quietly eat the allowance.
 - `[p]retroset allowprivateurls [true|false]` (owner) lets ROM URLs point inside your own network. Off, and best left off: see [ROM URLs](#rom-urls).
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
@@ -179,15 +179,10 @@ uses once the controls are added:
 | Neo Geo Pocket | 11 | 3 |
 
 Three controls fit beside every console's bottom row, so none of them needs a
-row of its own. The cluster was four wide while there was a **Replay** button,
-which was one too many to share a row with Start and Select — so six of the
-eight consoles had their controls on a separate row and the widest three used
-all five of Discord's action rows. Removing Replay gave every console one
-component and, on six of them, one whole row back: the worst case is now the
-Super Nintendo at 19 components over four rows, leaving six components and a
-spare row in hand.
+row of its own. The worst case is the Super Nintendo at 19 components over
+four rows, leaving six components and a spare row in hand.
 
-There is no **Stop** button and no **Reset** button. Putting a game to sleep
+There is no **Stop** and no **Reset** button. Putting a game to sleep
 (`[p]retrosleep`), rebooting it (`[p]retroreboot`) and finishing with it
 (`[p]retroend`) are all commands, because each of them is destructive to a
 game everybody in the channel is playing and none of them should be one
@@ -307,7 +302,7 @@ one-line notice when the state could not be used.
 **A replaced game keeps a Resume button.** When a channel moves on, the old
 message's controls are swapped for a single **▶️ Resume**, and its text says so:
 
-> Replaced by **µCity**. **Pokemon** was saved — press Resume to come back to it.
+> Replaced by **µCity**. **Libbet** was saved — press Resume to come back to it.
 
 Pressing it starts that game again in that channel, right on that message: the
 game it replaces is saved and retired in turn (and gets a Resume button of its
@@ -573,13 +568,9 @@ and not a trim: the pre-roll happens in *front* of the recording, so the same
 number of frames go in and the same number of frames' worth of picture
 durations come out.
 
-`tests/test_emulator.py` holds all of it against real cores:
-`test_a_clip_plays_for_as_long_as_it_emulated` for the timing rule,
-`test_the_preroll_opens_a_clip_on_the_first_picture_the_press_changed` for the
-table above, `test_a_completely_static_screen_still_produces_a_whole_clip` for
-the case the bound protects, and
-`test_the_preroll_leaves_the_seam_with_no_repeat_and_no_gap` for two presses
-in a row. If a press still feels slow to land, `[p]retroset hold` is the dial
+`tests/test_emulator.py` holds all of it against real cores: the timing rule,
+the table above, the static screen the bound protects, and the seam between
+two presses in a row. If a press still feels slow to land, `[p]retroset hold` is the dial
 — a shorter hold reacts sooner, at the risk of a game not noticing the press
 at all below about 100ms.
 
@@ -611,31 +602,16 @@ exactly as informative and much likelier at a second than it was at four.
 
 **A session keeps no footage at all.** The clip a press records is encoded,
 uploaded as the message's attachment, and dropped. There is nowhere else it
-lives, which is why the message is the only place to look for it.
+lives, which is why the message is the only place to look for it. The only
+thing a session holds is its **Undo** history, which is capped in both
+directions (see below).
 
-That took two goes. There used to be a **Replay** button that stitched the
-last fifteen seconds of play back into one animation, and with it a
-per-session buffer of recent clips bounded at **8 MiB**; removing the button
-removed the buffer and left a single clip per session behind, and nothing
-read *that* either — the one edit a press makes is handed the clip it is
-about to post. So it has gone too. Measured on the real cores, fifteen
-seconds of play at the default clip length:
-
-| Console | Buffer (15 × 1s) | One clip | Now |
-| --- | --- | --- | --- |
-| Game Boy (µCity) | 13.5 KiB | 0.7 KiB | 0 |
-| NES (nestest) | 21.8 KiB | 1.4 KiB | 0 |
-| Super Nintendo | 153.9 KiB | 12.4 KiB | 0 |
-| Genesis | 111.2 KiB | 2.0 KiB | 0 |
-
-At the 0.2s clip floor the buffer held 76 clips, 36.1 KiB of them. The
-*press* is no faster for any of it in a way anybody can feel: the bookkeeping
-the buffer needed on every press — copy, append, three caps to re-check, a
-button label to rewrite — measured 6.1 µs against a press that spends 37 ms
-recording a clip, so about 0.015% of it. What was really saved is the memory,
-the 0.18–0.40 s of decoding and re-encoding a Replay click cost, and a
-component on every console's controls. The only thing a session holds now is
-its **Undo** history, which is capped in both directions (see below).
+Clips are **animated WebP**, always. Measured on a 4 second clip, WebP is
+24.4 KiB against a 53.2 KiB GIF on a moving Game Boy screen and 248 KiB
+against 998 KiB on the Super Nintendo — and it is pixel-exact, where GIF has
+to be quantized down to 64 colours, and it stores frame durations in
+milliseconds rather than centiseconds, so it can hold the 67 ms a frame of a
+15 fps clip actually lasts.
 
 ### What the message says
 
@@ -816,9 +792,7 @@ empties the history, says so in one line, and leaves the game exactly as it
 was.
 
 **The undo's own clip replaces the undone press's** on the message, so what
-the channel is left looking at is where the game actually is. (This used to
-be a larger job: the replay buffer had to rewind in step with the game, or a
-stitched replay would show somebody walking into a room they were not in.)
+the channel is left looking at is where the game actually is.
 
 Two deliberate details:
 
@@ -944,9 +918,10 @@ A button is held down for 160ms at the start of the clip, directions included.
 That is long enough that no game polling its controller a few times a second can
 miss it, and short enough that one press is one action: a Game Boy walk cycle is
 16 frames (about 270ms), so a longer hold starts a *second* step and the
-character crosses two tiles for one press. Tune it with `[p]retroset hold`. In
-Pokémon Red, one press of a direction at a one second clip walks exactly one
-tile and the step lands around frame 26 of 60, so the clip shows it finish.
+character crosses two tiles for one press. Tune it with `[p]retroset hold`.
+Measured on a Game Boy RPG, one press of a direction at a one second clip
+walks exactly one tile and the step lands around frame 26 of 60, so the clip
+shows it finish.
 
 Everything scheduled into a clip has to be **released before the clip's last
 picture**, or the player never sees what their press did. That makes a short
@@ -973,13 +948,12 @@ Engine.
 
 **It is hidden, not greyed out, when only one tap fits.** One tap is not a
 repeat at all — it is exactly what the confirm button one row over already
-does — so rather than drawing a dead button, the row is drawn without it. It
-was greyed out until now, and that turned out to be worse than useless: a
-present, dead, unexplained control reads as broken, and it was reported as the
-feature having been *removed from the cog*. It comes back by itself on the
-next press as soon as the clip is long enough, because the controls are
-redrawn on every press, so `[p]retroset cliplength` corrects it either way
-without restarting anything.
+does — so rather than drawing a dead button, the row is drawn without it. A
+present, dead, unexplained control reads as broken: the greyed-out version of
+this button was reported as the feature having been *removed from the cog*.
+It comes back by itself on the next press as soon as the clip is long enough,
+because the controls are redrawn on every press, so `[p]retroset cliplength`
+corrects it either way without restarting anything.
 
 **And it says so when it goes.** A control that silently disappears reads as
 removed just as surely as a greyed-out one does, so the press on which it

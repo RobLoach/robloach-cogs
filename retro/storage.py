@@ -366,10 +366,6 @@ class StorageMixin(MixinMeta):
             log.warning("Could not read the Retro save file %s", path, exc_info=True)
             return None
 
-    def _read_sram(self, channel_id: int, slug: str) -> typing.Optional[bytes]:
-        """The stored battery save for a game, or None if there isn't one."""
-        return self._read_file(self._sram_path(channel_id, slug))
-
     @staticmethod
     def _discard(path: Path) -> None:
         """Delete a save file that no core will load. Never raises."""
@@ -385,11 +381,11 @@ class StorageMixin(MixinMeta):
             return "0 bytes"
         if size < 1024:
             return f"{size:,} bytes"
-        for unit in ("KiB", "MiB", "GiB"):
+        for unit in ("KiB", "MiB"):
             size /= 1024.0
-            if size < 1024 or unit == "GiB":
+            if size < 1024:
                 return f"{size:,.1f} {unit}"
-        return f"{size:,.1f} GiB"  # pragma: no cover - the loop always returns
+        return f"{size / 1024.0:,.1f} GiB"
 
     def _prune_cached_games(
         self, channel_id: int, keep_slug: str
@@ -490,10 +486,7 @@ class StorageMixin(MixinMeta):
                 size = int(path.stat().st_size)
             except OSError:
                 continue
-            try:
-                first = path.relative_to(root).parts[0]
-            except ValueError:  # pragma: no cover - rglob stays under root
-                first = "other"
+            first = path.relative_to(root).parts[0]
             key = "other" if first == path.name else first
             usage[key] = usage.get(key, 0) + size
             usage["total"] += size

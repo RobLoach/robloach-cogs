@@ -261,7 +261,7 @@ async def test_a_resumed_game_draws_its_repeat_button_from_the_real_core(
     await retired.view.children[0].callback(interaction)
 
     back = retro.cog.sessions[retired.channel.id]
-    assert back.repeat_taps == 1 and not back.has_repeat_button
+    assert back.repeat_taps == 1
     assert retro.control(back, "repeat") is None
     # The row the controls sit on still has Wait and Undo, in that order.
     row = max(c.row for c in back.children)

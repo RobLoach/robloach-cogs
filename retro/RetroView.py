@@ -13,13 +13,12 @@ import discord
 from redbot.core import commands
 
 from .emulator import (
+    CLIP_EXTENSION,
     CLIP_SECONDS,
-    DEFAULT_CLIP_FORMAT,
     DEFAULT_FPS,
     EmulatorError,
     RetroEmulator,
     clamp_clip_seconds,
-    clip_extension,
     clip_frame_count,
     frame_count,
     input_budget,
@@ -45,8 +44,8 @@ log = logging.getLogger("red.robloach.retro")
 # How long a button is held down at the start of a clip, in milliseconds, for
 # every button including the directions.
 #
-# Measured against Pokemon Red under Gambatte (59.73 fps), with the player
-# already facing the way they were pushed and two clear tiles ahead:
+# Measured on a commercial Game Boy RPG under Gambatte (59.73 fps), with the
+# player already facing the way they were pushed and two clear tiles ahead:
 #
 #     hold    frames   tiles walked
 #     400ms       24        2          <- the old d-pad hold
@@ -67,12 +66,6 @@ DEFAULT_HOLD_MS = 160
 MIN_HOLD_MS = 50
 MAX_HOLD_MS = 2000
 
-# Directions used to be held twice as long as a face button, on the theory
-# that moving needs sustained input. On the consoles here it does not: the
-# game commits to a whole tile as soon as the step begins, so the only thing
-# the extra hold bought was a second step nobody asked for. There is no
-# direction multiplier any more, and no set of fields that needs one.
-#
 # The repeat button taps the console's confirm button this many times, spaced
 # this far apart, so text boxes and menus take one round trip instead of
 # three.
@@ -316,13 +309,6 @@ ACTION_NOTES: typing.Dict[str, typing.Tuple[str, str]] = {
     "reset": ("{who} reset the game.", "Reset the game."),
 }
 
-#: The impersonal forms, kept as names because the cog and the tests refer to
-#: them and because they are what a line falls back to.
-PRESSED_NOTE = ACTION_NOTES["press"][1]
-WAITED_NOTE = ACTION_NOTES["wait"][1]
-UNDONE_NOTE = ACTION_NOTES["undo"][1]
-RESET_NOTE = ACTION_NOTES["reset"][1]
-
 # How much of a display name goes on the line. 32 is Discord's own ceiling for
 # both a nickname and a global display name, so no real name is ever cut; the
 # cap is here for a name that arrives from somewhere else (a cached member
@@ -447,14 +433,8 @@ def presser_name(user: typing.Any) -> str:
     for character in raw:
         if character.isspace():
             characters.append(" ")
-            continue
-        try:
-            category = unicodedata.category(character)
-        except (TypeError, ValueError):  # not reachable from a str, but free
-            continue
-        if category in INVISIBLE_CATEGORIES:
-            continue
-        characters.append(character)
+        elif unicodedata.category(character) not in INVISIBLE_CATEGORIES:
+            characters.append(character)
     name = " ".join("".join(characters).split())
     if not name:
         return ""
@@ -480,6 +460,39 @@ def escape_label(name: str) -> str:
     """
     escaped = LEADING_ORDINAL.sub(r"\1\\\2", str(name).translate(MARKDOWN_ESCAPES))
     return discord.utils.escape_mentions(escaped)
+
+
+async def may_manage(bot, user: typing.Any, starter_id: typing.Optional[int]) -> bool:
+    """
+    Whether this person may do the things that are not open to everybody.
+
+    Anyone in the channel can play. Putting someone else's game to sleep
+    (`[p]retrosleep`), rebooting it (`[p]retroreboot`), finishing with it
+    (`[p]retroend`) and destroying or replacing its saves (the `[p]retrosaves`
+    group) all cost the whole channel its progress-in-flight, so they are the
+    same three people: whoever started the game, anybody who can moderate the
+    channel, and the bot owner.
+
+    **The one implementation.** It used to be two -- `RetroView.can_stop` and
+    `SavesMixin._may_manage_saves` -- which each claimed to be the single
+    source and checked the same three things in different orders.
+
+    The cheap checks come first, so ``is_owner`` (which can hit Red's config)
+    is only reached for somebody who is neither the starter nor a moderator.
+    ``guild_permissions`` is duck-typed rather than gated on
+    ``isinstance(user, discord.Member)``: a Member has the attribute and a
+    plain User does not, which *is* the question being asked, and an
+    isinstance check on a library class only makes the branch impossible to
+    exercise in a test.
+    """
+    if user is None:
+        return False
+    if starter_id and getattr(user, "id", None) == starter_id:
+        return True
+    permissions = getattr(user, "guild_permissions", None)
+    if permissions is not None and getattr(permissions, "manage_messages", False):
+        return True
+    return bool(await bot.is_owner(user))
 
 
 def action_note(action: str, user: typing.Any = None, button: str = "") -> str:
@@ -541,10 +554,9 @@ UNDO_DEPTH = 8
 # it is over the cap on its own: an Undo button that cannot undo the press
 # somebody has just made would be worse than the memory.
 #
-# This is now the *only* bound on anything a session holds: the undo history
-# is the only thing left that a session keeps at all. It used to be a quarter
-# of the 8 MiB replay buffer beside it, and then sat next to the single clip
-# that was on the message (`last_clip`, which nothing read and which is gone).
+# This is the *only* bound on anything a session holds: the undo history is
+# the only thing a session keeps at all. It holds no footage -- a clip is
+# built, uploaded and dropped inside one press.
 MAX_UNDO_BYTES = 2 * 1024 * 1024
 
 # Every button needs a custom_id that survives a restart, because that is how
@@ -562,16 +574,13 @@ CUSTOM_ID_PREFIX = "libretro"
 # view adds the three control buttons -- Wait, confirm x3, Undo -- to the
 # last row if they fit and to a row of their own if they do not.
 #
-# Two buttons that used to sit here are gone, and neither is coming back:
-# Stop (`[p]retrosleep` puts a game to sleep and `[p]retroend` finishes with
-# it) and Replay. There is no Reset button either, deliberately: rebooting
-# somebody's game is destructive to their progress-in-flight, so it is
-# `[p]retroreboot`, a command with the same permission check `[p]retrosleep`
-# has, rather than one more thing a passer-by can click by mistake.
+# There is deliberately no Reset button: rebooting somebody's game is
+# destructive to their progress-in-flight, so it is `[p]retroreboot`, a
+# command with the same permission check `[p]retrosleep` has, rather than one
+# more thing a passer-by can click by mistake.
 #
-# A message posted before a button was removed still has it drawn on it until
-# its next press redraws the row, and a click on that stale button resolves to
-# a custom_id this view no longer has -- which discord.py's
+# A click on a button a message was drawn with but this view no longer has
+# resolves to an unknown custom_id, which discord.py's
 # ViewStore.dispatch_view drops silently rather than raising.
 _STYLES = {
     "primary": discord.ButtonStyle.primary,
@@ -640,7 +649,7 @@ class Progress(typing.NamedTuple):
     One game's saved progress, in the order a boot is willing to try it.
 
     Four files rather than two, because every save keeps one previous
-    generation (see BACKUP_SUFFIX in Retro.py): a successful write of a *bad*
+    generation (see BACKUP_SUFFIX in storage.py): a successful write of a *bad*
     save is not something an atomic write can protect anybody from, and a save
     state is the thing players care most about. The backups are only ever
     reached when the newer file cannot be used.
@@ -657,15 +666,6 @@ class Progress(typing.NamedTuple):
     def has_state(self) -> bool:
         """Whether there is any save state at all to try."""
         return bool(self.state or self.state_backup)
-
-    @property
-    def has_anything(self) -> bool:
-        return bool(self.state or self.state_backup or self.sram or self.sram_backup)
-
-
-#: What a restore did, in the order :func:`restore_into` tries them. Read by
-#: ``Retro._settle_boot`` to decide what to say and what to throw away.
-RESTORE_ORDER = ("state", "backup-state", "sram", "backup-sram", "fresh")
 
 
 def restore_into(
@@ -981,7 +981,6 @@ class RetroView(discord.ui.View):
         timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
         clip_seconds: float = CLIP_SECONDS,
         hold_ms: int = DEFAULT_HOLD_MS,
-        clip_format: str = DEFAULT_CLIP_FORMAT,
     ) -> None:
         # Persistent views must not time out; idle sessions are hibernated by
         # the cog's background task instead.
@@ -1004,22 +1003,10 @@ class RetroView(discord.ui.View):
         # neither must be able to ask for a clip of no frames at all.
         self.clip_seconds: float = clamp_clip_seconds(clip_seconds)
         self.hold_ms: int = hold_ms
-        self.clip_format: str = clip_format
-        self.screen_filename: str = self._screen_filename(game_name, clip_format)
+        self.screen_filename: str = self._screen_filename(game_name)
 
         # The live emulator, or None while hibernated.
         self.emulator: typing.Optional[RetroEmulator] = None
-
-        # No attribute here holds a clip, and that is deliberate. A session
-        # used to keep its last fifteen seconds of footage -- up to
-        # MAX_REPLAY_BYTES, i.e. 8 MiB -- so the Replay button could stitch it
-        # back together, and after that button went it still kept the single
-        # clip that was on the message (`last_clip`, with a `remember_clip()`
-        # to set it). Nothing read either: `_show` is handed the clip it is
-        # about to post, as an argument. So a clip is now built, uploaded and
-        # dropped inside one press, and the picture the channel is looking at
-        # is read back off the message -- which is where it actually lives,
-        # and what a player sees.
 
         # The machine states the last few presses started from, oldest first,
         # each one zlib-compressed. This is what the Undo button pops. Memory
@@ -1079,8 +1066,7 @@ class RetroView(discord.ui.View):
         cluster -- Wait, confirm x3, Undo -- goes on the end of the last row
         if all of it fits there and on a row of its own if it does not. Three
         wide fits beside every console's bottom row here, including a
-        two-button Start/Select; it was four while Replay existed, which was
-        one too many for all but the Master System and the Neo Geo Pocket.
+        two-button Start/Select.
 
         The room for the cluster is reserved with CONTROL_BUTTONS, i.e. for
         all three of them, whether or not the confirm x3 button is drawn (see
@@ -1261,11 +1247,6 @@ class RetroView(discord.ui.View):
         """
         return len(self.press_plan(REPEAT_TAPS))
 
-    @property
-    def has_repeat_button(self) -> bool:
-        """Whether this clip length is long enough to draw the x3 button."""
-        return self.repeat_taps >= MIN_REPEAT_TAPS
-
     # -- The clip on the message --------------------------------------------
 
     def press_note(
@@ -1391,11 +1372,6 @@ class RetroView(discord.ui.View):
         self._build_controls()
 
     # -- The undo history ---------------------------------------------------
-
-    @property
-    def can_undo(self) -> bool:
-        """Whether there is a press to step back to."""
-        return bool(self.history)
 
     @property
     def history_bytes(self) -> int:
@@ -1592,11 +1568,8 @@ class RetroView(discord.ui.View):
            back where the undone press found it;
         2. a fresh clip is recorded with no input at all, so the channel can
            see where the game ended up. That clip replaces the undone
-           press's on the message, which is all there is to put back now:
-           there used to be a buffer of recent clips here that had to be
-           rewound in step with the game so a stitched replay could not show
-           somebody walking into a room they were not in, and both the
-           buffer and the replay are gone.
+           press's on the message, which is all there is to put back: the
+           message is the only place a clip exists.
 
         That second step means an undo costs one clip's worth of emulated
         time, exactly as the Wait button does, and that is deliberate. The
@@ -1693,10 +1666,10 @@ class RetroView(discord.ui.View):
         return self._record(emulator, None)
 
     @staticmethod
-    def _screen_filename(game_name: str, clip_format: str = DEFAULT_CLIP_FORMAT) -> str:
+    def _screen_filename(game_name: str) -> str:
         """A stable, Discord-safe attachment name for this session's clips."""
         safe = re.sub(r"[^A-Za-z0-9_-]+", "-", game_name).strip("-")[:48]
-        return f"{safe or 'screen'}{clip_extension(clip_format)}"
+        return f"{safe or 'screen'}{CLIP_EXTENSION}"
 
     def _set_disabled(self, disabled: bool) -> None:
         """
@@ -1949,11 +1922,10 @@ class RetroView(discord.ui.View):
         """
         Work out when, and for how long, to hold a button during a clip.
 
-        Every button, direction or not, is held for the same ``hold_ms``; see
-        DEFAULT_HOLD_MS for why the directions no longer get a multiplier,
-        and :func:`press_plan` for how the schedule is made to fit inside the
-        clip it is going to be recorded into. ``field`` of None is the Wait
-        button: no input at all.
+        Every button, direction or not, is held for the same ``hold_ms``
+        (see DEFAULT_HOLD_MS), and :func:`press_plan` is what makes the
+        schedule fit inside the clip it will be recorded into. ``field`` of
+        None is the Wait button: no input at all.
         """
         if field is None:
             return []
@@ -1967,7 +1939,6 @@ class RetroView(discord.ui.View):
         return emulator.record(
             self.clip_frames(emulator),
             presses=self._schedule(emulator, field, repeat),
-            clip_format=self.clip_format,
         )
 
     def run_press(self, field: typing.Optional[str], repeat: int = 1) -> bytes:
@@ -2177,11 +2148,8 @@ class RetroView(discord.ui.View):
             self.message = interaction.message
             self.message_id = interaction.message.id
         response = getattr(interaction, "response", None)
-        try:
-            if response is not None and response.is_done():
-                return
-        except Exception:  # pragma: no cover - is_done() cannot fail
-            log.debug("Could not read an interaction's response state.", exc_info=True)
+        if response is not None and response.is_done():
+            return
         try:
             await interaction.response.defer()
         except discord.HTTPException:
@@ -2340,26 +2308,5 @@ class RetroView(discord.ui.View):
             await self._show(interaction, clip, self.undo_note(interaction.user))
 
     async def can_stop(self, user: typing.Union[discord.Member, discord.User]) -> bool:
-        """
-        Whether this user may stop or reset the session.
-
-        Anyone in the channel can play; ending someone else's game
-        (`[p]retrosleep`), rebooting it (`[p]retroreboot`) and finishing with
-        it (`[p]retroend`) are the three things that are not open to
-        everybody, because all of them cost the whole channel its
-        progress-in-flight. One check for all three, rather than three that
-        could drift.
-
-        ``guild_permissions`` is duck-typed rather than gated on
-        ``isinstance(user, discord.Member)``, exactly as
-        ``SavesMixin._may_manage_saves`` does it: a Member has the attribute
-        and a plain User does not, which *is* the question being asked, and
-        an isinstance check on a library class only makes the branch
-        impossible to exercise in a test.
-        """
-        if user.id == self.starter_id:
-            return True
-        if await self.cog.bot.is_owner(user):
-            return True
-        permissions = getattr(user, "guild_permissions", None)
-        return bool(permissions is not None and getattr(permissions, "manage_messages", False))
+        """Whether this user may sleep, reboot or end the session."""
+        return await may_manage(self.cog.bot, user, self.starter_id)

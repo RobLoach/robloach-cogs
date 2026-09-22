@@ -28,7 +28,12 @@ import pytest
 
 pytest.importorskip("discord", reason="these tests drive the cog")
 
-from .fakes import FakeAttachment, FakeConfirm, FakeUser  # noqa: E402
+from .fakes import (  # noqa: E402
+    FakeAttachment,
+    FakeConfirm,
+    FakeUser,
+    history_is_consistent,
+)
 
 pytestmark = [pytest.mark.emulator, pytest.mark.slow]
 
@@ -318,7 +323,7 @@ async def test_undo_puts_a_real_core_and_its_picture_back(real, city):
     stored = zlib.decompress(view.history[-1])
     assert differing_bytes(stored, before) <= STATE_SLACK
     assert len(view.history[-1]) < len(before) // 4, "and it is worth compressing"
-    assert len(view.history[-1]) == view.history_bytes
+    assert history_is_consistent(view)
 
     undoing = real.interaction(view, message=view.message)
     await real.control(view, "undo").callback(undoing)
@@ -401,12 +406,10 @@ async def test_a_real_eight_deep_history_is_about_a_hundred_kilobytes(real, city
         )
 
     assert len(view.history) == viewmod.UNDO_DEPTH, "the depth cap bit"
-    assert view.history_bytes == sum(len(blob) for blob in view.history)
-    assert view.history_bytes <= viewmod.MAX_UNDO_BYTES
+    assert history_is_consistent(view)
     # uCity's states are 182 KiB each raw and about 16 KiB compressed, so a
-    # full history is a fraction of what the raw states would be -- and, now
-    # that the replay buffer is gone, the only thing a session holds beyond
-    # the one clip on its message.
+    # full history is a fraction of what the raw states would be -- and it is
+    # the only thing a session holds at all.
     assert view.history_bytes < raw, (view.history_bytes, raw)
     assert view.history_bytes < 300 * 1024, view.history_bytes
     assert max(len(blob) for blob in view.history) < raw // 4

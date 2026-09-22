@@ -7,9 +7,7 @@ shared object and no ``libretro.py`` installed at all -- which is what makes
 the clip arithmetic (and the pixel-exactness of the fast frame grab) cheap
 enough to cover in the fast test suite. Pillow is needed to *encode* a clip
 and is imported lazily, so even that is only paid for by the callers that do
-it. Nothing here reads a clip back any more: encoding is the only
-direction left now that the Replay button is gone, and the few tests that
-want a clip's frames open it with Pillow themselves.
+it. Encoding is the only direction: nothing here reads a clip back.
 
 Three groups, and they only meet in retro/emulator.py:
 
@@ -20,8 +18,7 @@ Three groups, and they only meet in retro/emulator.py:
 
 :class:`EmulatorError` lives here rather than next to the emulator because
 both halves raise it and this is the half that cannot import the other one.
-``retro.emulator`` re-exports every name below, so nothing downstream had to
-change when this module was split out of it.
+``retro.emulator`` re-exports every name below.
 """
 
 import io
@@ -54,10 +51,9 @@ class EmulatorError(RuntimeError):
 # so 15 fps against a 59.73 fps core is 4 emulated frames per clip frame and
 # exactly 67ms per frame -- a 1 second clip is 60 emulated frames and 16
 # pictures (fifteen on the cadence plus the closing frame, see capture_plan)
-# and measures 1.004s, which is 0.4% slow and invisible. (GIF is the format
-# that stores centiseconds; see encode_animation.) 20 fps would land on a round 50ms
-# and match the emulated time exactly, at about 39% more bytes and 32% more
-# encoding time, so 15 stays the default.
+# and measures 1.004s, which is 0.4% slow and invisible. 20 fps would land on
+# a round 50ms and match the emulated time exactly, at about 39% more bytes
+# and 32% more encoding time, so 15 stays the default.
 #
 # Lowering it was measured and rejected. Now that a frame is posted at the
 # console's own resolution (see MIN_CLIP_WIDTH) the encode is small enough
@@ -160,28 +156,15 @@ MIN_AFTERMATH_FRAMES = 1
 # one re-shown picture -- which is the honest failure mode.
 PREROLL_SECONDS = 0.25
 
-# A session used to keep its recent clips in memory so a Replay button could
-# decode and stitch the last fifteen seconds of them back into one animation.
-# That is gone: it was bounded at 8 MiB of footage per session and about 300
-# re-encoded frames of work per click, for a button most people pressed once.
-# Nothing here reads a clip back any more -- see encode_animation, which is
-# the only direction that is left.
-#
-# Animated WebP, encoded losslessly, is what gets posted. On a 75 frame Game
-# Boy clip it is 166 KiB where the equivalent GIF was 877 KiB, and on a SNES
-# clip 175 KiB against 1.52 MiB -- while being pixel-exact rather than
-# quantized down to 64 colours. It costs about 0.9s more to encode.
-#
-# Re-measured at the current defaults (see WEBP_METHOD below) on a 4 second
-# clip, the gap is the same shape: 24.4 KiB against a 53.2 KiB GIF on a
-# moving Game Boy screen, and 248 KiB against 998 KiB on the SNES. WebP costs
-# 0.15s more on the Game Boy and 1.3s more on the SNES, which is the price of
-# being exact.
-#
-# GIF is kept as a fallback for anywhere animated WebP is not welcome. It is
-# never selected automatically.
-CLIP_FORMATS = ("WEBP", "GIF")
-DEFAULT_CLIP_FORMAT = "WEBP"
+# Animated WebP, encoded losslessly, is the one format a clip is ever posted
+# in, and GIF is not worth reintroducing as an alternative: measured on a 4
+# second clip, WebP is 24.4 KiB against a 53.2 KiB GIF on a moving Game Boy
+# screen and 248 KiB against 998 KiB on the SNES, *and* pixel-exact rather
+# than quantized down to 64 colours. It costs 0.15s more to encode on the
+# Game Boy and 1.3s on the SNES, which is the price of being exact. GIF also
+# stores frame durations in centiseconds, so it cannot hold the 67ms a frame
+# of a 15 fps clip lasts (see CLIP_FPS) without playing ~4.5% slow.
+CLIP_EXTENSION = ".webp"
 
 # How hard libwebp is told to work. These are not exposed as settings: they
 # are a speed/size trade with one right answer, and the answer is measured
@@ -197,7 +180,7 @@ DEFAULT_CLIP_FORMAT = "WEBP"
 #     0.5s        1140/10     1140/7      588/12      588/8
 #     1s          1140/16     1140/12     588/17      588/10
 #     4s          1594/50     1650/31    1016/52     1056/42
-#   Game Boy, real motion (Pokemon title screen, every picture distinct)
+#   Game Boy, real motion (an animated title screen, every picture distinct)
 #     0.5s      10128/32    11218/19    5380/55     6408/33
 #     1s        15448/52    19538/40    9550/110   11248/79
 #     4s        30892/133   40176/132  21552/232   25058/177
@@ -252,16 +235,6 @@ DEFAULT_CLIP_FORMAT = "WEBP"
 WEBP_METHOD = 1
 WEBP_MINIMIZE_SIZE = False
 
-# GIF has no lossless mode, so the fallback path quantizes first. The consoles
-# here have small palettes, so this is very nearly lossless for them.
-GIF_COLORS = 64
-
-
-def clip_extension(clip_format: str = DEFAULT_CLIP_FORMAT) -> str:
-    """``"WEBP"`` -> ``".webp"``."""
-    return f".{str(clip_format).lower()}"
-
-
 # -- Grabbing a frame ---------------------------------------------------------
 #
 # libretro.py's ArrayVideoDriver.screenshot() converts the core's native
@@ -296,23 +269,18 @@ FAST_RAW_MODES = {
 #: Rotation -> the Pillow transpose that reproduces libretro.py's own
 #: rotation of the same name, or None when no transpose is needed.
 #:
-#: Rotation.NINETY is deliberately absent, and is a special case: libretro.py
-#: computes its starting offset as ``(width - 4) * height * 4`` where a 90
-#: degree rotation needs ``(width - 1) * ...``, so the output rows come out
-#: cyclically shifted by three and the three that wrap round land on negative
-#: offsets and overwrite the bottom of the picture. It is the same line of
-#: code, and the same bug, in libretro.py 0.6.0 and 0.11.1.
+#: **Rotation.NINETY is deliberately absent and must stay absent.**
+#: libretro.py 0.6.0 and 0.11.1 alike compute its starting offset as
+#: ``(width - 4) * height * 4`` where a 90 degree rotation needs
+#: ``(width - 1) * ...``, so the rows come out cyclically shifted by three
+#: and the three that wrap round overwrite the bottom of the picture. There
+#: is therefore no correct path for it at all -- the official screenshot() is
+#: the broken one -- and silently fixing it here would make the fast and slow
+#: grabs of the same frame disagree. So the fast path stands down and the
+#: frame goes the slow way. No console in systems.py asks for a rotation (an
+#: emulator test holds them to it), so this is a guard against a future core.
 #:
-#: So there is no correct path for a 90 degree rotation at all -- the slow
-#: official path is the broken one. Reproducing the bug in Pillow is not
-#: worth it and silently *fixing* it here would mean the fast and slow grabs
-#: of the same frame disagreed, so the fast path stands down and the frame
-#: goes through screenshot(). No console in systems.py asks for a rotation
-#: (there is an emulator test for that, and the WonderSwan was dropped
-#: because it did), so this is a guard against a future core rather than
-#: something a player can hit today.
-#:
-#: Rotation.ONE_EIGHTY and TWO_SEVENTY are correct upstream and are proved
+#: ONE_EIGHTY and TWO_SEVENTY are correct upstream and are proved
 #: byte-identical to it (see tests/test_frame_grab.py).
 FAST_ROTATIONS = {
     "NONE": None,
@@ -329,8 +297,10 @@ def _channel_expansion_table(bits: int) -> list:
     implementations disagree by a hair: Pillow scales (``c * 255 // hi``)
     while libretro.py replicates the high bits (``c << (8 - bits) | c >> ...``).
     On a 5-bit channel that is a difference of at most 1 on 21 of the 32
-    possible values -- invisible, but not *identical*, and identical is what
-    makes a cheap regression test possible.
+    possible values -- invisible, but not *identical*. Identical is worth
+    having because :func:`fast_frame_image` stands down to ``screenshot()``
+    for whole classes of frame, so both paths can be used within one session
+    and their pictures must not differ at all.
 
     Only the values a decoded channel can actually hold are remapped; the rest
     of the table is the identity, so applying it to a channel that was already
@@ -354,16 +324,10 @@ FAST_POINT_TABLES = {
     "XRGB8888": None,
 }
 
-#: How many distinct reasons to remember having logged.
-#:
-#: Most of the reasons below are drawn from a fixed set -- the pixel formats
-#: and rotations libretro defines -- but two of them interpolate the frame
-#: geometry the *core* chose ("a pitch of N is too small for M pixels", "an N
-#: byte framebuffer where M was needed"). A core that changes geometry
-#: mid-game while on the slow path could therefore mint a new string
-#: indefinitely, and this is a module-level set in a process that runs for
-#: months. The cap turns that into a duplicate log line, which is all this
-#: set was ever protecting against.
+#: How many distinct reasons to remember having logged. Two of the reasons
+#: below interpolate the frame geometry the *core* chose, so a core that
+#: changes geometry mid-game can mint new strings indefinitely -- and this is
+#: a module-level set in a process that runs for months.
 MAX_SLOW_GRAB_REASONS = 64
 
 #: Reasons the fast grab has already been logged as unavailable, so a core
@@ -869,16 +833,15 @@ def _pillow():
     return Image
 
 
-def encode_animation(images, duration_ms, clip_format: str = DEFAULT_CLIP_FORMAT) -> bytes:
+def encode_animation(images, duration_ms) -> bytes:
     """
-    Turn a list of same-sized Pillow images into one animation.
+    Turn a list of same-sized Pillow images into one animated WebP.
 
-    ``duration_ms`` is either one duration for every frame or a list with one
-    entry per frame. Every caller in the cog passes a single duration -- a
-    clip is sampled on one cadence from start to finish -- and the per-frame
-    form is kept because it costs nothing and Pillow's own encoder does not
-    hand a uniform frame time back (it collapses runs of identical frames and
-    adds their durations together).
+    ``duration_ms`` is either a list with one entry per frame or a single
+    duration for all of them. The only caller in the cog passes a list, because
+    :func:`capture_plan` gives the closing picture a shorter nominal duration
+    than the rest; the scalar form is kept because Pillow accepts it and it
+    costs a branch.
     """
     buffer = io.BytesIO()
     if isinstance(duration_ms, (list, tuple)):
@@ -886,50 +849,24 @@ def encode_animation(images, duration_ms, clip_format: str = DEFAULT_CLIP_FORMAT
     else:
         durations = max(1, int(duration_ms))
     try:
-        if clip_format == "WEBP":
-            images[0].save(
-                buffer,
-                format="WEBP",
-                save_all=True,
-                append_images=images[1:],
-                duration=durations,
-                # loop=1 plays the clip through exactly once and holds its
-                # last frame, which is what makes the picture left in the
-                # channel the state the next press carries on from; loop=0
-                # would mean "forever" and fill a busy channel with
-                # flickering.
-                loop=1,
-                lossless=True,
-                # See WEBP_METHOD and WEBP_MINIMIZE_SIZE, which carry the
-                # measurements these three numbers were chosen from.
-                quality=100,
-                method=WEBP_METHOD,
-                minimize_size=WEBP_MINIMIZE_SIZE,
-            )
-        else:
-            # GIF durations are stored in centiseconds, so round to 10ms
-            # here instead of letting the encoder truncate and play the
-            # clip too fast. This is the one place the clip's timing is
-            # not exact: 67ms a frame becomes 70ms, so a GIF plays about
-            # 4.5% slower than the game did. WebP has millisecond frame
-            # durations and does not need this. No loop= argument on
-            # purpose: Pillow only writes the looping extension when one
-            # is given.
-            #
-            # optimize=True made these GIFs 16-40% *bigger* (the frames
-            # are already palette images), as well as slower.
-            if isinstance(durations, list):
-                rounded = [max(10, round(value / 10) * 10) for value in durations]
-            else:
-                rounded = max(10, round(durations / 10) * 10)
-            images[0].save(
-                buffer,
-                format="GIF",
-                save_all=True,
-                append_images=images[1:],
-                duration=rounded,
-                optimize=False,
-            )
+        images[0].save(
+            buffer,
+            format="WEBP",
+            save_all=True,
+            append_images=images[1:],
+            duration=durations,
+            # loop=1 plays the clip through exactly once and holds its last
+            # frame, which is what makes the picture left in the channel the
+            # state the next press carries on from; loop=0 would mean
+            # "forever" and fill a busy channel with flickering.
+            loop=1,
+            lossless=True,
+            # See WEBP_METHOD and WEBP_MINIMIZE_SIZE, which carry the
+            # measurements these three numbers were chosen from.
+            quality=100,
+            method=WEBP_METHOD,
+            minimize_size=WEBP_MINIMIZE_SIZE,
+        )
     except Exception as exc:
         raise EmulatorError(f"The clip could not be encoded: {exc}") from exc
     return buffer.getvalue()

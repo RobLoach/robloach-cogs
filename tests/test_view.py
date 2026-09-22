@@ -202,10 +202,6 @@ def test_the_undo_button_is_one_of_the_controls_and_has_its_own_id(view):
     ids = {c.custom_id for c in view.children}
     for name in ("wait", "repeat", "undo"):
         assert f"{viewmod.CUSTOM_ID_PREFIX}:{name}" in ids, name
-    # And the Replay button that used to sit between x3 and Undo is gone,
-    # along with its custom_id: a click on a stale one is dropped silently
-    # (see test_a_click_on_a_removed_button_is_dropped_silently).
-    assert f"{viewmod.CUSTOM_ID_PREFIX}:replay" not in ids
     # It starts *enabled*, even though a fresh session has nothing to undo.
     # It used to be greyed out for that case, which made the explanation
     # unreachable: a disabled Discord button cannot be clicked, so the
@@ -213,7 +209,7 @@ def test_the_undo_button_is_one_of_the_controls_and_has_its_own_id(view):
     # never be got at -- and a permanently dead control reads as a broken
     # one. See _UndoButton and RetroView._undo.
     assert not undo.disabled
-    assert not view.can_undo, "and there really is nothing to undo yet"
+    assert not view.history, "and there really is nothing to undo yet"
 
 
 def test_the_repeat_button_taps_this_console_s_confirm_button(view, system):
@@ -273,7 +269,7 @@ def test_the_repeat_button_is_drawn_only_when_it_can_do_something(
         (c for c in view.children if isinstance(c, viewmod._RepeatButton)), None
     )
     assert view.repeat_taps == taps, (system.key, seconds)
-    assert view.has_repeat_button is drawn
+    assert (view.repeat_taps >= viewmod.MIN_REPEAT_TAPS) is drawn
     assert (button is not None) is drawn, (system.key, seconds)
     if button is None:
         # Nothing dead is left behind, on the objects or on the wire.
@@ -451,7 +447,6 @@ def test_the_dpad_names_itself_with_an_emoji_discord_accepts(view, system):
 
 def test_wait_and_the_repeat_button_say_what_they_do(view, system):
     assert view.press_note(None) == "Waited."
-    assert view.press_note(None) == viewmod.WAITED_NOTE
     # The repeat button counts the taps that will really happen, exactly as
     # its own label does, so the line and the button cannot disagree.
     repeat = next(
@@ -469,7 +464,6 @@ def test_wait_and_the_repeat_button_say_what_they_do(view, system):
     view.clip_seconds = 0.2
     view._update_repeat_label()
     assert view.repeat_taps == 1
-    assert not view.has_repeat_button
     assert view._repeat_button() is None
     assert view.press_note(system.confirm, viewmod.REPEAT_TAPS) == f"Pressed {confirm}."
 
@@ -482,12 +476,8 @@ def test_a_field_this_console_does_not_have_still_reads_as_something(view):
 def test_the_press_line_matches_the_tone_of_the_other_notes():
     # One short sentence, capitalised, full stop, no markdown: the same shape
     # as the line Undo has always shown.
-    for note in (
-        viewmod.UNDONE_NOTE,
-        viewmod.WAITED_NOTE,
-        viewmod.RESET_NOTE,
-        viewmod.PRESSED_NOTE.format(button="A"),
-    ):
+    for _named, plain in viewmod.ACTION_NOTES.values():
+        note = plain.format(button="A")
         assert note[0].isupper() and note.endswith("."), note
         assert "*" not in note and "`" not in note, note
         assert len(note) <= 40, note
@@ -538,15 +528,7 @@ def test_every_action_reads_in_one_voice(action):
 
 
 def test_the_four_actions_are_the_four_the_view_can_perform():
-    """One table, and the impersonal names are read out of it.
-
-    The point of ACTION_NOTES being a dict is that the five lines a session
-    can show cannot drift apart: there is no second place to change one.
-    """
-    assert viewmod.PRESSED_NOTE == viewmod.ACTION_NOTES["press"][1]
-    assert viewmod.WAITED_NOTE == viewmod.ACTION_NOTES["wait"][1]
-    assert viewmod.UNDONE_NOTE == viewmod.ACTION_NOTES["undo"][1]
-    assert viewmod.RESET_NOTE == viewmod.ACTION_NOTES["reset"][1]
+    """One table, so the lines a session can show cannot drift apart."""
     for named, plain in viewmod.ACTION_NOTES.values():
         assert "{who}" in named and "{who}" not in plain
         # The verb is lower case in the named form ("Rob pressed A.") and
@@ -833,10 +815,9 @@ def test_a_clip_length_is_printed_without_a_pointless_decimal():
     assert describe_seconds(4) == "4 seconds"
 
 
-def test_directions_are_no_longer_held_longer_than_anything_else():
-    # A Game Boy walk cycle is 16 frames (~270ms), so a longer hold walks two
-    # tiles for one press; see test_emulator.py's Pokemon tile count.
-    assert not hasattr(viewmod, "DPAD_HOLD_MULTIPLIER")
+def test_the_default_hold_is_under_a_game_boy_walk_cycle():
+    # 16 frames (~270ms), so a longer hold walks two tiles for one press;
+    # see test_emulator.py's tile count.
     assert round(59.727 * viewmod.DEFAULT_HOLD_MS / 1000) < 16
 
 

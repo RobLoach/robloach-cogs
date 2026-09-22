@@ -276,19 +276,17 @@ persistent view in a store keyed by message id, filled by `Client.add_view`
 *and* by every send or edit that carries a view, and emptied by nothing
 except `View.stop()` -- there is no `bot.remove_view`. So every game a
 channel plays used to leave a whole `RetroView` reachable for the life of the
-process -- and in those days each one held a replay buffer of up to 8 MiB,
-which is what made it worth chasing. `Retro._release_view` is the fix and
-these tests are the proof; they fail if it is taken out.
+process, each one holding a stack of compressed save states.
+`Retro._release_view` is the fix and these tests are the proof; they fail if
+it is taken out.
 
 Four of its sections are worth knowing about by name:
 
-* **section 2, the footage a session holds**, which is now zero. The replay
-  buffer went with the Replay button and the single `last_clip` that
-  replaced it went too (nothing in the cog read it: `_show` is handed the
-  clip it posts). So the assertions use `fakes.footage_bytes(view)` -- every
-  bytes-like attribute except the compressed undo history -- rather than
-  naming an attribute, because the thing being guarded against is a clip
-  coming back under a new name.
+* **section 2, the footage a session holds**, which is zero: a clip is
+  built, uploaded and let go of inside one press. The assertions use
+  `fakes.footage_bytes(view)` -- every bytes-like attribute except the
+  compressed undo history -- rather than naming an attribute, because the
+  thing being guarded against is a clip being kept under *any* name.
 * **section 5b, the silent failures that turn the safety machinery off.**
   Three handlers that each disabled something this file is about and said
   nothing: `RetroEmulator.stop` swallowing a failed unload (so a *running*
@@ -359,7 +357,7 @@ The script pulls the cores from the libretro buildbot and the ROMs from
 their authors' releases (dmg-acid2 and uCity are MIT-licensed, Libbet and
 the Magic Floor is zlib, nestest is the standard NES test ROM). Nothing it downloads is committed. Two assets
 cannot be fetched and are simply skipped without: a small SNES homebrew
-(`roms/snes_rotzoom.sfc`) and a Game Boy RPG (`roms/pokemon.gb`, for the
+(`roms/snes_rotzoom.sfc`) and a Game Boy RPG (`roms/gb-rpg.gb`, for the
 one-press-one-tile test). Layout:
 
 ```
@@ -367,10 +365,11 @@ $RETRO_TEST_ASSETS/cores/gambatte_libretro.so
 $RETRO_TEST_ASSETS/roms/ucity.gbc
 ```
 
-With `RETRO_TEST_ASSETS` unset the fixtures also look in a few places this
-project has historically kept them (`/tmp/coretest`, `/tmp/roms`); setting
-it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
-"no assets here" run.
+`RETRO_TEST_ASSETS` (or `./test-assets`) is the **only** place the fixtures
+look, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest "no assets
+here" run in which every test that needs one skips. There used to be a
+handful of `/tmp` fallbacks as well; they are gone, because `assets.core()`
+hands what it finds straight to `dlopen` and `/tmp` is world-writable.
 
 ## Adding a test
 
@@ -395,9 +394,10 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
   that module loads standalone too, so the version can be checked with
   neither Red nor `discord.py` installed.
 * **A mistake that is invisible until somebody reads a message gets a
-  source-level test.** `test_packaging.py` has two: no `.py` file may carry
-  a version literal of its own, and no string literal outside a *docstring*
-  may contain `[p]`. Red substitutes `[p]` in a command's help text and
+  source-level test.** `test_packaging.py` has four: every command the cog
+  publishes is named in `retro/README.md`, every README heading a *sent*
+  string points at exists, no `.py` file carries a version literal of its
+  own, and no string literal outside a *docstring* contains `[p]`. Red substitutes `[p]` in a command's help text and
   nowhere else, so `[p]retro <name>` in a string the cog builds and sends
   reaches the channel exactly as written -- an instruction to type a prefix
   nobody has. A command passes `ctx.clean_prefix`; a reply with no context
@@ -449,6 +449,38 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
 * Assert on behaviour the cog promises, and say why in a comment when the
   reason is not obvious -- most of these tests exist because something
   actually broke once.
+* **Four kinds of test are deliberately not here, and should not come back.**
+  Each of them used to be, in quantity, and none of them can fail for a
+  reason anybody wants to know about:
+  * **assertions on the prose of a README or of `info.json`.** A wording
+    change is not a regression, and a test that turns one into a failure
+    teaches people to stop improving the wording. What is checked instead is
+    mechanical and derived: that every command the cog publishes is named in
+    `retro/README.md`, and that every README heading a sent string points at
+    exists. Nothing checks *what a sentence says*.
+  * **"the removed feature is still removed".** Lists of `assert not
+    hasattr(module, "MAX_REPLAY_BYTES")` cannot fail unless somebody
+    deliberately re-adds the name, at which point they are in the way rather
+    than a warning. The exception worth keeping is a removal whose return
+    would be *broken* rather than merely unwanted, which is why
+    `test_systems.py` still refuses the two consoles this layout cannot
+    render. A feature that is gone is proved gone by the behaviour tests of
+    what replaced it.
+  * **restatements of a definition.** `PRESSED_NOTE == ACTION_NOTES["press"][1]`
+    is the line above it in the source.
+  * **assertions on a dependency's internals.** `inspect.getsource` of a
+    private Red module, or the exact text of a figure the libretro buildbot
+    republishes nightly, breaks on an unrelated upgrade and says nothing
+    about this cog. Ask the dependency a question instead (see
+    `test_reds_confirmview_is_the_shape_the_cog_drives_it_as`).
+* **An invariant gets one home.** The undo history's -- `history_bytes` is
+  exactly the sum of the deque, and both bounds hold -- was spelled out in
+  four files, which is three places for it to be spelled out differently. It
+  is `fakes.history_is_consistent(view)` now.
+* **A test that needs time to pass should say so, not sleep.** Use an
+  `Event` for "the other coroutine got there" and `os.utime` for "this file
+  is older than that one"; `time.sleep` in a test is wall clock every
+  developer pays on every run for something that can be stated exactly.
 * One libretro core can be loaded per process. Build emulators through the
   `emu` fixture, which stops the previous one for you, and never run the
   emulator tests in parallel.

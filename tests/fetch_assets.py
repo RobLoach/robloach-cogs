@@ -14,7 +14,7 @@ Nothing downloaded here is committed: the cores are 4-12 MiB platform
 binaries from the libretro buildbot, and the ROMs are fetched from their
 authors' own releases. Every ROM below is freely redistributable -- MIT
 licensed homebrew or a public test ROM -- and anything that is not (a
-commercial game, for the Pokemon walk-cycle test) has to be supplied by
+commercial game, for the walk-cycle test) has to be supplied by
 hand; the tests that need it skip when it is absent.
 
 Stdlib only, so it runs before anything is installed.
@@ -87,7 +87,7 @@ ROMS = {
 #: Assets that cannot be downloaded and are simply skipped without.
 BY_HAND = {
     "snes_rotzoom.sfc": "any small SNES homebrew or test ROM, for the busy-clip test",
-    "pokemon.gb": "a Game Boy RPG of your own, for the one-press-one-tile test",
+    "gb-rpg.gb": "a Game Boy RPG of your own, for the one-press-one-tile test",
 }
 
 

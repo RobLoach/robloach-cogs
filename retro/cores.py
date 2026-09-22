@@ -181,10 +181,7 @@ class CoresMixin(MixinMeta):
         `[p]retroset autodownload` is off all answer False.
         """
         task = getattr(self, "_download_task", None)
-        try:
-            return task is not None and not task.done()
-        except Exception:  # pragma: no cover - Task.done() cannot fail
-            return False
+        return task is not None and not task.done()
 
     def _no_cores_message(self, prefix: str) -> str:
         """

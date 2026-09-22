@@ -1,10 +1,10 @@
 """
 Standalone retro console emulator built on libretro.py.
 
-This module has no Red-DiscordBot or discord.py imports so it can be used and
-tested on its own. All methods are synchronous and not thread-safe; async
-callers should run them in a single worker thread (e.g. asyncio.to_thread)
-and serialize access with a lock.
+This module has no Red-DiscordBot or discord.py imports so it can be imported
+and tested with nothing but libretro.py and Pillow. All methods are
+synchronous and not thread-safe; async callers should run them in a single
+worker thread (e.g. asyncio.to_thread) and serialize access with a lock.
 
 Supports both the SessionBuilder API of libretro.py <= 0.6.x (the newest
 release available on Python 3.11, which Red-DiscordBot requires) and the
@@ -22,90 +22,42 @@ import re
 import typing
 from pathlib import Path
 
-try:
-    # The ordinary case: imported as part of the `retro` package.
-    from .clips import (
-        _SLOW_GRAB_LOGGED,
-        CLIP_FORMATS,
-        CLIP_FPS,
-        CLIP_SECONDS,
-        DEFAULT_CLIP_FORMAT,
-        FAST_POINT_TABLES,
-        FAST_RAW_MODES,
-        FAST_ROTATIONS,
-        GIF_COLORS,
-        MAX_CLIP_SCALE,
-        MAX_CLIP_SECONDS,
-        MIN_AFTERMATH_FRAMES,
-        MIN_CLIP_FRAMES,
-        MIN_CLIP_SECONDS,
-        MIN_CLIP_WIDTH,
-        PREROLL_SECONDS,
-        WEBP_METHOD,
-        WEBP_MINIMIZE_SIZE,
-        EmulatorError,
-        _channel_expansion_table,
-        _note_slow_frame_grab,
-        _pillow,
-        capture_plan,
-        capture_step,
-        clamp_clip_seconds,
-        clip_extension,
-        clip_frame_count,
-        clip_scale,
-        clip_size,
-        describe_seconds,
-        encode_animation,
-        fast_frame_image,
-        fast_frame_size,
-        format_seconds,
-        frame_count,
-        input_budget,
-        preroll_budget,
-    )
-except ImportError:  # pragma: no cover - `python retro/emulator.py`, see _main
-    # Run as a script, where there is no package to be relative to: the
-    # directory holding this file is sys.path[0], so the sibling module is
-    # importable by its bare name.
-    from clips import (  # type: ignore[no-redef]
-        _SLOW_GRAB_LOGGED,
-        CLIP_FORMATS,
-        CLIP_FPS,
-        CLIP_SECONDS,
-        DEFAULT_CLIP_FORMAT,
-        FAST_POINT_TABLES,
-        FAST_RAW_MODES,
-        FAST_ROTATIONS,
-        GIF_COLORS,
-        MAX_CLIP_SCALE,
-        MAX_CLIP_SECONDS,
-        MIN_AFTERMATH_FRAMES,
-        MIN_CLIP_FRAMES,
-        MIN_CLIP_SECONDS,
-        MIN_CLIP_WIDTH,
-        PREROLL_SECONDS,
-        WEBP_METHOD,
-        WEBP_MINIMIZE_SIZE,
-        EmulatorError,
-        _channel_expansion_table,
-        _note_slow_frame_grab,
-        _pillow,
-        capture_plan,
-        capture_step,
-        clamp_clip_seconds,
-        clip_extension,
-        clip_frame_count,
-        clip_scale,
-        clip_size,
-        describe_seconds,
-        encode_animation,
-        fast_frame_image,
-        fast_frame_size,
-        format_seconds,
-        frame_count,
-        input_budget,
-        preroll_budget,
-    )
+from .clips import (
+    _SLOW_GRAB_LOGGED,
+    CLIP_EXTENSION,
+    CLIP_FPS,
+    CLIP_SECONDS,
+    FAST_POINT_TABLES,
+    FAST_RAW_MODES,
+    FAST_ROTATIONS,
+    MAX_CLIP_SCALE,
+    MAX_CLIP_SECONDS,
+    MIN_AFTERMATH_FRAMES,
+    MIN_CLIP_FRAMES,
+    MIN_CLIP_SECONDS,
+    MIN_CLIP_WIDTH,
+    PREROLL_SECONDS,
+    WEBP_METHOD,
+    WEBP_MINIMIZE_SIZE,
+    EmulatorError,
+    _channel_expansion_table,
+    _note_slow_frame_grab,
+    _pillow,
+    capture_plan,
+    capture_step,
+    clamp_clip_seconds,
+    clip_frame_count,
+    clip_scale,
+    clip_size,
+    describe_seconds,
+    encode_animation,
+    fast_frame_image,
+    fast_frame_size,
+    format_seconds,
+    frame_count,
+    input_budget,
+    preroll_budget,
+)
 
 __all__ = [
     "RetroEmulator",
@@ -122,14 +74,12 @@ __all__ = [
     "MIN_CLIP_WIDTH",
     "PREROLL_SECONDS",
     "MAX_CLIP_SCALE",
-    "CLIP_FORMATS",
-    "DEFAULT_CLIP_FORMAT",
+    "CLIP_EXTENSION",
     "MAX_SRAM_SIZE",
     "RETRO_MEMORY_SAVE_RAM",
     "capture_plan",
     "capture_step",
     "clamp_clip_seconds",
-    "clip_extension",
     "clip_frame_count",
     "clip_scale",
     "clip_size",
@@ -151,7 +101,6 @@ __all__ = [
     "FAST_ROTATIONS",
     "WEBP_METHOD",
     "WEBP_MINIMIZE_SIZE",
-    "GIF_COLORS",
     "_channel_expansion_table",
     "_note_slow_frame_grab",
     "_pillow",
@@ -687,24 +636,6 @@ class RetroEmulator:
             )
             return None
 
-    @property
-    def system_directory(self) -> typing.Optional[str]:
-        """
-        The system directory this session actually reports to the core.
-
-        Read back from libretro.py rather than from what was asked for, so a
-        caller (or a test) can confirm the path really reached the core.
-        """
-        for source in (self._session, self._path_driver):
-            value = getattr(source, "system_directory", None) or getattr(
-                source, "system_dir", None
-            )
-            if isinstance(value, bytes):
-                return value.decode("utf-8", "replace")
-            if isinstance(value, str):
-                return value
-        return None
-
     def _log_start_failure(self, exc) -> None:
         """Log everything useful for diagnosing a start failure."""
         rom_exists = self.rom_path.is_file()
@@ -825,24 +756,12 @@ class RetroEmulator:
         except Exception:
             return 4 / 3
 
-    def frames_for_ms(self, milliseconds: float) -> int:
-        """How many emulated frames last roughly this long, at least one."""
-        return frame_count(self.fps, float(milliseconds) / 1000.0)
-
     def frames_for_seconds(self, seconds: float) -> int:
         return frame_count(self.fps, seconds)
 
     def clip_frames(self, seconds: float = CLIP_SECONDS) -> int:
         """How many emulated frames a clip of this length covers here."""
         return clip_frame_count(self.fps, seconds)
-
-    def capture_step(self, clip_fps: int = CLIP_FPS) -> int:
-        """How many emulated frames one picture of a clip covers here."""
-        return capture_step(self.fps, clip_fps)
-
-    def input_budget(self, frames: int, clip_fps: int = CLIP_FPS) -> int:
-        """The last frame of a clip a button may still be released on."""
-        return input_budget(self.fps, frames, clip_fps)
 
     # -- Input and emulation ------------------------------------------------
 
@@ -872,20 +791,6 @@ class RetroEmulator:
             # Every frame, so the audio libretro.py hoards never outgrows one
             # frame's worth; see _drain_audio().
             self._drain_audio()
-
-    def press(self, button: str, hold_frames: int = 12, release_frames: int = 40) -> None:
-        """
-        Hold a button for ``hold_frames`` frames, release it, then run
-        ``release_frames`` more frames so the game visibly responds.
-        """
-        button = self._check_button(button)
-        self._require_started()
-        self._pressed = frozenset({button})
-        try:
-            self.advance(hold_frames)
-        finally:
-            self._pressed = frozenset()
-        self.advance(release_frames)
 
     def reset(self) -> None:
         """
@@ -994,16 +899,6 @@ class RetroEmulator:
         except Exception:
             log.debug("Could not read the core's option definitions.", exc_info=True)
             return {}
-
-    def option_value(self, key: str) -> typing.Optional[str]:
-        """The value the core would read for ``key`` right now, or None."""
-        driver = self._option_driver
-        if driver is None:
-            return None
-        try:
-            return _text(driver.variables[_text(key).encode("utf-8")])
-        except Exception:
-            return None
 
     def set_option(self, key: str, value: str) -> bool:
         """
@@ -1178,7 +1073,7 @@ class RetroEmulator:
         frame_width, frame_height = self._frame_size()
         return clip_size(frame_width, frame_height, self.aspect_ratio, scale)
 
-    def _frame_image(self, size=None, *, scale: int = MAX_CLIP_SCALE, colors: int = 0):
+    def _frame_image(self, size=None, *, scale: int = MAX_CLIP_SCALE):
         """
         Grab the current screen as a Pillow image.
 
@@ -1202,11 +1097,6 @@ class RetroEmulator:
             image = Image.frombuffer(
                 "RGBA", (shot.width, shot.height), bytes(shot.data), "raw", "RGBA", 0, 1
             ).convert("RGB")
-        if colors:
-            # Quantizing before the resize is cheaper whenever the resize
-            # enlarges, and a nearest-neighbor resize of a P-mode image keeps
-            # the palette indices intact.
-            image = image.quantize(colors=colors)
         if size is None:
             size = self.output_size(scale=scale)
         if tuple(size) != image.size:
@@ -1227,7 +1117,7 @@ class RetroEmulator:
         from the first frame, exactly as this did before the pre-roll existed.
 
         The frame is compared at the core's own resolution, before the
-        NEAREST resize and any GIF quantization. That is the stricter
+        NEAREST resize. That is the stricter
         question of the two and the cheaper one: the posted picture is never
         *smaller* than the frame (see clip_scale), so a resize only ever
         repeats pixels and two frames that differ cannot resize to the same
@@ -1252,7 +1142,6 @@ class RetroEmulator:
         scale: int = MAX_CLIP_SCALE,
         fps: int = CLIP_FPS,
         presses: "typing.Iterable | None" = None,
-        clip_format: str = DEFAULT_CLIP_FORMAT,
     ) -> bytes:
         """
         Run the core for ``frames`` frames and return the clip as image bytes.
@@ -1324,11 +1213,6 @@ class RetroEmulator:
         console is frozen between one clip and the next.
         """
         self._require_started()
-        clip_format = str(clip_format).upper()
-        if clip_format not in CLIP_FORMATS:
-            raise EmulatorError(
-                f"Unknown clip format {clip_format!r}; expected one of {CLIP_FORMATS}"
-            )
         core_fps = self.fps
         if frames is None:
             frames = self.clip_frames(CLIP_SECONDS)
@@ -1363,10 +1247,6 @@ class RetroEmulator:
             budget = preroll_budget(core_fps, frames, min(later) if later else None)
             if budget > 0:
                 reference = self._frame_signature()
-
-        # GIF cannot store the full colour range, so quantize on the way in.
-        # Lossless WebP is exact, so quantizing it would only lose quality.
-        colors = GIF_COLORS if clip_format == "GIF" else 0
 
         images = []
         # Taken from the first captured frame, then held for the rest of the
@@ -1415,7 +1295,7 @@ class RetroEmulator:
                 if covered is not None:
                     if size is None:
                         size = self.output_size(scale=scale)
-                    images.append(self._frame_image(size, colors=colors))
+                    images.append(self._frame_image(size))
                     durations.append(max(1, round(1000 * covered / core_fps)))
                 index += 1
         finally:
@@ -1431,12 +1311,7 @@ class RetroEmulator:
                 preroll,
                 budget,
             )
-        return self._encode(images, durations, clip_format)
-
-    @staticmethod
-    def _encode(images, duration_ms, clip_format: str) -> bytes:
-        """Turn a list of same-sized Pillow images into one animation."""
-        return encode_animation(images, duration_ms, clip_format)
+        return encode_animation(images, durations)
 
 
 def _make_log_driver():
@@ -1524,65 +1399,3 @@ def _make_video_driver():
             ArrayVideoDriver.geometry.fset(self, value)
 
     return _TolerantArrayVideoDriver()
-
-
-def _main() -> int:
-    """
-    Tiny CLI for smoke-testing:
-
-        python retro/emulator.py CORE ROM OUT.png [FRAMES]
-        python retro/emulator.py CORE ROM OUT.webp [FRAMES]
-        python retro/emulator.py CORE ROM OUT.gif [FRAMES]
-
-    A ``.webp`` or ``.gif`` output records the frames as an animated clip; any
-    other extension runs the frames and writes a single PNG of the final
-    screen.
-
-    Setting ``RETRO_SYSTEM_DIR`` points the core's system (BIOS) directory at
-    that folder and prints back whatever libretro.py reports for it, which is
-    how the wiring is checked in CI.
-    """
-    import os
-    import sys
-    import time
-
-    if len(sys.argv) < 4:
-        print(__doc__)
-        print("Usage: python retro/emulator.py CORE ROM OUT.png|OUT.webp|OUT.gif [FRAMES]")
-        return 1
-    out_path = Path(sys.argv[3])
-    suffix = out_path.suffix.lower()
-    clip_format = {".webp": "WEBP", ".gif": "GIF"}.get(suffix)
-    system_dir = os.environ.get("RETRO_SYSTEM_DIR") or None
-
-    started = time.perf_counter()
-    with RetroEmulator(sys.argv[1], sys.argv[2], system_dir=system_dir) as emulator:
-        if system_dir:
-            print(f"system directory: {emulator.system_directory}")
-        # 0 for a cartridge with no battery, which is normal; see save_sram().
-        print(f"save ram: {emulator.sram_size} bytes")
-        print(f"core options: {len(emulator.option_definitions())}")
-        if len(sys.argv) > 4:
-            frames = int(sys.argv[4])
-        elif clip_format:
-            frames = emulator.clip_frames(CLIP_SECONDS)
-        else:
-            frames = 120
-        if clip_format:
-            payload = emulator.record(frames, clip_format=clip_format)
-        else:
-            emulator.advance(frames)
-            payload = emulator.screenshot()
-        fps = emulator.fps
-    elapsed = time.perf_counter() - started
-
-    out_path.write_bytes(payload)
-    print(
-        f"Wrote {len(payload)} bytes of {clip_format or 'PNG'} after {frames} "
-        f"frames ({fps:.2f} fps) to {out_path} in {elapsed:.2f}s"
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())

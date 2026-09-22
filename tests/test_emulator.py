@@ -15,13 +15,11 @@ import hashlib
 import io
 import logging
 import struct
-import subprocess
-import sys
 
 import pytest
 
 from .conftest import LIBBET_BOOT_SECONDS
-from .loader import REPO_ROOT, load_standalone
+from .loader import load_standalone
 
 pytestmark = [pytest.mark.emulator, pytest.mark.slow]
 
@@ -58,6 +56,57 @@ def image():
     from PIL import Image
 
     return Image
+
+
+# -- What the emulator does not wrap ------------------------------------------
+#
+# retro/clips.py's timing functions are plain functions of a frame rate -- the
+# cog calls them that way, laying a press schedule out before a core exists
+# (see RetroView.press_plan) -- so RetroEmulator has no methods for them and
+# these three fill in the core's own rate. The read-backs below reach into
+# libretro.py's drivers, which is the only way to see that a value really
+# crossed into the core; nothing in the cog asks, so nothing in the cog has a
+# property for it either.
+
+
+def frames_for_ms(emulator, milliseconds):
+    return E.frame_count(emulator.fps, float(milliseconds) / 1000.0)
+
+
+def capture_step(emulator):
+    return E.capture_step(emulator.fps)
+
+
+def input_budget(emulator, frames):
+    return E.input_budget(emulator.fps, frames)
+
+
+def press(emulator, button, hold_frames=12, release_frames=40):
+    """Hold a button, release it, run on -- and photograph nothing.
+
+    ``record()`` is the only way the cog drives a core, and it always
+    records (and may pre-roll); a couple of the tests below want the plain
+    version instead.
+    """
+    emulator._pressed = frozenset({emulator._check_button(button)})
+    try:
+        emulator.advance(hold_frames)
+    finally:
+        emulator._pressed = frozenset()
+    emulator.advance(release_frames)
+
+
+def system_directory(emulator):
+    """What libretro.py reports back as this session's system directory."""
+    for source in (emulator._session, emulator._path_driver):
+        value = getattr(source, "system_directory", None) or getattr(
+            source, "system_dir", None
+        )
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "replace")
+        if isinstance(value, str):
+            return value
+    return None
 
 
 def anmf(data):
@@ -126,7 +175,7 @@ def test_a_console_boots_and_records_a_playable_clip(
 
     emulator.advance(emulator.frames_for_seconds(2))
     frames = emulator.clip_frames(E.CLIP_SECONDS)
-    clip = emulator.record(frames, presses=[(button, 0, emulator.frames_for_ms(200))])
+    clip = emulator.record(frames, presses=[(button, 0, frames_for_ms(emulator, 200))])
 
     assert clip[:4] == b"RIFF" and clip[8:12] == b"WEBP", clip[:12]
     picture = image.open(io.BytesIO(clip))
@@ -272,7 +321,7 @@ def test_a_rotating_core_would_be_caught_rather_than_posted(emu, image, gambatte
 GRAB_CASES = [
     ("gambatte", "ucity.gbc"),
     ("gambatte", "dmg-acid2.gb"),
-    ("gambatte", "pokemon.gb"),
+    ("gambatte", "gb-rpg.gb"),
     ("mgba", "ucity.gbc"),
     ("fceumm", "nestest.nes"),
     ("nestopia", "nestest.nes"),
@@ -316,7 +365,7 @@ def test_a_recorded_clip_is_the_same_whichever_grab_made_it(emu, gambatte, ucity
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(2))
     state = emulator.save_state()
-    presses = [("right", 0, emulator.frames_for_ms(400))]
+    presses = [("right", 0, frames_for_ms(emulator, 400))]
 
     # Restored before *both* recordings, not just the second: a Game Boy that
     # has run two seconds and one that has been rewound to the same point are
@@ -353,14 +402,14 @@ def test_recording_converts_one_frame_per_picture_and_no_more(emu, gambatte, uci
 
 def test_frames_are_counted_from_the_core_s_own_frame_rate(emu, gambatte, ucity):
     emulator = emu(gambatte, ucity)
-    assert emulator.frames_for_ms(160) == 10, "~10 frames at 59.7fps"
-    assert emulator.frames_for_ms(400) == 24
-    assert emulator.frames_for_ms(0) == 1, "a hold is never zero frames"
+    assert frames_for_ms(emulator, 160) == 10, "~10 frames at 59.7fps"
+    assert frames_for_ms(emulator, 400) == 24
+    assert frames_for_ms(emulator, 0) == 1, "a hold is never zero frames"
     assert emulator.frames_for_seconds(4) == 239
     assert E.CLIP_SECONDS == 1.0
     # The default hold has to stay under a Game Boy walk cycle (16 frames) or
-    # one press walks two tiles; see the Pokemon test below.
-    assert emulator.frames_for_ms(160) < 16
+    # one press walks two tiles; see the walk-cycle test below.
+    assert frames_for_ms(emulator, 160) < 16
 
 
 @pytest.mark.parametrize("seconds", [0.2, 0.5, 0.8, 1.0, 4.0])
@@ -374,8 +423,8 @@ def test_a_fractional_clip_length_is_a_real_number_of_frames(
     assert frames >= E.MIN_CLIP_FRAMES, "a clip is never empty"
     assert emulator.fps != 60, "the frame count must come from the core"
 
-    step = emulator.capture_step()
-    budget = emulator.input_budget(frames)
+    step = capture_step(emulator)
+    budget = input_budget(emulator, frames)
     # Input has to be released on a frame that is actually photographed, and
     # at least one picture of the clip has to be left over to show it.
     assert budget % step == 0
@@ -387,15 +436,15 @@ def test_a_longer_hold_really_does_reach_the_core(emu, gambatte, ucity):
     def screen_after(hold_frames, field="down"):
         emulator = emu(gambatte, ucity)
         emulator.advance(emulator.frames_for_seconds(6))
-        emulator.press("start", hold_frames=emulator.frames_for_ms(200), release_frames=120)
-        emulator.press(field, hold_frames=hold_frames, release_frames=90)
+        press(emulator, "start", hold_frames=frames_for_ms(emulator, 200), release_frames=120)
+        press(emulator, field, hold_frames=hold_frames, release_frames=90)
         return hashlib.sha256(emulator.screenshot(scale=1)).hexdigest()[:12]
 
     assert screen_after(1) != screen_after(60)
 
 
 def test_one_press_walks_exactly_one_tile(assets, emu):
-    """The Pokemon Red two-tile bug, measured in the game's own WRAM.
+    """The two-tile bug, measured in a Game Boy RPG's own WRAM.
 
     The report was that pressing a direction walked the character TWO tiles.
     A Game Boy walk cycle is 16 frames, so any hold that outlasts it starts a
@@ -404,7 +453,7 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
     press of each length.
     """
     core = assets.need_core("gambatte")
-    rom = assets.need_rom("pokemon.gb")
+    rom = assets.need_rom("gb-rpg.gb")
     poke = emu(core, rom)
 
     wram = poke._session.core.get_memory(2)  # RETRO_MEMORY_SYSTEM_RAM
@@ -451,7 +500,7 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
         # Exactly what the cog schedules: the hold is capped at the last
         # frame of the clip that is still photographed, so what is measured
         # here is what a player would actually see.
-        hold = min(poke.frames_for_ms(hold_ms), poke.input_budget(frames))
+        hold = min(frames_for_ms(poke, hold_ms), input_budget(poke, frames))
         poke._pressed = frozenset({"left"})
         poke.advance(hold)
         poke._pressed = frozenset()
@@ -469,7 +518,7 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
     # changed by the last frame the clip photographs, not merely by the end of
     # the emulation. A Game Boy walk cycle is 16 frames and the hold is 10, so
     # the step lands around frame 26 of 60 and the clip shows the rest.
-    assert tiles(160, poke.input_budget(clip)) == 1, "the step finishes inside the clip"
+    assert tiles(160, input_budget(poke, clip)) == 1, "the step finishes inside the clip"
 
     # The shortest clip the settings allow still registers the press: the
     # hold is cut to the 8 frames a 12 frame clip can show being released,
@@ -518,7 +567,7 @@ def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
     frames = emulator.clip_frames(seconds)
     data = emulator.record(frames)
     durations, loop = anmf(data)
-    step = emulator.capture_step()
+    step = capture_step(emulator)
 
     assert durations, "no animation frames at all"
     # WebP stores milliseconds; a 15 fps clip off a 59.73 fps core is 67ms a
@@ -636,7 +685,7 @@ def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gam
         image.open(io.BytesIO(emulator.screenshot())).convert("RGB").tobytes()
     ).hexdigest()[:10]
 
-    moved = emulator.record(frames, presses=[("down", 0, emulator.frames_for_ms(160))])
+    moved = emulator.record(frames, presses=[("down", 0, frames_for_ms(emulator, 160))])
     hashes = frame_hashes(moved, image)
     assert hashes[0] != before
     assert hashes[0] != hashes[1], "the first two frames are duplicates"
@@ -711,8 +760,8 @@ def test_the_preroll_opens_a_clip_on_the_first_picture_the_press_changed(
     emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
     emulator.advance(emulator.frames_for_seconds(boot))
     frames = emulator.clip_frames(E.CLIP_SECONDS)
-    presses = [(button, 0, emulator.frames_for_ms(160))]
-    captured = len(E.capture_plan(frames, emulator.capture_step()))
+    presses = [(button, 0, frames_for_ms(emulator, 160))]
+    captured = len(E.capture_plan(frames, capture_step(emulator)))
     state = emulator.save_state()
 
     emulator.load_state(state)
@@ -786,8 +835,8 @@ def test_a_completely_static_screen_still_produces_a_whole_clip(
     emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
     emulator.advance(emulator.frames_for_seconds(boot))
     frames = emulator.clip_frames(E.CLIP_SECONDS)
-    presses = [(button, 0, emulator.frames_for_ms(160))]
-    plan = E.capture_plan(frames, emulator.capture_step())
+    presses = [(button, 0, frames_for_ms(emulator, 160))]
+    plan = E.capture_plan(frames, capture_step(emulator))
     budget = E.preroll_budget(emulator.fps, frames)
 
     state = emulator.save_state()
@@ -849,8 +898,8 @@ def test_the_hold_is_honoured_in_full_and_released_before_the_last_picture(
     emulator = emu(assets.need_core("gambatte"), libbet)
     emulator.advance(emulator.frames_for_seconds(LIBBET_BOOT_SECONDS))
     frames = emulator.clip_frames(E.CLIP_SECONDS)
-    hold = emulator.frames_for_ms(160)
-    budget = emulator.input_budget(frames)
+    hold = frames_for_ms(emulator, 160)
+    budget = input_budget(emulator, frames)
 
     timeline = []
     original = type(emulator).advance
@@ -908,7 +957,7 @@ def test_a_clip_with_no_input_in_it_has_no_preroll_at_all(assets, emu, libbet):
     # The screen is frozen, so the Wait clip is the held picture for its whole
     # length -- which is the truth about a paused game and what Wait is for.
     assert opening_repeats(shots, held) == len(shots)
-    assert len(shots) == len(E.capture_plan(frames, emulator.capture_step()))
+    assert len(shots) == len(E.capture_plan(frames, capture_step(emulator)))
     assert len(waited) > 0
 
     # A reset's boot clip goes through the same path (RetroView.run_reset
@@ -961,7 +1010,7 @@ def test_the_preroll_leaves_the_seam_with_no_repeat_and_no_gap(
     emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
     emulator.advance(emulator.frames_for_seconds(boot))
     frames = emulator.clip_frames(E.CLIP_SECONDS)
-    hold = emulator.frames_for_ms(160)
+    hold = frames_for_ms(emulator, 160)
     presses = [(button, 0, hold)]
     size = emulator.output_size()
     state = emulator.save_state()
@@ -1010,7 +1059,7 @@ def test_the_preroll_leaves_the_seam_with_no_repeat_and_no_gap(
     assert second_shots[0] == reference[start + second_pre]
     assert second_shots[0] != first_shots[-1], "the seam repeats a picture"
     # Neither clip lost a picture to any of this.
-    captured = len(E.capture_plan(frames, emulator.capture_step()))
+    captured = len(E.capture_plan(frames, capture_step(emulator)))
     assert len(first_shots) == len(second_shots) == captured
     # ...and both are still clips Pillow will open.
     for payload in (first, second):
@@ -1120,13 +1169,6 @@ def test_a_resumed_clip_picks_up_where_the_last_one_left_off(emu, image, gambatt
     assert len(resumed) < 2 or resumed[0] != resumed[1], "a duplicated opening frame"
 
 
-def test_the_gif_fallback_rounds_to_whole_centiseconds(emu, image, gambatte, ucity):
-    emulator = emu(gambatte, ucity)
-    emulator.advance(180)
-    gif = emulator.record(60, clip_format="GIF")
-    assert (image.open(io.BytesIO(gif)).info.get("duration", 0)) % 10 == 0
-
-
 # -- 4. Press schedules -------------------------------------------------------
 
 
@@ -1151,45 +1193,6 @@ def test_every_retropad_field_is_accepted():
     assert all(E.RetroEmulator._check_button(field) == field for field in E.BUTTONS)
 
 
-def test_an_unknown_clip_format_is_rejected(emu, gambatte, ucity):
-    emulator = emu(gambatte, ucity)
-    with pytest.raises(E.EmulatorError, match="Unknown clip format"):
-        emulator.record(30, clip_format="JPEG")
-
-
-def test_the_gif_fallback_still_produces_a_playable_gif(emu, image, gambatte, ucity):
-    emulator = emu(gambatte, ucity)
-    emulator.advance(180)
-    gif = emulator.record(120, clip_format="GIF", presses=[("right", 0, 24)])
-    assert gif[:6] in (b"GIF87a", b"GIF89a"), gif[:6]
-    picture = image.open(io.BytesIO(gif))
-    assert getattr(picture, "n_frames", 1) >= 1
-    assert picture.info.get("loop") is None, "a GIF must not loop forever"
-
-
-def test_webp_is_smaller_than_gif_on_a_busy_picture(assets, emu, image):
-    """WebP is the default for a reason; GIF is only the fallback."""
-    rom = assets.rom("snes_rotzoom.sfc") or assets.rom("pokemon.gb")
-    if rom is None:
-        pytest.skip("no busy ROM in RETRO_TEST_ASSETS")
-    core = assets.need_core("snes9x" if str(rom).endswith(".sfc") else "gambatte")
-    held = ("right", "a") if str(rom).endswith(".sfc") else ("start",)
-
-    sizes, frames_seen = {}, {}
-    for clip_format in ("WEBP", "GIF"):
-        emulator = emu(core, str(rom))
-        emulator.advance(emulator.frames_for_seconds(3))
-        count = emulator.clip_frames(E.CLIP_SECONDS)
-        data = emulator.record(
-            count, presses=[(b, 0, count) for b in held], clip_format=clip_format
-        )
-        sizes[clip_format] = len(data)
-        frames_seen[clip_format] = getattr(image.open(io.BytesIO(data)), "n_frames", 1)
-
-    assert sizes["WEBP"] < sizes["GIF"], sizes
-    assert frames_seen["WEBP"] == frames_seen["GIF"], frames_seen
-
-
 # -- 5. Save states -----------------------------------------------------------
 
 
@@ -1199,8 +1202,8 @@ def test_a_save_state_replays_identically_in_a_fresh_instance(emu, gambatte, uci
     state = emulator.save_state()
 
     def replay(target, first_release):
-        target.press("down", hold_frames=24, release_frames=first_release)
-        target.press("a", hold_frames=12, release_frames=119)
+        press(target, "down", hold_frames=24, release_frames=first_release)
+        press(target, "a", hold_frames=12, release_frames=119)
         return hashlib.sha256(target.screenshot(scale=1)).hexdigest()[:12]
 
     start = hashlib.sha256(emulator.screenshot(scale=1)).hexdigest()[:12]
@@ -1268,12 +1271,12 @@ def test_the_core_is_given_our_system_directory(emu, gambatte, ucity, tmp_path):
     system_dir = root / "system"
     emulator = emu(gambatte, ucity, system_dir=system_dir)
 
-    assert emulator.system_directory == str(system_dir)
+    assert system_directory(emulator) == str(system_dir)
     assert system_dir.is_dir()
     # libretro.py 0.6.x's path driver needs all four of these to exist.
     assert all((root / name).is_dir() for name in ("assets", "save", "playlist"))
     # Left alone, libretro.py hands every core a throwaway temp directory.
-    assert "libretro.py-" not in (emulator.system_directory or "")
+    assert "libretro.py-" not in (system_directory(emulator) or "")
 
 
 def environment_driver(session):
@@ -1352,25 +1355,6 @@ def test_a_core_still_boots_with_no_system_directory_at_all(emu, gambatte, ucity
     emulator = emu(gambatte, ucity)
     emulator.advance(5)
     assert emulator.started
-
-
-def test_the_command_line_wires_up_the_system_directory(gambatte, dmg_acid2, tmp_path):
-    # The same check CI used to do inline: run the module's own CLI and see
-    # that the path it reports back is the one it was given.
-    system_dir = tmp_path / "biostest" / "system"
-    output = tmp_path / "out.png"
-    result = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "retro" / "emulator.py"),
-         gambatte, dmg_acid2, str(output), "60"],
-        env={**__import__("os").environ, "RETRO_SYSTEM_DIR": str(system_dir)},
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert f"system directory: {system_dir}" in result.stdout, result.stdout
-    assert system_dir.is_dir()
-    assert output.is_file() and output.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
 # -- 8. Audio and logging cannot swamp the bot --------------------------------
@@ -1569,7 +1553,6 @@ def test_a_core_option_changes_what_the_core_draws(emu, image, gambatte, dmg_aci
         emulator.advance(emulator.frames_for_seconds(4))
         png = emulator.screenshot()
         picture = image.open(io.BytesIO(png)).convert("RGB")
-        assert emulator.option_value("gambatte_gb_colorization") == wanted
         shots[wanted] = (
             len(picture.getcolors(1 << 24)),
             hashlib.sha256(png).hexdigest(),

@@ -29,10 +29,19 @@ log = logging.getLogger("red.robloach.retro")
 # are brought across, which is what _migrate_legacy_namespace() does.
 #
 # This constant is the old name and must never change; the migration is keyed
-# on it. (The Config *identifier* integer and RetroView.CUSTOM_ID_PREFIX are
-# load-bearing for the same reason and are likewise frozen; see their own
-# comments.)
+# on it.
 LEGACY_COG_NAME = "RetroCog"
+
+#: The Config identifier, frozen for good, and the reason it lives here
+#: rather than in retro/Retro.py: both the cog's own Config handle and the
+#: legacy one below have to pass it, and two spellings of it would be two
+#: chances to hand every existing install an empty configuration.
+#:
+#: It is the sum of the bytes of "robloach-cogs/pyboy", the name this cog was
+#: born under, written out so it is visibly not a number anybody chose. Red
+#: keys every stored setting, saved game and hibernated session by it. Same
+#: reasoning as LEGACY_COG_NAME above and RetroView.CUSTOM_ID_PREFIX.
+CONFIG_IDENTIFIER = 114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121
 
 # Red's default (JSON) Config driver keeps a cog's stored settings in a file
 # called this, *inside* that cog's own data directory -- so the data directory
@@ -91,7 +100,7 @@ class MigrationMixin(MixinMeta):
         """
         return Config.get_conf(
             None,
-            identifier=114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121,
+            identifier=CONFIG_IDENTIFIER,
             cog_name=LEGACY_COG_NAME,
             force_registration=False,
         )

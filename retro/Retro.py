@@ -66,7 +66,12 @@ from .emulator import (
     describe_seconds,
     format_seconds,
 )
-from .migration import CONFIG_STORE_FILENAME, LEGACY_COG_NAME, MigrationMixin
+from .migration import (
+    CONFIG_IDENTIFIER,
+    CONFIG_STORE_FILENAME,
+    LEGACY_COG_NAME,
+    MigrationMixin,
+)
 from .RetroView import (
     DEFAULT_HOLD_MS,
     DEFAULT_TIMEOUT_MINUTES,
@@ -145,6 +150,7 @@ __all__ = [
     "SRAM_EXTENSIONS",
     "STATE_EXTENSIONS",
     # The RetroCog -> Retro rename
+    "CONFIG_IDENTIFIER",
     "CONFIG_STORE_FILENAME",
     "LEGACY_COG_NAME",
 ]
@@ -338,13 +344,10 @@ class Retro(
         self.bot = bot
         self.config: Config = Config.get_conf(
             self,
-            # The sum of the bytes of "robloach-cogs/pyboy", the name this cog
-            # was born under. It is what Red keys every stored setting, saved
-            # game and hibernated session by, so it is frozen for good: a new
-            # number would silently hand every existing install an empty
-            # configuration. Same reasoning as CUSTOM_ID_PREFIX in RetroView.
-            identifier=114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121,
-            force_registration=True
+            # Frozen for good; see CONFIG_IDENTIFIER in retro/migration.py,
+            # which is also where the legacy namespace's handle reads it.
+            identifier=CONFIG_IDENTIFIER,
+            force_registration=True,
         )
         self.config.register_global(**DEFAULT_GLOBALS)
         self.config.register_channel(**DEFAULT_CHANNEL)
@@ -1150,11 +1153,7 @@ class Retro(
         The undo history is dropped here as well as handed over, because it
         is the expensive part: a stray reference to the view from somewhere
         unexpected should cost a few kilobytes of object rather than a stack
-        of save states. (It used to be worth far more than that: a session
-        kept up to MAX_REPLAY_BYTES -- eight megabytes -- of footage for the
-        Replay button, and then one clip after that button went; a session
-        holds no footage at all now, so there is nothing of that left to
-        release.) Emptying the history costs nothing either way: this is only
+        of save states. Emptying it costs nothing either way -- this is only
         called for a view the cog has finished with, whose game is either
         retired or gone, so there is nothing anybody could still want to
         undo.
@@ -1166,14 +1165,10 @@ class Retro(
 
         Never raises: it is on every discard path, including cog_unload.
         """
-        for name in ("forget_history", "forget_queue"):
-            forget = getattr(view, name, None)
-            if forget is None:
-                continue
-            try:
-                forget()
-            except Exception:  # pragma: no cover - a deque cannot fail here
-                log.debug("Could not empty a view's %s.", name, exc_info=True)
+        if isinstance(view, RetroView):
+            # A RetiredView holds neither, which is why this is guarded.
+            view.forget_history()
+            view.forget_queue()
         try:
             view.stop()
         except Exception:
@@ -1198,6 +1193,27 @@ class Retro(
             emulator.stop()
         except Exception:
             log.exception("Could not free a libretro core.")
+
+    async def _force_hibernate(self, view: RetroView) -> None:
+        """
+        Save the game and free the core, whatever state the view is in.
+
+        The belt and braces behind every ``await self.hibernate(...)`` that
+        is wrapped in a ``try``: a stale view, or a message the bot can no
+        longer edit, must not leave a libretro core loaded. Only one may be
+        (MAX_LIVE_EMULATORS), so a core leaked here is not merely memory --
+        it is the cog not working again until the bot restarts.
+
+        The order is the one everything else uses: the state is written
+        *before* the core is freed, because after ``stop()`` there is nothing
+        left to read. Never raises, and safe on a session that is already
+        asleep.
+        """
+        emulator, view.emulator = getattr(view, "emulator", None), None
+        if emulator is None:
+            return
+        await self._write_state(view, emulator)
+        await asyncio.to_thread(emulator.stop)
 
     def _hibernate_now(self, view: RetroView) -> None:
         """
@@ -1828,17 +1844,22 @@ class Retro(
         self, exclude: typing.Optional[RetroView] = None
     ) -> typing.List[RetroView]:
         """
-        Put other sessions to sleep so only MAX_LIVE_EMULATORS stay loaded.
+        Put every *other* live session to sleep, freeing the one core slot.
+
+        MAX_LIVE_EMULATORS is 1 and cannot be anything else -- two libretro
+        cores in one process share its global state and segfault the bot --
+        so "evict down to the limit" is simply "evict everything else".
+        There used to be a least-recently-active sort here to choose between
+        them, which with a limit of one never had a choice to make.
 
         Each one is saved before its core is freed, and its own message is
         edited to say it went to sleep. Returns the sessions that were
         evicted so the caller can mention them.
         """
         evicted: typing.List[RetroView] = []
-        live = [v for v in self.sessions.values() if v.live and v is not exclude]
-        live.sort(key=lambda v: v.last_active)
-        while len(live) >= MAX_LIVE_EMULATORS:
-            view = live.pop(0)
+        for view in list(self.sessions.values()):
+            if not view.live or view is exclude:
+                continue
             await self._hibernate_locked(
                 view,
                 "Another channel started playing, so this game was saved and "
@@ -1878,101 +1899,53 @@ class Retro(
             "left off."
         )
 
-    async def _write_state(
-        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
-    ) -> bool:
+    def _write_progress(self, view: RetroView, emulator: RetroEmulator) -> bool:
         """
-        Save the session's progress to disk. Never raises.
+        Both halves of a game's progress to disk, in order. Never raises.
 
-        Writes both halves of it: the save state (the exact moment, only ever
-        loadable by the same build of the same core) and the cartridge's
-        battery save (the player's own in-game save, in a format that outlives
-        a core update). Both are captured here, before any caller frees the
-        emulator, because afterwards there is nothing left to read.
+        The one implementation of the ordering and the backup rules, shared by
+        the two ways of asking for it: :meth:`_write_state` runs it in a
+        worker thread and :meth:`_write_state_now` runs it on the calling
+        thread because it cannot await. It used to be written out twice.
 
-        Each write rotates the file it replaces to ``<name>.bak`` first, so
-        the channel always has the generation before this one to fall back to.
-        See BACKUP_SUFFIX and ``[p]retrosaves rollback``.
+        Both halves, because they are different things: the save state is the
+        exact moment and is only ever loadable by the same build of the same
+        core, and the cartridge's battery memory is the player's own in-game
+        save in a format that outlives a core update. **SRAM first**, so if
+        only one of the two gets written it is the one that survives an
+        update. Each write rotates the file it replaces to ``<name>.bak``
+        first, so the channel always has the generation before this one to
+        fall back to; see BACKUP_SUFFIX and `[p]retrosaves rollback`.
 
-        The return value is whether the *state* was written; a cartridge with
-        no battery is the normal case and is not a failure.
+        Blocking, so an async caller runs it in a thread. The return value is
+        whether the *state* was written; a cartridge with no battery is the
+        normal case and is not a failure.
         """
-        emulator = emulator if emulator is not None else view.emulator
-        if emulator is None or not emulator.started:
-            return False
-        # SRAM first: it is the copy that survives a core update, so if only
-        # one of the two can be written it should be this one.
-        await self._write_sram(view, emulator)
-        try:
-            data = await asyncio.to_thread(emulator.save_state)
-        except EmulatorError as error:
-            log.warning("Could not save the Libretro state for %s: %s", view.slug, error)
-            return False
-        path = self._state_path(view.channel_id, view.slug)
-        try:
-            await asyncio.to_thread(self._write_atomic, path, data, True)
-        except OSError:
-            log.warning("Could not write the Libretro state %s", path, exc_info=True)
-            return False
-        return True
-
-    def _write_state_now(
-        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
-    ) -> bool:
-        """
-        The same two writes as :meth:`_write_state`, without awaiting.
-
-        For cancellation handlers only. A task that is being cancelled cannot
-        rely on ``await`` -- the next one may raise CancelledError straight
-        back out and leave the core loaded and the progress unwritten -- so
-        this does both writes on the calling thread. It is a few milliseconds
-        of blocking on a path that is already tearing down.
-
-        Never raises, for the same reason _write_state does not.
-        """
-        emulator = emulator if emulator is not None else view.emulator
-        if emulator is None or not emulator.started:
-            return False
-        # SRAM first, as in _write_state: it is the copy that survives a core
-        # update, so if only one of the two gets written it should be this.
-        try:
-            sram = emulator.save_sram()
-            if sram:
-                self._write_atomic(self._sram_path(view.channel_id, view.slug), sram, True)
-        except Exception:
-            log.warning(
-                "Could not write the battery save for %s while shutting down.",
-                view.slug,
-                exc_info=True,
-            )
+        self._write_sram_now(view, emulator)
         try:
             data = emulator.save_state()
             self._write_atomic(self._state_path(view.channel_id, view.slug), data, True)
         except Exception:
             log.warning(
-                "Could not write the save state for %s while shutting down.",
-                view.slug,
-                exc_info=True,
+                "Could not write the save state for %s.", view.slug, exc_info=True
             )
             return False
         return True
 
-    async def _write_sram(
-        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
-    ) -> bool:
+    def _write_sram_now(self, view: RetroView, emulator: RetroEmulator) -> bool:
         """
-        Write the cartridge's battery save next to the save state.
+        Write the cartridge's battery save next to the save state. Never raises.
 
         Returns False, and writes nothing at all, for a cartridge that has no
         battery -- most NES and Game Boy puzzle games, every test ROM. That is
         the ordinary case, not an error, so it is not logged and never leaves
         an empty ``.srm`` behind for the resume path to trip over.
+
+        Blocking; see :meth:`_write_progress`, which is its only caller here,
+        and :meth:`_write_sram` for the awaitable form.
         """
-        emulator = emulator if emulator is not None else view.emulator
-        if emulator is None or not emulator.started:
-            return False
         try:
-            data = await asyncio.to_thread(emulator.save_sram)
+            data = emulator.save_sram()
         except Exception:
             log.warning(
                 "Could not read the battery save for %s.", view.slug, exc_info=True
@@ -1980,13 +1953,55 @@ class Retro(
             return False
         if not data:
             return False
-        path = self._sram_path(view.channel_id, view.slug)
         try:
-            await asyncio.to_thread(self._write_atomic, path, data, True)
+            self._write_atomic(self._sram_path(view.channel_id, view.slug), data, True)
         except OSError:
-            log.warning("Could not write the battery save %s", path, exc_info=True)
+            log.warning(
+                "Could not write the battery save for %s.", view.slug, exc_info=True
+            )
             return False
         return True
+
+    async def _write_state(
+        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
+    ) -> bool:
+        """
+        Save the session's progress to disk, off the event loop. Never raises.
+
+        :meth:`_write_progress` in a worker thread. Called before any caller
+        frees the emulator, because afterwards there is nothing left to read.
+        """
+        emulator = emulator if emulator is not None else view.emulator
+        if emulator is None or not emulator.started:
+            return False
+        return await asyncio.to_thread(self._write_progress, view, emulator)
+
+    def _write_state_now(
+        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
+    ) -> bool:
+        """
+        The same writes as :meth:`_write_state`, without awaiting anything.
+
+        For cancellation handlers only. A task that is being cancelled cannot
+        rely on ``await`` -- the next one may raise CancelledError straight
+        back out and leave the core loaded and the progress unwritten -- so
+        this runs :meth:`_write_progress` on the calling thread. It is a few
+        milliseconds of blocking on a path that is already tearing down, and
+        it is why the shared piece is synchronous rather than a coroutine.
+        """
+        emulator = emulator if emulator is not None else view.emulator
+        if emulator is None or not emulator.started:
+            return False
+        return self._write_progress(view, emulator)
+
+    async def _write_sram(
+        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
+    ) -> bool:
+        """The battery save on its own, off the event loop. Never raises."""
+        emulator = emulator if emulator is not None else view.emulator
+        if emulator is None or not emulator.started:
+            return False
+        return await asyncio.to_thread(self._write_sram_now, view, emulator)
 
     async def _hibernation_loop(self) -> None:
         """Put sessions to sleep once they have been idle for long enough."""
@@ -2537,10 +2552,7 @@ class Retro(
         so the channel bucket is not spent on a resume either.
         """
         try:
-            bucket = self.start_buckets.get_bucket(ctx)
-            if bucket is None:  # pragma: no cover - only a custom BucketType
-                return 0.0
-            return float(bucket.update_rate_limit() or 0.0)
+            return float(self.start_buckets.get_bucket(ctx).update_rate_limit() or 0.0)
         except Exception:
             # A rate limit that cannot be calculated must not stop the game.
             log.debug("Could not check the Retro channel cooldown.", exc_info=True)
@@ -2949,10 +2961,7 @@ class Retro(
             # Even if the view or its message is stale, make sure the game is
             # saved and the emulator is freed.
             log.exception("Failed to put the Libretro session to sleep cleanly.")
-            emulator, view.emulator = view.emulator, None
-            if emulator is not None:
-                await self._write_state(view, emulator)
-                await asyncio.to_thread(emulator.stop)
+            await self._force_hibernate(view)
         await ctx.send(
             "The game has been saved and put to sleep. Press any button on "
             f"it to carry on, or `{ctx.clean_prefix}retroend` to finish with "

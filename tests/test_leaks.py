@@ -35,7 +35,7 @@ pytest.importorskip("discord", reason="the leak tests need discord.py")
 import discord  # noqa: E402
 from discord.ui.view import ViewStore  # noqa: E402
 
-from .fakes import FakeUser, footage_bytes  # noqa: E402
+from .fakes import FakeUser, footage_bytes, history_is_consistent  # noqa: E402
 
 C = load_standalone("retro_clips_for_leaks", "clips.py")
 #: emulator.py on its own too: the three silent-failure tests in section
@@ -297,26 +297,17 @@ async def test_forgetting_a_retired_record_releases_its_view(retro, store):
 
 # -- 2. The footage a session holds --------------------------------------------
 #
-# This section used to be about the replay buffer, which was the one thing in
-# a session big enough to matter: up to MAX_REPLAY_BYTES -- 8 MiB -- of
-# footage apiece, bounded by a count cap, a byte cap and a seconds cap that
-# all had to be enforced as clips arrived. Removing the Replay button removed
-# all of it, leaving the single clip that was on the message
-# (`RetroView.last_clip`); nothing read that either, so it has gone too and
-# the number these tests are about is now zero.
+# Zero, at every point in a session's life. A clip is built, uploaded and let
+# go of inside one press, and the message is the only place the picture a
+# player is looking at exists.
 #
 # `fakes.footage_bytes` is deliberately attribute-agnostic -- every
 # bytes-like thing a view holds, bar the compressed undo history -- because
-# the thing being guarded against is a clip coming back under a new name.
+# the thing being guarded against is a clip being kept under *any* name.
 
 
 async def test_a_session_holds_no_footage_however_long_it_is_played(retro):
-    """No container to grow, and no clip either: it is built and let go of.
-
-    The buffer this replaces kept fifteen seconds of footage, which at the
-    0.2s clip floor was 76 clips (MAX_REPLAY_CLIPS) and needed a byte cap of
-    its own to bound. Sixty presses here would have filled it.
-    """
+    """No container to grow, and no clip either: it is built and let go of."""
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9640, "oneclip")
     view.clip_seconds = retro.clipsmod.MIN_CLIP_SECONDS
@@ -333,8 +324,6 @@ async def test_a_session_holds_no_footage_however_long_it_is_played(retro):
     assert len(set(clips)) == 60, "the fake produced the same clip twice"
     assert all(isinstance(clip, bytes) and clip for clip in clips)
     assert held == [0] * 60, held
-    assert not hasattr(view, "clips"), "the replay buffer came back"
-    assert not hasattr(view, "last_clip"), "the per-session clip came back"
 
 
 async def test_the_press_queue_is_bounded_and_let_go_of(retro):
@@ -370,11 +359,9 @@ async def test_a_discarded_session_holds_no_footage_either(retro, store):
     """
     The same statement at the other end of a session's life.
 
-    It used to need saying twice, because the clip was held until
-    ``_release_view`` dropped it: even if something else kept the view (a
-    stale reference in a traceback, say) the expensive part had to be gone.
-    Now there is nothing to drop, so what is checked is that retiring a
-    session leaves it holding neither footage nor undo history.
+    Retiring a session leaves it holding neither footage nor undo history,
+    so even a stale reference to the view from somewhere unexpected (a
+    traceback, say) costs a few kilobytes of object and nothing more.
     """
     await retro.install_cores("gambatte")
     view, ctx, _ = await retro.posted_game(9642, "clipdrop")
@@ -384,7 +371,7 @@ async def test_a_discarded_session_holds_no_footage_either(retro, store):
 
     await retro.cog._retire(view, "replaced")
     assert footage_bytes(view) == 0, "a retired session kept a clip"
-    assert not view.history and view.history_bytes == 0
+    assert not view.history and history_is_consistent(view)
 
 
 async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro, store):
@@ -393,10 +380,9 @@ async def test_the_footage_a_bot_holds_does_not_grow_with_the_games_played(retro
 
     This plays thirty games across ten channels, presses buttons in each, and
     adds up the payload bytes still reachable from the cog and from discord.py
-    at the end. With the views retained it grew with every game, at up to
-    MAX_REPLAY_BYTES a session and then at one clip a session; the answer is
-    now zero throughout, and it is measured rather than assumed because a
-    clip is exactly the kind of thing that comes back by accident.
+    at the end. The answer is zero throughout, and it is measured rather
+    than assumed because a clip is exactly the kind of thing that comes back
+    by accident.
     """
     await retro.install_cores("gambatte")
 
@@ -446,9 +432,10 @@ def test_the_slow_grab_log_cannot_grow_without_bound():
     """
     C._SLOW_GRAB_LOGGED.clear()
     try:
-        for index in range(10_000):
+        # Three times the cap, which is enough to see it bite twice.
+        for index in range(3 * C.MAX_SLOW_GRAB_REASONS + 8):
             C._note_slow_frame_grab(f"a pitch of {index} is too small for {index} pixels")
-        assert len(C._SLOW_GRAB_LOGGED) <= C.MAX_SLOW_GRAB_REASONS, len(C._SLOW_GRAB_LOGGED)
+            assert len(C._SLOW_GRAB_LOGGED) <= C.MAX_SLOW_GRAB_REASONS, index
         assert C.MAX_SLOW_GRAB_REASONS < 1000, "a cap nobody can reach is not a cap"
     finally:
         C._SLOW_GRAB_LOGGED.clear()

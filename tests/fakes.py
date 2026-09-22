@@ -30,6 +30,7 @@ from retro.emulator import (
     capture_step,
     clip_frame_count,
     encode_animation,
+    frame_count,
     input_budget,
 )
 
@@ -56,7 +57,7 @@ FAKE_CLIP_FRAMES = 3
 FAKE_FRAME_MS = 1000
 
 
-def _tiny_animation(seed, clip_format="WEBP", frames=FAKE_CLIP_FRAMES, size=(8, 8)):
+def _tiny_animation(seed, frames=FAKE_CLIP_FRAMES, size=(8, 8)):
     """A real, minimal animated clip that decodes back to ``frames`` frames."""
     images = []
     for index in range(frames):
@@ -65,7 +66,7 @@ def _tiny_animation(seed, clip_format="WEBP", frames=FAKE_CLIP_FRAMES, size=(8, 
         # the decoded frame count is exactly what went in.
         image.putpixel((0, 0), ((seed + index) % 251, index % 241, 7))
         images.append(image)
-    return encode_animation(images, FAKE_FRAME_MS, clip_format)
+    return encode_animation(images, FAKE_FRAME_MS)
 
 
 class FakeEmulator:
@@ -89,7 +90,6 @@ class FakeEmulator:
         self.frame = 0
         self.loaded_from = None
         self.last_presses = None
-        self.last_format = None
         self.sram = None
         self.loaded_sram = None
         #: How many times this instance has been power-cycled; see reset().
@@ -142,14 +142,18 @@ class FakeEmulator:
     def frames_for_seconds(self, seconds):
         return max(1, round(self.fps * seconds))
 
-    def frames_for_ms(self, ms):
-        return max(1, round(self.fps * ms / 1000.0))
-
-    # The clip arithmetic is shared rather than re-implemented: these three
-    # are pure functions of a frame rate in retro/emulator.py, and a fake
-    # copy of them would only ever prove itself right.
     def clip_frames(self, seconds):
         return clip_frame_count(self.fps, seconds)
+
+    # -- arithmetic the real class does not have
+    #
+    # retro/clips.py's timing functions are plain functions of a frame rate
+    # (the cog calls them that way: see RetroView.press_plan), so there is no
+    # wrapper for them on RetroEmulator. These three are the same functions
+    # with this fake's own rate filled in, purely so the tests that check a
+    # schedule can ask the emulator under test rather than repeating 59.7275.
+    def frames_for_ms(self, ms):
+        return frame_count(self.fps, float(ms) / 1000.0)
 
     def capture_step(self, clip_fps=15):
         return capture_step(self.fps, clip_fps)
@@ -161,10 +165,6 @@ class FakeEmulator:
     def advance(self, frames=1):
         self._require()
         self.frame += max(0, frames)
-
-    def press(self, button, hold_frames=12, release_frames=40):
-        self._require()
-        self.frame += hold_frames + release_frames
 
     def reset(self):
         """A power cycle: the machine starts over, the cartridge does not.
@@ -180,17 +180,16 @@ class FakeEmulator:
         self.resets += 1
         self.advance(1)
 
-    def record(self, frames=None, *, scale=2, fps=15, presses=None, clip_format="WEBP"):
+    def record(self, frames=None, *, scale=2, fps=15, presses=None):
         self._require()
         self.last_presses = list(presses or ())
-        self.last_format = clip_format
         self.frame += frames or 300
         if HAS_PILLOW:
             # A real, tiny animation rather than a sentinel, so a test can
             # open a clip and look at its last picture the way the channel
             # does. The frame count is the emulated frame number, so one clip
             # is still distinguishable from another.
-            return _tiny_animation(self.frame, clip_format)
+            return _tiny_animation(self.frame)
         return b"RIFF\0\0\0\0WEBPVP8X" + f"frame={self.frame}".encode().ljust(58, b"\0")
 
     def screenshot(self, scale=2):
@@ -577,16 +576,35 @@ def file_bytes(upload):
 def clip_bytes(files):
     """The bytes of the first attachment a send or an edit carried, or None.
 
-    This is how the tests read the clip that is on a message now. A session
-    holds no footage of its own -- there was a `RetroView.last_clip` once,
-    and before that a whole replay buffer -- so the message is the only
-    place the picture a player is looking at exists.
+    A session holds no footage of its own, so the message is the only place
+    the picture a player is looking at exists.
     """
     for upload in files or ():
         data = file_bytes(upload)
         if data:
             return data
     return None
+
+
+def history_is_consistent(view):
+    """The undo history's own invariants, in one place.
+
+    ``history_bytes`` is a running total kept beside a deque, so it can only
+    be wrong by drifting: this is the statement that it is exactly the sum of
+    what is in the deque and that both bounds hold. It used to be spelled out
+    in four different test files, which is three places for it to be spelled
+    out differently.
+
+    See RetroView._trim_history, UNDO_DEPTH and MAX_UNDO_BYTES.
+    """
+    from retro.RetroView import MAX_UNDO_BYTES, UNDO_DEPTH
+
+    assert view.history_bytes == sum(len(blob) for blob in view.history)
+    assert len(view.history) <= UNDO_DEPTH, len(view.history)
+    # One entry is always kept, even over the byte cap on its own: an Undo
+    # that cannot undo the press somebody just made is worse than the memory.
+    assert len(view.history) <= 1 or view.history_bytes <= MAX_UNDO_BYTES
+    return True
 
 
 #: Attributes that legitimately hold bytes which are not a picture: the undo
@@ -609,9 +627,7 @@ def footage_bytes(owner):
     """How many bytes of picture an object is holding in its own attributes.
 
     Deliberately attribute-*agnostic*, because the thing being guarded
-    against is a clip coming back under a new name: `RetroView` held a
-    replay buffer once (up to 8 MiB) and a single `last_clip` after that,
-    and the statement now is that it holds neither -- which only stays
+    against is a clip being kept under any name at all -- which only stays
     checked if the measurement does not name what it is looking for. See
     NOT_FOOTAGE for the one exception.
     """

@@ -53,28 +53,18 @@ HAS_PILLOW = importlib.util.find_spec("PIL") is not None
 # Files may also sit directly in the root, which is what a "just unzip the
 # buildbot downloads here" directory looks like.
 
-#: Logical ROM name -> paths this machine may already have it at. These are
-#: only consulted when RETRO_TEST_ASSETS is unset, so pointing that variable
-#: at an empty directory really does produce a run with no assets.
-LEGACY_ROMS = {
-    "ucity.gbc": ("/tmp/dl-ucity.gbc", "/tmp/pyboy-smoke/ucity.gbc"),
-    "dmg-acid2.gb": ("/tmp/pyboy-smoke/dmg-acid2.gb", "/tmp/roms/dmg-acid2.gb"),
-    "libbet.gb": ("/tmp/roms/libbet.gb",),
-    "nestest.nes": ("/tmp/roms/nestest.nes",),
-    "snes_rotzoom.sfc": ("/tmp/roms/snes_rotzoom.sfc",),
-    "pokemon.gb": ("/tmp/pyboy-smoke/dl-pokemon.gb",),
-}
-
-LEGACY_CORE_DIRS = ("/tmp/coretest",)
-
-
 class Assets:
-    """Where the cores and ROMs are, if they are anywhere."""
+    """Where the cores and ROMs are, if they are anywhere.
 
-    def __init__(self, roots, core_dirs, legacy_roms):
+    Only ``$RETRO_TEST_ASSETS`` (or ``test-assets/`` in the checkout) is ever
+    searched, and that is deliberate: ``core()`` hands what it finds straight
+    to ``dlopen``, so a search path anybody on the machine can write to --
+    ``/tmp``, which this used to fall back to -- is arbitrary code execution
+    during a test run.
+    """
+
+    def __init__(self, roots):
         self.roots = list(roots)
-        self.core_dirs = list(core_dirs)
-        self.legacy_roms = dict(legacy_roms)
 
     # -- lookup
     def core(self, name):
@@ -85,11 +75,6 @@ class Assets:
                 for candidate in (root / "cores" / filename, root / filename):
                     if candidate.is_file():
                         return candidate
-        for directory in self.core_dirs:
-            for filename in filenames:
-                candidate = Path(directory) / filename
-                if candidate.is_file():
-                    return candidate
         return None
 
     def rom(self, name):
@@ -98,9 +83,6 @@ class Assets:
             for candidate in (root / "roms" / name, root / name):
                 if candidate.is_file():
                     return candidate
-        for candidate in self.legacy_roms.get(name, ()):
-            if Path(candidate).is_file():
-                return Path(candidate)
         return None
 
     # -- lookup, or skip
@@ -121,11 +103,8 @@ class Assets:
 def assets():
     """Where this machine keeps the cores and ROMs the slow tests need."""
     configured = os.environ.get("RETRO_TEST_ASSETS")
-    if configured:
-        # An explicit assets directory is the whole story: no /tmp fallbacks,
-        # so `RETRO_TEST_ASSETS=/empty pytest` is an honest "no assets" run.
-        return Assets([Path(configured).expanduser()], [], {})
-    return Assets([REPO_ROOT / "test-assets"], LEGACY_CORE_DIRS, LEGACY_ROMS)
+    root = Path(configured).expanduser() if configured else REPO_ROOT / "test-assets"
+    return Assets([root])
 
 
 @pytest.fixture(scope="session")

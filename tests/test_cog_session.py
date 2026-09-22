@@ -7,8 +7,8 @@ tests/fakes.py. Nothing here needs a libretro core.
 import asyncio
 import os
 import re
+import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -24,6 +24,7 @@ from .fakes import (  # noqa: E402
     FakeEmulator,
     FakeUser,
     footage_bytes,
+    history_is_consistent,
 )
 
 # -- Defaults -----------------------------------------------------------------
@@ -136,7 +137,7 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
     # now do no more than the console's own A button -- is gone.
     vanishing = retro.interaction(view, message=view.message)
     await view._press(vanishing, "a")
-    assert view.repeat_taps == 1 and not view.has_repeat_button
+    assert view.repeat_taps == 1
     assert retro.control(view, "repeat") is None
     # ...and that press says where it went, once. A control that silently
     # disappears reads as removed just as surely as a greyed-out one does,
@@ -166,15 +167,6 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
     assert [c.label for c in view.children if c.row == 2] == [
         "Start", "Select", "Wait", "A x3", "Undo"
     ]
-
-
-async def test_nothing_of_the_stop_button_is_left_in_the_view(retro):
-    await retro.install_cores("gambatte")
-    view, _, _ = await retro.posted_game(8052, "stopless")
-    assert not hasattr(retro.viewmod, "_StopButton")
-    assert not hasattr(view, "stop_item")
-    assert not hasattr(view, "_stop")
-    assert not hasattr(view, "_sync_children")
 
 
 async def test_can_stop_is_kept_for_retrosleep_reboot_and_end(retro):
@@ -376,10 +368,9 @@ async def test_every_button_is_held_for_the_configured_time(retro, held):
     a_hold = view._schedule(emulator, "a", 1)[0][2]
     up_hold = view._schedule(emulator, "up", 1)[0][2]
     assert a_hold == emulator.frames_for_ms(160)
-    # The fix for "pressing right in Pokemon walks two tiles": a direction is
+    # The fix for "pressing right walks two tiles": a direction is
     # held for exactly as long as a face button now.
     assert up_hold == a_hold
-    assert not hasattr(retro.viewmod, "DPAD_HOLD_MULTIPLIER")
     for field in ("up", "down", "left", "right", "a", "b", "start", "select"):
         if field in set(view.system.fields):
             assert view._schedule(emulator, field, 1)[0][2] == emulator.frames_for_ms(view.hold_ms)
@@ -432,9 +423,12 @@ async def test_a_schedule_never_outlasts_a_short_clip(retro, held):
 async def test_a_press_reaches_the_emulator_as_a_webp_clip_schedule(retro, held):
     view, _, _ = held
     emulator = view.emulator
-    view.run_press("a")
+    clip = view.run_press("a")
     assert emulator.last_presses == view._schedule(emulator, "a", 1)
-    assert emulator.last_format == "WEBP"
+    # Animated WebP is the only format a clip is ever encoded in; see
+    # CLIP_EXTENSION in retro/clips.py for why GIF is not worth having back.
+    assert clip[:4] == b"RIFF" and clip[8:12] == b"WEBP"
+    assert view.screen_filename.endswith(".webp")
 
 
 async def test_retroset_hold_stores_clamps_and_reaches_live_sessions(retro, held):
@@ -680,8 +674,6 @@ async def test_the_clip_put_on_the_message_is_a_real_animation(retro):
     clip = interaction.clip()
     assert isinstance(clip, bytes) and clip
     assert clip[:4] == b"RIFF" and clip[8:12] == b"WEBP"
-    assert not hasattr(view, "last_clip"), "the session kept a copy of the clip"
-    assert not hasattr(view, "remember_clip")
 
 
 async def test_a_save_state_is_written_every_third_press(retro):
@@ -844,12 +836,24 @@ async def test_two_simultaneous_presses_both_happen_one_edit_each(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9011, "race")
     original = view.run_press
+    original_enqueue = view.enqueue_press
+    # The first press's worker thread is held until the second click has
+    # actually been taken down, which is what makes this a race rather than
+    # two presses in sequence -- and is exactly what four tenths of a second
+    # of `time.sleep` was buying, less reliably and 400ms more slowly.
+    queued = threading.Event()
 
     def slow(field, repeat=1):
-        time.sleep(0.4)
+        assert queued.wait(10), "the second press never arrived"
         return original(field, repeat)
 
+    def enqueue(*args, **kwargs):
+        accepted = original_enqueue(*args, **kwargs)
+        queued.set()
+        return accepted
+
     view.run_press = slow
+    view.enqueue_press = enqueue
     first = retro.interaction(
         view, user=FakeUser(uid=21, name="Rob"), message=view.message
     )
@@ -860,6 +864,7 @@ async def test_two_simultaneous_presses_both_happen_one_edit_each(retro):
         await asyncio.gather(view._press(first, "a"), view._press(second, "b"))
     finally:
         view.run_press = original
+        view.enqueue_press = original_enqueue
 
     # One defer and one edit each: "one press, one visible change" holds for
     # both of them rather than for whichever won the race.
@@ -1440,61 +1445,20 @@ async def test_two_people_pressing_are_told_apart(retro):
     ]
 
 
-# -- Nothing of the Replay button is left --------------------------------------
-
-
-def test_the_replay_button_and_its_buffer_are_gone(retro):
-    """Removed in full, not merely hidden: it saved 8 MiB a session.
-
-    A session used to keep its recent clips so Replay could stitch the last
-    fifteen seconds back together. All of it went -- the button, its
-    custom_id, its emoji, the buffer and the stitching -- so this is a list
-    of names that must not come back rather than a behaviour check.
-    """
-    for name in (
-        "_ReplayButton",
-        "REPLAY_SECONDS",
-        "MAX_REPLAY_BYTES",
-        "MAX_REPLAY_CLIPS",
-        "MAX_REPLAY_FRAMES",
-        "concatenate_clips",
-    ):
-        assert not hasattr(retro.viewmod, name), name
-    for name in (
-        "REPLAY_SECONDS",
-        "MAX_REPLAY_BYTES",
-        "MAX_REPLAY_CLIPS",
-        "MAX_REPLAY_FRAMES",
-        "concatenate_clips",
-        "decode_clip",
-    ):
-        assert not hasattr(retro.clipsmod, name), name
-        assert not hasattr(retro.emumod, name), name
-        assert name not in retro.emumod.__all__, name
-    assert not hasattr(retro.sysmod, "REPLAY_EMOJI")
-    # The single clip that replaced the buffer is gone too. Nothing read it:
-    # `_show` is handed the clip it is about to post, so keeping a copy on
-    # the session was bookkeeping and a test hook and nothing else.
-    assert not hasattr(retro.viewmod.RetroView, "remember_clip")
-    for module in (retro.viewmod, retro.cogmod):
-        source = Path(module.__file__).read_text()
-        # The comments may say it was removed and why; nothing may set it.
-        assert "self.last_clip =" not in source, module.__name__
-        assert "view.last_clip =" not in source, module.__name__
+# -- A session holds no footage -----------------------------------------------
 
 
 async def test_a_session_holds_no_footage_at_all(retro):
-    """Not a buffer of clips, and not one clip either.
+    """A press builds a clip, uploads it and drops it.
 
-    The replay buffer went with the Replay button, and the single
-    ``last_clip`` that replaced it went too: nothing read it. So a press
-    builds a clip, uploads it and drops it, and twenty presses leave the
-    session holding no bytes of picture whatsoever.
+    Measured rather than asserted by name (see fakes.footage_bytes), because
+    the thing being guarded against is a clip being kept under *any* name:
+    twenty presses must leave the session holding no bytes of picture
+    whatsoever. The one attribute that legitimately holds bytes is the undo
+    history, which is compressed save states and has its own bounds.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9027, "oneclip")
-    for gone in ("clips", "buffered_seconds", "_trim_clips", "last_clip", "remember_clip"):
-        assert not hasattr(view, gone), gone
 
     posted = []
     for _ in range(20):
@@ -1594,14 +1558,14 @@ async def test_the_undo_button_stays_clickable_with_nothing_to_undo(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9203, "deadundo")
     button = retro.control(view, "undo")
-    assert not button.disabled and not view.can_undo
+    assert not button.disabled and not view.history
 
     await view._press(retro.interaction(view, message=view.message), "a")
-    assert not button.disabled and view.can_undo
+    assert not button.disabled and view.history
 
     await undo(retro, view)
     assert not button.disabled, "still clickable once the history is spent"
-    assert not view.can_undo
+    assert not view.history
 
 
 async def test_an_undo_with_nothing_to_undo_says_so_and_touches_nothing(retro):
@@ -1635,8 +1599,7 @@ async def test_a_session_restored_after_a_restart_has_nothing_to_undo(retro):
     await cog2._restore_sessions()
     restored = cog2.sessions[channel.id]
 
-    assert not restored.history and not restored.can_undo
-    assert restored.history_bytes == 0
+    assert not restored.history and restored.history_bytes == 0
     button = next(
         c for c in restored.children
         if c.custom_id == f"{retro.viewmod.CUSTOM_ID_PREFIX}:undo"
@@ -1701,7 +1664,7 @@ async def test_the_history_is_bounded_by_its_depth(retro):
         await view._press(retro.interaction(view, message=view.message), "a")
 
     assert len(view.history) == retro.viewmod.UNDO_DEPTH
-    assert view.history_bytes == sum(len(blob) for blob in view.history)
+    assert history_is_consistent(view)
 
 
 async def test_the_history_is_bounded_by_bytes_as_well_as_by_count(
@@ -1721,11 +1684,11 @@ async def test_the_history_is_bounded_by_bytes_as_well_as_by_count(
         await view._press(retro.interaction(view, message=view.message), "a")
     assert len(view.history) < retro.viewmod.UNDO_DEPTH
     assert view.history_bytes <= one * 2 + 1
-    assert view.history_bytes == sum(len(blob) for blob in view.history)
+    assert history_is_consistent(view)
 
     # A single state larger than the whole cap keeps exactly one entry: an
     # Undo that cannot undo the press somebody just made is worse than the
-    # memory. Same compromise the replay buffer makes.
+    # memory.
     monkeypatch.setattr(retro.viewmod, "MAX_UNDO_BYTES", 1)
     for _ in range(3):
         await view._press(retro.interaction(view, message=view.message), "a")
@@ -1854,7 +1817,7 @@ async def test_a_core_that_cannot_save_states_costs_undo_and_nothing_else(retro)
 
     assert interaction.kinds() == ["response.defer", "edit_original_response"]
     assert interaction.log[-1][1]["n_attachments"] == 1, "the press still worked"
-    assert not view.history and not view.can_undo
+    assert not view.history
     assert not retro.control(view, "undo").disabled, "still clickable"
 
 
@@ -1976,7 +1939,7 @@ async def test_a_session_is_restored_from_config_after_a_restart(retro):
     # undo history. Undo is still *clickable*, because a dead unexplained
     # control after every restart is what read as "Undo is broken".
     assert footage_bytes(restored) == 0
-    assert not restored.can_undo
+    assert not restored.history
     assert not retro.control(restored, "undo").disabled
     # ...and nothing is queued either: the queue is per-process intent.
     assert not restored.queue

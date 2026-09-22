@@ -85,18 +85,24 @@ def pre_rename(retro):
 
 def test_the_cog_class_is_called_retro(retro):
     assert retro.cogmod.Retro.__name__ == "Retro"
-    assert not hasattr(retro.cogmod, "RetroCog")
     assert retro.cogmod.LEGACY_COG_NAME == LEGACY
 
 
 def test_the_load_bearing_identifiers_did_not_move(retro):
-    # Both are baked into things already on Discord or already on disk, and
-    # both have a comment in the source saying so.
+    """The two strings baked into data that already exists.
+
+    A new value for either silently hands every existing install an empty
+    configuration (the Config identifier) or orphans every live game in
+    every channel (the custom_id prefix Discord routes clicks by).
+    """
     assert retro.viewmod.CUSTOM_ID_PREFIX == "libretro"
-    identifier = sum(b for b in b"robloach-cogs/pyboy")
-    assert identifier == 1925
-    source = open(retro.cogmod.__file__).read()
-    assert "114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98+111+121" in source
+    assert retro.migrationmod.CONFIG_IDENTIFIER == sum(b"robloach-cogs/pyboy") == 1925
+    # ...and it is one constant, so the cog's own Config handle and the
+    # legacy namespace's cannot be given different numbers.
+    assert retro.cogmod.CONFIG_IDENTIFIER is retro.migrationmod.CONFIG_IDENTIFIER
+    for module in (retro.cogmod, retro.migrationmod):
+        source = open(module.__file__).read()
+        assert source.count("identifier=CONFIG_IDENTIFIER") == 1, module.__name__
 
 
 # -- Moving the data directory ------------------------------------------------
@@ -357,18 +363,25 @@ def test_red_really_does_offer_both_escape_hatches():
 
 
 @pytest.mark.redbot
-def test_reds_json_driver_keeps_its_store_inside_the_data_folder(retro):
-    # This is *why* _migrate_data_directory has to skip one filename: with the
-    # default driver a cog's data folder and its Config namespace are the same
-    # folder, so a naive "move everything" would drop the old namespace's
-    # settings straight on top of the new one's.
-    import inspect
+def test_reds_json_driver_keeps_its_store_inside_the_data_folder(retro, tmp_path):
+    """Why _migrate_data_directory has to skip exactly one filename.
 
-    from redbot.core._drivers import json as json_driver
+    With Red's default driver a cog's data folder and its Config namespace
+    are the *same folder*, so a naive "move everything" would drop the old
+    namespace's settings straight on top of the new one's. Asked of the
+    driver rather than read out of the text of ``redbot.core._drivers.json``,
+    which is a private module whose wording is nobody's contract.
+    """
+    from redbot.core._drivers import JsonDriver
+    from redbot.core.data_manager import cog_data_path
 
-    source = inspect.getsource(json_driver)
-    assert f'file_name_override: str = "{retro.cogmod.CONFIG_STORE_FILENAME}"' in source
-    assert "cog_data_path(raw_name=cog_name)" in source
+    driver = JsonDriver("Retro", "1925", data_path_override=tmp_path)
+    assert driver.data_path.name == retro.cogmod.CONFIG_STORE_FILENAME
+    assert driver.data_path.parent == tmp_path
+    # ...and with no override it really is the cog's own data directory.
+    assert JsonDriver("Retro", "1925").data_path.parent == cog_data_path(
+        raw_name="Retro"
+    )
 
 
 @pytest.mark.redbot

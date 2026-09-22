@@ -10,21 +10,17 @@ Every core listed here is BIOS-free (it boots a game with nothing but the ROM)
 and is published for linux/x86_64, linux/aarch64, macOS and Windows on the
 libretro buildbot.
 
-Two further conditions a new console has to meet, both learned the hard way:
+Two further conditions a new console has to meet, both learned the hard way,
+and both the reason a console somebody expects to find here is not:
 
-* **It must not ask for a screen rotation.** libretro.py's software video
-  driver rotates a frame by 90 degrees from the wrong starting offset --
-  ``(width - 4) * height`` where ``(width - 1) * height`` is meant -- so a
-  core that calls ``RETRO_ENVIRONMENT_SET_ROTATION`` with 90 degrees gets a
-  picture whose rows are cyclically shifted and partly overwritten, on both
-  libretro.py 0.6.0 and 0.11.1. There is no fast path and no slow path that
-  survives it, so the WonderSwan (``mednafen_wswan``), which rotates for a
-  good half of its library, is deliberately absent. An emulator test asserts
-  that no core here reports a rotation after boot.
+* **It must not ask for a screen rotation.** libretro.py rotates a frame by
+  90 degrees from the wrong offset and corrupts it (see FAST_ROTATIONS in
+  retro/clips.py); there is no path, fast or slow, that survives it. The
+  WonderSwan (``mednafen_wswan``) rotates for half its library and is
+  therefore absent. An emulator test asserts no core here reports a rotation.
 * **Its controls must fit one d-pad and the grid below.** The Virtual Boy
   (``mednafen_vb``) is out because its defining control scheme is *two*
-  d-pads -- its own input descriptors are "Left D-Pad Up" and "Right D-Pad
-  Up" and so on -- which this layout cannot express.
+  d-pads, which this layout cannot express.
 """
 
 import sys
@@ -36,14 +32,12 @@ __all__ = [
     "System",
     "SYSTEMS",
     "CORES",
-    "EXTENSIONS",
     "core_suffix",
     "core_filename",
     "system_for_core",
     "system_for_extension",
     "system_by_key",
     "core_name_from_filename",
-    "extensions_for_core",
     "DPAD",
     "SPACER",
     "SPACER_LABEL",
@@ -267,8 +261,8 @@ DOWN = Button("", "down", emoji="\N{DOWNWARDS BLACK ARROW}\N{VARIATION SELECTOR-
 LEFT = Button("", "left", emoji="\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}")
 RIGHT = Button("", "right", emoji="\N{BLACK RIGHTWARDS ARROW}\N{VARIATION SELECTOR-16}")
 
-# Kept in the historical Up/Down/Left/Right order; RetroView reads it for the
-# set of fields that count as a direction.
+#: The four directions, for :func:`all_button_emoji` -- which is what holds
+#: every emoji this cog can put on a button to validate_emoji() at import.
 DPAD: typing.Tuple[Button, ...] = (UP, DOWN, LEFT, RIGHT)
 
 
@@ -598,10 +592,6 @@ for _system in SYSTEMS:
         _BY_EXTENSION[_extension] = _system
 del _system, _extension
 
-# Every extension `[p]retro` will accept, with the leading dot, sorted so the
-# help text reads the same every time.
-EXTENSIONS: typing.Tuple[str, ...] = tuple(sorted(f".{e}" for e in _BY_EXTENSION))
-
 
 def system_for_extension(extension: str) -> typing.Optional[System]:
     """Pick the console for a file extension (with or without the dot)."""
@@ -621,14 +611,6 @@ def system_for_core(core: str) -> typing.Optional[System]:
         if system.core == core:
             return system
     return None
-
-
-def extensions_for_core(core: str) -> typing.Tuple[str, ...]:
-    found: typing.List[str] = []
-    for system in SYSTEMS:
-        if system.core == core:
-            found.extend(f".{e}" for e in system.extensions)
-    return tuple(sorted(found))
 
 
 def core_suffix() -> str:
