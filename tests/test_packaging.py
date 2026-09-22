@@ -107,6 +107,59 @@ def test_the_emulator_and_tables_import_with_nothing_installed():
                 assert imported.split(".")[0] in sys.stdlib_module_names, (name, imported)
 
 
+def string_literals_outside_docstrings(path):
+    """Every ``str`` constant in one file that is not a docstring.
+
+    A docstring is the one place `[p]` belongs: Red rewrites it there, for
+    command help. Nowhere else -- so an f-string's literal parts count too,
+    which they do here because ast.walk reaches the Constant nodes inside a
+    JoinedStr.
+    """
+    tree = ast.parse(path.read_text())
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ) and ast.get_docstring(node, clean=False) is not None:
+            docstrings.add(id(node.body[0].value))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        ):
+            yield node.lineno, node.value
+
+
+def test_no_sent_string_carries_a_literal_command_prefix():
+    """`[p]` is a docstring convention, not a substitution Red does anywhere.
+
+    Red rewrites `[p]` in a command's *help text* -- that is the whole of it.
+    A string the cog builds and sends reaches the channel exactly as
+    written, so `[p]retro <name>` is an instruction to type a prefix nobody
+    has. Three sent strings used to do this (the disk budget's refusal, the
+    Resume button's "the ROM has been cleaned up" reply and the save
+    importer's), and a fourth, `[p]retroset version`'s footer, was found
+    while fixing them.
+
+    This is a source-level test rather than a behavioural one on purpose:
+    the mistake is cheap to make, invisible until somebody reads the
+    message, and reachable from paths (a button click, a background write)
+    that no test necessarily walks. Every caller now passes a real prefix --
+    `ctx.clean_prefix`, or `Retro._prefix_for` where there is no context --
+    so the literal has no remaining honest use outside a docstring.
+    """
+    offenders = []
+    for path in sorted((REPO_ROOT / "retro").glob("*.py")):
+        for lineno, value in string_literals_outside_docstrings(path):
+            if "[p]" in value:
+                offenders.append(f"{path.name}:{lineno}: {value[:70]!r}")
+    assert not offenders, (
+        "these strings are not docstrings, so Red will not substitute their "
+        f"`[p]`: {offenders}"
+    )
+
+
 def test_the_readme_lists_the_cog():
     assert "[Retro](retro)" in (REPO_ROOT / "README.md").read_text()
 

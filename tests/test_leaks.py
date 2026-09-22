@@ -38,6 +38,10 @@ from discord.ui.view import ViewStore  # noqa: E402
 from .fakes import footage_bytes  # noqa: E402
 
 C = load_standalone("retro_clips_for_leaks", "clips.py")
+#: emulator.py on its own too: the three silent-failure tests in section
+#: 5b drive RetroEmulator.stop(), _drain_audio() and probe_core_options()
+#: with stand-ins rather than a real core.
+E = load_standalone("retro_emulator_for_leaks", "emulator.py")
 
 
 # -- A real discord.py view store behind the fake bot -------------------------
@@ -692,6 +696,51 @@ async def test_a_rom_the_core_will_not_digest_leaves_nothing_behind(retro, when)
     assert fine is not None and fine.live
 
 
+async def test_a_pruned_rom_frees_the_core_of_the_game_it_was_playing(retro):
+    """The other way into _drop_session_view, and the least obvious one.
+
+    ``_forget_pruned_roms`` drops the session record of a channel whose
+    cached ROM the disk budget has just deleted -- of a channel that may be
+    playing it *right now*, because a live session only protects its own
+    ROM. The record goes, the view leaves ``cog.sessions``, and the core it
+    was holding used to go with it: unreachable, unstoppable, and occupying
+    the single MAX_LIVE_EMULATORS slot for the life of the process.
+    """
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9807, "prunedunderneath")
+    emulator = view.emulator
+    assert emulator is not None and emulator.started
+    played = emulator.frame
+
+    await retro.cog._forget_pruned_roms([view.rom_filename])
+
+    assert channel.id not in retro.cog.sessions
+    assert not emulator.started, (
+        "pruning a ROM out from under a live game left its core loaded"
+    )
+    assert view.emulator is None
+    # The progress was banked first, which is the rule for every path that
+    # frees a core: the ROM is re-downloadable, the save state is not.
+    state = retro.cog._state_path(channel.id, view.slug)
+    assert state.read_bytes() == f"STATE:{played}".encode().ljust(64, b"\0")
+
+
+async def test_a_channel_the_bot_can_no_longer_see_frees_its_core_too(retro):
+    """The startup sweep, which is the same drop reached from a third place."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9808, "unreachable")
+    emulator = view.emulator
+    assert emulator.started
+    # The bot is ready and this channel is not in its cache any more, which
+    # is what _channel_is_gone is allowed to act on.
+    retro.bot.channels.pop(channel.id, None)
+
+    await retro.cog._forget_unreachable_sessions()
+
+    assert channel.id not in retro.cog.sessions
+    assert not emulator.started, "the startup sweep left a libretro core loaded"
+
+
 async def test_many_starts_and_stops_leave_no_emulator_running(retro):
     """The ordinary path, repeated, as a backstop for all of the above."""
     await retro.install_cores("gambatte")
@@ -703,6 +752,197 @@ async def test_many_starts_and_stops_leave_no_emulator_running(retro):
         retro.cog.sessions.pop(channel.id, None)
     running = [e for e in fake.instances if e.started]
     assert not running, f"{len(running)} of {len(fake.instances)} cores are still loaded"
+
+
+# -- 5b. The silent failures that turn the safety machinery off ----------------
+#
+# Three `except: pass`-shaped handlers that each disabled something this file
+# is about, with nothing in the log to say they had. They are grouped here
+# because the leak they permit is the point of them, not because they share
+# any code.
+
+
+def test_a_core_that_will_not_unload_is_logged_rather_than_swallowed(caplog):
+    """The one failure in the emulator that must be loud.
+
+    ``stop()`` drops the session, the drivers and ``started`` before asking
+    libretro.py to unload, so an unload that fails leaves a *running* core
+    with nothing pointing at it while the cog believes its single
+    MAX_LIVE_EMULATORS slot is free. It used to be ``except Exception:
+    pass``, which is to say the one thing that makes the leak invisible.
+    """
+    import logging
+
+    class Wedged:
+        def __exit__(self, *exc):
+            raise RuntimeError("retro_deinit went wrong")
+
+    emulator = E.RetroEmulator("nowhere/gambatte_libretro.so", "nowhere/game.gb")
+    emulator._session = Wedged()
+    emulator.started = True
+
+    with caplog.at_level(logging.DEBUG, logger="red.robloach.retro.emulator"):
+        emulator.stop()  # must not raise: it is on every teardown path
+
+    assert not emulator.started
+    shouted = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR and "did not unload" in record.getMessage()
+    ]
+    assert shouted, [(r.levelname, r.getMessage()) for r in caplog.records]
+    assert shouted[0].exc_info, "the traceback is the useful half"
+
+
+def test_one_bad_audio_drain_does_not_switch_the_drain_off_for_ever(caplog):
+    """The leak it exists to prevent is 176 KiB per emulated second.
+
+    ``_drain_audio`` used to answer any exception by setting
+    ``self._audio_buffer = None``, which permanently disabled itself -- with
+    no log line -- and quietly restored the whole leak. One failed ``del`` is
+    not evidence that the next one will fail, and the cost of trying again is
+    an attribute read.
+    """
+    import logging
+
+    class Awkward:
+        def __init__(self):
+            self.attempts = 0
+
+        def __delitem__(self, key):
+            self.attempts += 1
+            raise RuntimeError("not the array we thought it was")
+
+    emulator = E.RetroEmulator("nowhere/gambatte_libretro.so", "nowhere/game.gb")
+    buffer = Awkward()
+    emulator._audio_buffer = buffer
+
+    with caplog.at_level(logging.DEBUG, logger="red.robloach.retro.emulator"):
+        for _ in range(240):  # four emulated seconds of frames
+            emulator._drain_audio()
+
+    assert buffer.attempts == 240, (
+        "the drain gave up after one failure, restoring the audio leak"
+    )
+    assert emulator._audio_buffer is buffer
+    said = [r for r in caplog.records if "audio buffer" in r.getMessage()]
+    assert len(said) == 1, (
+        "the failure is reported exactly once a session: silently is a "
+        f"hidden leak, and once a frame is its own flood ({len(said)} lines)"
+    )
+    assert said[0].levelno >= logging.WARNING
+
+
+def test_a_core_whose_init_explodes_is_still_deinitialised(monkeypatch, tmp_path):
+    """``probe_core_options`` only skips deinit when retro_init never ran.
+
+    The flag used to be set *after* ``init()`` returned, so a retro_init that
+    raised part of the way through -- a core that has begun claiming global
+    state -- was walked away from still initialised. That is precisely the
+    state MAX_LIVE_EMULATORS exists to prevent.
+
+    The other half of the asymmetry is deliberate and is asserted below:
+    ``retro_deinit`` on a core whose ``retro_init`` never ran is not defined
+    by the libretro API (``Core.deinit`` documents that it does not check),
+    and a core that frees in deinit what it allocates in init would be
+    freeing a pointer it never set.
+    """
+    libretro = pytest.importorskip("libretro")
+    core_file = tmp_path / "wedged_libretro.so"
+    core_file.write_bytes(b"\x7fELF not really a core")
+    calls = []
+
+    class Explodes:
+        def __init__(self, path):
+            calls.append("dlopen")
+
+        def set_environment(self, environment):
+            calls.append("set_environment")
+
+        def init(self):
+            calls.append("init")
+            raise RuntimeError("retro_init fell over half way through")
+
+        def deinit(self):
+            calls.append("deinit")
+
+    monkeypatch.setattr(libretro, "Core", Explodes)
+    with pytest.raises(E.EmulatorError):
+        E.probe_core_options(core_file)
+    assert calls == ["dlopen", "set_environment", "init", "deinit"], calls
+
+
+def test_a_probe_whose_deinit_fails_says_so_loudly(monkeypatch, tmp_path, caplog):
+    """Same reasoning as RetroEmulator.stop: a core that stayed loaded.
+
+    It was a bare ``log.warning``, which is not what "one of the two states
+    this cog is built to avoid has just happened" deserves.
+    """
+    import logging
+
+    libretro = pytest.importorskip("libretro")
+    core_file = tmp_path / "stubborn_libretro.so"
+    core_file.write_bytes(b"\x7fELF not really a core")
+
+    class Stubborn:
+        def __init__(self, path):
+            pass
+
+        def set_environment(self, environment):
+            pass
+
+        def init(self):
+            pass
+
+        def deinit(self):
+            raise RuntimeError("retro_deinit went wrong")
+
+    monkeypatch.setattr(libretro, "Core", Stubborn)
+    with caplog.at_level(logging.DEBUG, logger="red.robloach.retro.emulator"):
+        E.probe_core_options(core_file)  # must not raise: it read its options
+
+    shouted = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        and "did not deinitialise" in record.getMessage()
+    ]
+    assert shouted, [(r.levelname, r.getMessage()) for r in caplog.records]
+
+
+def test_a_core_that_never_reached_init_is_not_deinitialised(monkeypatch, tmp_path):
+    """The comment now matches the code, and this is which way round.
+
+    Unloading a core in this cog means retro_deinit plus dropping the
+    wrapper; it never means dlclose, because libretro.py never unmaps a core
+    (``Session.__exit__`` is deinit and ``del self._core``) and ctypes does
+    not dlclose a CDLL when it is collected either. A merely-mapped shared
+    object holds no emulation state, so it is not the hazard; calling
+    retro_deinit on a core that was never initialised is.
+    """
+    libretro = pytest.importorskip("libretro")
+    core_file = tmp_path / "early_libretro.so"
+    core_file.write_bytes(b"\x7fELF not really a core")
+    calls = []
+
+    class FailsEarly:
+        def __init__(self, path):
+            calls.append("dlopen")
+
+        def set_environment(self, environment):
+            calls.append("set_environment")
+            raise RuntimeError("the core rejected the environment callback")
+
+        def init(self):  # pragma: no cover - never reached
+            calls.append("init")
+
+        def deinit(self):
+            calls.append("deinit")
+
+    monkeypatch.setattr(libretro, "Core", FailsEarly)
+    with pytest.raises(E.EmulatorError):
+        E.probe_core_options(core_file)
+    assert calls == ["dlopen", "set_environment"], calls
 
 
 # -- 6. Frames and images ------------------------------------------------------
@@ -990,6 +1230,15 @@ async def test_starting_a_forgotten_game_again_still_picks_up_its_save(retro):
 
 
 async def test_a_deleted_channel_is_forgotten_and_keeps_its_saves(retro):
+    """And frees the core the channel was holding.
+
+    The core is the part that cannot be skipped. Dropping the view out of
+    ``cog.sessions`` is exactly what puts a still-loaded core beyond reach:
+    ``_evict_locked`` only ever looks in ``sessions``, so nothing can
+    hibernate it, nothing can stop it, and MAX_LIVE_EMULATORS (which is 1)
+    now believes its one slot is free. The next channel to start a game
+    loads a second libretro core into a process that already has one.
+    """
     await retro.install_cores("gambatte")
     view, ctx, channel = await retro.posted_game(9902, "deletedchan")
     await view._press(retro.interaction(view, message=view.message), "a")
@@ -997,16 +1246,44 @@ async def test_a_deleted_channel_is_forgotten_and_keeps_its_saves(retro):
     retro.cog._sram_path(channel.id, view.slug).write_bytes(b"battery")
     saved = saves_of(retro, channel.id, view.slug)
     assert len(saved) == 2, saved
+    emulator = view.emulator
+    assert emulator is not None and emulator.started, "the game was not awake"
+    played = emulator.frame
 
     await retro.cog.on_guild_channel_delete(channel)
 
     assert channel.id not in retro.cog.sessions
     assert not await retro.cog.config.all_channels(), "the Config row survived"
     assert view.closed and view.is_finished(), "the view was not released"
+    # The whole point of this test. `started` is what RetroEmulator.stop()
+    # clears, so this is "the core was unloaded" and not merely "the view
+    # stopped pointing at it".
+    assert not emulator.started, (
+        "the libretro core was left loaded by a deleted channel, where "
+        "nothing can ever reach it again"
+    )
+    assert view.emulator is None, "the view still points at a freed core"
+    assert not any(e.started for e in retro.fakes["RetroEmulator"].instances), (
+        "a core is still running after the only channel playing was deleted"
+    )
+
     # Kept, deliberately: they are small, the disk budget prunes ROMs rather
     # than saves, and an archived thread is indistinguishable from a deleted
     # channel here. See the note above Retro._channel_is_gone.
-    assert saves_of(retro, channel.id, view.slug) == saved
+    assert set(saved) <= set(saves_of(retro, channel.id, view.slug))
+    # ...and the progress was banked on the way out, exactly as every other
+    # path that frees a core does it. Forgetting where a game was *posted*
+    # must never cost the channel how far it had got.
+    state = retro.cog._state_path(channel.id, view.slug)
+    assert state.read_bytes() == f"STATE:{played}".encode().ljust(64, b"\0"), (
+        "the save state was not written before the core was freed"
+    )
+
+    # And the slot really is free: another channel can start a game, which is
+    # the thing a leaked core silently breaks.
+    later, _, elsewhere = await retro.posted_game(9906, "afterwards")
+    assert later is not None and later.live
+    assert sum(1 for e in retro.fakes["RetroEmulator"].instances if e.started) == 1
 
 
 async def test_deleting_a_channel_that_never_played_writes_nothing(retro):
@@ -1197,3 +1474,172 @@ async def test_the_records_do_not_grow_with_the_channels_a_bot_has_seen(retro):
     # Twelve channels came and went and nobody's progress did.
     for channel_id, _first_slug, second_slug in slugs:
         assert retro.cog._state_path(channel_id, second_slug).is_file(), second_slug
+
+
+# -- 10. The disk budget's own leak -------------------------------------------
+#
+# ``_write_atomic`` writes ``<name>.tmp`` and renames it into place. Every
+# pruner in the cog skips a ``.tmp`` -- it is not a playable ROM and not a
+# save, so nothing is allowed to offer it or to delete it as if it were one --
+# while ``_data_usage`` counts it, because it really is bytes on the disk. So
+# an orphaned temporary file is budget nothing can ever reclaim: a 32 MiB ROM
+# write that died on a full disk used to cost 32 MiB of the bot's allowance
+# for good.
+
+
+def test_a_failed_write_leaves_no_temporary_file_behind(retro):
+    """The full disk, half way through. And it costs the budget nothing."""
+    import builtins
+
+    target = retro.cog._roms_dir() / "9980-doomed.gbc"
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    before = retro.cog._data_usage()["total"]
+    real_open = builtins.open
+
+    class FillsUp:
+        """A handle that writes half of what it is given and then gives up."""
+
+        def __init__(self, handle):
+            self.handle = handle
+
+        def write(self, data):
+            self.handle.write(bytes(data)[: len(data) // 2])
+            raise OSError(28, "No space left on device")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self.handle.__exit__(*exc)
+
+    def breaking_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        return FillsUp(handle) if str(path) == str(temporary) else handle
+
+    # Put back by hand rather than through monkeypatch, because this fixture
+    # shares its monkeypatch with the one that wires the cog up.
+    builtins.open = breaking_open
+    try:
+        with pytest.raises(OSError):
+            retro.cog._write_atomic(target, b"x" * 4096)
+    finally:
+        builtins.open = real_open
+
+    assert not temporary.exists(), "a partial write was left to rot"
+    assert not target.exists()
+    assert retro.cog._data_usage()["total"] == before, (
+        "the failed write took disk budget with it"
+    )
+
+
+def test_a_failed_rename_leaves_no_temporary_file_behind(retro, monkeypatch):
+    """The other half: the write worked and the rename did not."""
+    from pathlib import Path
+
+    target = retro.cog._state_path(9981, "doomed")
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    real = Path.replace
+
+    def refuse(self, other):
+        if self.suffix == ".tmp":
+            raise OSError(18, "Invalid cross-device link")
+        return real(self, other)
+
+    monkeypatch.setattr(Path, "replace", refuse)
+    with pytest.raises(OSError):
+        retro.cog._write_atomic(target, b"STATE:1".ljust(64, b"\0"), True)
+
+    assert not temporary.exists(), "a partial write was left to rot"
+
+
+def test_a_cancelled_write_leaves_no_temporary_file_behind(retro, monkeypatch):
+    """A cancelled task unwinding through the write leaves the same orphan.
+
+    Which is why the cleanup catches BaseException: CancelledError is not an
+    Exception, and `[p]unload retro` during a save is exactly the moment a
+    32 MiB ROM write is most likely to be interrupted.
+    """
+    from pathlib import Path
+
+    target = retro.cog._roms_dir() / "9982-cancelled.gbc"
+    temporary = target.with_suffix(target.suffix + ".tmp")
+
+    def cancel(self, other):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(Path, "replace", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        retro.cog._write_atomic(target, b"x" * 2048)
+
+    assert not temporary.exists()
+
+
+def test_the_orphans_of_an_earlier_run_are_swept_at_load(retro):
+    """``_write_atomic`` cannot clean up after SIGKILL, so the load does.
+
+    An orphan is invisible to every pruner and counted by the budget, so one
+    left by a killed process (or by a version of this cog from before the
+    cleanup existed) would sit there for the life of the install.
+    """
+    roms = retro.cog._roms_dir()
+    states = retro.cog._data_dir("states")
+    orphans = [
+        roms / "9983-killed.gbc.tmp",
+        states / "9983-killed.state.tmp",
+        states / "9983-killed.srm.tmp",
+    ]
+    for path in orphans:
+        path.write_bytes(b"x" * 1024)
+    keep = roms / "9983-real.gbc"
+    keep.write_bytes(b"y" * 1024)
+    state = retro.cog._state_path(9983, "real")
+    state.write_bytes(b"STATE:1")
+    before = retro.cog._data_usage()["total"]
+
+    freed = retro.cog._sweep_partial_writes()
+
+    assert freed == 3 * 1024, freed
+    assert not any(path.exists() for path in orphans)
+    assert keep.is_file() and state.is_file(), "the sweep took a real file"
+    assert retro.cog._data_usage()["total"] == before - freed
+
+
+async def test_cog_load_sweeps_the_orphans_itself(retro):
+    """The wiring, so the sweep is not a helper nobody calls."""
+    orphan = retro.cog._roms_dir() / "9984-killed.gbc.tmp"
+    orphan.write_bytes(b"x" * 2048)
+
+    cog, _bot = retro.make_cog()
+    try:
+        await cog.cog_load()
+    finally:
+        await cog.cog_unload()
+
+    assert not orphan.exists(), "cog_load did not sweep the data directory"
+
+
+def test_a_save_state_is_flushed_to_the_platter_before_it_is_renamed(retro, monkeypatch):
+    """The saves are the one thing here that exists nowhere else.
+
+    A ROM re-downloads and a core re-installs; the exact moment a channel had
+    reached does not come back, so the write the player cares about most pays
+    for an fsync. The re-downloadable files deliberately do not -- ``retro``
+    caches up to 32 MiB per game and five games per channel, and syncing all
+    of that would be paid on every start for nothing.
+    """
+    import os as os_module
+
+    synced = []
+    real = os_module.fsync
+    monkeypatch.setattr(
+        os_module, "fsync", lambda fd: (synced.append(fd), real(fd))[1]
+    )
+
+    retro.cog._write_atomic(
+        retro.cog._state_path(9985, "durable"), b"STATE:1".ljust(64, b"\0"), True
+    )
+    assert len(synced) == 1, "a save state was left in the page cache"
+
+    synced.clear()
+    retro.cog._write_atomic(retro.cog._roms_dir() / "9985-durable.gbc", b"x" * 4096)
+    assert synced == [], "a re-downloadable ROM paid for an fsync"

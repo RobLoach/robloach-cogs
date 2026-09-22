@@ -483,9 +483,19 @@ class FakeBot:
         #: cog's life and the cog must not mistake an empty cache for a pile
         #: of deleted channels; see ``Retro._channel_is_gone``.
         self.ready = True
+        #: What ``get_valid_prefixes`` answers. The same ``!`` FakeContext
+        #: hands out as ``clean_prefix``, so a reply written from a button
+        #: click and one written from a command agree. Red's own list can
+        #: hold several, and with ``--mentionable`` the bot's mention comes
+        #: first; a test that cares sets this.
+        self.prefixes = ["!"]
 
     async def is_owner(self, user):
         return user.id == 1
+
+    async def get_valid_prefixes(self, guild=None):
+        """Red's own helper: the prefixes that work, DMs if guild is None."""
+        return list(self.prefixes)
 
     def is_ready(self):
         return self.ready
@@ -704,12 +714,16 @@ class FakeFollowup:
 
 
 class FakeInteraction:
-    def __init__(self, viewmod, view, user=None, message=None):
+    def __init__(self, viewmod, view, user=None, message=None, guild=None):
         self.viewmod = viewmod
         self.view = view
         self.user = user or FakeUser()
         self.message = message
         self.channel_id = view.channel_id
+        # discord.Interaction carries the guild it was raised in, which is
+        # what a reply needs to look the bot's prefix up with; see
+        # Retro._prefix_for.
+        self.guild = guild or types.SimpleNamespace(id=getattr(view, "guild_id", None))
         self.log = []
         self.response = FakeResponse(self)
         self.followup = FakeFollowup(self)

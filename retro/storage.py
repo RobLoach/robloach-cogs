@@ -12,6 +12,7 @@ Nothing in here talks to Discord.
 
 import asyncio
 import logging
+import os
 import re
 import typing
 from pathlib import Path
@@ -251,18 +252,109 @@ class StorageMixin(MixinMeta):
         when the live file is not there (see :func:`RetroView.restore_into`).
         Only the saves ask for this: a cached ROM or a downloaded core is
         re-fetchable and a second copy of it is just disk.
+
+        ``keep_backup`` is also what decides whether the write is *flushed*
+        to the platter before the rename. It is the saves that ask for it and
+        only the saves that are worth it: a save state is the one file here
+        that exists nowhere else -- a ROM re-downloads, a core re-installs,
+        but the exact moment a channel had reached does not come back -- and a
+        state is a few hundred kilobytes, written every
+        SAVE_STATE_EVERY_PRESSES presses and when a game sleeps, against a
+        clip that costs a second of emulation to encode. The directory entry
+        is deliberately *not* flushed as well: doubling the syncs would buy
+        only the difference between "the rename is durable now" and "the
+        rename is durable at the next commit", and either way the file at
+        ``path`` is a whole save state rather than half of one.
+
+        The temporary file is removed on every way out that is not a
+        successful rename. Nothing else can: every pruner in this cog skips a
+        ``.tmp`` (it is not a game and not a save), while ``_data_usage``
+        counts one -- so a 32 MiB ROM write that died on a full disk used to
+        take 32 MiB of the disk budget with it, permanently, and the only cure
+        was somebody deleting the file by hand. See _sweep_partial_writes for
+        the ones left behind by a process that was killed outright.
         """
         temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_bytes(data)
-        if keep_backup:
+        try:
+            with open(temporary, "wb") as handle:
+                handle.write(data)
+                if keep_backup:
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            if keep_backup:
+                try:
+                    # replace(), not a copy: a rename is atomic and costs
+                    # nothing, so the previous generation is never
+                    # half-written either.
+                    path.replace(cls._backup_path(path))
+                except FileNotFoundError:
+                    # Nothing to rotate. The first save of a new game.
+                    pass
+            temporary.replace(path)
+        except BaseException:
+            # BaseException, not OSError: a cancelled task unwinding through
+            # here leaves exactly the same orphan behind as a failed write,
+            # and the orphan is the thing being cleaned up.
             try:
-                # replace(), not a copy: a rename is atomic and costs nothing,
-                # so the previous generation is never half-written either.
-                path.replace(cls._backup_path(path))
-            except FileNotFoundError:
-                # Nothing to rotate. The first save of a new game.
-                pass
-        temporary.replace(path)
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                log.warning(
+                    "Could not clean up the partial write %s; it will count "
+                    "against the disk budget until the next cog load.",
+                    temporary,
+                    exc_info=True,
+                )
+            raise
+
+    def _sweep_partial_writes(self) -> int:
+        """
+        Delete the ``.tmp`` files a killed process left behind. Blocking.
+
+        Returns how many bytes were reclaimed. _write_atomic cleans up after
+        itself now, but it cannot clean up after ``SIGKILL``, a power cut, or
+        any version of this cog that shipped before it did -- and an orphan
+        is invisible to everything except the disk budget, which counts it.
+        So the data directory is swept once, at load.
+
+        Safe because a ``.tmp`` is never a file anybody can use: it is not a
+        playable ROM (_cached_rom skips it), not a save (_stored_slugs and
+        both pruners skip it), and never read back by anything. Load is also
+        the one moment when no write of this cog's can be in flight, so
+        nothing living can be deleted out from under itself.
+
+        Never raises: it is on the cog load path and a cog that will not load
+        is worse than a few megabytes nobody can account for.
+        """
+        freed = 0
+        found = 0
+        try:
+            orphans = list(cog_data_path(self).rglob("*.tmp"))
+        except OSError:
+            log.warning("Could not sweep the Retro data directory.", exc_info=True)
+            return 0
+        for path in orphans:
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                size = int(path.stat().st_size)
+                path.unlink()
+            except OSError:
+                log.warning(
+                    "Could not delete the abandoned partial write %s",
+                    path,
+                    exc_info=True,
+                )
+                continue
+            freed += size
+            found += 1
+        if found:
+            log.info(
+                "Reclaimed %s from %s abandoned partial write(s) left by an "
+                "earlier run.",
+                self._humanize_bytes(freed),
+                found,
+            )
+        return freed
 
     def _read_file(self, path: Path) -> typing.Optional[bytes]:
         """The contents of one save file, or None if it is not usable."""
@@ -474,7 +566,11 @@ class StorageMixin(MixinMeta):
         return freed, deleted
 
     async def _make_room(
-        self, incoming: int, keep_rom: typing.Optional[str] = None
+        self,
+        incoming: int,
+        keep_rom: typing.Optional[str] = None,
+        *,
+        prefix: str = "",
     ) -> typing.Tuple[bool, str]:
         """
         Check the budget, prune cached ROMs if that helps, and report.
@@ -483,6 +579,13 @@ class StorageMixin(MixinMeta):
         worth saying either way: a refusal has to explain itself, and a
         download that only fitted because five cached ROMs were thrown away
         should say so rather than silently deleting other channels' caches.
+
+        ``prefix`` is the bot's real command prefix, for the commands the
+        refusal points at. Red only rewrites ``[p]`` in a *docstring*, so a
+        sent string has to be given the prefix by whoever is sending it --
+        every caller here has a ``ctx`` and passes ``ctx.clean_prefix``. The
+        default names the commands without one rather than printing a `[p]`
+        nobody can type.
         """
         budget = await self._disk_budget()
         if not budget:
@@ -537,7 +640,7 @@ class StorageMixin(MixinMeta):
             )
         lines.append(
             "No save was deleted to make room and none will be. Free some up "
-            "with `[p]retrosaves delete <game>`, or ask the bot owner to raise "
-            "`[p]retroset diskbudget`."
+            f"with `{prefix}retrosaves delete <game>`, or ask the bot owner "
+            f"to raise `{prefix}retroset diskbudget`."
         )
         return False, " ".join(lines)

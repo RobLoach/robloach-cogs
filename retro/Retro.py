@@ -373,6 +373,14 @@ class Retro(
             await self._migrate_core_path()
         except Exception:
             log.exception("Failed to migrate the old Libretro core setting.")
+        # The one moment when no write of this cog's is in flight, so the one
+        # moment a leftover `.tmp` can be judged abandoned. An orphan is
+        # invisible to every pruner and counted by the disk budget, so left
+        # alone it is disk nobody can ever reclaim; see _sweep_partial_writes.
+        try:
+            await asyncio.to_thread(self._sweep_partial_writes)
+        except Exception:
+            log.exception("Failed to sweep the Retro data directory.")
         try:
             await self._restore_sessions()
         except Exception:
@@ -389,13 +397,35 @@ class Retro(
             setattr(self, attribute, None)
             if task is not None:
                 task.cancel()
+        # `except Exception` was not enough here: CancelledError is not an
+        # Exception, so a single hibernate cancelled by the shutdown that
+        # asked for the unload took the whole loop with it and abandoned
+        # every session after it -- unsaved, and with a core still loaded.
+        # Once one cancellation has been seen no further await can be
+        # trusted to come back, so the rest are saved and freed on this
+        # thread and the cancellation is re-raised at the end, where it
+        # costs nothing.
+        cancelled: typing.Optional[BaseException] = None
         for view in list(self.sessions.values()):
             try:
-                await self.hibernate(
-                    view,
-                    "The console was put away. Press a button to pick up "
-                    "where you left off.",
+                if cancelled is None:
+                    await self.hibernate(
+                        view,
+                        "The console was put away. Press a button to pick up "
+                        "where you left off.",
+                    )
+                else:
+                    self._hibernate_now(view)
+            except asyncio.CancelledError as error:
+                cancelled = error
+                log.warning(
+                    "Putting a Libretro session away was cancelled during "
+                    "unload; the rest are being saved without waiting."
                 )
+                # Whatever this one still held has already been freed by
+                # _hibernate_locked's finally, but the write may not have
+                # happened; there is nothing left to save if it has.
+                self._hibernate_now(view)
             except Exception:
                 log.exception("Failed to hibernate a Libretro session on unload.")
             # The buttons stay enabled on the message so the game can be
@@ -409,6 +439,11 @@ class Retro(
             retired.alive = False
             self._release_view(retired)
         self.retired.clear()
+        if cancelled is not None:
+            # Re-raised rather than swallowed: the task really was cancelled
+            # and its caller is entitled to know. Everything above has
+            # already been done.
+            raise cancelled
 
     # -- Red's end-user data API --------------------------------------------
     #
@@ -818,11 +853,38 @@ class Retro(
             return False
 
     def _drop_session_view(self, channel_id: int) -> None:
-        """Take a channel's live view out of service. Keeps nothing."""
+        """
+        Take a channel's live view out of service, freeing its core.
+
+        The core is the part that cannot be skipped. ``self.sessions`` is the
+        only place _evict_locked looks, so the moment the view is popped out
+        of it a still-loaded core is unreachable: nothing can ever hibernate
+        it, nothing can ever stop it, and with MAX_LIVE_EMULATORS at 1 the
+        slot accounting believes it is free. The next game to start loads a
+        second core into a process that already has one, which is the state
+        the whole single-emulator machinery exists to prevent.
+
+        The save state is written first, exactly as every other path that
+        frees a core does: forgetting the *pointer* to a channel's game is
+        never meant to cost the channel's progress, which is the entire
+        argument for doing it automatically (see the section above).
+
+        Both are done on this thread rather than awaited. This is called from
+        ``_forget_channel`` and ``_forget_session``, whose own callers are
+        Discord listeners and a startup sweep, and staying synchronous is
+        worth more than the few milliseconds it costs: there is no moment at
+        which the view is out of ``self.sessions`` with its core still
+        attached, so no other task can see the half-dropped state. See
+        _free_emulator and _write_state_now, which exist for the same reason.
+        """
         view = self.sessions.pop(int(channel_id), None)
         if view is None:
             return
         view.closed = True
+        emulator, view.emulator = getattr(view, "emulator", None), None
+        if emulator is not None:
+            self._write_state_now(view, emulator)
+            self._free_emulator(emulator)
         self._release_view(view)
 
     def _drop_retired_views(self, channel_id: int) -> None:
@@ -1124,6 +1186,25 @@ class Retro(
         except Exception:
             log.exception("Could not free a libretro core.")
 
+    def _hibernate_now(self, view: RetroView) -> None:
+        """
+        Put one session to sleep without awaiting anything. Never raises.
+
+        The two halves of :meth:`_hibernate_locked` that cannot be skipped --
+        write the progress, then free the core -- done on the calling thread,
+        for a teardown that has already been cancelled once and therefore
+        cannot rely on an ``await`` coming back. The lock is deliberately not
+        taken, for the same reason: acquiring it is an await.
+
+        Safe on a session that is already asleep, which is the common case
+        by the time this is reached.
+        """
+        emulator, view.emulator = getattr(view, "emulator", None), None
+        if emulator is None:
+            return
+        self._write_state_now(view, emulator)
+        self._free_emulator(emulator)
+
     async def _save_record(self, view: RetroView) -> None:
         """Write the session record. Never raises: it is on every save path."""
         try:
@@ -1307,12 +1388,15 @@ class Retro(
             # the way. Say so; the save state is very probably still there,
             # so starting the game again by name will pick it back up (see
             # _start_session).
+            # There is no ctx.clean_prefix on a button click, and Red only
+            # substitutes `[p]` in a docstring, so the prefix is asked for.
+            prefix = await self._prefix_for(getattr(interaction, "guild", None))
             await self._whisper_interaction(
                 interaction,
                 f"The cached ROM for **{game_name}** has been cleaned up, so "
                 "this button cannot start it. Start it again with "
-                f"`[p]retro <name or url>` \N{EM DASH} its save is still here, "
-                "and it will pick up where it left off.",
+                f"`{prefix}retro <name or url>` \N{EM DASH} its save is still "
+                "here, and it will pick up where it left off.",
             )
             return
 
@@ -1355,16 +1439,39 @@ class Retro(
         # Booted *before* anything is taken away from the channel, so a core
         # that will not come up costs nothing: whatever was playing is merely
         # hibernated (which its own buttons undo) rather than retired.
+        previous: typing.Optional[RetroView] = None
         try:
             async with self.emulator_lock:
                 # One core at a time, here as everywhere else.
                 await self._evict_locked(exclude=view)
                 clip = await asyncio.to_thread(view._boot, emulator, progress)
+                # The new session becomes the channel's *inside the lock*,
+                # with its core already attached, and before anything that
+                # can await. This used to happen after the lock had been
+                # released and after _retire (which re-takes the lock and
+                # edits a message), which left a window where a live core
+                # belonged to no session in self.sessions: a press in another
+                # channel arriving in it takes the lock, finds nothing live
+                # to evict, and loads a second core into a process that is
+                # only ever allowed one (MAX_LIVE_EMULATORS).
+                #
+                # Whatever this replaces is remembered rather than retired
+                # here, because retiring it awaits; _evict_locked has already
+                # saved it and freed its core, so the only thing left to do
+                # to it is cosmetic and can wait for the lock to be free.
+                previous = self.sessions.get(channel_id)
+                if previous is view:
+                    previous = None
+                view.emulator = emulator
+                self.sessions[channel_id] = view
         except asyncio.CancelledError:
             # A reload or shutdown landing on the boot. Nothing is awaited
             # from here (see _free_emulator) and there is nothing to report
             # to: the interaction is going away with the task. The Resume
             # button is left as it is, which is also how the message looks.
+            if self.sessions.get(channel_id) is view:
+                del self.sessions[channel_id]
+            view.emulator = None
             self._free_emulator(emulator)
             view.closed = True
             self._release_view(view)
@@ -1373,6 +1480,9 @@ class Retro(
             log.warning(
                 "Could not resume %s in channel %s: %s", view.slug, channel_id, error
             )
+            if self.sessions.get(channel_id) is view:
+                del self.sessions[channel_id]
+            view.emulator = None
             try:
                 await asyncio.to_thread(emulator.stop)
             except Exception:
@@ -1384,20 +1494,16 @@ class Retro(
             await self._restore_retired_message(interaction, retired, record, error)
             return
 
-        # It is up, so the channel really does change hands now. The game it
+        # It is up and the channel has already changed hands. The game it
         # replaces is retired exactly as starting a different game by name
         # would retire it, and gets a Resume button of its own.
-        previous = self.sessions.get(channel_id)
-        if previous is not None and previous is not view:
+        if previous is not None:
             await self._retire(
                 previous,
                 f"Replaced by **{game_name}**. **{previous.game_name}** was "
                 "saved \N{EM DASH} press Resume to come back to it.",
             )
-            self.sessions.pop(channel_id, None)
-        self.sessions[channel_id] = view
 
-        view.emulator = emulator
         # Same reason as RetroView.start(): with a core in hand the repeat
         # button's label can be written from its real frame rate, and this is
         # the last chance before the message goes back out.
@@ -1444,6 +1550,36 @@ class Retro(
         except discord.HTTPException:
             log.warning("Could not report a failed Resume.", exc_info=True)
 
+    async def _prefix_for(self, guild) -> str:
+        """
+        The bot's own command prefix, for a message with no ``ctx`` to ask.
+
+        Red rewrites ``[p]`` in a command's *help text* and nowhere else, so
+        a sent string that says `[p]retro` says exactly that to the player --
+        and `[p]` is not a prefix anybody can type. A command replies through
+        ``ctx.clean_prefix``; a button click has no context, so this asks the
+        bot, which is the same question ``clean_prefix`` answers.
+
+        A mention prefix is skipped when there is anything else, because
+        Red's ``--mentionable`` puts ``<@id>`` first in the list and a raw
+        mention in the middle of a sentence reads as a bug. If the bot cannot
+        answer at all the commands are named without a prefix, which is
+        wrong-but-readable rather than actively misleading.
+        """
+        try:
+            prefixes = [
+                str(prefix)
+                for prefix in (await self.bot.get_valid_prefixes(guild) or [])
+                if prefix
+            ]
+        except Exception:
+            log.debug("Could not read the bot's command prefixes.", exc_info=True)
+            return ""
+        for prefix in prefixes:
+            if not prefix.startswith("<@"):
+                return prefix
+        return prefixes[0] if prefixes else ""
+
     @staticmethod
     async def _whisper_interaction(interaction, message: str) -> None:
         """Tell only the person who clicked, whether or not we have replied."""
@@ -1463,10 +1599,27 @@ class Retro(
     ) -> None:
         emulator, view.emulator = view.emulator, None
         if emulator is not None:
-            # Always write the save state *before* the core is freed: after
-            # emulator.stop() the machine state is gone for good.
-            await self._write_state(view, emulator)
-            await asyncio.to_thread(emulator.stop)
+            # This local is now the only reference to the core, so every way
+            # out of here has to free it -- including the one `try` used to
+            # miss. A CancelledError from the write (a bot shutdown, or
+            # `[p]unload retro` landing mid-save) is not an Exception, and
+            # without the finally below it left a loaded core with nothing
+            # pointing at it: the one MAX_LIVE_EMULATORS slot, spent for the
+            # life of the process. Same shape as _wake_locked's.
+            stopped = False
+            try:
+                # Always write the save state *before* the core is freed:
+                # after emulator.stop() the machine state is gone for good.
+                await self._write_state(view, emulator)
+                await asyncio.to_thread(emulator.stop)
+                stopped = True
+            finally:
+                if not stopped:
+                    # Only reached while unwinding, which on the path that
+                    # matters means the task is being cancelled and the next
+                    # await would raise straight back out. Freed on this
+                    # thread instead; see _free_emulator.
+                    self._free_emulator(emulator)
         # The controls stay enabled so the next press can wake the session
         # back up; nothing about the buttons changes when a game sleeps.
         await self._save_record(view)
@@ -2435,7 +2588,7 @@ class Retro(
                 "pressing its buttons is never rate limited.",
             )
             return
-        room, note = await self._make_room(0)
+        room, note = await self._make_room(0, prefix=ctx.clean_prefix)
         if note:
             # Either the refusal, or the report of what was pruned to avoid
             # one. Both are worth saying out loud.
@@ -2525,7 +2678,9 @@ class Retro(
         # full, and this one refuses to write what came back. Pruning here
         # excludes this game's own ROM, which may already be on disk from the
         # last time the channel played it.
-        room, note = await self._make_room(len(data), keep_rom=rom_filename)
+        room, note = await self._make_room(
+            len(data), keep_rom=rom_filename, prefix=ctx.clean_prefix
+        )
         if note:
             await self._safe_send(ctx, note)
         if not room:
@@ -3292,7 +3447,7 @@ class Retro(
                 f"That BIOS file is bigger than the {MAX_BIOS_SIZE_LABEL} limit."
             )
             return
-        room, note = await self._make_room(len(data))
+        room, note = await self._make_room(len(data), prefix=ctx.clean_prefix)
         if note:
             await self._safe_send(ctx, note)
         if not room:
@@ -3410,7 +3565,9 @@ class Retro(
                 f"{len(files)} files keeps its own names."
             )
 
-        room, budget_note = await self._make_room(sum(len(f.data) for f in files))
+        room, budget_note = await self._make_room(
+            sum(len(f.data) for f in files), prefix=ctx.clean_prefix
+        )
         if budget_note:
             await self._safe_send(ctx, budget_note)
         if not room:
@@ -3720,8 +3877,9 @@ class Retro(
         if enabled:
             log.warning(
                 "The Retro cog's private-address URL guard has been turned "
-                "OFF by the bot owner: any member who can run [p]retro can "
-                "now make this bot issue requests inside its own network."
+                "OFF by the bot owner: any member who can run the retro "
+                "command can now make this bot issue requests inside its own "
+                "network."
             )
             await ctx.send(
                 "\N{WARNING SIGN}\N{VARIATION SELECTOR-16} ROM URLs may now "
@@ -3757,7 +3915,7 @@ class Retro(
         **Examples:**
         - `[p]retroset version`
         """
-        await self._safe_send(ctx, version.describe())
+        await self._safe_send(ctx, version.describe(ctx.clean_prefix))
 
     @retroset.command(name="settings")
     @commands.bot_has_permissions(embed_links=True)

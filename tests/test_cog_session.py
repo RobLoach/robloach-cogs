@@ -18,7 +18,13 @@ import types  # noqa: E402
 
 import discord  # noqa: E402
 
-from .fakes import NES_BYTES, ROM_BYTES, FakeUser, footage_bytes  # noqa: E402
+from .fakes import (  # noqa: E402
+    NES_BYTES,
+    ROM_BYTES,
+    FakeEmulator,
+    FakeUser,
+    footage_bytes,
+)
 
 # -- Defaults -----------------------------------------------------------------
 
@@ -1955,6 +1961,84 @@ async def test_cog_unload_saves_every_live_game_and_frees_the_cores(retro):
     assert retro.cog._state_path(channel.id, view.slug).is_file()
     assert retro.cog._idle_task is None
     assert retro.cog.sessions == {}
+
+
+async def test_a_cancelled_save_still_frees_the_core_it_was_saving(retro):
+    """The teardown case ``try`` used to miss entirely.
+
+    ``_hibernate_locked`` takes the emulator out of the view into a local,
+    writes the save state, and only then stops the core. A CancelledError
+    from that write -- a bot shutdown, or `[p]unload retro` landing on it --
+    is not an Exception, so it went straight past everything and left the
+    last reference to a *loaded* core on a dead stack frame. Nothing could
+    ever stop it again, and MAX_LIVE_EMULATORS is 1.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9091, "cancelmidsave")
+    emulator = view.emulator
+    assert emulator.started
+
+    async def cancelled(*args, **kwargs):
+        raise asyncio.CancelledError()
+
+    retro.cog._write_state = cancelled
+
+    with pytest.raises(asyncio.CancelledError):
+        await retro.cog.hibernate(view, "going away")
+
+    assert not emulator.started, "the core was abandoned while still loaded"
+    assert view.emulator is None
+    # ...and the lock it was holding is free, so the cog is not wedged.
+    assert not retro.cog.emulator_lock.locked()
+
+
+async def test_one_cancelled_hibernate_does_not_abandon_the_other_sessions(retro):
+    """`except Exception` never caught this, so the loop ended at the first.
+
+    Every session after the cancelled one kept its core and never wrote its
+    progress. There may be several: only one is *live* at a time, but the
+    sleeping ones still have to be released, and the live one is whichever
+    channel pressed a button last.
+    """
+    await retro.install_cores("gambatte")
+    views = []
+    for index in range(3):
+        view, _, _ = await retro.posted_game(9092 + index, f"unloadmany{index}")
+        views.append(view)
+    # Starting a game evicts whatever was playing, so all three have held a
+    # core and only the newest still has one. That is the shape the unload
+    # loop actually walks.
+    for view in views[:-1]:
+        assert not view.live
+    assert views[-1].live
+
+    real_hibernate = retro.cogmod.Retro.hibernate
+    calls = []
+
+    async def cancel_the_first(self, view, reason=None):
+        calls.append(view)
+        if len(calls) == 1:
+            raise asyncio.CancelledError()
+        return await real_hibernate(self, view, reason)
+
+    retro.cogmod.Retro.hibernate = cancel_the_first
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await retro.cog.cog_unload()
+    finally:
+        retro.cogmod.Retro.hibernate = real_hibernate
+
+    # Every session was dealt with, not just the ones before the cancellation.
+    assert len(calls) == 1, "the loop kept awaiting after it had been cancelled"
+    assert retro.cog.sessions == {}
+    for view in views:
+        assert view.closed and view.is_finished(), "a view was left registered"
+        assert view.emulator is None, "a core was abandoned by the unload"
+    assert not any(e.started for e in FakeEmulator.instances), (
+        "a libretro core survived the unload"
+    )
+    # And the live one's progress was written on the way out rather than lost.
+    assert retro.cog._state_path(views[-1].channel_id, views[-1].slug).is_file()
 
 
 # -- Cache pruning ------------------------------------------------------------

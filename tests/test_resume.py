@@ -12,6 +12,8 @@ state, then the cartridge's battery save, then the beginning -- and the part
 that has to keep working after the bot has been restarted.
 """
 
+import types
+
 import pytest
 
 pytest.importorskip("discord", reason="the cog tests need discord.py")
@@ -332,6 +334,87 @@ async def test_starting_a_retired_game_by_name_stands_its_button_down(retro, ret
     assert back.slug == retired.old.slug and back.boot_outcome == "state"
 
 
+async def test_a_press_elsewhere_mid_resume_never_loads_a_second_core(
+    retro, retired, monkeypatch
+):
+    """The window between "the core is up" and "the channel has it".
+
+    ``resume_retired`` booted its core inside the emulator lock, let the lock
+    go, and only *then* retired the game it was replacing (which re-takes the
+    lock and awaits a message edit) before finally attaching the core to the
+    view and putting it in ``cog.sessions``. A press in another channel
+    landing in that window takes the lock, looks through ``cog.sessions`` for
+    something live to evict, finds nothing -- the resumed session is not in
+    there yet and its view's ``emulator`` is still None -- and loads a second
+    libretro core into a process that may only ever have one
+    (MAX_LIVE_EMULATORS). Two live cores share process-global state and
+    segfault the bot.
+
+    So the press is fired from inside ``_retire``, which is the first thing
+    the resume does after the lock is released.
+    """
+    elsewhere = retro.channel(9660)
+    other = await retro.start_game(retro.context(elsewhere), "elsewhere")
+    await retro.cog.hibernate(other)
+    assert not other.live, "the other channel has to be asleep to be woken"
+
+    live_during_the_press = []
+    real_retire = retro.cogmod.Retro._retire
+
+    async def retire_and_press(self, view, reason):
+        await self.run_press(other, "a")
+        live_during_the_press.append(
+            [e for e in FakeEmulator.instances if e.started]
+        )
+        return await real_retire(self, view, reason)
+
+    monkeypatch.setattr(retro.cogmod.Retro, "_retire", retire_and_press)
+
+    interaction = retro.interaction(retired.view, message=retired.old.message)
+    await retired.view.children[0].callback(interaction)
+
+    assert live_during_the_press, "_retire was never reached, so nothing is proved"
+    assert len(live_during_the_press[0]) == 1, (
+        "a second libretro core was loaded while the resumed one was still "
+        f"running: {live_during_the_press[0]}"
+    )
+    # And the invariant still holds once everything has settled.
+    assert sum(1 for e in FakeEmulator.instances if e.started) == 1
+    assert len([v for v in retro.cog.sessions.values() if v.live]) <= 1
+
+
+async def test_a_resumed_session_is_in_sessions_before_anything_awaits(retro, retired):
+    """The narrower statement the fix is actually made of.
+
+    By the time ``_retire`` -- the first thing the resume awaits after
+    letting the emulator lock go -- is called, the channel's entry already
+    points at the new view and that view already holds the core. Anything
+    that looks for a live session from here on finds it.
+    """
+    seen = {}
+    real_retire = retro.cogmod.Retro._retire
+
+    async def note(self, view, reason):
+        registered = self.sessions.get(retired.channel.id)
+        seen["view"] = registered
+        seen["emulator"] = getattr(registered, "emulator", None)
+        seen["replaced"] = view
+        return await real_retire(self, view, reason)
+
+    retro.cogmod.Retro._retire = note
+    try:
+        interaction = retro.interaction(retired.view, message=retired.old.message)
+        await retired.view.children[0].callback(interaction)
+    finally:
+        retro.cogmod.Retro._retire = real_retire
+
+    back = retro.cog.sessions[retired.channel.id]
+    assert seen["replaced"] is retired.current, "the wrong game was retired"
+    assert seen["view"] is back, "the channel still pointed at the old session"
+    assert seen["emulator"] is not None, "the core was not attached yet"
+    assert back.emulator is seen["emulator"]
+
+
 async def test_resume_says_so_gracefully_when_the_rom_has_been_pruned(retro, retired):
     retro.cog._rom_path(retired.old.rom_filename).unlink()
     interaction = retro.interaction(retired.view, message=retired.old.message)
@@ -342,9 +425,52 @@ async def test_resume_says_so_gracefully_when_the_rom_has_been_pruned(retro, ret
     assert snap["ephemeral"] is True
     assert "cleaned up" in snap["content"]
     assert "save is still here" in snap["content"]
+    # It tells the player to start the game again, so it has to name the
+    # command with the prefix this bot answers to. A button click has no
+    # ctx.clean_prefix, and Red only rewrites `[p]` in a docstring, so this
+    # reply used to reach the channel saying `[p]retro <name or url>` --
+    # which is not something anybody can type. See Retro._prefix_for.
+    assert "[p]" not in snap["content"], snap["content"]
+    assert "`!retro <name or url>`" in snap["content"], snap["content"]
     # Nothing was broken by the attempt.
     assert retro.cog.sessions[retired.channel.id] is retired.current
     assert retired.view.alive is True
+
+
+async def test_the_resume_reply_follows_the_bot_s_own_prefix(retro, retired):
+    """Whatever the owner set it to, and never the bot's own mention.
+
+    Red's ``--mentionable`` puts ``<@id>`` at the front of the prefix list,
+    and a raw mention in the middle of a sentence reads as a bug rather than
+    as an instruction, so the first *typable* prefix is the one used.
+    """
+    retro.bot.prefixes = ["<@123456> ", "retro!", "?"]
+    retro.cog._rom_path(retired.old.rom_filename).unlink()
+    interaction = retro.interaction(retired.view, message=retired.old.message)
+    await retired.view.children[0].callback(interaction)
+
+    content = interaction.log[0][1]["content"]
+    assert "`retro!retro <name or url>`" in content, content
+    assert "<@123456>" not in content, content
+
+
+async def test_a_bot_that_cannot_say_its_prefix_still_answers(retro):
+    """Degrades to naming the command bare, never to printing `[p]`."""
+
+    class Mute:
+        async def get_valid_prefixes(self, guild=None):
+            raise RuntimeError("no prefix cache yet")
+
+    retro.cog.bot = Mute()
+    assert await retro.cog._prefix_for(None) == ""
+    retro.cog.bot = types.SimpleNamespace(
+        get_valid_prefixes=lambda guild=None: _returning([])
+    )
+    assert await retro.cog._prefix_for(None) == ""
+
+
+async def _returning(value):
+    return value
 
 
 async def test_resume_says_so_when_the_core_has_gone(retro, retired):

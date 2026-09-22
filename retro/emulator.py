@@ -351,12 +351,19 @@ def probe_core_options(core_path, options=None) -> typing.Dict[str, dict]:
         environment = CompositeEnvironmentDriver(drivers)
 
     core = None
+    #: Whether retro_init has been *entered*. Set before the call rather than
+    #: after it: libretro.py's thin wrapper is one ctypes call with nothing
+    #: around it, so a raise gives no way to tell whether the core got as far
+    #: as claiming anything, and the conservative assumption for that phase
+    #: is that it did. A failure strictly earlier -- the dlopen, or
+    #: retro_set_environment -- is unambiguous, and that core has genuinely
+    #: never been initialised. See the finally block.
     initialised = False
     try:
         core = Core(str(core_path))
         core.set_environment(environment.environment)
-        core.init()
         initialised = True
+        core.init()
         return describe_definitions(option_driver.definitions)
     except EmulatorError:
         raise
@@ -364,13 +371,40 @@ def probe_core_options(core_path, options=None) -> typing.Dict[str, dict]:
         log.warning("Could not read the options of the core %s", core_path, exc_info=True)
         raise EmulatorError(f"The core's options could not be read: {exc}") from exc
     finally:
-        # Always unload: leaving a half-initialised core in the process is
-        # exactly the state MAX_LIVE_EMULATORS exists to prevent.
+        # Deinitialise if retro_init was reached, and drop the wrapper either
+        # way. That *is* unloading a core as far as this process is
+        # concerned, here and everywhere else in the cog: libretro.py never
+        # unmaps one (Session.__exit__ is retro_deinit followed by
+        # `del self._core`, and ctypes' CDLL does not dlclose when it is
+        # collected either), so a shared object this process has opened stays
+        # mapped until it exits. That is fine and is not what
+        # MAX_LIVE_EMULATORS is about: a merely-mapped .so holds no emulation
+        # state, is handed back by dlopen the next time a game starts, and
+        # costs a few megabytes of shared file mapping. Two *initialised*
+        # cores, each running its own process-global state, are the hazard.
+        #
+        # So the guard stays, and it is the correct guard rather than a
+        # missing case: retro_deinit on a core whose retro_init never ran is
+        # not defined by the libretro API, and libretro.py will make the call
+        # regardless -- ``Core.deinit`` documents that it "does not validate
+        # that the core has been initialized". A core that frees in deinit
+        # what it allocates in init would be freeing a pointer it never set.
+        # An uninitialised core is a safe thing to walk away from; a
+        # double-freed one is not.
         if core is not None and initialised:
             try:
                 core.deinit()
             except Exception:
-                log.warning("The core %s did not deinitialise cleanly.", core_path, exc_info=True)
+                # Loud, for the same reason RetroEmulator.stop is: a core
+                # that would not deinitialise is an initialised core still in
+                # the process, and the next game to start will load another
+                # one over the top of it.
+                log.exception(
+                    "The core %s did not deinitialise cleanly. It may still "
+                    "be initialised in this process; reload the cog if games "
+                    "stop starting.",
+                    core_path,
+                )
         del core
 
 
@@ -418,6 +452,10 @@ class RetroEmulator:
         self._video = None
         self._path_driver = None
         self._audio_buffer = None
+        #: Whether _drain_audio has already complained. It runs once per
+        #: emulated frame, so it says so once a session rather than sixty
+        #: times a second; see _drain_audio.
+        self._audio_drain_failed = False
         self._joypad_state_cls = None
         self.started = False
         # How many frames the last :meth:`record` ran through before it began
@@ -540,6 +578,7 @@ class RetroEmulator:
         self._path_driver = path_driver
         self.started = True
         self._audio_buffer = self._find_audio_buffer(session)
+        self._audio_drain_failed = False
 
     @staticmethod
     def _find_audio_buffer(session):
@@ -570,6 +609,15 @@ class RetroEmulator:
         emulated second at 44.1 kHz stereo, so a channel that plays for an
         hour would be sitting on 600 MiB of audio nobody can hear. The cog
         posts silent clips, so the samples are dropped as they arrive.
+
+        A failure here used to set ``self._audio_buffer`` to None, which
+        turned the drain off for the rest of the session -- silently, and on
+        the strength of one bad call. That is the wrong way round: the thing
+        being protected against is a leak of hundreds of megabytes, and the
+        cost of trying again next frame is one attribute read and a
+        ``del``. So it keeps trying, and says so once. Once, because this
+        runs sixty times an emulated second and a warning per frame would be
+        its own denial of service on the log.
         """
         buffer = self._audio_buffer
         if buffer is None:
@@ -577,8 +625,15 @@ class RetroEmulator:
         try:
             del buffer[:]
         except Exception:
-            # Whatever this is, it is not the array we thought it was.
-            self._audio_buffer = None
+            if not self._audio_drain_failed:
+                self._audio_drain_failed = True
+                log.warning(
+                    "Could not empty the libretro audio buffer for %s; memory "
+                    "use may grow while this game is running. This is "
+                    "reported once per session.",
+                    self.core_path,
+                    exc_info=True,
+                )
 
     def _make_path_driver(self, libretro):
         """
@@ -678,17 +733,37 @@ class RetroEmulator:
         )
 
     def stop(self) -> None:
-        """Unload the game and free the core. Safe to call more than once."""
+        """
+        Unload the game and free the core. Safe to call more than once.
+
+        The failure in here is the one failure in this module that must not
+        be quiet. Everything above has already been dropped -- the session,
+        the drivers, ``started`` -- so an unload that did not happen leaves a
+        core *running* in the process with nothing pointing at it, while the
+        cog goes on believing its single MAX_LIVE_EMULATORS slot is free and
+        loads another one over the top of it. Two live libretro cores share
+        one process's global state and segfault the bot. Nobody can act on
+        this from Discord; the owner reading the log is the only person who
+        can, so it is logged at error with its traceback rather than
+        swallowed.
+        """
         session, self._session = self._session, None
         self._video = None
         self._path_driver = None
         self._audio_buffer = None
+        self._audio_drain_failed = False
         self.started = False
         if session is not None:
             try:
                 session.__exit__(None, None, None)
             except Exception:
-                pass
+                log.exception(
+                    "The libretro core %s did not unload cleanly. It may "
+                    "still be loaded in this process, which is the one state "
+                    "this cog runs a single emulator at a time to avoid; "
+                    "reload the cog if games stop starting.",
+                    self.core_path,
+                )
 
     close = stop
 

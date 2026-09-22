@@ -808,6 +808,12 @@ async def test_a_state_cannot_be_imported_for_a_game_whose_rom_is_gone(retro):
     said = ctx.said()
     assert "cleaned up" in said and "cannot be checked" in said
     assert not cog._state_path(9271, "pruned").is_file()
+    # The reply tells the player to start the game, so it has to name the
+    # command with the prefix this bot actually answers to. Red only
+    # substitutes `[p]` in a docstring, so a sent string that says `[p]retro`
+    # says exactly that; see test_packaging.py's source-level guard.
+    assert f"`{ctx.clean_prefix}retro <name or url>`" in said, said
+    assert "[p]" not in said, said
 
 
 async def test_a_stranger_may_not_import_over_someone_elses_save(battery):

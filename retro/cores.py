@@ -304,7 +304,8 @@ class CoresMixin(MixinMeta):
         except Exception:
             log.exception(
                 "The automatic core download failed; giving up until the cog "
-                "is loaded again. Run `[p]retroset download` to retry now."
+                "is loaded again. Run the `retroset download` command to "
+                "retry now."
             )
 
     async def _auto_download_cores(self) -> None:
@@ -548,10 +549,15 @@ class CoresMixin(MixinMeta):
         core: str,
         definitions: typing.Dict[str, dict],
         text: str,
-        prefix: str = "[p]",
+        prefix: str,
     ) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
         """
         Turn what somebody typed into a real option key.
+
+        ``prefix`` has no default on purpose: the error this returns is sent
+        to a channel and names a command, and Red only rewrites ``[p]`` in a
+        docstring. A default would be a `[p]` waiting for the next caller to
+        forget.
 
         Returns ``(key, error)``; exactly one of the two is set. Cores name
         their options inconsistently -- FCEUmm uses ``fceumm_region`` but

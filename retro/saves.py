@@ -1377,7 +1377,7 @@ class SavesMixin(MixinMeta):
         # Sleep first, so nothing that is written below can be overwritten by
         # a core that is still holding the old save in memory.
         paused = await self._pause_for_saves(ctx, entry, "a save was imported")
-        problem = await self._check_import(entry, state, sram)
+        problem = await self._check_import(entry, state, sram, ctx.clean_prefix)
         if problem is not None:
             lines = [problem, "Nothing was changed."]
             if paused:
@@ -1536,6 +1536,7 @@ class SavesMixin(MixinMeta):
         entry: SaveInfo,
         state: typing.Optional[bytes],
         sram: typing.Optional[bytes],
+        prefix: str = "",
     ) -> typing.Optional[str]:
         """
         Try an incoming save on the real core, and say what is wrong with it.
@@ -1549,6 +1550,11 @@ class SavesMixin(MixinMeta):
         Loading a core is subject to the one-at-a-time rule like everything
         else, so the lock is held and anything still running is hibernated
         first.
+
+        ``prefix`` is the bot's real command prefix. What comes back from
+        here is *sent*, and Red only rewrites ``[p]`` in a docstring, so the
+        command this points at has to be spelled with the prefix the caller
+        was invoked with (``ctx.clean_prefix``).
         """
         if state is None and sram is None:
             return None
@@ -1559,7 +1565,8 @@ class SavesMixin(MixinMeta):
                     "cleaned up, so a save state cannot be checked against it "
                     "\N{EM DASH} and a state that does not match its core is "
                     "refused at boot anyway. Start the game once with "
-                    "`[p]retro <name or url>` and import the state after that."
+                    f"`{prefix}retro <name or url>` and import the state "
+                    "after that."
                 )
             # A battery save is the cartridge's own format and is checked
             # against the region size at boot, so storing one unvalidated

@@ -237,7 +237,7 @@ process -- and in those days each one held a replay buffer of up to 8 MiB,
 which is what made it worth chasing. `Retro._release_view` is the fix and
 these tests are the proof; they fail if it is taken out.
 
-Two of its nine sections are worth knowing about by name:
+Four of its sections are worth knowing about by name:
 
 * **section 2, the footage a session holds**, which is now zero. The replay
   buffer went with the Replay button and the single `last_clip` that
@@ -246,6 +246,20 @@ Two of its nine sections are worth knowing about by name:
   bytes-like attribute except the compressed undo history -- rather than
   naming an attribute, because the thing being guarded against is a clip
   coming back under a new name.
+* **section 5b, the silent failures that turn the safety machinery off.**
+  Three handlers that each disabled something this file is about and said
+  nothing: `RetroEmulator.stop` swallowing a failed unload (so a *running*
+  core with nothing pointing at it looked exactly like a free
+  MAX_LIVE_EMULATORS slot), `_drain_audio` answering one bad `del` by
+  switching itself off for the rest of the session (restoring the whole
+  176 KiB-per-emulated-second audio leak), and `probe_core_options` skipping
+  `retro_deinit` for a `retro_init` that raised half way through. The tests
+  drive `retro/emulator.py` through `load_standalone` with stand-ins, so
+  they need no core -- the two `probe_core_options` ones need libretro.py
+  importable and skip without it. The deliberate asymmetry is asserted as
+  well: deinit is *not* called when `retro_init` was never reached, because
+  the libretro API does not define that and libretro.py will make the call
+  regardless.
 * **section 9, the session records in Config**, which is about the growth
   that was not in memory at all: the per-channel `session` and `retired`
   records were written and never deleted, so a bot rebuilt a `RetroView`
@@ -253,7 +267,15 @@ Two of its nine sections are worth knowing about by name:
   listeners, the load-time skip, the after-ready sweep and the "N channels
   in, nothing left behind" count -- and, just as hard, the semantics that
   make dropping a record safe: a record is a pointer, the saves are not, and
-  the saves are kept.
+  the saves are kept. Each of those paths also has to *free the core* of a
+  channel that was still playing, which is section 5's other half: the view
+  leaves `cog.sessions`, and `_evict_locked` looks nowhere else.
+* **section 10, the disk budget's own leak.** `_write_atomic` writes
+  `<name>.tmp` and renames it; every pruner skips a `.tmp` and `_data_usage`
+  counts one, so an orphan is budget nothing can reclaim. These cover the
+  cleanup on a failed write, a failed rename and a cancellation, the sweep
+  of the ones an earlier run left behind, and which writes pay for an
+  `fsync` (the saves do, a re-downloadable ROM does not).
 
 Three conventions in there worth knowing:
 
@@ -329,6 +351,17 @@ it turns that off, so `RETRO_TEST_ASSETS=$(mktemp -d) pytest` is an honest
   covers the cog as Red's Downloader sees it, `retro/version.py` included --
   that module loads standalone too, so the version can be checked with
   neither Red nor `discord.py` installed.
+* **A mistake that is invisible until somebody reads a message gets a
+  source-level test.** `test_packaging.py` has two: no `.py` file may carry
+  a version literal of its own, and no string literal outside a *docstring*
+  may contain `[p]`. Red substitutes `[p]` in a command's help text and
+  nowhere else, so `[p]retro <name>` in a string the cog builds and sends
+  reaches the channel exactly as written -- an instruction to type a prefix
+  nobody has. A command passes `ctx.clean_prefix`; a reply with no context
+  (a button click) asks `Retro._prefix_for`, which is why `FakeBot` answers
+  `get_valid_prefixes` with the same `!` that `FakeContext.clean_prefix`
+  hands out. The behavioural halves are in `test_cog_content.py`,
+  `test_cog_saves.py` and `test_resume.py`.
 * **A corrupted ROM is a regression test, not a fuzzer.** Everything in
   `test_malformed_roms.py` is seeded, so a failure is reproducible, and the
   sixteen runs it makes cost about 1.5s in total. What it asserts for every

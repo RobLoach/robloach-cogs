@@ -84,7 +84,7 @@ can start it by name:
 - `[p]retroset game add|remove|list` (owner) manages the games anyone can start by name.
 - `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below.
 - `[p]retroset bios add|list|remove` (owner) manages BIOS files for cores that need one. See below.
-- `[p]retroset diskbudget [megabytes]` (owner, aliased `disk`/`budget`) caps what the whole cog may use on disk, and with no argument reports what is using it. The default is 1024 MiB; `0` is no limit. **No save is ever deleted to make room** — cached ROMs are, oldest first.
+- `[p]retroset diskbudget [megabytes]` (owner, aliased `disk`/`budget`) caps what the whole cog may use on disk, and with no argument reports what is using it. The default is 1024 MiB; `0` is no limit. **No save is ever deleted to make room** — cached ROMs are, oldest first. A download or save that fails part way through cleans its own half-written file up, and any left behind by a process that was killed outright are swept when the cog next loads, so a failed write cannot quietly eat the allowance.
 - `[p]retroset allowprivateurls [true|false]` (owner) lets ROM URLs point inside your own network. Off, and best left off: see [ROM URLs](#rom-urls).
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
 - `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 1 second; anything from 0.2 to 15 works, fractions included (`0.8` is a real answer).
@@ -258,8 +258,12 @@ your time but cannot break a game.
 ## Saving and sleeping
 
 The cog never throws a game away. Progress is written to a save state
-automatically — every few presses, whenever a game goes to sleep, and when the
-cog is unloaded — next to a cached copy of the ROM.
+automatically — every few presses, whenever a game goes to sleep, when the cog
+is unloaded, and whenever a channel's game is put away for any other reason
+(the channel was deleted, its cached ROM was pruned) — next to a cached copy of
+the ROM. Every save is written beside its target and renamed into place, and
+flushed to the disk before the rename, so a crash or a power cut leaves the
+previous save rather than half of a new one.
 
 Cores are never allowed to hoard: the audio libretro.py accumulates is dropped
 every frame (it would otherwise grow by about 176 KiB per emulated second, since
@@ -313,9 +317,12 @@ the whole of this section:
 | the **save state** and **battery save** | the player's progress, keyed by channel **and game** | only when somebody asks (`[p]retrosaves delete`), or when the per-channel game cap drops that game entirely |
 
 Because progress is keyed by channel and game rather than by message,
-**dropping a record loses the button and nothing else**. Starting the game
-again by name re-downloads the ROM and restores from the save exactly as it
-always did, so the cog does it automatically in four cases:
+**dropping a record loses the button and nothing else**. If the channel's game
+was still awake it is saved and its emulator freed first, exactly as going to
+sleep would — a forgotten channel must not leave a core running, since only one
+may be loaded at a time. Starting the game again by name re-downloads the ROM
+and restores from the save exactly as it always did, so the cog does it
+automatically in four cases:
 
 * **the cached ROM it named was pruned**, by the disk budget or by the
   per-channel cap of five games. A Resume button without its ROM can only

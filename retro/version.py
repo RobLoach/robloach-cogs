@@ -279,7 +279,7 @@ def summary() -> str:
     return line
 
 
-def describe() -> str:
+def describe(prefix: str = "") -> str:
     """
     Everything known about the running build, as lines for a chat message.
 
@@ -287,6 +287,10 @@ def describe() -> str:
     is for: the version somebody can compare against the repository, the
     commit if there is one, and the fingerprint that settles it when the two
     of them are not enough.
+
+    ``prefix`` is the bot's real command prefix. These lines are *sent*, and
+    Red only rewrites ``[p]`` in a docstring, so the reload command named at
+    the end has to be spelled out by the caller (``ctx.clean_prefix``).
     """
     lines = [f"**Version** `{VERSION}`"]
     if VERSION == UNKNOWN_VERSION:
@@ -305,7 +309,7 @@ def describe() -> str:
         "of the `.py` files as they were **when the cog was loaded**, so it "
         "answers \N{LEFT DOUBLE QUOTATION MARK}am I running the new "
         "code?\N{RIGHT DOUBLE QUOTATION MARK} even when nobody remembered to "
-        "bump a number. Pulling new code without `[p]reload retro` "
+        f"bump a number. Pulling new code without `{prefix}reload retro` "
         "deliberately does not change it."
     )
     return "\n".join(lines)

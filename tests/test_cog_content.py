@@ -1062,3 +1062,55 @@ async def test_refreshing_a_deleted_message_is_a_no_op(retro):
     view.message = None
     view.message_id = 999999999
     await view.refresh("gone")  # must not raise
+
+
+# -- The command prefix in a sent string --------------------------------------
+#
+# Red rewrites `[p]` in a command's help text and nowhere else, so any string
+# the cog *builds* has to be given the real prefix. The source-level guard is
+# test_packaging.py's test_no_sent_string_carries_a_literal_command_prefix;
+# these are the behavioural halves for the three paths that got it wrong.
+
+
+async def test_the_disk_budget_refusal_names_the_real_prefix(retro):
+    """`[p]retrosaves delete` is not a command anybody can type."""
+    # A 1 MiB budget already spent on something the pruner is not allowed to
+    # touch (a BIOS file), so pruning cannot save the day and the refusal
+    # branch is the one that runs. That is the branch that names two
+    # commands.
+    await retro.cog.config.disk_budget_mb.set(1)
+    (retro.cog._system_dir() / "filler.bin").write_bytes(b"x" * (900 * 1024))
+    ctx = retro.context(retro.channel(9970))
+
+    room, note = await retro.cog._make_room(
+        900 * 1024, prefix=ctx.clean_prefix
+    )
+
+    assert not room, note
+    assert "[p]" not in note, note
+    assert f"`{ctx.clean_prefix}retrosaves delete <game>`" in note, note
+    assert f"`{ctx.clean_prefix}retroset diskbudget`" in note, note
+
+
+async def test_a_refused_download_says_it_in_the_channel_with_a_real_prefix(retro):
+    """The same sentence, through the command that actually sends it."""
+    await retro.install_cores("gambatte")
+    await retro.cog.config.disk_budget_mb.set(1)
+    (retro.cog._system_dir() / "filler.bin").write_bytes(b"x" * (1024 * 1024))
+    ctx = retro.context(retro.channel(9971), attachments=[FakeAttachment(ROM_BYTES, "big.gbc")])
+    retro.forgive_cooldowns()
+
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game=None)
+
+    said = ctx.said()
+    assert "run out of room" in said, said
+    assert "[p]" not in said, said
+    assert ctx.clean_prefix + "retrosaves delete" in said, said
+
+
+async def test_the_version_footer_names_the_reload_command_with_a_prefix(retro):
+    ctx = retro.context(retro.channel(9972))
+    await retro.cogmod.Retro.retroset_version.callback(retro.cog, ctx)
+    said = ctx.said()
+    assert "[p]" not in said, said
+    assert f"`{ctx.clean_prefix}reload retro`" in said, said
