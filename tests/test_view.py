@@ -206,8 +206,14 @@ def test_the_undo_button_is_one_of_the_controls_and_has_its_own_id(view):
     # along with its custom_id: a click on a stale one is dropped silently
     # (see test_a_click_on_a_removed_button_is_dropped_silently).
     assert f"{viewmod.CUSTOM_ID_PREFIX}:replay" not in ids
-    # It starts greyed out, because a fresh session has nothing to undo.
-    assert undo.disabled
+    # It starts *enabled*, even though a fresh session has nothing to undo.
+    # It used to be greyed out for that case, which made the explanation
+    # unreachable: a disabled Discord button cannot be clicked, so the
+    # private "there is nothing to undo yet, and here is why" line could
+    # never be got at -- and a permanently dead control reads as a broken
+    # one. See _UndoButton and RetroView._undo.
+    assert not undo.disabled
+    assert not view.can_undo, "and there really is nothing to undo yet"
 
 
 def test_the_repeat_button_taps_this_console_s_confirm_button(view, system):

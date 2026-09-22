@@ -35,7 +35,7 @@ pytest.importorskip("discord", reason="the leak tests need discord.py")
 import discord  # noqa: E402
 from discord.ui.view import ViewStore  # noqa: E402
 
-from .fakes import footage_bytes  # noqa: E402
+from .fakes import FakeUser, footage_bytes  # noqa: E402
 
 C = load_standalone("retro_clips_for_leaks", "clips.py")
 #: emulator.py on its own too: the three silent-failure tests in section
@@ -335,6 +335,35 @@ async def test_a_session_holds_no_footage_however_long_it_is_played(retro):
     assert held == [0] * 60, held
     assert not hasattr(view, "clips"), "the replay buffer came back"
     assert not hasattr(view, "last_clip"), "the per-session clip came back"
+
+
+async def test_the_press_queue_is_bounded_and_let_go_of(retro):
+    """A new per-session container, so it needs the same argument.
+
+    It holds *intent* -- a button name and a deferred interaction, no bytes
+    of picture and no emulator state -- and it is bounded twice over: at
+    MAX_QUEUED_PRESSES entries, and at one entry per person however many
+    people are clicking. A retired session drops it entirely.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9641, "queuebound")
+    cap = retro.viewmod.MAX_QUEUED_PRESSES
+
+    async with view.lock:
+        # A hundred clicks from fifty people, which is the shape a busy
+        # channel takes: never more than the cap waiting.
+        for index in range(100):
+            clicker = FakeUser(uid=3000 + index % 50, name=f"C{index % 50}")
+            view.enqueue_press(
+                retro.interaction(view, user=clicker, message=view.message), "a"
+            )
+            assert len(view.queue) <= cap, index
+        assert len(view.queue) == cap
+        # No picture in it, and nothing counted as footage.
+        assert footage_bytes(view) == 0
+
+    retro.cog._release_view(view)
+    assert not view.queue
 
 
 async def test_a_discarded_session_holds_no_footage_either(retro, store):

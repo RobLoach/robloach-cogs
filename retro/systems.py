@@ -150,7 +150,12 @@ EMOJI_CODEPOINTS: typing.Dict[int, bool] = {
     0x2B07: True,   # DOWNWARDS BLACK ARROW
     0x2B05: True,   # LEFTWARDS BLACK ARROW
     0x27A1: True,   # BLACK RIGHTWARDS ARROW
-    0x23E9: False,  # BLACK RIGHT-POINTING DOUBLE TRIANGLE
+    # HOURGLASS WITH FLOWING SAND, which is what the Wait button does: time
+    # passes and nothing is pressed. It replaced U+23E9 BLACK RIGHT-POINTING
+    # DOUBLE TRIANGLE (fast-forward), which was simply wrong -- the game runs
+    # at its own speed either way, and a fast-forward symbol promises a
+    # feature this cog does not have. Emoji_Presentation=Yes, so no U+FE0F.
+    0x23F3: False,
     0x25B6: True,   # BLACK RIGHT-POINTING TRIANGLE
     # LEFTWARDS ARROW WITH HOOK, which Unicode's emoji-data.txt calls "right
     # arrow curving left" and every client draws as the undo/reply arrow. It
@@ -167,7 +172,10 @@ VARIATION_SELECTOR_16 = "\N{VARIATION SELECTOR-16}"
 # has been replaced. They live here rather than in RetroView so that
 # validate_emoji() sees every emoji the cog can render without importing
 # discord.py.
-WAIT_EMOJI = "\N{BLACK RIGHT-POINTING DOUBLE TRIANGLE}"
+# The Wait button lets a clip's worth of time pass with no input at all, so
+# it is an hourglass rather than the fast-forward triangles it used to be:
+# nothing is sped up, and nothing is skipped. See EMOJI_CODEPOINTS.
+WAIT_EMOJI = "\N{HOURGLASS WITH FLOWING SAND}"
 RESUME_EMOJI = "\N{BLACK RIGHT-POINTING TRIANGLE}\N{VARIATION SELECTOR-16}"
 UNDO_EMOJI = "\N{LEFTWARDS ARROW WITH HOOK}\N{VARIATION SELECTOR-16}"
 

@@ -527,24 +527,24 @@ def playable(viewmod, view):
     return [c for c in view.children if not isinstance(c, viewmod._SpacerButton)]
 
 
-#: The controls that may legitimately be greyed out at any moment. **Undo**
-#: is the only one: it is always drawn, and it is dead whenever the history is
-#: empty -- which is every session's starting state and every session's state
-#: after a bot restart, since the history is memory only.
+#: The controls that may legitimately be greyed out at any moment, which is
+#: now **none of them**. Both entries this used to have are gone, and for the
+#: same reason each time: a control that is present, dead and unexplained
+#: reads as broken.
 #:
-#: The **x3** button used to be in here as well, for a clip too short to fit
-#: two taps. It is not any more, because that case is now answered by not
-#: drawing the button at all (see MIN_REPEAT_TAPS in retro/RetroView.py), so
-#: whenever it *is* on the message it is live -- which makes it fair game for
-#: the "a press does not grey the controls out" assertions below.
+#: * the **x3** button, on a clip too short to fit two taps. Answered by not
+#:   drawing the button at all (see MIN_REPEAT_TAPS in retro/RetroView.py),
+#:   with a one-line notice when it goes;
+#: * **Undo**, whenever the history was empty -- which is every session's
+#:   state after a bot restart, since the history is memory only. It is
+#:   always enabled now, and a click with nothing to undo is answered
+#:   privately; a *disabled* button could not be clicked at all, so that
+#:   explanation was unreachable. See _UndoButton.
 #:
-#: `playable()` keeps Undo, so a test that is *about* it still finds it (it is
-#: asked for by custom_id anyway). `pressable()` and the
-#: `any_disabled`/`all_disabled` snapshot keys below leave it out, so an
-#: assertion that a press did not grey the controls out stays an assertion
-#: about the console's own buttons rather than quietly becoming one about
-#: whether there was anything to undo.
-CONDITIONAL_CONTROLS = ("undo",)
+#: Left as an empty tuple rather than removed, because it is what
+#: `pressable()` filters by and the next control that can have nothing to do
+#: should have to argue with this comment first.
+CONDITIONAL_CONTROLS = ()
 
 
 def pressable(viewmod, view):
@@ -1062,6 +1062,32 @@ class RetroEnv:
             if data:
                 return data
         return clip_bytes([(getattr(message, "kwargs", None) or {}).get("file")])
+
+    # -- the one line the message carries
+    #
+    # Spelled out here rather than read back off the view, so the tests state
+    # the format instead of agreeing with whatever the view does. The literal
+    # form is pinned once, against a known game, in test_view.py.
+
+    @staticmethod
+    def header(view, asleep=False):
+        """``**ucity** · Game Boy``, plus ``· asleep`` when it is."""
+        line = f"**{view.game_name}** \N{MIDDLE DOT} {view.system.name}"
+        return f"{line} \N{MIDDLE DOT} asleep" if asleep else line
+
+    def line(self, view, text=None, asleep=False, suffixes=()):
+        """The whole content: header, what happened, then any suffixes."""
+        parts = [self.header(view, asleep)]
+        if text:
+            parts.append(text)
+        whole = " \N{EM DASH} ".join(parts)
+        for suffix in suffixes:
+            whole = f"{whole} {suffix}"
+        return whole
+
+    def queued(self, *entries):
+        """The ``*Queued: ...*`` suffix for these ``"who button"`` strings."""
+        return self.viewmod.QUEUE_NOTE.format(queued=", ".join(entries))
 
     def button(self, view, custom_id):
         """The child with this custom_id, or None if the view has no such one.

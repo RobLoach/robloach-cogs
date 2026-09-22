@@ -66,16 +66,26 @@ def test_every_mixin_module_exists_and_is_imported():
 #: lost, and a group whose subcommand failed to attach fails silently.
 COMMANDS = {
     "retro",
+    # The player-facing "what can I start?" listing. `[p]retroset game list`
+    # says part of the same thing and the whole retroset group is owner-only,
+    # so players were being pointed at a command they cannot run.
+    "retro list",
+    # Finish with a game and retire its controls -- the thing `[p]retrostop`
+    # never did despite the name.
+    "retroend",
     # Reboots the running game. Deliberately not a button: see the note
-    # above _STYLES in retro/RetroView.py.
-    "retroreset",
+    # above _STYLES in retro/RetroView.py. Was `retroreset`, which is kept
+    # as an alias.
+    "retroreboot",
     "retrosaves",
     "retrosaves delete",
+    # Was `retrosaves reset`, one word away from `retroreset` and opposite in
+    # effect. Both old names are kept as aliases.
+    "retrosaves dropstate",
     "retrosaves export",
     "retrosaves import",
     "retrosaves info",
     "retrosaves list",
-    "retrosaves reset",
     "retrosaves rollback",
     "retroset",
     "retroset allowprivateurls",
@@ -96,7 +106,47 @@ COMMANDS = {
     "retroset settings",
     "retroset timeout",
     "retroset version",
-    "retrostop",
+    # Was `retrostop`, which never stopped anything; kept as an alias.
+    "retrosleep",
+}
+
+#: Command name -> the aliases it must keep. Two reasons they are pinned:
+#: an old name that stops working is somebody's muscle memory gone, and the
+#: aliases that were *removed* collided with something else and must not come
+#: back. See ALIASES_REMOVED.
+ALIASES = {
+    "retroreboot": {"retroreset"},
+    "retrosleep": {"retrostop", "retropause"},
+    "retroend": {"retroretire"},
+    "retro list": {"games", "consoles"},
+    "retrosaves": {"saves"},
+    "retrosaves dropstate": {"reset", "restart"},
+    "retrosaves rollback": {"previous"},
+    "retrosaves export": {"backup"},
+    "retrosaves import": {"upload"},
+    "retrosaves list": {"ls"},
+    "retrosaves info": {"show", "about"},
+    "retrosaves delete": {"wipe", "erase", "clear"},
+    "retroset bios": {"firmware"},
+}
+
+#: Aliases that were taken away, and why. Each of them meant something else
+#: somewhere else in this same cog:
+#:
+#: * `retrosaves rollback`'s **undo** -- there is an Undo *button* under every
+#:   game doing something completely different (one press back, in memory), so
+#:   a player who liked it and typed the word lost several presses of save;
+#: * `retrosaves export`'s **download** -- `[p]retroset download` installs
+#:   emulators;
+#: * `retrosaves import`'s **restore** -- "restore" is what the whole codebase
+#:   calls putting a game back on boot;
+#: * `retroset bios`'s **system** -- "system" is the directory those files go
+#:   in, and also what a player calls a console.
+ALIASES_REMOVED = {
+    "retrosaves rollback": "undo",
+    "retrosaves export": "download",
+    "retrosaves import": "restore",
+    "retroset bios": "system",
 }
 
 #: The registered Config keys. Every one of these is already written into
@@ -134,6 +184,37 @@ LISTENERS = {
 def test_the_command_surface_is_exactly_what_it_was(retro):
     published = {command.qualified_name for command in type(retro.cog).__cog_commands__}
     assert published == COMMANDS
+
+
+@pytest.mark.redbot
+def test_the_aliases_people_already_type_still_work(retro):
+    by_name = {c.qualified_name: c for c in type(retro.cog).__cog_commands__}
+    for name, expected in ALIASES.items():
+        assert expected <= set(by_name[name].aliases), (name, by_name[name].aliases)
+
+
+@pytest.mark.redbot
+def test_the_colliding_aliases_are_gone_and_stay_gone(retro):
+    by_name = {c.qualified_name: c for c in type(retro.cog).__cog_commands__}
+    for name, gone in ALIASES_REMOVED.items():
+        assert gone not in by_name[name].aliases, (name, gone)
+
+
+@pytest.mark.redbot
+def test_no_saved_game_name_can_shadow_a_retro_subcommand(retro):
+    """`[p]retro` is a group now, so its subcommand names are reserved.
+
+    discord.py resolves a subcommand before the group's own argument, so a
+    preset called "list" could never be started by bare name. RESERVED_GAME_NAMES
+    is what `[p]retroset game add` refuses, and it has to be exactly the set
+    of things `[p]retro <word>` would swallow.
+    """
+    group = type(retro.cog).retro
+    reserved = set()
+    for command in group.commands:
+        reserved.add(command.name)
+        reserved.update(command.aliases)
+    assert reserved == set(retro.cogmod.RESERVED_GAME_NAMES)
 
 
 @pytest.mark.redbot

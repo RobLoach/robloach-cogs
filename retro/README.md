@@ -71,13 +71,15 @@ can start it by name:
 ## Commands
 
 - `[p]retro [name|url]` starts a game from a saved name, a URL, or a ROM attached to the message. `.zip` files are unpacked for you. With no arguments it brings back the game already going in the channel.
-- `[p]retrostop` saves the game and puts it to sleep. The controls keep working — pressing any button wakes it up again. There is no Stop button under the screen; this command is how a game is stopped.
-- `[p]retroreset` reboots the game that is running, as if you had flipped its power switch. There is no Reset button under the screen either, deliberately — see [Resetting a game](#resetting-a-game). Not to be confused with `[p]retrosaves reset`, which deletes a save state *file*.
+- `[p]retro list` (aliased `games`/`consoles`) shows the games this bot has saved by name and the consoles it can play right now. **Anyone can run it**, which is the point: `[p]retroset game list` says part of the same thing and the whole `[p]retroset` group is owner-only, so players used to be pointed at a command they could not run.
+- `[p]retrosleep` (aliased `retrostop`, `retropause`) saves the game and puts it to sleep. The controls keep working — pressing any button wakes it up again. Queued presses are dropped.
+- `[p]retroend` (aliased `retroretire`) finishes with the channel's game: it is saved, the emulator is freed, and the whole controller is replaced by a single **▶️ Resume** button. Nothing is deleted. This is the one thing the cog could not do before — `[p]retrostop` only ever paused.
+- `[p]retroreboot` (aliased `retroreset`) reboots the game that is running, as if you had flipped its power switch. There is no Reset button under the screen, deliberately — see [Rebooting a game](#rebooting-a-game).
 - `[p]retrosaves [game]` (aliased `saves`) lists what this channel has saved, or shows one game in detail. See [Managing saves](#managing-saves).
-- `[p]retrosaves export <game>` posts a game's battery save as a file to keep. `export state <game>` or `export both <game>` sends the save state too.
-- `[p]retrosaves import <game>` installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real core first.
-- `[p]retrosaves reset <game>` drops the save state, so the game restarts from the last in-game save.
-- `[p]retrosaves rollback <game>` (aliased `undo`) goes back to the previous save-state generation — the durable, on-disk version of the **Undo** button.
+- `[p]retrosaves export <game>` posts a game's in-game save as a file to keep. `export state <game>` or `export both <game>` sends the save state too.
+- `[p]retrosaves import <game>` installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real emulator first.
+- `[p]retrosaves dropstate <game>` (aliased `reset`, `restart`) deletes the save state file, so the game restarts from the last in-game save.
+- `[p]retrosaves rollback <game>` goes back to the previous save-state generation — the durable, on-disk version of the **Undo** button.
 - `[p]retrosaves delete <game>` wipes both halves of a game's save, after asking.
 - `[p]retroset download` (owner) downloads every supported core for your platform from the [libretro buildbot](https://buildbot.libretro.com). `[p]retroset download <core>` fetches or refreshes just one.
 - `[p]retroset autodownload [true|false]` (owner) controls whether missing cores are fetched automatically when the cog loads. On by default.
@@ -148,7 +150,7 @@ column open:
 ```
 ·  ⬆️
 ⬅️  ⬇️  ➡️   B  A
-Start  Select  ⏩ Wait   A ×3   ↩️ Undo
+Start  Select  ⏳ Wait   A ×3   ↩️ Undo
 ```
 
 Consoles with more buttons grow upwards and sideways into the same shape — the
@@ -160,7 +162,7 @@ the six-button Genesis and PC Engine keep their real two-by-three face cluster:
 ·  ⬆️   X  Y  Z
 ⬅️  ⬇️  ➡️
 ·  ·   A  B  C
-Mode  Start  ⏩ Wait   B ×3   ↩️ Undo
+Mode  Start  ⏳ Wait   B ×3   ↩️ Undo
 ```
 
 Discord allows five rows of five components, and this is what each console
@@ -185,9 +187,18 @@ component and, on six of them, one whole row back: the worst case is now the
 Super Nintendo at 19 components over four rows, leaving six components and a
 spare row in hand.
 
-There is no **Stop** button and no **Reset** button. Both are commands
-(`[p]retrostop`, `[p]retroreset`), because both are destructive to a game
-everybody in the channel is playing and neither should be one mis-tap away.
+There is no **Stop** button and no **Reset** button. Putting a game to sleep
+(`[p]retrosleep`), rebooting it (`[p]retroreboot`) and finishing with it
+(`[p]retroend`) are all commands, because each of them is destructive to a
+game everybody in the channel is playing and none of them should be one
+mis-tap away.
+
+**⏳ Wait** used to be drawn with ⏩, the fast-forward symbol, which was
+simply a lie: nothing is sped up and nothing is skipped — the button lets one
+clip's worth of time pass with no input at all. An hourglass says that. (Every
+emoji the cog can put on a button is listed and checked at import time, because
+a character that is not a real Unicode emoji is a `400 Invalid Form Body` on
+the send and takes out the whole command; that has happened in production.)
 
 ## Core options
 
@@ -271,8 +282,8 @@ nothing plays it), and everything a core prints goes to the
 `red.robloach.retro.core` logger at DEBUG rather than onto the bot's console.
 
 A game goes to sleep after 10 minutes without input (configurable with
-`[p]retroset timeout`), when somebody runs `[p]retrostop`, or when the bot shuts
-down. Sleeping frees the emulator but keeps the controls live: the next button
+`[p]retroset timeout`), when somebody runs `[p]retrosleep`, or when the bot
+shuts down. Sleeping frees the emulator but keeps the controls live: the next button
 press wakes the game up exactly where it was, even if the bot has restarted in
 between.
 
@@ -290,7 +301,7 @@ and forth freely.
 the channel's (in which case its existing message is simply brought back), or
 was replaced five games ago, running `[p]retro <name>` restores that channel's
 save state for it rather than cold-booting over the top — the same save
-state → battery save → fresh chain a sleeping game is woken with, and a plain
+state → in-game save → fresh chain a sleeping game is woken with, and a plain
 one-line notice when the state could not be used.
 
 **A replaced game keeps a Resume button.** When a channel moves on, the old
@@ -314,7 +325,7 @@ the whole of this section:
 | | what it is | when it goes |
 | --- | --- | --- |
 | the **session** and **Resume** records | a pointer: *this message, in this channel, was playing this game* | by itself, as soon as it cannot resume anything |
-| the **save state** and **battery save** | the player's progress, keyed by channel **and game** | only when somebody asks (`[p]retrosaves delete`), or when the per-channel game cap drops that game entirely |
+| the **save state** and **in-game save** | the player's progress, keyed by channel **and game** | only when somebody asks (`[p]retrosaves delete`), or when the per-channel game cap drops that game entirely |
 
 Because progress is keyed by channel and game rather than by message,
 **dropping a record loses the button and nothing else**. If the channel's game
@@ -345,19 +356,27 @@ somebody's progress on that evidence is not a trade worth making. The
 opposite mistake costs a few hundred kilobytes, which `[p]retroset diskbudget`
 counts and reports under *saves*.
 
-### Battery saves, as insurance
+### In-game saves, as insurance
+
+**Two words for two things, and the cog uses only these two.** A **save
+state** is the exact moment a game was left at, down to the frame; it only
+loads on the same build of the same emulator. An **in-game save** is what a
+player saved from inside the game, on its own menu. The second one is the
+cartridge's battery-backed memory, which is why the file is a `.srm` and why
+other emulators call it a battery save or SRAM — but a player meets it as
+"the save I made in the game", so that is what it is called everywhere the
+cog speaks. `[p]retrosaves` defines both in its own help.
 
 A save state is a snapshot of the whole machine, and it is only ever loadable
 by the same build of the same core: **update a core and every save state it
-wrote stops fitting**, which would strand a sleeping game. So the cartridge's
-own battery save — its SRAM, the thing an original cart kept your file in — is
-written alongside the state, on exactly the same schedule, as a `.srm` file
+wrote stops fitting**, which would strand a sleeping game. So the in-game save
+is written alongside the state, on exactly the same schedule, as a `.srm` file
 that any emulator can read.
 
 When a game wakes up, the save state is preferred: it brings back the precise
 moment, mid-jump if that is where you were. If the state is missing or the
 core has since been updated and rejects it, the game is booted fresh with the
-battery save poured back in, and the channel is told:
+in-game save poured back in, and the channel is told:
 
 > This game's save state could not be used (most likely the emulator core was
 > updated), so it started from the title screen — but your in-game save
@@ -369,7 +388,7 @@ is left behind, and if a save state is ever lost for one of those the channel
 is told the game simply started over.
 
 **One restore chain, two doors.** Starting a game and waking a sleeping one
-run the same function — save state, then battery save, then the beginning —
+run the same function — save state, then in-game save, then the beginning —
 and the same code decides what to say afterwards and throws away a state the
 core would not take. They used to be two copies kept in step by the tests; now
 they cannot drift apart, and the suite holds the two against each other for
@@ -385,10 +404,10 @@ nothing else is stored, and nothing is kept per user.
 [p]retrosaves <game>                   one game in detail
 [p]retrosaves list
 [p]retrosaves info <game>
-[p]retrosaves export <game>            post the battery save as a file
+[p]retrosaves export <game>            post the in-game save as a file
 [p]retrosaves export state|both <game> send the save state too
 [p]retrosaves import <game>            install an attached save file
-[p]retrosaves reset <game>             drop the save state only
+[p]retrosaves dropstate <game>         delete the save state file only
 [p]retrosaves delete <game>            wipe both halves, after asking
 ```
 
@@ -398,7 +417,7 @@ A listing looks like this, paginated with arrows when it does not fit:
 **3 game(s)** in this channel, 2 with saved progress, 434.6 KiB in total.
 
 **µCity** — `ucity` • Game Boy • **playing now**
-  save state 178.3 KiB, 2 minutes ago • battery save 128.0 KiB, 2 minutes ago
+  save state 178.3 KiB, 2 minutes ago • in-game save 128.0 KiB, 2 minutes ago
 **Tobu Tobu Girl** — `tobu` • Game Boy • resumable
   save state 178.3 KiB, 3 days ago
 ```
@@ -408,12 +427,19 @@ the part people actually want — what starting the game right now would do:
 from its save state, from the title screen with the in-game save in place, or
 from the very beginning.
 
-**`reset` and `delete` are different things, deliberately.** `reset` throws
-away the save state and keeps the cartridge's battery save, which is
+**`dropstate` and `delete` are different things, deliberately.** `dropstate`
+deletes the save state and keeps the in-game save, which is
 "restart from my last in-game save".
 `delete` wipes both, which is "start this game completely fresh": it takes the
 player's in-game save with it, and asks for a yes first. Neither touches the
 cached ROM, so the game still starts instantly afterwards.
+
+`dropstate` used to be called `[p]retrosaves reset`, one word away from
+`[p]retroreset` and opposite in effect — one deleted a file and touched no
+running game, the other rebooted a running game and deleted no file. Each help
+text carried a bolded disclaimer about the other, and there was a third in a
+reply, which is what wrong names look like. Both were renamed for what they
+do; both old names still work.
 
 **Exporting** posts the `.srm` as a plain attachment, so a player can keep it
 or load it in another emulator. The save state is only sent when asked for,
@@ -423,17 +449,17 @@ and skipped rather than failing the command.
 
 **Importing** is checked hard before anything is written. The file has to be
 named like a save (`.srm`/`.sav`, or `.state`), be inside the size ceilings
-(1 MiB for a battery save, 16 MiB for a state), and then actually fit: the
-game is booted on the real core and the files are offered to it, so a battery
+(1 MiB for an in-game save, 16 MiB for a state), and then actually fit: the
+game is booted on the real core and the files are offered to it, so an in-game
 save for the wrong cartridge comes back as
 
-> That battery save is 8.0 KiB (8,192 bytes) but **µCity** has 128.0 KiB
+> That in-game save is 8.0 KiB (8,192 bytes) but **µCity** has 128.0 KiB
 > (131,072 bytes) of save memory.
 
 and a state from another emulator comes back as the core's own complaint,
-never a stack trace. Importing a battery save on its own also removes the
-existing save state, because a state is restored *before* SRAM is looked at
-and would otherwise be put back over the import.
+never a stack trace. Importing an in-game save on its own also removes the
+existing save state, because a state is restored *before* the in-game save is
+looked at and would otherwise be put back over the import.
 
 **A game that is being played right now is saved and put to sleep first.** A
 running emulator holds the authoritative copy of both saves and writes them
@@ -448,9 +474,9 @@ to disk, so without that, `[p]retrosaves delete` — "start this game
 completely fresh" — would be one button press away from coming back.
 
 **Who may do what.** Listing, `info` and `export` are open to the channel,
-like playing. `reset`, `delete` and `import` are limited to the person who
+like playing. `dropstate`, `delete` and `import` are limited to the person who
 started the game, anybody with **Manage Messages**, and the bot owner — the
-same three who may `[p]retrostop` someone else's game.
+same three who may `[p]retrosleep` someone else's game.
 
 ## Playing
 
@@ -534,7 +560,7 @@ anyway, so the console sees the same input on the same frames as it did before
 the pre-roll existed; all that changes is which frames get photographed. The
 hold is therefore honoured in full, and the guarantee that the button is up
 before the clip's last picture holds with *more* room than before rather than
-less. A clip with no input in it — **Wait**, **Undo**, a boot, `[p]retroreset`
+less. A clip with no input in it — **Wait**, **Undo**, a boot, `[p]retroreboot`
 — has no pre-roll at all: nothing was pressed, so there is nothing whose
 effect to wait for, and skipping frames because a paused game has not moved
 would throw away the only thing Wait does.
@@ -611,6 +637,81 @@ the 0.18–0.40 s of decoding and re-encoding a Replay click cost, and a
 component on every console's controls. The only thing a session holds now is
 its **Undo** history, which is capped in both directions (see below).
 
+### What the message says
+
+The clip and the buttons are most of the interface, and the text is **one
+line**, always, made of three parts that all ride on the single edit a press
+was making anyway:
+
+> **µCity** · Game Boy — Rob pressed A. *Queued: Ada ⬅️*
+
+1. **what game this is, and on what.** A short stable prefix. The first clip
+   of a cold boot used to go out with no text at all, and after that the only
+   text was the press line, so somebody scrolling into a channel saw an
+   animation, a grid of unlabelled arrows and "Rob pressed A." with nothing
+   anywhere saying what was being played. It is not the status card this cog
+   used to have and that is not coming back — it is a prefix on a line that
+   already existed. While the session is asleep it reads
+   `**µCity** · Game Boy · asleep`;
+2. **what just happened** — who pressed which button, or whatever had to be
+   said instead (see below);
+3. **what is queued** behind it, which is the whole acknowledgement a queued
+   press gets. See [Queued presses](#queued-presses).
+
+### Queued presses
+
+**A press that lands while somebody else's is being emulated is queued, not
+dropped.** A press holds the session for about a second, and a click that
+arrived during that second used to be acknowledged to Discord and then
+silently forgotten. In a channel with two or three people playing, *most*
+clicks land in that second — so the controller felt intermittently dead: press
+a direction, nothing happens, press it again.
+
+Four rules, and each of them is there for a reason:
+
+* **at most three presses wait.** Each one is a second of latency, and a
+  queued press is emulated against a game state its author has not seen yet.
+  Three waiting plus the one running is about four seconds, which is the most
+  that is still recognisably "I pressed that";
+* **one waiting press per person.** This is what makes a group take turns
+  without anything having to schedule them: a fast clicker cannot fill the
+  queue on their own. A second click from somebody who already has one waiting
+  is refused and the first one stands — the message has already told them
+  their press is queued, and quietly swapping it for something else would make
+  that acknowledgement a lie for a second;
+* **every waiting press is visible.** An input nobody can see is an input that
+  feels lost, which is the whole complaint. The queue is listed as a suffix on
+  the very line the running press is already rewriting, so it costs **no extra
+  edit** — an ephemeral "your press is queued" would be a second message per
+  click (removed once already for being spam) and any further edit of this
+  message would re-render the attachment and visibly rewind the clip;
+* **the queue is intent, never work.** A waiting entry is a button name and a
+  deferred interaction. Nothing touches the emulator until its turn comes and
+  the session's lock is taken again for it, so the one-core-at-a-time rule is
+  untouched.
+
+When its turn comes, a queued press makes exactly the same **single edit** an
+immediate one does, through its own deferred interaction — a component defer
+leaves `edit_original_response` available for the next fifteen minutes. So
+"one press, one visible change" holds for every press rather than for
+whichever one won the race.
+
+**The queue is thrown away** whenever the game stops being the thing those
+presses were aimed at: `[p]retrosleep`, `[p]retroreboot`, `[p]retroend`,
+**Undo**, an idle timeout, another channel taking the emulator, or the channel
+switching games. Replaying a queued direction into a different game state is
+worse than dropping it, and Undo is the sharpest case — those presses were
+queued against the state the undo has just put *back*, so running them would
+undo the undo one button at a time. Because a press that vanishes silently is
+the bug this whole mechanism fixes, the one case where dropping is right says
+so out loud, once, on the next line the session writes:
+
+> **µCity** · Game Boy — Rob undid the last press. *2 queued presses dropped*
+
+**Undo is deliberately not queueable.** A click that arrives while a press is
+being emulated is acknowledged and dropped rather than taken down: "one press
+back" queued three presses deep means undoing a press its author never saw.
+
 **Who pressed which button is written on the message.** Every action replaces
 the one line above the clip with a sentence naming both — in one voice for all
 five of them:
@@ -625,7 +726,7 @@ five of them:
 The *button* name comes from the console's own button table, so a Genesis
 press reads `Rob pressed C.` where the RetroPad would have called that button
 A, and the Neo Geo Pocket's A and B are the right way round. The d-pad has no
-labels, so it names itself with its arrow. `[p]retroreset` is a command rather
+labels, so it names itself with its arrow. `[p]retroreboot` is a command rather
 than a button and is attributed the same way, from whoever ran it.
 
 The *person* is their server display name — their nickname in this server if
@@ -690,15 +791,23 @@ above are what *today's* cores cost and a
 count alone bounds nothing.
 
 **The history is in memory only** — and it is cheap to lose, because the real
-save state is on disk either way. So a bot restart empties it: the button greys itself out, and a
-click that gets through anyway says
+save state is on disk either way. So a bot restart empties it, which means
+*every* message that has outlived a restart has nothing to undo until somebody
+presses something.
 
-> There is nothing to undo yet. Undo steps back through the last 8 presses,
-> and that history is kept in memory only — so it is empty until somebody
-> presses something, and the bot has restarted since the last press here. The
-> game itself is exactly where you left it.
+**The button stays clickable for that case.** It used to grey itself out, on
+the theory that a dead button beats a lying one, and that turned out to hide
+the only explanation there is: a disabled Discord button cannot be clicked, so
+the line below could never be reached by the person looking at the dead
+control — and a permanently dead, unexplained control reads as "Undo is
+broken". (Exactly the same mistake the greyed-out **×3** button made, which
+was reported as the feature having been removed.) Clicking it with nothing to
+undo now costs one private reply and **no edit of the message at all**:
 
-rather than failing. A game going to *sleep* is different: the session object
+> There is nothing to undo here yet: Undo steps back through the last 8
+> presses, and that history is kept in memory only, so a bot restart empties
+> it. Press any button and Undo works again from there. The game itself is
+> exactly where you left it. A game going to *sleep* is different: the session object
 survives, and a save state can be loaded into any instance of the same core
 build, so Undo still reaches back across a sleep — waking the game restores
 the moment it fell asleep at, and the undo steps back from there. If a core
@@ -727,31 +836,45 @@ Two deliberate details:
 
 There is no `[p]retro` command for it, deliberately: the button is where the
 misclick happened, the history it pops only exists in that session's memory,
-and `[p]retrosaves rollback` (aliased **`[p]retrosaves undo`**) is already
-the durable, on-disk version of the same idea — it goes back to the previous
-*save state generation* for a game, which is the answer when the in-memory
-history is gone.
+and `[p]retrosaves rollback` is already the durable, on-disk version of the
+same idea — it goes back to the previous *save state generation* for a game,
+which is the answer when the in-memory history is gone.
 
-### Resetting a game
+`rollback` used to be aliased **`undo`**, and that alias is gone. It was the
+worst collision in the cog: somebody who liked the Undo button and typed the
+word got a command that threw away *several* presses' worth of save instead of
+one, on disk. Three more aliases went with it for the same reason — `export`'s
+`download` (because `[p]retroset download` installs emulators), `import`'s
+`restore` (because "restore" is what the whole cog calls putting a game back
+on boot) and `[p]retroset bios`'s `system` (because "system" is the directory
+those files go in, and also what a player calls a console).
 
-`[p]retroreset` reboots the game that is playing in the channel, as if you had
-flipped its power switch. The clip on its message shows the game booting, and
-the message says *Rob reset the game.* — named from whoever ran the command,
-in the same voice a press is named in.
+An undo also **throws away anything queued**, which is why it is not itself
+queueable; see [Queued presses](#queued-presses).
 
-**It is a command and not a button, deliberately.** A reset throws away the
+### Rebooting a game
+
+`[p]retroreboot` reboots the game that is playing in the channel, as if you
+had flipped its power switch. The clip on its message shows the game booting,
+and the message says *Rob reset the game.* — named from whoever ran the
+command, in the same voice a press is named in.
+
+**It is a command and not a button, deliberately.** A reboot throws away the
 progress-in-flight of everybody in the channel, which is exactly the reason
-`[p]retrostop` is not a button either, and it has the same permission check:
+`[p]retrosleep` is not a button either, and it has the same permission check:
 only the person who **started** the game, anybody with **Manage Messages**,
 and the bot owner can run it. Everyone else is told so and nothing happens.
 
-**`[p]retroreset` and `[p]retrosaves reset` are completely different
-commands**, which is the one thing to be clear about:
+**It was called `[p]retroreset`** (which still works). The pair
+`[p]retroreset` / `[p]retrosaves reset` were one word apart and opposite in
+effect, so each help text needed a bolded disclaimer about the other and a
+reply carried a third. Renaming both to what they do — reboot the console
+now, versus delete a save file — retired all three disclaimers:
 
 | | what it does |
 | --- | --- |
-| `[p]retroreset` | reboots the game **now**. Nothing on disk is deleted. |
-| `[p]retrosaves reset <game>` | deletes a save **state file**, so the game next starts from its last in-game save. Touches no running game. |
+| `[p]retroreboot` | reboots the game **now**. Nothing on disk is deleted. |
+| `[p]retrosaves dropstate <game>` | deletes a save **state file**, so the game next starts from its last in-game save. Touches no running game. |
 
 Three decisions inside it, and the reasons for them:
 
@@ -762,11 +885,11 @@ Three decisions inside it, and the reasons for them:
   automatic save (within three presses) or the next time it sleeps, both of
   which also rotate the pre-reset state into the previous generation that
   `[p]retrosaves rollback` can bring back.
-* **The cartridge's battery save is not touched at all.** That is the save the
+* **The in-game save is not touched at all.** That is the save the
   player made from inside the game, and resetting a real console never wiped
   one — `retro_reset` is the reset line, not a new cartridge. Use
   `[p]retrosaves delete` if that is really what you want.
-* **A reset is an undo point.** The state it is about to throw away is pushed
+* **A reboot is an undo point.** The state it is about to throw away is pushed
   onto the session's history first, so one click of **↩️ Undo** puts the
   player back where they were. Nothing else in this cog can lose as much in
   one command, and the undo machinery exists for exactly that class of
@@ -792,16 +915,24 @@ way round it: the instant "your click landed" feedback is gone, because
 anything that shows you something either edits this message (and rewinds the
 clip) or posts a second one (an ephemeral "still emulating" notice, which was
 tried and removed for being spam). Clicks that arrive while a press is being
-emulated are still swallowed silently — nobody ever sees *This interaction
-failed* — and the same is true of a click that lands while the game is being
-rebooted by `[p]retroreset`.
+emulated are **queued** rather than dropped, and nobody ever sees *This
+interaction failed*; see [Queued presses](#queued-presses). A click that lands
+while the game is being rebooted by `[p]retroreboot` is dropped, because the
+queue goes with the reboot.
 
 The clip and **one line** of text are all that is posted: no status card, no
-caption. The line says who pressed which button, unless there is something
-more important to say — the game having gone to sleep and come back, or a save
-state that could not be restored — and the next press rewrites it either way.
-Waking a sleeping game says *Resumed where you left off…* alongside the clip
-it came back with, instead of naming the presser.
+caption. The line always names the game and its console, then says who pressed
+which button unless there is something more important to say — the game having
+gone to sleep and come back, or a save state that could not be restored — and
+the next press rewrites it either way. See
+[What the message says](#what-the-message-says).
+
+**Whether the session is asleep is legible without an extra edit.** The edit
+that *puts* a game to sleep leaves `· asleep` on that line, so the message
+reads asleep for as long as it is one; the waking press's single edit takes
+the mark off and says *Woke up where you left off.* A wake is the longest wait
+in the cog (a core to load, a save state to restore), and both halves of
+saying so ride on edits that were happening anyway.
 
 **The game only runs while a clip is being recorded.** Between one press and the
 next the console is frozen mid-frame — it is not ticking away in the background,
@@ -849,6 +980,15 @@ feature having been *removed from the cog*. It comes back by itself on the
 next press as soon as the clip is long enough, because the controls are
 redrawn on every press, so `[p]retroset cliplength` corrects it either way
 without restarting anything.
+
+**And it says so when it goes.** A control that silently disappears reads as
+removed just as surely as a greyed-out one does, so the press on which it
+vanishes carries one line — on an edit that was happening anyway:
+
+> The **A x3** button is hidden while clips are this short: only one tap fits,
+> which is what **A** already does. A longer `cliplength` brings it back.
+
+Coming back says nothing: the button is right there saying what it does.
 
 | Clip length | Taps | The button |
 | --- | --- | --- |
@@ -933,8 +1073,9 @@ because it posts the save file itself. **Embed Links** is used by one
 owner-only command, `[p]retroset settings`.
 
 Among the people in a channel, playing and looking at saves are open to
-everybody; destroying progress is not. `[p]retrostop`, `[p]retroreset`,
-`[p]retrosaves reset`, `[p]retrosaves delete` and `[p]retrosaves import` all
+everybody; destroying progress is not. `[p]retrosleep`, `[p]retroend`,
+`[p]retroreboot`,
+`[p]retrosaves dropstate`, `[p]retrosaves delete` and `[p]retrosaves import` all
 want the person who started the game, **Manage Messages**, or the bot owner.
 
 ## ROM URLs
@@ -1059,12 +1200,21 @@ entirely up to you.
 
 ## Upgrading from an earlier version
 
+**Nothing to do.** Install the new version, reload the cog, and everything —
+settings, downloaded emulators, cached ROMs, save states, in-game saves, BIOS
+files, saved game names and live sessions — moves itself across on the first
+load. The rest of this section is the detail, and it lives here rather than in
+the cog's install message: over a third of that message used to be this story,
+which is developer trivia to anybody installing the cog for the first time.
+
+### The RetroCog → Retro rename
+
 The cog's Python class used to be called `RetroCog` and is now simply `Retro`,
 which is the name that appears in `[p]help` and `[p]cog list`. Red derives
 **both** of a cog's storage locations from that class name — `Config` keys
 every setting and session by it, and the data folder is `<data>/cogs/<class
 name>/ ` — so the rename would otherwise have orphaned every downloaded core,
-cached ROM, save state, battery save, BIOS file, saved game and live session.
+cached ROM, save state, in-game save, BIOS file, saved game and live session.
 
 It does not. The first time the renamed cog loads it migrates itself:
 

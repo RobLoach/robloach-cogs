@@ -25,8 +25,8 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, the per-console press line, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves`, `[p]retroreset` and the Undo button included), the session-record lifecycle (the channel and guild listeners, and bounded growth), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `preroll_budget`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; a few tests that read a clip's frames back want Pillow) |
-| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, resetting a core, save states, battery saves, core options, BIOS directory, deliberately corrupted ROMs (`test_malformed_roms.py`), and the save export/import round trip, the Undo round trip and the `[p]retroreset` round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` and `test_malformed_roms.py` also want `discord.py`) |
+| fast | console tables, button layouts, emoji, the per-console press line, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves`, `[p]retroreboot`, `[p]retroend`, the press queue and the Undo button included), the session-record lifecycle (the channel and guild listeners, and bounded growth), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `preroll_budget`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; a few tests that read a clip's frames back want Pillow) |
+| `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, resetting a core, save states, battery saves, core options, BIOS directory, deliberately corrupted ROMs (`test_malformed_roms.py`), and the save export/import round trip, the Undo round trip and the `[p]retroreboot` round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` and `test_malformed_roms.py` also want `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
 `pytest -m emulator -n 2` roughly halves the slow half (29s to 17s here). It
@@ -103,6 +103,41 @@ with an empty history is the one click that makes *no* edit at all: it
 answers privately, so the assertion there is `["response.send_message"]` and
 an untouched message.
 
+**And a queued press obeys it too**, which is the thing to watch when
+touching the queue: a press that was taken down while somebody else's was
+running is edited onto its *own* deferred interaction when its turn comes, so
+"one press, one edit" is a statement about every press rather than about
+whichever one won the race. The section "Overlapping presses are queued, not
+dropped" in `test_cog_session.py` is all of it:
+
+* `test_the_running_press_says_what_is_queued_behind_it` -- the running
+  press's single edit carries `*Queued: Ada ⬅️*`, and the queued press then
+  makes its own `["response.defer", "edit_original_response"]`;
+* `test_two_simultaneous_presses_both_happen_one_edit_each` -- which used to
+  assert that the loser produced *nothing at all*. That was the bug;
+* `test_a_queued_press_runs_against_the_state_it_was_queued_behind` -- order,
+  read off `FakeEmulator.frame` (its frame counter *is* its machine state, so
+  "which state did this press see" is answerable exactly);
+* `test_the_queue_is_bounded_and_says_how_deep` and
+  `test_one_person_gets_one_waiting_press_however_fast_they_click` -- the two
+  rules that keep the latency and the fairness;
+* `test_the_queue_is_discarded_when_the_game_moves_somewhere_else`,
+  parametrised over hibernate / retire / reboot / undo / replaced, plus
+  `test_a_discard_says_so_once_on_the_next_line`. A press that vanishes
+  silently is the bug the queue exists to fix, so the one case where dropping
+  is right has to say so.
+
+**The line above the clip now starts with the game and the console**, so
+almost every content assertion goes through `fakes.RetroEnv.line(view, text)`
+rather than comparing a bare sentence. That helper *spells the format out*
+instead of reading it back off the view -- a test that agreed with whatever
+`RetroView._line` did would assert nothing -- and the literal form is pinned
+once, against a known game, in
+`test_the_line_names_the_game_and_its_console_before_anything_else`.
+`test_the_header_says_when_the_session_is_asleep` covers the other half:
+`· asleep` goes on by the edit that puts the game to sleep and comes off by
+the edit the waking press makes, so neither state costs an extra edit.
+
 **Saying who pressed which button rides on that same edit.** Every action
 writes one line of `content` -- `Rob pressed A.`, `Rob pressed ⬅️.`,
 `Rob waited.`, `Rob undid the last press.`, `Rob reset the game.` -- and the
@@ -112,7 +147,7 @@ ways:
 * `test_every_action_says_who_did_it` is table-driven over `ATTRIBUTED`, one
   row per action, each row saying how to perform it and what the message must
   then read. A press, Wait and ×3 arrive as `interaction.user`;
-  `[p]retroreset` is a *command* and arrives as `ctx.author`, so its row goes
+  `[p]retroreboot` is a *command* and arrives as `ctx.author`, so its row goes
   through the command and reads the edit off the message
   (`fakes.RetroEnv.message_edit`) rather than off an interaction log;
 * `test_no_action_can_notify_anybody` re-runs the same table with a display
@@ -141,18 +176,26 @@ change the shape of the message -- markdown, backticks, start-of-line
 markdown, masked links, mass mentions, zero-width characters, newlines and a
 200 character name.
 
-**One control is allowed to be greyed out at any moment: Undo**, with an
-empty history (which is every session's first moment, and every session's
-state after a restart). So `fakes.pressable()` -- and the
-`any_disabled`/`all_disabled` keys of the interaction snapshot -- leave it
-out, while `fakes.playable()` keeps it for the tests that are about it.
-Without that split, "a press does not grey the controls out" quietly becomes
-"there was something to undo".
+**No control is allowed to be greyed out any more**, so
+`fakes.CONDITIONAL_CONTROLS` is an empty tuple. Both entries it used to have
+went for the same reason -- a present, dead, unexplained control reads as
+broken:
 
-**×3 used to be the second one, and is not any more**: on a clip too short
-for two taps it is not drawn at all, so whenever it is on the message it is
-live. `fakes.button()` therefore returns `None` for a control the view does
-not have, and the presence/absence table is
+* **Undo**, whenever the history was empty (which is every session's state
+  after a bot restart, since the history is memory only). It is always
+  enabled now and a click with nothing to undo is answered privately; a
+  *disabled* Discord button cannot be clicked, so that explanation used to be
+  unreachable by the very person looking at the dead control. See
+  `test_the_undo_button_stays_clickable_with_nothing_to_undo`;
+* **×3**, on a clip too short for two taps, which is not drawn at all --
+  plus one line on the press that hides it, because a control that silently
+  disappears reads as removed just as surely
+  (`test_retroset_cliplength_reaches_live_sessions_and_their_buttons`).
+
+`fakes.pressable()` still filters by `CONDITIONAL_CONTROLS`, so the next
+control that can have nothing to do has to argue with that comment first.
+`fakes.button()` returns `None` for a control the view does not have, and the
+×3 presence/absence table is
 `test_the_repeat_button_is_drawn_only_when_it_can_do_something` in
 `test_view.py` -- `REPEAT_BY_LENGTH` × all eight consoles, from the 0.2s
 settings floor to the 15s ceiling, checking the tap count, whether the button
@@ -204,7 +247,7 @@ Four tests carry that, and between them they are the whole argument:
   player had already seen, so that skipping them loses nothing.
 
 `test_a_clip_with_no_input_in_it_has_no_preroll_at_all` is the other side of
-it: Wait, Undo, a boot and `[p]retroreset` record with no schedule, so they
+it: Wait, Undo, a boot and `[p]retroreboot` record with no schedule, so they
 photograph from their first frame as they always did. The bound itself is
 plain arithmetic and is covered with no core at all in `test_clips.py`
 (`preroll_budget`), including the rule that stops it running through one of
@@ -298,11 +341,11 @@ is looking at reads it off the edit that carried it:
 * `interaction.clip()` for a button press, which edits the *interaction*
   (`FakeInteraction.snapshot` keeps the attachment's bytes under `"clip"`);
 * `retro.shown_clip(view)` for the paths that edit the message itself --
-  `[p]retroreset` through `RetroView.show_clip`, and the first clip of a
+  `[p]retroreboot` through `RetroView.show_clip`, and the first clip of a
   game, which arrives as the `file=` of the send.
 
 That is closer to what the feature promises than an attribute was, which is
-why the real-core Undo and `[p]retroreset` comparisons in
+why the real-core Undo and `[p]retroreboot` comparisons in
 `test_saves_roundtrip.py` go through it.
 
 ## Getting the cores and ROMs

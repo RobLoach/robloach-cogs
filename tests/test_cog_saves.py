@@ -48,7 +48,7 @@ def test_the_group_and_its_subcommands_are_where_they_say_they_are(retro):
         for top in retro.cogmod.Retro.__cog_commands__
         for command in [top, *getattr(top, "walk_commands", lambda: ())()]
     }
-    for name in ("list", "info", "export", "import", "reset", "delete"):
+    for name in ("list", "info", "export", "import", "dropstate", "delete"):
         assert f"retrosaves {name}" in walked, name
 
 
@@ -110,8 +110,8 @@ async def test_the_listing_names_the_game_its_slug_and_both_halves(battery):
     assert "ucity" in said
     assert "`ucity`" in said, "the slug the other commands take"
     assert "Game Boy" in said
-    assert "save state" in said and "battery save" in said
-    assert "8.0 KiB" in said, "the battery save's size"
+    assert "save state" in said and "in-game save" in said
+    assert "8.0 KiB" in said, "the in-game save's size"
     assert "<t:" in said, "a timestamp Discord renders in the reader's timezone"
     assert "playing now" in said
 
@@ -268,7 +268,7 @@ async def test_export_sends_the_battery_save_byte_for_byte(battery):
     uploaded = ctx.uploaded()
     assert set(uploaded) == {"ucity.srm"}, "the state is not sent unless asked for"
     assert uploaded["ucity.srm"] == marker
-    assert "battery save" in ctx.said()
+    assert "in-game save" in ctx.said()
 
 
 async def test_export_both_sends_the_state_as_well_with_a_warning(battery):
@@ -340,7 +340,7 @@ async def test_anyone_in_the_channel_may_export(battery):
 # -- Who may destroy a save ---------------------------------------------------
 
 
-@pytest.mark.parametrize("subcommand", ["retrosaves_reset", "retrosaves_delete"])
+@pytest.mark.parametrize("subcommand", ["retrosaves_dropstate", "retrosaves_delete"])
 async def test_a_passer_by_may_not_destroy_someone_elses_save(battery, subcommand):
     view, _, channel = await playing(battery, 9230, "ucity")
     cog = battery.cog
@@ -368,7 +368,7 @@ async def test_the_same_three_who_may_stop_a_game_may_reset_its_save(battery, wh
     await cog._write_state(view)
     ctx = battery.context(channel, author=who(view))
 
-    await command(battery, "retrosaves_reset")(cog, ctx, game="ucity")
+    await command(battery, "retrosaves_dropstate")(cog, ctx, game="ucity")
     assert not cog._state_path(9231, "ucity").is_file()
     assert "Only the person who started" not in ctx.said()
 
@@ -384,7 +384,7 @@ async def test_reset_drops_the_state_and_keeps_the_battery_save(battery):
     await cog._write_state(view)
     ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
 
-    await command(battery, "retrosaves_reset")(cog, ctx, game="ucity")
+    await command(battery, "retrosaves_dropstate")(cog, ctx, game="ucity")
 
     assert not cog._state_path(9240, "ucity").is_file()
     assert cog._sram_path(9240, "ucity").read_bytes() == marker
@@ -406,7 +406,7 @@ async def test_resetting_a_live_game_is_not_undone_by_the_next_press(battery):
     assert view.live and cog._state_path(9241, "ucity").is_file()
     ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
 
-    await command(battery, "retrosaves_reset")(cog, ctx, game="ucity")
+    await command(battery, "retrosaves_dropstate")(cog, ctx, game="ucity")
 
     assert not view.live, "the live session was saved and put to sleep first"
     assert "put to sleep" in ctx.said()
@@ -424,7 +424,7 @@ async def test_resetting_a_live_game_is_not_undone_by_the_next_press(battery):
 @pytest.mark.parametrize(
     "name, kwargs",
     [
-        ("retrosaves_reset", {"game": "ucity"}),
+        ("retrosaves_dropstate", {"game": "ucity"}),
         ("retrosaves_delete", {"game": "ucity"}),
         ("retrosaves_rollback", {"game": "ucity"}),
     ],
@@ -454,7 +454,9 @@ async def test_changing_the_saves_takes_the_undo_history_with_them(
 
     assert not view.history, name
     assert view.history_bytes == 0
-    assert battery.control(view, "undo").disabled
+    # The button stays clickable -- a click with nothing to undo is answered
+    # privately rather than by a dead control. See _UndoButton.
+    assert not battery.control(view, "undo").disabled
 
 
 async def test_a_sleeping_session_loses_its_undo_history_too(battery):
@@ -469,13 +471,13 @@ async def test_a_sleeping_session_loses_its_undo_history_too(battery):
     assert not view.live and view.history
 
     ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
-    await command(battery, "retrosaves_reset")(cog, ctx, game="ucity")
+    await command(battery, "retrosaves_dropstate")(cog, ctx, game="ucity")
 
     assert not view.history
 
 
 async def test_a_session_that_will_not_hibernate_cleanly_still_frees_its_core(battery):
-    # The same belt and braces `[p]retrostop` has: a stale view, or a message
+    # The same belt and braces `[p]retrosleep` has: a stale view, or a message
     # the bot can no longer edit, must not leave a core running -- everything
     # after this point assumes the files on disk are the only copy.
     view, _, channel = await playing(battery, 9243, "ucity")
@@ -490,7 +492,7 @@ async def test_a_session_that_will_not_hibernate_cleanly_still_frees_its_core(ba
     view.refresh = _explode
     ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
 
-    await command(battery, "retrosaves_reset")(cog, ctx, game="ucity")
+    await command(battery, "retrosaves_dropstate")(cog, ctx, game="ucity")
 
     assert not view.live, "the core was freed anyway"
     assert not cog._state_path(9243, "ucity").is_file()
@@ -502,7 +504,7 @@ async def test_resetting_a_game_with_no_state_says_there_is_nothing_to_do(batter
     cog = battery.cog
     ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
 
-    await command(battery, "retrosaves_reset")(cog, ctx, game="ucity")
+    await command(battery, "retrosaves_dropstate")(cog, ctx, game="ucity")
     assert "no save state" in ctx.said()
     assert view.live, "and a game with nothing to reset is not disturbed"
 
@@ -537,9 +539,13 @@ async def test_the_question_says_what_would_be_lost_and_offers_reset_instead(bat
 
     await command(battery, "retrosaves_delete")(cog, ctx, game="ucity")
     said = ctx.said()
-    assert "save state" in said and "battery save" in said
+    # One word per concept, everywhere a player can see it: "save state"
+    # for the exact moment and "in-game save" for what the player saved from
+    # inside the game. Never "battery save", never "SRAM".
+    assert "save state" in said and "in-game save" in said
+    assert "battery save" not in said and "SRAM" not in said
     assert "can be undone" in said
-    assert "retrosaves reset ucity" in said, "the gentler option is offered"
+    assert "retrosaves dropstate ucity" in said, "the gentler option is offered"
 
 
 async def test_delete_wipes_both_halves_and_keeps_the_rom(battery):

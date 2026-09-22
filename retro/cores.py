@@ -164,11 +164,67 @@ class CoresMixin(MixinMeta):
     def _cores_dir(self) -> Path:
         return self._data_dir("cores")
 
-    @staticmethod
-    def _missing_core_message(prefix: str, system, core: str) -> str:
+    def _cores_downloading(self) -> bool:
+        """
+        Whether the automatic core download is still running.
+
+        Cores fetch themselves in the background the first time the cog
+        loads (see :meth:`_auto_download_loop`), and that is silent: nothing
+        is posted when it starts, nothing when it finishes. So for the first
+        minute or so of a fresh install there are genuinely no cores
+        installed *and* asking the owner to install some is the wrong advice
+        -- the install message has just promised they arrive on their own.
+
+        Read off the task the cog created rather than a flag, so it cannot
+        drift out of step with reality: a task that has finished, failed,
+        been cancelled by `[p]unload`, or was never started because
+        `[p]retroset autodownload` is off all answer False.
+        """
+        task = getattr(self, "_download_task", None)
+        try:
+            return task is not None and not task.done()
+        except Exception:  # pragma: no cover - Task.done() cannot fail
+            return False
+
+    def _no_cores_message(self, prefix: str) -> str:
+        """
+        What to say when a game cannot start because nothing is installed.
+
+        Two genuinely different situations, and telling them apart is the
+        whole point: "ask the bot owner" is a lie while the download the
+        owner was promised is in flight. See :meth:`_cores_downloading`.
+        """
+        if self._cores_downloading():
+            return (
+                "The emulator cores are still downloading \N{EM DASH} they "
+                "fetch themselves in the background the first time this cog "
+                "loads. Try again in a moment."
+            )
         return (
-            f"No {system.name} core is installed. Ask the bot owner to run "
-            f"`{prefix}retroset download {core}`."
+            "No emulator cores are installed yet. They normally download "
+            "themselves; ask the bot owner to run "
+            f"`{prefix}retroset download` to fetch them now."
+        )
+
+    def _missing_core_message(self, prefix: str, system, core: str) -> str:
+        """
+        The same, for a console whose own emulator is the one missing.
+
+        "Core" is what libretro calls one of these and it means nothing to a
+        player, so the sentence says *emulator for the Game Boy* and puts the
+        core's name in backticks beside it, where it reads as the thing the
+        owner has to type rather than as jargon.
+        """
+        if self._cores_downloading():
+            return (
+                f"This bot has no {system.name} emulator installed yet, and "
+                "the emulators are still downloading in the background. Try "
+                "again in a moment."
+            )
+        return (
+            f"This bot has no {system.name} emulator installed (it needs "
+            f"`{core}`, the libretro emulator for the {system.name}). Ask the "
+            f"bot owner to run `{prefix}retroset download {core}`."
         )
 
     @staticmethod

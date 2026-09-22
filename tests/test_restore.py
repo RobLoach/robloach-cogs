@@ -60,11 +60,23 @@ def announced(view):
     A notice is cleared as it is rendered, so a fresh start's has already been
     spent on the message the first clip arrived on, while a wake's is still
     pending and rides on the clip of the press that woke it.
+
+    The header (``**game** · Game Boy``) is stripped off, because it is on
+    every line the session ever writes and says nothing about a restore. What
+    is left is None when the restore had nothing to announce -- which is the
+    assertion most of this module makes.
     """
     if view.notice is not None:
         return view.notice
     message = getattr(view, "message", None)
-    return (getattr(message, "kwargs", None) or {}).get("content")
+    content = (getattr(message, "kwargs", None) or {}).get("content")
+    if content is None:
+        return None
+    head, separator, tail = content.partition(" \N{EM DASH} ")
+    if not separator:
+        # Nothing but the header, i.e. nothing was said.
+        return None
+    return tail
 
 
 def outcome_of(cog, view, channel_id):

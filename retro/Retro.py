@@ -20,8 +20,8 @@ built. Each one is a separate concern with its own module:
 What is left here is the cog itself: its Config schema, the session
 lifecycle (start, hibernate, wake, retire, resume, forget), talking to
 Discord without letting an HTTP failure surface as a traceback, the rate
-limits, and the `[p]retro`, `[p]retrostop`, `[p]retroreset` and `[p]retroset`
-commands.
+limits, and the `[p]retro`, `[p]retrosleep`, `[p]retroend`,
+`[p]retroreboot` and `[p]retroset` commands.
 
 Constants that moved into those modules are re-exported at the bottom of
 this one, so `retro.Retro.<NAME>` keeps meaning what it always did.
@@ -171,6 +171,17 @@ DOWNLOAD_TIMEOUT_SECONDS = 120
 
 # Where to point people who want games they are allowed to play.
 HOMEBREW_URL = "https://retrobrews.github.io/"
+
+#: Names `[p]retroset game add` will not accept, because `[p]retro` is a
+#: group and discord.py resolves a subcommand before the group's own
+#: argument: a preset called "list" could never be started by bare name.
+#:
+#: Written out rather than derived from the command object, because the test
+#: stub's Group does not keep its subcommands -- so instead there is a
+#: `redbot`-marked test that asserts this set is exactly the real group's
+#: subcommand names and aliases. Add a `[p]retro` subcommand and that test
+#: fails until this follows it.
+RESERVED_GAME_NAMES: typing.FrozenSet[str] = frozenset({"list", "games", "consoles"})
 
 # The worked example in the help text: a complete, open source SimCity-like
 # game for the Game Boy Color, MIT licensed, and a direct release download.
@@ -590,7 +601,7 @@ class Retro(
                 "you.",
                 "",
                 "The game itself belongs to the channel: its emulator save "
-                "state, the game's in-cartridge battery save and a cached copy "
+                "state, the game's own in-game save and a cached copy "
                 "of the ROM are shared by everybody who plays there, and none "
                 "of them record who pressed which button.",
                 "",
@@ -942,7 +953,7 @@ class Retro(
             return
         log.info(
             "Forgot channel %s's Retro session and Resume buttons (%s). "
-            "Its save states and battery saves were kept.",
+            "Its save states and in-game saves were kept.",
             channel_id,
             why,
         )
@@ -1155,12 +1166,14 @@ class Retro(
 
         Never raises: it is on every discard path, including cog_unload.
         """
-        forget = getattr(view, "forget_history", None)
-        if forget is not None:
+        for name in ("forget_history", "forget_queue"):
+            forget = getattr(view, name, None)
+            if forget is None:
+                continue
             try:
                 forget()
             except Exception:  # pragma: no cover - a deque cannot fail here
-                log.debug("Could not empty an undo history.", exc_info=True)
+                log.debug("Could not empty a view's %s.", name, exc_info=True)
         try:
             view.stop()
         except Exception:
@@ -1286,7 +1299,7 @@ class Retro(
 
         Nothing is written to disk, unlike ``run_undo``, which writes the
         state it restored straight through. That asymmetry is the whole of the
-        save-state decision behind `[p]retroreset`: an undo is a correction
+        save-state decision behind `[p]retroreboot`: an undo is a correction
         that should survive a restart, while a reset must not quietly
         overwrite a good save state with the title screen. The record is
         saved (it is only the session's bookkeeping) but the ``.state`` file
@@ -1295,7 +1308,7 @@ class Retro(
         ``RetroView.run_reset`` and the command's own help.
 
         Raises EmulatorError if the session cannot be woken or the core will
-        not reset. Called by `[p]retroreset` and nothing else: there is no
+        not reset. Called by `[p]retroreboot` and nothing else: there is no
         Reset button.
         """
         async with self.emulator_lock:
@@ -1405,8 +1418,9 @@ class Retro(
         if core_path is None:
             await self._whisper_interaction(
                 interaction,
-                f"The emulator core **{game_name}** needs (`{core}`) is not "
-                "installed any more, so it cannot be started.",
+                f"The emulator **{game_name}** needs is not installed any "
+                f"more (`{core}`, the libretro emulator for that console), so "
+                "it cannot be started.",
             )
             return
 
@@ -1597,6 +1611,12 @@ class Retro(
     async def _hibernate_locked(
         self, view: RetroView, reason: typing.Optional[str] = None
     ) -> None:
+        # Whatever was still waiting to be pressed goes now, before the core
+        # does. Those presses were aimed at a game that was awake, and a
+        # sleeping session's next press is a *wake* -- replaying three queued
+        # directions into a game that has just come back from a save state is
+        # worse than dropping them. The count rides out on the line below.
+        view.forget_queue()
         emulator, view.emulator = view.emulator, None
         if emulator is not None:
             # This local is now the only reference to the core, so every way
@@ -1633,8 +1653,8 @@ class Retro(
         core_path = await self._core_path(view.core)
         if core_path is None:
             raise EmulatorError(
-                f"The {view.system.name} core ({view.core}) is not installed "
-                "any more, so this game cannot be resumed."
+                f"this bot's {view.system.name} emulator (`{view.core}`) is "
+                "not installed any more, so the game cannot be resumed"
             )
         rom_path = self._rom_path(view.rom_filename)
         if rom_path is None or not rom_path.is_file():
@@ -2039,28 +2059,42 @@ class Retro(
 
     @staticmethod
     def _http_error_message(error: typing.Optional[Exception]) -> str:
-        """Turn a Discord rejection into something worth reading."""
+        """
+        Turn a Discord rejection into something worth reading.
+
+        The HTTP status and Discord's own error code are **logged, never
+        shown**. They used to be in the reply -- a player could be handed
+        ``50035 Invalid Form Body`` or ``HTTP 503`` -- which is an internal
+        detail dressed up as an explanation: it tells somebody who can only
+        press buttons nothing they can act on, and reads like a crash. What
+        goes back is what they can do about it; what goes to the log is what
+        the bot owner needs to diagnose it.
+        """
         if isinstance(error, discord.Forbidden):
             return (
                 "Discord would not let me post that here. I need the **Attach "
                 "Files** permission in this channel to post a clip."
             )
         code = getattr(error, "code", 0) or 0
+        status = getattr(error, "status", None)
+        if error is not None:
+            log.warning(
+                "Discord refused a Retro message: HTTP %s, code %s.", status, code
+            )
         if code == 50035:
             return (
-                "Discord rejected the message as invalid (`50035 Invalid Form "
-                "Body`). That is a bug in this cog rather than anything you "
-                "did; the details are in the bot's log."
+                "Discord refused that message. It is a bug in this cog rather "
+                "than anything you did, and the bot owner will find the "
+                "details in the log."
             )
-        if code == 40005 or getattr(error, "status", 0) == 413:
-            return "That clip was too large for Discord to accept."
-        status = getattr(error, "status", None)
-        if status is None:
-            return "Discord rejected the message. The details are in the bot's log."
+        if code == 40005 or status == 413:
+            return (
+                "That clip was too large for Discord to accept. A shorter "
+                "`cliplength` makes smaller clips."
+            )
         return (
-            f"Discord rejected the message (HTTP {status}"
-            + (f", code {code}" if code else "")
-            + "). Try again in a moment."
+            "Discord refused that message \N{EM DASH} the game itself is "
+            "fine. Try again in a moment; the details are in the bot's log."
         )
 
     def _friendly_error(self, error: BaseException) -> typing.Optional[str]:
@@ -2336,6 +2370,16 @@ class Retro(
         return Path(found.name).name, found.data
 
     async def _no_rom_help(self, ctx: commands.Context) -> None:
+        """
+        How to start a game: what is saved by name, and what will run.
+
+        Shown by a bare `[p]retro` in a channel with no session, and by
+        `[p]retro list` at any time. The second caller is why this is not
+        private to the first: bare `[p]retro` *resumes* once a game is
+        running, so everything in here used to become unreachable the moment
+        somebody started playing -- which is precisely when a second person
+        arrives and wants to know what else they can start.
+        """
         presets = await self.config.games()
         lines = [
             "Attach a console ROM (a `.zip` is fine) to your message, or pass "
@@ -2348,13 +2392,16 @@ class Retro(
         if presets:
             names = ", ".join(f"`{name}`" for name in sorted(presets)[:15])
             lines.append("")
-            lines.append(f"You can also start a saved game by name: {names}")
+            lines.append(
+                f"You can also start a saved game by name: {names} "
+                f"\N{EM DASH} `{ctx.clean_prefix}retro {sorted(presets)[0]}`."
+            )
         else:
             lines.append("")
             lines.append(
-                "The bot owner can save games by name with "
-                f"`{ctx.clean_prefix}retroset game add <name> <url>`, for "
-                f"example `{ctx.clean_prefix}retroset game add "
+                "This bot has no games saved by name yet. The bot owner can "
+                f"add one with `{ctx.clean_prefix}retroset game add <name> "
+                f"<url>`, for example `{ctx.clean_prefix}retroset game add "
                 f"{EXAMPLE_GAME} {EXAMPLE_ROM_URL}`."
             )
         installed = await self._installed_cores()
@@ -2363,6 +2410,17 @@ class Retro(
             lines.append("")
             lines.append("Consoles this bot can play right now:")
             lines.extend(self._supported_lines(playable))
+        elif self._cores_downloading():
+            lines.append("")
+            lines.append(
+                "No console emulators are ready yet \N{EM DASH} they are "
+                "downloading in the background. Try again in a moment."
+            )
+        lines.append("")
+        lines.append(
+            f"`{ctx.clean_prefix}retrosaves` lists what this channel has "
+            "played and how much of each game is saved."
+        )
         lines.append("")
         lines.append(
             "Only use ROMs you have the rights to. There are hundreds of free "
@@ -2503,7 +2561,20 @@ class Retro(
     # embed anywhere in the play loop. (`[p]retroset settings` still uses one,
     # and asks for Embed Links itself.)
     @commands.bot_has_permissions(attach_files=True)
-    @commands.command()
+    # A group rather than a plain command, for exactly one subcommand:
+    # `[p]retro list`. Everything a player needs to know to start a game --
+    # which games this bot has saved by name, which consoles it can actually
+    # play right now -- used to be reachable only through `[p]retroset game
+    # list`, which is owner-only, or through a bare `[p]retro` in a channel
+    # with no session, which stops working the moment a game is running
+    # (bare `[p]retro` then resumes it). See _no_rom_help, which is what both
+    # of them show.
+    #
+    # `invoke_without_command=True`, so `[p]retro ucity` and `[p]retro <url>`
+    # still reach the body below untouched. The cost is that a saved game
+    # called "list" (or "games", or "consoles") could not be started by bare
+    # name any more, so `[p]retroset game add` refuses those names.
+    @commands.group(invoke_without_command=True)
     async def retro(self, ctx: commands.Context, *, game: typing.Optional[str] = None) -> None:
         """
         Play a retro console game in this channel.
@@ -2516,26 +2587,30 @@ class Retro(
 
         Games keep their progress: a session goes to sleep when nobody plays,
         and the next button press picks it back up, even after the bot
-        restarts. Anyone in the channel can press the buttons.
+        restarts. Anyone in the channel can press the buttons, and a press
+        that lands while somebody else's is still running is queued rather
+        than lost.
 
         Only use ROMs you have the rights to. Hundreds of free homebrew games
         for these consoles are at <https://retrobrews.github.io/>.
 
         **Examples:**
         - `[p]retro` (with a ROM attached, or to resume this channel's game)
+        - `[p]retro list` (the games and consoles this bot can play)
         - `[p]retro https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc`
         - `[p]retro ucity`
 
         **Arguments:**
-        - `[game]` - A saved game name (see `[p]retroset game list`) or a ROM URL.
+        - `[game]` - A saved game name (see `[p]retro list`) or a ROM URL.
         """
         installed = await self._installed_cores()
         if not installed:
             self._forgive_cooldown(ctx)
-            await ctx.send(
-                "No emulator cores are installed. Ask the bot owner to run "
-                f"`{ctx.clean_prefix}retroset download` first."
-            )
+            # Not simply "ask the bot owner": on a fresh install the
+            # emulators are very probably downloading themselves right now,
+            # which is exactly what the install message promised. See
+            # CoresMixin._no_cores_message.
+            await ctx.send(self._no_cores_message(ctx.clean_prefix))
             return
 
         game = game.strip() if game else None
@@ -2563,9 +2638,13 @@ class Retro(
                 url, source = game, game
             else:
                 self._forgive_cooldown(ctx)
+                # `[p]retro list` rather than `[p]retroset game list`: the
+                # whole `retroset` group is owner-only, so the old advice sent
+                # every player to a command they cannot run.
                 await ctx.send(
                     f"There's no saved game called `{game}`. Pass a ROM URL, "
-                    f"attach a ROM, or see `{ctx.clean_prefix}retroset game list`."
+                    "attach a ROM, or run "
+                    f"`{ctx.clean_prefix}retro list` to see what this bot has."
                 )
                 return
             # Asking for the game that is already going here resumes it
@@ -2806,20 +2885,44 @@ class Retro(
         await self._save_record(view)
 
     @commands.guild_only()
-    @commands.command()
-    async def retrostop(self, ctx: commands.Context) -> None:
+    @retro.command(name="list", aliases=["games", "consoles"])
+    async def retro_list(self, ctx: commands.Context) -> None:
         """
-        Put this channel's game to sleep.
+        See which games this bot has saved and which consoles it can play.
 
-        The game is saved and the emulator is freed, but the controls stay
-        live: pressing any button picks the game up again where it left off.
-        This is the only way to stop a game; there is no Stop button.
+        The player-facing answer to "what can I start?". `[p]retroset game
+        list` says part of the same thing but the whole `[p]retroset` group
+        is owner-only, so this is the one to use — and unlike a bare
+        `[p]retro`, it works while a game is already running.
 
-        Only the person who started the game, members with the Manage
-        Messages permission, and the bot owner can stop it.
+        `[p]retrosaves` is the companion to this one: it lists what *this
+        channel* has played and how much of each game is saved.
 
         **Examples:**
-        - `[p]retrostop`
+        - `[p]retro list`
+        """
+        await self._no_rom_help(ctx)
+
+    @commands.guild_only()
+    @commands.command(name="retrosleep", aliases=["retrostop", "retropause"])
+    async def retrosleep(self, ctx: commands.Context) -> None:
+        """
+        Put this channel's game to sleep, keeping its controls live.
+
+        The game is saved and the emulator is freed, but the message keeps
+        working: pressing any button wakes the game and picks it up exactly
+        where it left off. Nothing is thrown away, and any presses that were
+        queued up are dropped.
+
+        It used to be called `[p]retrostop`, which it never was — it is a
+        pause, not a stop. That name still works. To really finish with a
+        game and retire its controls, use `[p]retroend`.
+
+        Only the person who started the game, members with the Manage
+        Messages permission, and the bot owner can do this.
+
+        **Examples:**
+        - `[p]retrosleep`
         """
         view = self.sessions.get(ctx.channel.id)
         if view is None:
@@ -2828,7 +2931,7 @@ class Retro(
         if not await view.can_stop(ctx.author):
             await ctx.send(
                 "Only the person who started the game, moderators, or the "
-                "bot owner can stop it."
+                "bot owner can do that."
             )
             return
         # Sanitised, exactly as the press line's name is: this sentence goes
@@ -2839,51 +2942,110 @@ class Retro(
             async with view.lock:
                 await self.hibernate(
                     view,
-                    f"Stopped{' by ' + who if who else ''}. Press a button "
-                    "to pick up where you left off.",
+                    f"Put to sleep{' by ' + who if who else ''}. Press a "
+                    "button to pick up where you left off.",
                 )
         except Exception:
             # Even if the view or its message is stale, make sure the game is
             # saved and the emulator is freed.
-            log.exception("Failed to stop the Libretro session cleanly.")
+            log.exception("Failed to put the Libretro session to sleep cleanly.")
             emulator, view.emulator = view.emulator, None
             if emulator is not None:
                 await self._write_state(view, emulator)
                 await asyncio.to_thread(emulator.stop)
         await ctx.send(
             "The game has been saved and put to sleep. Press any button on "
-            "it to carry on."
+            f"it to carry on, or `{ctx.clean_prefix}retroend` to finish with "
+            "it altogether."
         )
 
     @commands.guild_only()
-    @commands.command()
-    async def retroreset(self, ctx: commands.Context) -> None:
+    @commands.command(name="retroend", aliases=["retroretire"])
+    async def retroend(self, ctx: commands.Context) -> None:
+        """
+        Finish with this channel's game and retire its controls.
+
+        The one thing the cog could not do before. `[p]retrosleep` only
+        *pauses* — the controls stay live and the next press wakes the game —
+        so there was no way to say "we are done with this" and have the
+        controller stop responding.
+
+        This saves the game, frees the emulator, and replaces the whole
+        controller with a single **Resume** button, exactly as starting a
+        different game in this channel would. Nothing is deleted: the save
+        state, the in-game save and the cached ROM all stay, so Resume (or
+        `[p]retro <name>`) brings the game back where it was.
+
+        Only the person who started the game, members with the Manage
+        Messages permission, and the bot owner can do this.
+
+        **Examples:**
+        - `[p]retroend`
+        """
+        view = self.sessions.get(ctx.channel.id)
+        if view is None:
+            await self._safe_send(ctx, "No game is running in this channel.")
+            return
+        if not await view.can_stop(ctx.author):
+            await self._safe_send(
+                ctx,
+                "Only the person who started the game, moderators, or the "
+                "bot owner can do that.",
+            )
+            return
+        who = presser_name(ctx.author)
+        # The same path a channel switching games takes: saved, core freed,
+        # record kept, and the message left with a Resume button. Doing it
+        # any other way would mean a second way to retire a session.
+        await self._retire(
+            view,
+            f"Finished{' by ' + who if who else ''} \N{EM DASH} "
+            f"**{view.game_name}** was saved. Press Resume to come back to it.",
+        )
+        self.sessions.pop(ctx.channel.id, None)
+        log.info(
+            "Retired %s in channel %s at %s's request.",
+            view.slug,
+            ctx.channel.id,
+            getattr(ctx.author, "id", "?"),
+        )
+        await self._safe_send(
+            ctx,
+            f"**{view.game_name}** has been saved and its controls retired. "
+            "Its message keeps a **Resume** button, and "
+            f"`{ctx.clean_prefix}retro {view.slug}` starts it again here. "
+            "Nothing was deleted.",
+        )
+
+    @commands.guild_only()
+    @commands.command(name="retroreboot", aliases=["retroreset"])
+    async def retroreboot(self, ctx: commands.Context) -> None:
         """
         Reboot this channel's game, as if you had flipped its power switch.
 
         The game starts again from its title screen, here and now, and the
-        clip on its message shows it booting. **This is not the same thing as
-        `[p]retrosaves reset`**, which touches no running game at all: that
-        one deletes a save state *file* on disk so the game starts from the
-        last in-game save the next time somebody plays it. This one reboots
-        the game that is playing right now.
+        clip on its message shows it booting. Any queued presses are dropped.
 
         Nothing on disk is deleted or overwritten. The save state still holds
-        the moment before the reset until the game saves again of its own
-        accord -- a few presses of the rebooted game, or the next time it
-        goes to sleep -- so a reset that was a mistake is recoverable: press
+        the moment before the reboot until the game saves again of its own
+        accord — a few presses of the rebooted game, or the next time it goes
+        to sleep — so a reboot that was a mistake is recoverable: press
         **Undo**, which steps straight back to the moment before it. The
-        cartridge's battery save (the one the game itself writes when you
-        save from its own menu) is not touched at all, exactly as resetting a
-        real console never wiped one.
+        in-game save (the one the game itself writes when you save from its
+        own menu) is not touched at all, exactly as resetting a real console
+        never wiped one.
+
+        It used to be called `[p]retroreset`, which read far too much like
+        `[p]retrosaves dropstate` — a command that deletes a file and touches
+        no running game. The old name still works.
 
         Only the person who started the game, members with the Manage
-        Messages permission, and the bot owner can reset it, for the same
-        reason only they can stop it: it throws away everybody's
+        Messages permission, and the bot owner can do this, for the same
+        reason only they can put it to sleep: it throws away everybody's
         progress-in-flight.
 
         **Examples:**
-        - `[p]retroreset`
+        - `[p]retroreboot`
         """
         view = self.sessions.get(ctx.channel.id)
         if view is None:
@@ -2897,24 +3059,26 @@ class Retro(
             await self._safe_send(
                 ctx,
                 "Only the person who started the game, moderators, or the "
-                "bot owner can reset it.",
+                "bot owner can reboot it.",
             )
             return
-        # The view's own lock, exactly as `[p]retrostop` takes it, so a press
+        # The view's own lock, exactly as `[p]retrosleep` takes it, so a press
         # that is already being emulated finishes before the machine is
-        # rebooted underneath it.
+        # rebooted underneath it -- and so that a runner working through the
+        # press queue lets go between two of them and this gets in. Rebooting
+        # discards the queue; see RetroView.run_reset.
         async with ctx.typing():
             try:
                 async with view.lock:
                     clip = await self.run_reset(view)
             except EmulatorError as error:
                 await self._safe_send(
-                    ctx, f"**{view.game_name}** could not be reset: {error}"
+                    ctx, f"**{view.game_name}** could not be rebooted: {error}"
                 )
                 return
             except Exception:
                 log.exception(
-                    "Unexpected failure resetting the Retro session in channel %s.",
+                    "Unexpected failure rebooting the Retro session in channel %s.",
                     ctx.channel.id,
                 )
                 await self._safe_send(
@@ -2922,12 +3086,12 @@ class Retro(
                 )
                 return
         log.info(
-            "Reset %s in channel %s at %s's request.",
+            "Rebooted %s in channel %s at %s's request.",
             view.slug,
             ctx.channel.id,
             getattr(ctx.author, "id", "?"),
         )
-        # The reset clip goes on the game's own message, with the line that
+        # The reboot clip goes on the game's own message, with the line that
         # says who did what -- one edit, like a press, and named the same way
         # a press is even though this is a command rather than a button.
         await view.show_clip(clip, view.reset_note(ctx.author))
@@ -2938,13 +3102,12 @@ class Retro(
         who = presser_name(ctx.author)
         await self._safe_send(
             ctx,
-            f"**{view.game_name}** has been reset{' by ' + who if who else ''} "
-            "\N{EM DASH} it is back at its title screen. Its in-game battery "
-            "save is untouched, and nothing on disk has been overwritten: "
-            "press **Undo** on the game to step straight back to the moment "
-            "before the reset, or carry on playing and the reset becomes the "
-            "save a few presses from now. To throw away a save state *file* "
-            f"instead, use `{ctx.clean_prefix}retrosaves reset`.",
+            f"**{view.game_name}** has been rebooted{' by ' + who if who else ''} "
+            "\N{EM DASH} it is back at its title screen. Its in-game save is "
+            "untouched, and nothing on disk has been overwritten: press "
+            "**Undo** on the game to step straight back to the moment before "
+            "the reboot, or carry on playing and the reboot becomes the save "
+            "a few presses from now.",
         )
 
     @commands.group()
@@ -3300,6 +3463,18 @@ class Retro(
             )
             return
         key = self._slug(name)
+        # `[p]retro` is a group now, for `[p]retro list`, so a preset whose
+        # name is one of its subcommand names could never be started by bare
+        # name: discord.py resolves the subcommand first. Refused here, while
+        # the owner is still looking at it, rather than silently producing a
+        # preset nobody can play.
+        if key in RESERVED_GAME_NAMES:
+            await self._safe_send(
+                ctx,
+                f"`{key}` cannot be a game name: `{ctx.clean_prefix}retro "
+                f"{key}` already means something else. Pick another name.",
+            )
+            return
         async with self.config.games() as games:
             existed = key in games
             games[key] = url
@@ -3346,7 +3521,11 @@ class Retro(
         for page in pagify(lines):
             await ctx.send(page)
 
-    @retroset.group(name="bios", aliases=["firmware", "system"])
+    # No `system` alias any more: this group manages *firmware files*, and
+    # "system" is what libretro calls the directory they go in, what a player
+    # calls a console, and what `[p]retroset settings` prints three of. One
+    # word for one thing.
+    @retroset.group(name="bios", aliases=["firmware"])
     async def retroset_bios(self, ctx: commands.Context) -> None:
         """
         Manage the BIOS/firmware files cores can use.
@@ -3744,7 +3923,7 @@ class Retro(
         Set how much disk the cog may use in total, in MiB.
 
         Everything the cog stores counts: the emulator cores, every channel's
-        cached ROMs, every save state and battery save with the one previous
+        cached ROMs, every save state and in-game save with the one previous
         generation each, and any BIOS files you have installed. When a new
         download would go over the budget, cached ROMs nobody is playing are
         deleted oldest first to make room, and if that is not enough the
@@ -4076,8 +4255,8 @@ class Retro(
         )
         if batteries:
             sessions_value += (
-                f"\n{batteries} have an in-game battery save on disk, which "
-                "survives a core update even when the save state does not."
+                f"\n{batteries} have an in-game save on disk, which "
+                "survives an emulator update even when the save state does not."
             )
         embed.add_field(name="Sessions", value=sessions_value, inline=False)
         embed.add_field(

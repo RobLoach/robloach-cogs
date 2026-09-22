@@ -319,25 +319,79 @@ def test_the_readme_describes_the_clip_preroll_and_its_bound():
     assert "test_the_dead_lead_in_is_photographed_rather_than_trimmed" not in COG_README
 
 
-def test_the_readme_describes_resetting_a_game():
-    assert "### Resetting a game" in COG_README
-    assert "[p]retroreset" in COG_README
-    # The distinction that has to be unmistakable, and the three decisions.
-    assert "completely different" in COG_README
+def test_the_readme_describes_rebooting_a_game():
+    assert "### Rebooting a game" in COG_README
+    assert "[p]retroreboot" in COG_README
+    assert "[p]retroreset" in COG_README, "the old name still works and is said so"
+    # The three decisions inside it.
     assert "Nothing on disk is written" in COG_README
-    assert "battery save is not touched" in COG_README
-    assert "A reset is an undo point" in COG_README
+    assert "in-game save is not touched" in COG_README
+    assert "A reboot is an undo point" in COG_README
     assert "command and not a button" in COG_README
+
+
+def test_the_readme_documents_the_press_queue():
+    """The headline change: a press that lands mid-emulation is not lost."""
+    assert "### Queued presses" in COG_README
+    for phrase in (
+        "queued, not\ndropped",
+        "at most three presses wait",
+        "one waiting press per person",
+        "every waiting press is visible",
+        "the queue is intent, never work",
+        "no extra\n  edit",
+        "The queue is thrown away",
+        "Undo is deliberately not queueable",
+        "2 queued presses dropped",
+    ):
+        assert phrase in COG_README, phrase
+
+
+def test_the_readme_documents_the_one_line_on_the_message():
+    """What game is playing, and whether it is asleep."""
+    assert "### What the message says" in COG_README
+    assert "**\u00b5City** \u00b7 Game Boy \u2014 Rob pressed A." in COG_README
+    assert "\u00b7 asleep" in COG_README
+    assert "no text at all" in COG_README, "what the first clip used to carry"
+    assert "not the status card this cog" in COG_README
+    assert "Woke up where you left off." in COG_README
+
+
+def test_the_readme_says_the_wait_button_is_not_a_fast_forward():
+    assert "\u23f3 Wait" in COG_README
+    assert "fast-forward symbol" in COG_README
+    assert "nothing is sped up" in COG_README
+
+
+def test_the_readme_explains_the_renames_and_the_dropped_aliases():
+    """Four names were wrong and four aliases collided; both are recorded."""
+    for phrase in (
+        "[p]retrosleep",
+        "[p]retroend",
+        "[p]retroreboot",
+        "[p]retrosaves dropstate",
+        "[p]retro list",
+        "aliased `retrostop`",
+        "aliased `retroreset`",
+        "aliased `reset`, `restart`",
+        "that alias is gone",
+    ):
+        assert phrase in COG_README, phrase
+    # And the removed aliases must not be advertised as working.
+    assert "aliased `undo`" not in COG_README
+    assert "[p]retrosaves undo" not in COG_README
 
 
 def test_the_readme_describes_the_undo_button():
     assert "### Undo" in COG_README
     assert "steps the game back one press" in COG_README
-    # The two decisions somebody reading it has to know about: what a restart
-    # does to the history, and that the buffer rewinds with the game.
+    # The three decisions somebody reading it has to know about: what a
+    # restart does to the history, why the button is still clickable for that
+    # case, and that the undo's clip replaces the undone press's.
     assert "The history is in memory only" in COG_README
+    assert "The button stays clickable for that case" in COG_README
     assert "undo's own clip replaces the undone press's" in COG_README
-    assert "↩️ Undo" in COG_README, "and it is drawn in the layout"
+    assert "\u21a9\ufe0f Undo" in COG_README, "and it is drawn in the layout"
 
 
 def test_the_readme_describes_the_resume_button():
@@ -355,7 +409,7 @@ def test_the_readme_documents_the_save_commands():
     for command in (
         "[p]retrosaves export",
         "[p]retrosaves import",
-        "[p]retrosaves reset",
+        "[p]retrosaves dropstate",
         "[p]retrosaves delete",
     ):
         assert command in COG_README, command
@@ -464,9 +518,10 @@ def test_the_readme_describes_the_single_restore_chain():
     [
         "Resume",
         "Undo",
-        "says who pressed which button",
+        "who pressed which button",
         "never a ping",
-        "[p]retroreset",
+        "queued rather than lost",
+        "[p]retroreboot",
         "detected automatically",
         "[p]retrosaves",
     ],
@@ -628,3 +683,105 @@ def test_the_load_bearing_constants_are_still_in_the_source():
     # re-exported from Retro.py so `retro.Retro.LEGACY_COG_NAME` still works.
     assert 'LEGACY_COG_NAME = "RetroCog"' in MIGRATION_SOURCE
     assert "LEGACY_COG_NAME" in COG_SOURCE
+
+
+# -- One word per concept, everywhere a player can see it ---------------------
+#
+# Four names were in use for two concepts -- "save state", "battery save",
+# "in-game save" and "SRAM" -- sometimes in adjacent sentences. A player
+# meeting two of them for the same file has no way to know they are the same
+# file. So: **save state** for the exact moment, **in-game save** for what the
+# player saved from inside the game, and nothing else.
+#
+# "Battery save" and "SRAM" survive in comments, internal docstrings and
+# identifiers (`_sram_path`, `.srm`), where they are accurate and
+# developer-facing. What is checked here is the text a player really reads:
+# every **command docstring**, because Red turns those into `[p]help`.
+
+#: The one place both words are *defined*, and therefore the one place a
+#: synonym belongs: the `[p]retrosaves` group's own help.
+VOCABULARY_EXEMPTION = "other emulators call it a battery"
+
+
+def command_docstrings(module_name):
+    """``{function name: docstring}`` for every command in one module.
+
+    A command is a function whose decorators include a ``.command(...)`` or
+    ``.group(...)`` call -- which is exactly what Red publishes and exactly
+    what it turns into help text. Read off the parsed source rather than off
+    the cog class, so it works without the real Red installed.
+    """
+    source = (REPO_ROOT / "retro" / module_name).read_text()
+    found = {}
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call):
+                continue
+            target = ast.unparse(decorator.func)
+            if target.endswith((".command", ".group")):
+                doc = ast.get_docstring(node)
+                if doc:
+                    found[node.name] = doc
+                break
+    return found
+
+
+@pytest.mark.parametrize("module", ["saves.py", "Retro.py"])
+def test_no_command_help_text_says_battery_save_or_sram(module):
+    docs = command_docstrings(module)
+    assert docs, module
+    offenders = {}
+    for name, doc in docs.items():
+        if VOCABULARY_EXEMPTION in doc:
+            continue
+        lowered = doc.lower()
+        if "battery save" in lowered or "sram" in lowered:
+            offenders[name] = doc
+    assert not offenders, sorted(offenders)
+
+
+def test_every_command_that_names_a_save_uses_one_of_the_two_words():
+    """And they really do talk about saves, so this is not vacuous."""
+    docs = command_docstrings("saves.py")
+    talkers = [
+        name
+        for name, doc in docs.items()
+        if "save state" in doc or "in-game save" in doc
+    ]
+    assert len(talkers) >= 5, talkers
+
+
+def test_the_group_docstring_is_where_both_words_are_defined():
+    doc = command_docstrings("saves.py")["retrosaves"]
+    assert "a **save state**" in doc
+    assert "an **in-game save**" in doc
+    assert VOCABULARY_EXEMPTION in doc
+    assert "the only two names this cog uses" in doc
+
+
+def test_the_readme_uses_the_same_two_words():
+    assert "### In-game saves, as insurance" in COG_README
+    assert "Two words for two things" in COG_README
+    assert "### Battery saves, as insurance" not in COG_README
+    assert "defines both in its own help" in COG_README
+
+
+def test_the_install_message_is_about_installing():
+    """It used to spend over a third of itself on the RetroCog rename.
+
+    That is developer trivia to somebody installing the cog for the first
+    time, and it now lives in the README's upgrade section instead.
+    """
+    message = COG_INFO["install_msg"]
+    assert "RetroCog" not in message
+    assert len(message) < 400, len(message)
+    # What it does have to say: how to load it, how to start, and that the
+    # emulators are on their way.
+    assert "[p]load retro" in message
+    assert "[p]retro list" in message
+    assert "download themselves" in message
+    assert "README" in message
+    # ...and the story it dropped is in the README, under its own heading.
+    assert "### The RetroCog \u2192 Retro rename" in COG_README

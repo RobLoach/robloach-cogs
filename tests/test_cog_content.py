@@ -916,8 +916,11 @@ async def test_a_rejected_game_message_saves_the_game_and_leaves_no_session(retr
     assert not FakeEmulator.instances[-1].started
     assert retro.cog._state_path(channel.id, "doomed").is_file()
     said = ctx.said()
-    assert "50035" in said
+    # Discord's own numbers are logged, never shown: "50035 Invalid Form
+    # Body" is an internal detail dressed up as an explanation. See
+    # Retro._http_error_message.
     assert "bug in this cog" in said
+    assert "50035" not in said and "HTTP" not in said
 
 
 async def test_a_forbidden_send_names_the_permission_it_needs(retro):
@@ -974,11 +977,15 @@ async def test_an_edit_discord_refuses_mid_press_leaves_the_controls_usable(retr
 
     await view._press(interaction, "a")
     assert "followup.send" in interaction.kinds()
-    assert any(
-        "safe" in str(data.get("content", ""))
+    whispers = [
+        str(data.get("content", ""))
         for kind, data in interaction.log
         if kind == "followup.send"
-    )
+    ]
+    assert any("the game itself is fine" in text.lower() for text in whispers)
+    # ...and not an HTTP status, which is what it used to say. See
+    # RetroView._show.
+    assert not any("HTTP" in text for text in whispers), whispers
     assert not any(getattr(c, "disabled", False) for c in retro.playable(view))
     assert retro.cog.sessions.get(channel.id) is view
 
@@ -991,7 +998,8 @@ async def test_a_known_failure_becomes_a_sentence(retro, error_name):
     from retro.emulator import EmulatorError
 
     cases = {
-        "http": (http_error(), "50035"),
+        # The code goes to the log; what the player gets is actionable.
+        "http": (http_error(), "bug in this cog"),
         "forbidden": (
             discord.Forbidden(
                 types.SimpleNamespace(status=403, reason="f"),
@@ -1114,3 +1122,149 @@ async def test_the_version_footer_names_the_reload_command_with_a_prefix(retro):
     said = ctx.said()
     assert "[p]" not in said, said
     assert f"`{ctx.clean_prefix}reload retro`" in said, said
+
+
+# -- Discoverability: what a player can find without being the owner ----------
+#
+# The whole `[p]retroset` group is owner-only, so every sentence that pointed a
+# player at `[p]retroset game list` pointed them at a command they cannot run.
+# `[p]retro list` is the player-facing answer, and unlike a bare `[p]retro` it
+# keeps working once a game is running (bare `[p]retro` resumes then).
+
+
+async def test_retro_list_names_the_saved_games_and_the_playable_consoles(retro):
+    await retro.install_cores("gambatte")
+    await retro.cog.config.games.set(
+        {"ucity": "https://example.com/ucity.gbc", "tobu": "https://example.com/tobu.gb"}
+    )
+    ctx = retro.context(retro.channel(9700))
+
+    await retro.cogmod.Retro.retro_list.callback(retro.cog, ctx)
+
+    said = ctx.said()
+    assert "`ucity`" in said and "`tobu`" in said
+    assert "Game Boy" in said, "and the consoles that will actually run"
+    assert "retrosaves" in said, "and where to see this channel's own saves"
+    assert "retrobrews" in said
+
+
+async def test_retro_list_still_works_while_a_game_is_running(retro):
+    """The reachability bug: bare `[p]retro` resumes once a session exists.
+
+    `_no_rom_help` is the good content, and it used to be reachable only from
+    a bare `[p]retro` in a channel with *no* session -- which is precisely not
+    the moment somebody walks in and asks what else they can play.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9701, "running")
+    assert view is not None
+
+    before = len(ctx.sent)
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game=None)
+    resumed = " ".join(str(x) for x in ctx.sent[before:])
+    assert "is already running" in resumed, "bare [p]retro resumes"
+
+    before = len(ctx.sent)
+    await retro.cogmod.Retro.retro_list.callback(retro.cog, ctx)
+    listing = " ".join(str(x) for x in ctx.sent[before:])
+    assert "Consoles this bot can play right now" in listing
+
+
+async def test_a_name_that_is_not_a_saved_game_points_at_a_reachable_command(retro):
+    await retro.install_cores("gambatte")
+    ctx = retro.context(retro.channel(9702))
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="nosuchgame")
+    said = ctx.said()
+    assert "no saved game called" in said
+    assert "retro list" in said
+    assert "retroset game list" not in said, "that one is owner-only"
+
+
+async def test_the_retro_docstring_points_players_at_a_reachable_command(retro):
+    doc = retro.cogmod.Retro.retro.callback.__doc__
+    assert "[p]retro list" in doc
+    assert "[p]retroset game list" not in doc
+
+
+async def test_a_game_cannot_be_saved_under_a_retro_subcommand_name(retro):
+    """Otherwise the preset exists and can never be started by bare name."""
+    ctx = retro.context(retro.channel(9703))
+    add = retro.cogmod.Retro.retroset_game_add.callback
+    await add(retro.cog, ctx, "list", "https://example.com/x.gb")
+    assert "cannot be a game name" in ctx.said()
+    assert not await retro.cog.config.games()
+
+    await add(retro.cog, ctx, "ucity", "https://example.com/ucity.gbc")
+    assert "ucity" in await retro.cog.config.games()
+
+
+# -- "No cores are installed" is a lie while they are downloading -------------
+
+
+def _downloading(retro, running=True):
+    """Stand `_download_task` up as the auto-download task, finished or not."""
+
+    class _Task:
+        def done(self):
+            return not running
+
+    retro.cog._download_task = _Task()
+
+
+async def test_no_cores_yet_says_they_are_still_downloading(retro):
+    """The install message has just promised they arrive on their own.
+
+    The download is silent -- nothing is posted when it starts and nothing
+    when it finishes -- so for the first minute of a fresh install there
+    genuinely are no cores *and* "ask the bot owner to run retroset download"
+    is the wrong advice.
+    """
+    _downloading(retro, running=True)
+    assert retro.cog._cores_downloading()
+    ctx = retro.context(retro.channel(9710))
+    await retro.cogmod.Retro.retro.callback(
+        retro.cog, ctx, game="https://example.com/x.gb"
+    )
+    said = ctx.said()
+    assert "still downloading" in said
+    assert "try again in a moment" in said.lower()
+    assert "Ask the bot owner" not in said
+
+
+async def test_no_cores_and_nothing_downloading_asks_the_owner(retro):
+    _downloading(retro, running=False)
+    assert not retro.cog._cores_downloading()
+    ctx = retro.context(retro.channel(9711))
+    await retro.cogmod.Retro.retro.callback(
+        retro.cog, ctx, game="https://example.com/x.gb"
+    )
+    said = ctx.said()
+    assert "retroset download" in said
+    assert "still downloading" not in said
+
+
+async def test_a_missing_console_emulator_says_emulator_rather_than_core(retro):
+    """"Core" is libretro's word and means nothing to a player."""
+    await retro.install_cores("gambatte")
+    _downloading(retro, running=False)
+    nes = retro.sysmod.system_by_key("nes")
+    said = retro.cog._missing_core_message("!", nes, nes.core)
+    assert "no Nintendo Entertainment System emulator" in said
+    assert "`fceumm`" in said, "the name the owner has to type is still there"
+    assert "retroset download fceumm" in said
+
+    _downloading(retro, running=True)
+    waiting = retro.cog._missing_core_message("!", nes, nes.core)
+    assert "still downloading" in waiting
+    assert "retroset download" not in waiting
+
+
+async def test_the_no_cores_path_does_not_charge_the_cooldown(retro):
+    _downloading(retro, running=True)
+    ctx = retro.context(retro.channel(9712))
+    ctx.command = types.SimpleNamespace(reset_cooldown=lambda c: forgiven.append(c))
+    forgiven = []
+    await retro.cogmod.Retro.retro.callback(
+        retro.cog, ctx, game="https://example.com/x.gb"
+    )
+    assert forgiven == [ctx]

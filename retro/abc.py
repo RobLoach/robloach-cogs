@@ -39,6 +39,11 @@ class MixinMeta(ABC):
     emulator_lock: asyncio.Lock
     #: The per-channel half of the start rate limit.
     start_buckets: typing.Any
+    #: The detached task that fetches missing cores shortly after the cog
+    #: loads, or None. Read by CoresMixin._cores_downloading, which is how
+    #: "no cores are installed" stops being said while the download the
+    #: install message promised is still in flight.
+    _download_task: typing.Optional[asyncio.Task]
     #: Drops the session and Resume-button records that pointed at a cached
     #: ROM which has just been deleted, keeping the saves. Implemented on the
     #: cog itself (retro/Retro.py) and called by the disk budget after it

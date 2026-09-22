@@ -434,7 +434,7 @@ class SavesMixin(MixinMeta):
         """
         Whether this person may destroy or replace a save.
 
-        The same three who may `[p]retrostop` someone else's game (see
+        The same three who may `[p]retrosleep` someone else's game (see
         RetroView.can_stop): whoever started it, anybody who can moderate the
         channel, and the bot owner. Playing is open to everybody and so are
         listing, inspecting and exporting -- wiping a channel's progress is
@@ -505,7 +505,7 @@ class SavesMixin(MixinMeta):
             "the game back up."
         )
         try:
-            # The view's own lock, exactly as `[p]retrostop` takes it, so a
+            # The view's own lock, exactly as `[p]retrosleep` takes it, so a
             # press that is already being emulated finishes before the core is
             # taken away from it.
             async with view.lock:
@@ -568,7 +568,7 @@ class SavesMixin(MixinMeta):
         fallback = (
             "the previous save state is tried next"
             if entry.has_state_backup
-            else "the battery save below is used instead"
+            else "the in-game save below is used instead"
             if entry.has_sram
             else "the game starts from the beginning instead"
         )
@@ -613,7 +613,7 @@ class SavesMixin(MixinMeta):
             )
         if entry.has_sram:
             parts.append(
-                f"battery save {self._humanize_bytes(entry.sram_size)}, "
+                f"in-game save {self._humanize_bytes(entry.sram_size)}, "
                 f"{self._when(entry.sram_written)}"
             )
         if entry.has_backup:
@@ -640,18 +640,24 @@ class SavesMixin(MixinMeta):
         """
         See and manage this channel's saved games.
 
-        Every game a channel plays keeps its progress in two pieces: a **save
-        state**, which is the exact moment the game was left at, and the
-        cartridge's **battery save**, which is what the player saved from
-        inside the game. A save state only works on the emulator core that
-        wrote it, so the battery save is kept beside it as insurance.
+        Every game a channel plays keeps its progress in two pieces, and these
+        are the only two names this cog uses for them:
+
+        - a **save state** — the exact moment the game was left at, down to
+          the frame. It only loads on the same build of the same emulator, so
+          an emulator update can cost one.
+        - an **in-game save** — what a player saved from inside the game, on
+          its own menu. It is the cartridge's battery-backed memory, which is
+          why the file is a `.srm` and why other emulators call it a battery
+          save or SRAM. It survives an emulator update, so it is kept beside
+          the save state as insurance.
 
         Run it with no arguments to list everything this channel has saved, or
         with a game's name to see that one in detail.
 
-        Anyone can list, inspect and export. Deleting, resetting and importing
-        are limited to the person who started the game, moderators with the
-        Manage Messages permission, and the bot owner.
+        Anyone can list, inspect and export. Deleting, dropping a save state
+        and importing are limited to the person who started the game,
+        moderators with the Manage Messages permission, and the bot owner.
 
         **Examples:**
         - `[p]retrosaves`
@@ -717,8 +723,8 @@ class SavesMixin(MixinMeta):
                 f"`{ctx.clean_prefix}retrosaves info <game>` for one in full, "
                 f"`{ctx.clean_prefix}retrosaves export <game>` to take a copy "
                 f"away, `{ctx.clean_prefix}retrosaves rollback <game>` to go "
-                f"back one save, `{ctx.clean_prefix}retrosaves reset <game>` "
-                "to go back to the last in-game save.",
+                f"back one save, `{ctx.clean_prefix}retrosaves dropstate "
+                "<game>` to go back to the last in-game save.",
             ]
         )
         await self._send_pages(ctx, "\n".join(lines))
@@ -788,7 +794,7 @@ class SavesMixin(MixinMeta):
                 )
             if entry.has_sram_backup:
                 kept.append(
-                    f"a battery save of {self._humanize_bytes(entry.sram_backup_size)} "
+                    f"an in-game save of {self._humanize_bytes(entry.sram_backup_size)} "
                     f"from {self._when(entry.sram_backup_written)}"
                 )
             lines.append(
@@ -821,7 +827,7 @@ class SavesMixin(MixinMeta):
                 [
                     "",
                     f"`{ctx.clean_prefix}retrosaves export {entry.slug}` takes "
-                    f"a copy away; `{ctx.clean_prefix}retrosaves reset "
+                    f"a copy away; `{ctx.clean_prefix}retrosaves dropstate "
                     f"{entry.slug}` drops the save state and goes back to the "
                     f"last in-game save; `{ctx.clean_prefix}retrosaves delete "
                     f"{entry.slug}` wipes both.",
@@ -851,14 +857,16 @@ class SavesMixin(MixinMeta):
     @commands.cooldown(
         SAVE_COOLDOWN_RATE, SAVE_COOLDOWN_SECONDS, commands.BucketType.user
     )
-    @retrosaves.command(name="export", aliases=["download", "backup"])
+    # No `download` alias any more: `[p]retroset download` fetches emulators,
+    # and one word cannot mean both "send me my save" and "install a core".
+    @retrosaves.command(name="export", aliases=["backup"])
     async def retrosaves_export(self, ctx: commands.Context, *, game: str) -> None:
         """
         Post a game's save as a file you can keep.
 
-        By default this sends the cartridge's battery save, the `.srm` file
-        RetroArch and most emulators read, so a player can carry their
-        in-game progress somewhere else. Put `state` or `both` in front of the
+        By default this sends the in-game save, the `.srm` file RetroArch
+        and most emulators read, so a player can carry their progress
+        somewhere else. Put `state` or `both` in front of the
         name to send the save state as well — that one only works on the exact
         emulator core that wrote it, and it is much larger.
 
@@ -890,7 +898,7 @@ class SavesMixin(MixinMeta):
         if what in ("sram", "both"):
             wanted.append(
                 (
-                    "battery save",
+                    "in-game save",
                     self._sram_path(ctx.channel.id, entry.slug),
                     f"{entry.slug}.srm",
                     entry.sram_size,
@@ -950,28 +958,31 @@ class SavesMixin(MixinMeta):
         )
         await self._safe_send(ctx, "\n".join(lines), files=files)
 
-    @retrosaves.command(name="reset", aliases=["restart", "dropstate"])
-    async def retrosaves_reset(self, ctx: commands.Context, *, game: str) -> None:
+    @retrosaves.command(name="dropstate", aliases=["reset", "restart"])
+    async def retrosaves_dropstate(self, ctx: commands.Context, *, game: str) -> None:
         """
-        Throw away a game's save state, keeping its in-game save.
+        Delete a game's save state file, keeping its in-game save.
 
-        This is "restart from my last in-game save": the exact moment the game
-        was left at is dropped, and the next time it starts it boots from the
-        title screen with the cartridge's battery save in place, so the player
-        can load their own save from inside the game.
+        This is "go back to my last in-game save": the exact moment the game
+        was left at is deleted, and the next time it starts it boots from the
+        title screen with the in-game save in place, so a player can load
+        their own save from inside the game.
 
-        **This is not `[p]retroreset`**, which touches no file at all: that
-        one reboots the game that is running right now, as if you had flipped
-        its power switch. This one deletes a save state *file* on disk, and
-        works on any game this channel has played.
+        It works on any game this channel has played, running or not, and it
+        deletes a *file* — it does not touch a game that is playing. To reboot
+        the game that is playing right now, use `[p]retroreboot`.
 
         Use `[p]retrosaves delete` instead to wipe the in-game save too.
+
+        It used to be called `[p]retrosaves reset`, which read exactly like
+        `[p]retroreset` while doing something completely different. Both old
+        names still work.
 
         Only the person who started the game, moderators (Manage Messages) and
         the bot owner can do this.
 
         **Examples:**
-        - `[p]retrosaves reset ucity`
+        - `[p]retrosaves dropstate ucity`
 
         **Arguments:**
         - `<game>` - A game this channel has played.
@@ -980,7 +991,7 @@ class SavesMixin(MixinMeta):
         if entry is None:
             return
         if not await self._may_manage_saves(ctx, entry):
-            await self._refuse_management(ctx, entry, "reset its save")
+            await self._refuse_management(ctx, entry, "drop its save state")
             return
         if not entry.has_state and not entry.has_state_backup:
             await self._safe_send(
@@ -1045,7 +1056,11 @@ class SavesMixin(MixinMeta):
             )
         await self._safe_send(ctx, " ".join(lines))
 
-    @retrosaves.command(name="rollback", aliases=["undo", "previous"])
+    # No `undo` alias any more. There is an **Undo** button under every game
+    # that does something completely different -- one press back, in memory --
+    # so a player who liked that button and typed the word lost several
+    # presses' worth of save instead. See RetroView._undo.
+    @retrosaves.command(name="rollback", aliases=["previous"])
     async def retrosaves_rollback(self, ctx: commands.Context, *, game: str) -> None:
         """
         Go back to the save before the last one.
@@ -1083,7 +1098,7 @@ class SavesMixin(MixinMeta):
                 f"**{entry.game_name}** has no previous save to go back to. "
                 "One is kept from its second automatic save onwards, so play "
                 "it for a few more presses and there will be. "
-                f"`{ctx.clean_prefix}retrosaves reset {entry.slug}` goes back "
+                f"`{ctx.clean_prefix}retrosaves dropstate {entry.slug}` goes back "
                 "to the last in-game save instead, and "
                 f"`{ctx.clean_prefix}retrosaves import {entry.slug}` installs "
                 "a copy you exported earlier.",
@@ -1151,7 +1166,7 @@ class SavesMixin(MixinMeta):
         state, state_backup, sram, sram_backup = self._save_paths(channel_id, slug)
         for live, backup, label in (
             (state, state_backup, "save state"),
-            (sram, sram_backup, "battery save"),
+            (sram, sram_backup, "in-game save"),
         ):
             if not backup.is_file():
                 continue
@@ -1178,7 +1193,7 @@ class SavesMixin(MixinMeta):
         """
         Wipe a game's save data so it starts completely fresh.
 
-        Deletes **both** the save state and the cartridge's battery save, so
+        Deletes **both** the save state and the in-game save, so
         the next time the game starts it is exactly as if nobody had ever
         played it here. The in-game save goes with it, and none of it can be
         recovered — take a copy with `[p]retrosaves export` first if you might
@@ -1186,7 +1201,7 @@ class SavesMixin(MixinMeta):
 
         The cached ROM is kept, so the game itself still starts instantly.
         To keep the in-game save and only drop the exact moment, use
-        `[p]retrosaves reset`.
+        `[p]retrosaves dropstate`.
 
         Only the person who started the game, moderators (Manage Messages) and
         the bot owner can do this, and it asks first.
@@ -1221,9 +1236,9 @@ class SavesMixin(MixinMeta):
             named.append("its save state")
         if entry.has_sram:
             pieces.append(
-                f"its in-game battery save ({self._humanize_bytes(entry.sram_size)})"
+                f"its in-game save ({self._humanize_bytes(entry.sram_size)})"
             )
-            named.append("its in-game battery save")
+            named.append("its in-game save")
         if entry.has_backup:
             pieces.append("the previous generation of both")
             named.append("the previous generation")
@@ -1238,7 +1253,7 @@ class SavesMixin(MixinMeta):
             )
         question += (
             f"\nTo keep the in-game save and only go back to it, use "
-            f"`{ctx.clean_prefix}retrosaves reset {entry.slug}` instead."
+            f"`{ctx.clean_prefix}retrosaves dropstate {entry.slug}` instead."
         )
         if not await self._confirm(ctx, question):
             await self._safe_send(
@@ -1308,20 +1323,24 @@ class SavesMixin(MixinMeta):
     @commands.cooldown(
         SAVE_COOLDOWN_RATE, SAVE_COOLDOWN_SECONDS, commands.BucketType.user
     )
-    @retrosaves.command(name="import", aliases=["upload", "restore"])
+    # No `restore` alias any more: "restore" is what this whole cog calls
+    # putting a game back on boot (see RetroView.restore_into, and every
+    # sentence about a save state that could not be restored), so an alias
+    # that meant "install this attachment" was the same word for two things.
+    @retrosaves.command(name="import", aliases=["upload"])
     async def retrosaves_import(self, ctx: commands.Context, *, game: str) -> None:
         """
         Install a save file you attach, so a player can bring progress in.
 
-        Attach the cartridge's battery save (`.srm` or `.sav`) and, if you
-        want the exact moment back too, its save state (`.state`). Both are
-        checked against the real emulator core before anything is written: a
-        battery save that is the wrong size for this cartridge, or a save
-        state this core will not load, is refused with an explanation rather
-        than quietly ignored when the game next starts.
+        Attach the in-game save (`.srm` or `.sav`) and, if you want the
+        exact moment back too, its save state (`.state`). Both are checked
+        against the real emulator before anything is written: an in-game save
+        that is the wrong size for this cartridge, or a save state this
+        emulator will not load, is refused with an explanation rather than
+        quietly ignored when the game next starts.
 
         **This overwrites whatever the channel already has for that game**,
-        so it asks first. Importing a battery save on its own also removes the
+        so it asks first. Importing an in-game save on its own also removes the
         old save state, because a save state is the whole machine and would
         otherwise be restored over the top of the save you just brought in.
 
@@ -1350,7 +1369,7 @@ class SavesMixin(MixinMeta):
         replacing = []
         if sram is not None and entry.has_sram:
             replacing.append(
-                f"its in-game battery save ({self._humanize_bytes(entry.sram_size)})"
+                f"its in-game save ({self._humanize_bytes(entry.sram_size)})"
             )
         if entry.has_state:
             # Even a battery-save-only import takes the state with it; see
@@ -1413,7 +1432,7 @@ class SavesMixin(MixinMeta):
             lines.append(
                 "The old save state was removed with it: a save state is the "
                 "whole machine and would have been restored over the top of "
-                "the battery save you just brought in."
+                "the in-game save you just brought in."
             )
         if state is not None:
             lines.append(
@@ -1440,7 +1459,7 @@ class SavesMixin(MixinMeta):
         typing.Tuple[typing.Optional[bytes], typing.Optional[bytes]]
     ]:
         """
-        Sort the attachments into ``(save state, battery save)`` bytes.
+        Sort the attachments into ``(save state, in-game save)`` bytes.
 
         Everything that can be checked without a core is checked here: that
         there is an attachment at all, that its extension says what it is,
@@ -1451,7 +1470,7 @@ class SavesMixin(MixinMeta):
         if not attachments:
             await self._safe_send(
                 ctx,
-                "Attach the save file to your message: a battery save "
+                "Attach the save file to your message: an in-game save "
                 f"(`{'`, `'.join(SRAM_EXTENSIONS)}`) and optionally a save "
                 f"state (`{'`, `'.join(STATE_EXTENSIONS)}`). Export one first "
                 f"with `{ctx.clean_prefix}retrosaves export {entry.slug}` to "
@@ -1461,7 +1480,7 @@ class SavesMixin(MixinMeta):
         if len(attachments) > 2:
             await self._safe_send(
                 ctx,
-                "Attach at most two files: one battery save and one save "
+                "Attach at most two files: one in-game save and one save "
                 "state.",
             )
             return None
@@ -1478,7 +1497,7 @@ class SavesMixin(MixinMeta):
                 await self._safe_send(
                     ctx,
                     f"`{name or 'that file'}` is not a save this cog knows. A "
-                    f"battery save ends in `{'`, `'.join(SRAM_EXTENSIONS)}` "
+                    f"in-game save ends in `{'`, `'.join(SRAM_EXTENSIONS)}` "
                     f"and a save state in `{'`, `'.join(STATE_EXTENSIONS)}`. "
                     "Rename the file to match and attach it again.",
                 )
@@ -1486,7 +1505,7 @@ class SavesMixin(MixinMeta):
             if kind in found:
                 await self._safe_send(
                     ctx,
-                    f"Two {'battery saves' if kind == 'sram' else 'save states'} "
+                    f"Two {'in-game saves' if kind == 'sram' else 'save states'} "
                     "were attached; attach one of each at most.",
                 )
                 return None
@@ -1501,7 +1520,7 @@ class SavesMixin(MixinMeta):
                     ctx,
                     f"`{name}` is {self._humanize_bytes(size)}, past the "
                     f"{label} limit for a "
-                    f"{'battery save' if kind == 'sram' else 'save state'}. "
+                    f"{'in-game save' if kind == 'sram' else 'save state'}. "
                     "That is not a save for one of these consoles.",
                 )
                 return None
@@ -1622,12 +1641,12 @@ class SavesMixin(MixinMeta):
             if not size:
                 return (
                     f"**{entry.game_name}** has no battery-backed save memory "
-                    "at all, so there is nowhere to put a battery save. This "
+                    "at all, so there is nowhere to put an in-game save. This "
                     "cartridge keeps its progress in save states only."
                 )
             if len(sram) != size:
                 return (
-                    f"That battery save is {self._humanize_bytes(len(sram))} "
+                    f"That in-game save is {self._humanize_bytes(len(sram))} "
                     f"({len(sram):,} bytes) but **{entry.game_name}** has "
                     f"{self._humanize_bytes(size)} ({size:,} bytes) of save "
                     "memory. It is a save for a different game, a different "
@@ -1645,7 +1664,7 @@ class SavesMixin(MixinMeta):
                     "state only works on the exact build of the exact core "
                     "that wrote it, so one from another emulator, another "
                     "machine, or an older version of this core cannot be used "
-                    "\N{EM DASH} the battery save is the one that travels."
+                    "\N{EM DASH} the in-game save is the one that travels."
                 )
         return None
 
@@ -1672,7 +1691,7 @@ class SavesMixin(MixinMeta):
             # progress, and an import is exactly the kind of mistake somebody
             # wants to undo. `[p]retrosaves rollback` brings it back.
             self._write_atomic(sram_path, sram, True)
-            written.append(f"a {self._humanize_bytes(len(sram))} battery save")
+            written.append(f"a {self._humanize_bytes(len(sram))} in-game save")
         if state is not None:
             self._write_atomic(state_path, state, True)
             written.append(f"a {self._humanize_bytes(len(state))} save state")

@@ -121,6 +121,17 @@ MIN_REPEAT_GAP_MS = 80
 # Wait and Undo do not move when it comes and goes.
 MIN_REPEAT_TAPS = 2
 
+#: Said once, on the next line the session writes, when the repeat button has
+#: had to go. A control that vanishes with no explanation reads as removed
+#: just as surely as a greyed-out one does -- that is precisely how the
+#: greyed-out version was reported -- so the moment it goes is the moment to
+#: say why, and where it went. It rides on an edit that was happening anyway.
+REPEAT_GONE_NOTE = (
+    "The **{button} x3** button is hidden while clips are this short: only "
+    "one tap fits, which is what **{button}** already does. A longer "
+    "`cliplength` brings it back."
+)
+
 # Seconds of emulation to run before the first clip, so the console's boot
 # logo is out of the way. Converted to frames with the core's real frame rate.
 #
@@ -137,7 +148,127 @@ DEFAULT_TIMEOUT_MINUTES = 10
 # makes exactly one edit to the message now (see RetroView._ack_now), so by
 # the time anybody reads it the game is already back. Cleared by the next
 # press, like every other one-off line.
-RESUMED_NOTE = "Resumed where you left off\N{HORIZONTAL ELLIPSIS}"
+#
+# It is only half of saying "this session is asleep", and it is the half that
+# arrives *late*: a wake is the longest wait in the cog (a core to dlopen, a
+# save state to load) and this line is written at the end of it. The other
+# half is ASLEEP_MARK, which the edit that *puts* the session to sleep leaves
+# on the header, so the message reads "asleep" for the whole time it is --
+# and the wake's one edit takes the mark off and adds this. Two states, two
+# edits that were happening anyway, no third one.
+RESUMED_NOTE = "Woke up where you left off."
+
+#: Appended to the header (see :meth:`RetroView.header`) whenever there is no
+#: core loaded for this session, which is exactly "asleep": stopped, evicted
+#: by another channel, idle-timed-out, or waiting out a bot restart. The next
+#: press wakes it, and the edit that press makes drops the mark again.
+ASLEEP_MARK = "asleep"
+
+#: How the game and the console are named on the line above the clip. A
+#: stable prefix rather than a status card: the first clip of a cold boot used
+#: to go out with *no* text at all, and after that the only text was the press
+#: line, so somebody scrolling past saw an animation, a grid of buttons and
+#: "Rob pressed A." with nothing anywhere saying what game it was.
+#:
+#: It rides on the content that is already rewritten by every press, so it
+#: costs nothing: no card, no embed, no extra edit. One line, always.
+HEADER = "**{game}** \N{MIDDLE DOT} {console}"
+
+#: What separates the header from whatever just happened.
+HEADER_SEPARATOR = " \N{EM DASH} "
+
+# How much of a game's name goes in the header. Game names come from a ROM
+# filename that has already been through Retro._sanitize_filename (which caps
+# it at 64 characters), so this is a second, independent bound for a name that
+# arrives from a stored session record written by an older version.
+MAX_GAME_NAME = 48
+
+# -- Queued presses -----------------------------------------------------------
+#
+# A press takes about a second of real time, and for that second the session's
+# lock is held. A click that arrives during it used to be *dropped*: deferred
+# so Discord never said "interaction failed", and then silently forgotten. In
+# a channel with two or three people playing, most clicks land in that second,
+# so the controller felt intermittently dead -- press a direction, nothing
+# happens, press it again.
+#
+# So a click that cannot run now is queued instead, under four rules that are
+# each there for a reason:
+#
+# * **at most MAX_QUEUED_PRESSES waiting.** Each one costs a second, and a
+#   queued press is emulated against a game state its author has not seen
+#   yet. Three waiting plus the one running is about four seconds of latency,
+#   which is the most that is still recognisably "I pressed that".
+# * **one waiting press per person.** Round-robin rather than
+#   first-come-first-served, and it falls out of the rule rather than needing
+#   a scheduler: a fast clicker cannot fill the queue on their own, so a
+#   roomful of people take it in turns without anybody arranging it. A second
+#   click from somebody who already has one waiting is refused and the first
+#   one stands -- the message has already told them their press is queued (see
+#   RetroView.queue_note), and quietly swapping it for something else would
+#   make that acknowledgement a lie for a second.
+# * **every waiting press is visible.** An input nobody can see is an input
+#   that feels lost, which is the whole complaint. The queue is listed as a
+#   suffix on the very line the running press is already rewriting, so it
+#   costs no extra edit -- see RetroView.queue_note and _ack_now.
+# * **the queue is intent, never work.** A pending entry is a button name and
+#   a deferred interaction; nothing touches the emulator until the runner
+#   takes the lock again for it. The one-core-at-a-time discipline is
+#   untouched.
+#
+# A queued press makes its own single edit when it runs, through its own
+# deferred interaction -- a component defer is a DEFERRED_UPDATE_MESSAGE and
+# leaves edit_original_response available for the next fifteen minutes -- so
+# "one press, one edit" still holds exactly.
+MAX_QUEUED_PRESSES = 3
+
+#: What a queued Wait is called in the listing. The other entries name the
+#: console's own button (or the d-pad's arrow) through System.caption_for,
+#: exactly as the press line does.
+QUEUED_WAIT = "wait"
+
+#: The suffix that shows what is waiting. Italic and parenthetical on purpose:
+#: the sentence in front of it is what just happened, and this is a footnote
+#: to it rather than a second announcement.
+QUEUE_NOTE = "*Queued: {queued}*"
+
+#: One entry in that listing, with and without a name to use.
+QUEUE_ENTRY = "{who} {button}"
+QUEUE_ENTRY_ANONYMOUS = "{button}"
+
+#: Said once, on the next line the session writes, when something threw the
+#: queue away: a reset, an undo, a stop. Without it the presses simply
+#: vanish, which is the bug this whole mechanism exists to fix -- so the one
+#: case where dropping them is *right* has to say so out loud.
+DROPPED_NOTE = "*{count} queued press{plural} dropped*"
+
+
+class Pending(typing.NamedTuple):
+    """
+    One press somebody has asked for that has not been emulated yet.
+
+    Intent only: a button, a count of taps, and the deferred interaction the
+    clip will eventually be edited onto. No emulator work is held here and
+    none is done to build one.
+
+    ``who`` is the author's display name, sanitised at the moment they
+    clicked (see :func:`presser_name`), rather than the user object: the
+    listing has to keep reading correctly for somebody who has left the guild
+    between clicking and being run, and re-deriving a name from a member
+    object that has since gone is exactly how that produces " pressed A.".
+
+    ``epoch`` is the session's queue generation when this was accepted. Bumped
+    by :meth:`RetroView.forget_queue`, so an entry that was already taken off
+    the front when the game was reset or undone is still discarded rather
+    than replayed into a state nobody queued it against.
+    """
+
+    interaction: typing.Any
+    user_id: typing.Optional[int]
+    who: str
+    field: typing.Optional[str]
+    repeat: int
+    epoch: int
 
 # Writing a save state costs a few milliseconds and a couple of hundred
 # kilobytes of disk, so it happens every few presses rather than every press.
@@ -330,8 +461,25 @@ def presser_name(user: typing.Any) -> str:
     if len(name) > MAX_PRESSER_NAME:
         name = name[: MAX_PRESSER_NAME - 1].rstrip() + "\N{HORIZONTAL ELLIPSIS}"
 
-    name = LEADING_ORDINAL.sub(r"\1\\\2", name.translate(MARKDOWN_ESCAPES))
-    return discord.utils.escape_mentions(name)
+    return escape_label(name)
+
+
+def escape_label(name: str) -> str:
+    """
+    Make a name safe to drop into a sentence Discord will render.
+
+    MARKDOWN_ESCAPES for every character Discord reads as markup,
+    LEADING_ORDINAL for the one piece of it that is positional, and
+    discord.py's ``escape_mentions`` for ``@everyone``/``@here``/``<@id>``.
+    The result contains no mention syntax at all.
+
+    Shared by :func:`presser_name` and :meth:`RetroView.header`, because the
+    two things that go on that one line -- who clicked and what game it is --
+    have exactly the same problem: a game called ``__x__`` or a nickname of
+    ``# hello`` would otherwise reformat the line it sits on.
+    """
+    escaped = LEADING_ORDINAL.sub(r"\1\\\2", str(name).translate(MARKDOWN_ESCAPES))
+    return discord.utils.escape_mentions(escaped)
 
 
 def action_note(action: str, user: typing.Any = None, button: str = "") -> str:
@@ -415,11 +563,11 @@ CUSTOM_ID_PREFIX = "libretro"
 # last row if they fit and to a row of their own if they do not.
 #
 # Two buttons that used to sit here are gone, and neither is coming back:
-# Stop (`[p]retrostop` is the way to put a game to sleep) and Replay. There
-# is no Reset button either, deliberately: rebooting somebody's game is
-# destructive to their progress-in-flight, so it is `[p]retroreset`, a
-# command with the same permission check `[p]retrostop` has, rather than one
-# more thing a passer-by can click by mistake.
+# Stop (`[p]retrosleep` puts a game to sleep and `[p]retroend` finishes with
+# it) and Replay. There is no Reset button either, deliberately: rebooting
+# somebody's game is destructive to their progress-in-flight, so it is
+# `[p]retroreboot`, a command with the same permission check `[p]retrosleep`
+# has, rather than one more thing a passer-by can click by mistake.
 #
 # A message posted before a button was removed still has it drawn on it until
 # its next press redraws the row, and a click on that stale button resolves to
@@ -667,12 +815,20 @@ class _UndoButton(discord.ui.Button):
     The one control that can put the game *back*, which is also why there is
     no Reset button beside it: see the note above _STYLES.
 
-    Greyed out whenever there is nothing to undo, which is not a rare case:
-    the history is memory-only (see :attr:`RetroView.history`), so a message
-    that survived a bot restart has an empty one until somebody presses
-    something. A click that gets through anyway -- a stale button on a
-    message Discord has not re-rendered -- is answered with a private line
-    rather than an error; see :meth:`RetroView._undo`.
+    **Always enabled, even with nothing to undo.** It used to be greyed out
+    whenever the history was empty, which is not a rare case at all: the
+    history is memory-only (see :attr:`RetroView.history`), so every message
+    that has survived a bot restart has an empty one until somebody presses
+    something. The result was a permanently dead control with no explanation
+    -- which reads as "Undo is broken", exactly as the greyed-out x3 button
+    read as "the repeat feature was removed" (see MIN_REPEAT_TAPS).
+
+    Worse, the explanation was *unreachable*: a disabled Discord button
+    cannot be clicked, so the private line :meth:`RetroView._undo` writes for
+    an empty history could only ever be seen by somebody clicking a stale
+    button on a message Discord had not re-rendered. Leaving it enabled makes
+    that line the answer to the obvious question, and costs one interaction
+    response and zero edits of the message.
     """
 
     def __init__(self, row: int) -> None:
@@ -791,13 +947,16 @@ class RetroView(discord.ui.View):
     An interactive game controller, laid out for whichever console is running.
 
     The view *is* the session: it outlives the emulator. When the emulator is
-    freed (idle timeout, `[p]retrostop`, cog unload, bot restart) the session
+    freed (idle timeout, `[p]retrosleep`, cog unload, bot restart) the session
     hibernates, the controls stay enabled, and the next press transparently
     boots the core again from the cached ROM plus the last save state.
 
-    Anyone in the channel can press the buttons (it's a social feature); only
-    the person who started the game, moderators, and the bot owner can stop
-    the session (`[p]retrostop`) or reboot it (`[p]retroreset`).
+    Anyone in the channel can press the buttons (it's a social feature), and
+    a press that arrives while somebody else's is being emulated is queued
+    rather than dropped -- see the note above MAX_QUEUED_PRESSES. Only the
+    person who started the game, moderators, and the bot owner can put the
+    session to sleep (`[p]retrosleep`), reboot it (`[p]retroreboot`) or finish
+    with it (`[p]retroend`).
 
     The message carries the clip and one line of text. There is no status
     card: the buttons say what they do, and the line says what just happened
@@ -889,9 +1048,26 @@ class RetroView(discord.ui.View):
 
         self.message: typing.Optional[discord.Message] = None
         self.lock: asyncio.Lock = asyncio.Lock()
+
+        # Presses that arrived while the lock was held, oldest first, at most
+        # MAX_QUEUED_PRESSES of them and at most one per person. See the
+        # "Queued presses" note above MAX_QUEUED_PRESSES; nothing in here is
+        # emulator work, and nothing in here survives a reset, an undo, a
+        # sleep or a retirement.
+        self.queue: typing.Deque[Pending] = collections.deque()
+        # Bumped by forget_queue(), so an entry already taken off the front
+        # cannot be run against a state it was not queued against.
+        self._queue_epoch: int = 0
+        # Whether a runner is working through the queue. Held across the gaps
+        # where it lets the lock go (so `[p]retroreboot` can get in), and read
+        # by _press to decide "queue this" rather than "run this now".
+        self._draining: bool = False
+        # How many entries the last discard threw away, so the next line the
+        # session writes can say so once. See DROPPED_NOTE.
+        self.queue_dropped: int = 0
+
         self._build_controls()
         self._update_repeat_label()
-        self._update_undo_button()
 
     # -- Layout -------------------------------------------------------------
 
@@ -1032,8 +1208,13 @@ class RetroView(discord.ui.View):
         Used when a channel switches to a different game: the old message may
         still be sitting in the channel with working-looking buttons, and
         waking its emulator back up would put two cores in the air at once.
+
+        Anything still waiting in the queue goes with it. Those presses were
+        aimed at a game this channel has moved on from, and replaying them
+        into whatever is playing now would be worse than dropping them.
         """
         self.closed = True
+        self.forget_queue()
         self._set_disabled(True)
 
     def touch(self) -> None:
@@ -1128,7 +1309,7 @@ class RetroView(discord.ui.View):
     @staticmethod
     def reset_note(user: typing.Any = None) -> str:
         """
-        The line `[p]retroreset` puts on the message; see ACTION_NOTES.
+        The line `[p]retroreboot` puts on the message; see ACTION_NOTES.
 
         A command rather than a button, so the author is ``ctx.author``
         rather than ``interaction.user`` -- but the same person, named the
@@ -1154,11 +1335,14 @@ class RetroView(discord.ui.View):
         does not, and it is **removed from the row** rather than greyed out.
         That is a change from how it used to behave, and the reason is that
         the greyed-out version was reported as the feature having been taken
-        out of the cog: a dead control with no explanation looks broken, and
-        Undo -- the other control that can have nothing to do -- at least has
-        a name that says what it would do and an ephemeral line if you click
-        it anyway. A missing control says "not at this clip length", which is
-        the truth. It also frees a component.
+        out of the cog: a dead control with no explanation looks broken. A
+        missing control says "not at this clip length", which is the truth.
+        It also frees a component.
+
+        A control that silently *disappears* reads as removed too, though, so
+        going sets :attr:`notice` -- one line on the next edit the session
+        makes, which is an edit that was happening anyway. Coming back says
+        nothing: the button is right there saying what it does.
 
         Called on every redraw (see :meth:`_set_disabled`), so changing
         `[p]retroset cliplength` mid-game adds or removes the button on the
@@ -1176,6 +1360,10 @@ class RetroView(discord.ui.View):
         button = self._repeat_button()
         wanted = taps >= MIN_REPEAT_TAPS
         if wanted != (button is not None):
+            if not wanted:
+                self.notice = REPEAT_GONE_NOTE.format(
+                    button=self.system.label_for(self.system.confirm)
+                )
             self._rebuild_controls()
             return
         if button is not None:
@@ -1201,7 +1389,6 @@ class RetroView(discord.ui.View):
         """
         self.clear_items()
         self._build_controls()
-        self._update_undo_button()
 
     # -- The undo history ---------------------------------------------------
 
@@ -1260,22 +1447,139 @@ class RetroView(discord.ui.View):
         """Throw the undo history away, leaving the game exactly as it is."""
         self.history.clear()
         self._history_bytes = 0
-        self._update_undo_button()
 
-    def _update_undo_button(self) -> None:
-        """
-        Grey Undo out when there is nothing to undo.
+    # -- The press queue ----------------------------------------------------
 
-        Which is the state every session starts in, and the state a session
-        comes back from a bot restart in: the history is memory only. Better
-        a dead button than a lying one. The custom_id never changes, so none
-        of this affects how Discord routes a click.
+    @property
+    def running(self) -> bool:
         """
-        button = next(
-            (child for child in self.children if isinstance(child, _UndoButton)), None
+        Whether the emulator is being driven for this session right now.
+
+        Two things say so: the lock is held by a press that is emulating, or
+        a runner is working through the queue and has merely let the lock go
+        between two of them (see :meth:`_drain`). Either way nothing else may
+        touch the core.
+        """
+        return bool(self.lock.locked() or self._draining)
+
+    @property
+    def busy(self) -> bool:
+        """
+        Whether a press must be queued rather than run now.
+
+        :attr:`running`, or something is already waiting -- in which case
+        running now would jump the line. A non-empty queue with no runner
+        cannot normally happen (entries are only ever made while one is
+        working), so the second half is a guard against the ordering bug
+        rather than a state anybody reaches.
+        """
+        return bool(self.running or self.queue)
+
+    def enqueue_press(
+        self,
+        interaction: typing.Any,
+        field: typing.Optional[str],
+        repeat: int = 1,
+        user: typing.Any = None,
+    ) -> bool:
+        """
+        Remember a press to emulate as soon as the session is free.
+
+        Returns whether it was accepted. It is refused when
+
+        * the session has been replaced or retired -- there is nothing left
+          for a press to reach;
+        * MAX_QUEUED_PRESSES are already waiting;
+        * **this person already has one waiting.** One slot each is what
+          makes a group take turns without a scheduler, and the first click
+          is the one that stands: the message has already said it is queued.
+
+        Never raises, and never touches the emulator: see the note above
+        MAX_QUEUED_PRESSES.
+        """
+        if self.closed or len(self.queue) >= MAX_QUEUED_PRESSES:
+            return False
+        user = user if user is not None else getattr(interaction, "user", None)
+        user_id = getattr(user, "id", None)
+        if user_id is not None and any(
+            entry.user_id == user_id for entry in self.queue
+        ):
+            return False
+        self.queue.append(
+            Pending(
+                interaction=interaction,
+                user_id=user_id,
+                who=presser_name(user),
+                field=field,
+                repeat=max(1, int(repeat)),
+                epoch=self._queue_epoch,
+            )
         )
-        if button is not None:
-            button.disabled = not self.history
+        return True
+
+    def forget_queue(self) -> int:
+        """
+        Throw every waiting press away, and remember how many that was.
+
+        Called whenever the game stops being the thing those presses were
+        aimed at: it is stopped, rebooted, undone, put to sleep, retired, or
+        replaced by another game. Replaying a queued direction into a
+        different game state is worse than dropping it -- Undo in particular
+        would be undone again by the very presses it was correcting.
+
+        Returns the number dropped, and leaves it in :attr:`queue_dropped` so
+        the next line the session writes can say so once (see DROPPED_NOTE).
+        Bumping the epoch is what also discards an entry a runner has already
+        taken off the front but not yet emulated.
+        """
+        dropped = len(self.queue)
+        self.queue.clear()
+        self._queue_epoch += 1
+        if dropped:
+            self.queue_dropped += dropped
+        return dropped
+
+    def queued_label(self, entry: Pending) -> str:
+        """One waiting press, named the way the press line names a button."""
+        if entry.field is None:
+            button = QUEUED_WAIT
+        else:
+            button = self.system.caption_for(entry.field)
+            taps = len(self.press_plan(entry.repeat)) if entry.repeat > 1 else 1
+            if taps > 1:
+                button = f"{button} x{taps}"
+        template = QUEUE_ENTRY if entry.who else QUEUE_ENTRY_ANONYMOUS
+        return template.format(who=entry.who, button=button)
+
+    def queue_note(self) -> str:
+        """
+        The suffix that says what is waiting, or ``""`` when nothing is.
+
+        This is the whole acknowledgement a queued press gets, and it is
+        deliberately the *only* one: it rides on the line the running press
+        is already rewriting, so a queued click costs no edit of its own. An
+        ephemeral "your press is queued" would be a second message per click
+        (removed once already for being spam) and any edit of this message
+        would re-render the attachment and visibly rewind the clip -- see
+        :meth:`_ack_now`.
+        """
+        if not self.queue:
+            return ""
+        return QUEUE_NOTE.format(
+            queued=", ".join(self.queued_label(entry) for entry in self.queue)
+        )
+
+    def dropped_note(self) -> str:
+        """
+        The suffix that says a discard happened, shown exactly once.
+
+        Cleared as it is read, like :attr:`notice`, because "3 queued presses
+        dropped" is news about one moment rather than a state.
+        """
+        dropped, self.queue_dropped = self.queue_dropped, 0
+        if not dropped:
+            return ""
+        return DROPPED_NOTE.format(count=dropped, plural="" if dropped == 1 else "es")
 
     def run_undo(self) -> bytes:
         """
@@ -1306,6 +1610,12 @@ class RetroView(discord.ui.View):
         is a cheap price for a clip that still carries on where the last one
         stopped.
 
+        Anything waiting in the press queue is thrown away, and this is the
+        case that most needs it: those presses were queued against the state
+        the undo has just put *back*, so running them would undo the undo one
+        button at a time. See :meth:`forget_queue`, which leaves a count for
+        the line this clip goes out on.
+
         Raises EmulatorError if there is nothing to undo, if the core is not
         running, or if the state will not load -- which is a real case: a
         core update mid-session invalidates every state it wrote, so the
@@ -1316,6 +1626,10 @@ class RetroView(discord.ui.View):
             raise EmulatorError("The emulator is not running.")
         if not self.history:
             raise EmulatorError("There is nothing to undo.")
+        # Only ever reached with the session's lock held, so no runner is
+        # working through the queue and nothing can be added between the
+        # discard and the clip.
+        self.forget_queue()
         blob = self.history.pop()
         self._history_bytes -= len(blob)
         try:
@@ -1336,7 +1650,7 @@ class RetroView(discord.ui.View):
         Reboot the machine and record a clip of it coming back up.
 
         Runs in a worker thread, called from ``Retro.run_reset``, which is
-        what `[p]retroreset` goes through. There is deliberately no button
+        what `[p]retroreboot` goes through. There is deliberately no button
         for this: see the note above _STYLES.
 
         Three things happen, in this order:
@@ -1361,13 +1675,17 @@ class RetroView(discord.ui.View):
         this way: the save state on disk still holds the moment before the
         reset until the game saves again of its own accord (every
         SAVE_STATE_EVERY_PRESSES presses, or when it next sleeps). See
-        ``Retro.retroreset``, which says so in the reply.
+        ``Retro.retroreboot``, which says so in the reply.
+
+        Anything waiting in the press queue is thrown away as well: it was
+        aimed at a game that was mid-play, and this is the title screen.
 
         Raises EmulatorError if the core is not running or will not reset.
         """
         emulator = self.emulator
         if emulator is None:
             raise EmulatorError("The emulator is not running.")
+        self.forget_queue()
         # Before anything is thrown away: this is the moment Undo puts back.
         self.remember_state(emulator)
         emulator.reset()
@@ -1388,8 +1706,8 @@ class RetroView(discord.ui.View):
         out for the second it took to emulate, and that cost an extra edit of
         the message, which is what made the previous clip play again from the
         beginning (see :meth:`_ack_now`). ``False`` is still called on every
-        redraw, because that is also where the repeat button and Undo are
-        made to say what they will really do.
+        redraw, because that is also where the repeat button is made to say
+        what it will really do.
         """
         for child in self.children:
             if isinstance(child, _SpacerButton):
@@ -1397,37 +1715,87 @@ class RetroView(discord.ui.View):
             if hasattr(child, "disabled"):
                 child.disabled = disabled
         if not disabled:
-            # The repeat button and Undo are the two controls that can have
-            # nothing to do, and they answer it differently: the repeat
-            # button is *drawn at all* only if the clip is long enough to fit
-            # more than one tap, while Undo is always drawn and greyed out
-            # until a press this process saw has something to step back to.
-            # This runs on every redraw, so changing the clip length mid-game
-            # adds or removes the repeat button and every press re-arms Undo.
+            # The repeat button is the one control that can have nothing to
+            # do, and the answer is not to draw it at all rather than to grey
+            # it out; see MIN_REPEAT_TAPS and _update_repeat_label. Undo used
+            # to be greyed out beside it whenever the history was empty and
+            # is not any more -- see _UndoButton, which explains why.
             self._update_repeat_label()
-            self._update_undo_button()
 
     # -- Messages -----------------------------------------------------------
 
-    def _content(self, message: typing.Optional[str] = None) -> typing.Optional[str]:
+    @property
+    def header(self) -> str:
         """
-        The text to put on the message with the clip: one short line, or none.
+        What game this is, and on what, in the few characters it deserves.
 
-        The clip and the buttons are most of the interface: a card repeating
-        the console's name over a picture of that console is noise. Text is
-        one line and no more -- ``message`` from the caller (which button was
-        pressed, the game went to sleep, the emulator failed), or a pending
-        one-off notice, which beats it and is cleared as it is shown so it
-        appears exactly once.
+        ``**µCity** · Game Boy``, plus ``· asleep`` while there is no core
+        loaded. It is the *stable* part of the one line the message carries,
+        and it exists because the line used to be nothing but "Rob pressed
+        A." -- and, on the first clip of a cold boot, nothing at all. Anybody
+        scrolling into the channel saw an animation, a grid of unlabelled
+        arrows and a name, with nothing anywhere saying what was being
+        played.
 
-        Returning None is meaningful rather than lazy: discord.py sends an
-        explicit null for it, which *clears* whatever the message said before,
-        so yesterday's "asleep" line does not linger over today's clip.
+        Deliberately not a status card: the card this cog used to have was
+        removed, and this is one line rather than a second attempt at it. See
+        HEADER and ASLEEP_MARK.
+
+        The game's name is escaped the same way a presser's is: it comes from
+        a ROM filename, so it can perfectly well contain the underscores and
+        hyphens Discord reads as markup. See :func:`escape_label`.
+        """
+        name = str(self.game_name or "Game")[:MAX_GAME_NAME]
+        line = HEADER.format(game=escape_label(name), console=self.system.name)
+        if not self.live:
+            line = f"{line} \N{MIDDLE DOT} {ASLEEP_MARK}"
+        return line
+
+    def _line(self, text: typing.Optional[str] = None) -> str:
+        """
+        The whole of the one line the message carries, assembled.
+
+        Three pieces, in this order, and every one of them rides on an edit
+        that was already being made:
+
+        1. the :attr:`header` -- what game, what console, and whether it is
+           asleep. Always there;
+        2. ``text`` -- what just happened. Which button was pressed and by
+           whom, that the session woke up, that a save state could not be
+           restored, that the emulator failed;
+        3. the queue, and anything the queue has just dropped. See
+           :meth:`queue_note` and :meth:`dropped_note`: this suffix is the
+           entire acknowledgement a queued press gets, which is why it has to
+           live on a line somebody else's press is rewriting anyway.
+
+        Never returns None any more, and that is a real change: it used to,
+        so that discord.py would send an explicit null and clear a stale
+        line. With a header there is always something to say, so every edit
+        rewrites the whole content and nothing can go stale either way.
+        """
+        parts = [self.header]
+        if text:
+            parts.append(text)
+        line = HEADER_SEPARATOR.join(parts)
+        for suffix in (self.dropped_note(), self.queue_note()):
+            if suffix:
+                line = f"{line} {suffix}"
+        return line
+
+    def _content(self, message: typing.Optional[str] = None) -> str:
+        """
+        The text to put on the message with the clip: one short line.
+
+        The clip and the buttons are most of the interface, so the text is
+        one line and no more: the :attr:`header`, then ``message`` from the
+        caller (which button was pressed, the game went to sleep, the
+        emulator failed), or a pending one-off notice, which beats it and is
+        cleared as it is shown so it appears exactly once.
         """
         if message is not None:
-            return message
+            return self._line(message)
         notice, self.notice = self.notice, None
-        return notice
+        return self._line(notice)
 
     def _clip_file(self, data: bytes) -> discord.File:
         """
@@ -1486,7 +1854,7 @@ class RetroView(discord.ui.View):
         :meth:`_show` is the same edit made from a button click, where the
         interaction is what has to be edited; this is for a *command* that
         moved the game on and wants the game's own message to show it --
-        `[p]retroreset`. One edit, for the same reason a press makes one (see
+        `[p]retroreboot`. One edit, for the same reason a press makes one (see
         :meth:`_ack_now`), and the same precedence: a pending :attr:`notice`
         beats ``note``.
 
@@ -1623,47 +1991,139 @@ class RetroView(discord.ui.View):
         field: typing.Optional[str],
         repeat: int = 1,
     ) -> None:
-        if self.closed or self.lock.locked():
-            # Either someone else's press is still being emulated, or this
-            # message belongs to a session that has been replaced.
+        """
+        Handle one click of a console button, the Wait button or x3.
+
+        Three outcomes, and only the first of them does any emulating:
+
+        * the session is free, so this press runs now and then the presses
+          that arrived while it was running are worked through in order;
+        * the session is :attr:`busy`, so the press is *queued* -- see the
+          note above MAX_QUEUED_PRESSES. It used to be dropped here, which is
+          why the controller felt dead in a busy channel;
+        * the session has been replaced or retired, so there is nothing to
+          press. Acknowledged and ignored.
+
+        Every one of them acknowledges the click, so Discord never shows
+        "interaction failed", and none of them edits the message more than
+        once; see :meth:`_ack_now`.
+        """
+        if self.closed:
+            # This message belongs to a session that has been replaced.
             # Acknowledge the click so Discord never shows "interaction
             # failed", but say nothing: nagging everyone who taps a button is
             # just spam.
             await self._silent_ack(interaction)
             return
+        if self.busy:
+            # Somebody else's press is still being emulated (or a runner is
+            # between two of them). Take this one down and answer with a
+            # plain defer: the acknowledgement is the suffix the running
+            # press's own edit puts on the line, which costs no edit here.
+            self.enqueue_press(interaction, field, repeat)
+            await self._silent_ack(interaction)
+            return
         async with self.lock:
-            # A hibernated session has a core to load and a save state to
-            # restore before it can emulate anything, which is the one delay
-            # worth explaining. It is said *with* the clip rather than before
-            # it, because a press only gets one edit now; see _ack_now.
-            resuming = not self.live
-            await self._ack_now(interaction)
-            try:
-                clip = await self.cog.run_press(self, field, repeat)
-            except EmulatorError as error:
-                log.warning(
-                    "Emulation failed in channel %s: %s", self.channel_id, error
-                )
-                await self._recover(interaction, str(error))
-                return
-            except Exception:
-                log.exception("Unexpected emulator failure in channel %s", self.channel_id)
-                await self._recover(interaction, "The emulator hit an unexpected error.")
-                return
-            self.touch()
-            # The press names itself, and whoever made it, on the message --
-            # on the very same edit that carries the clip (see
-            # :meth:`press_note`). The resume line beats it when there is
-            # one, because "the game was asleep and is back" is news and
-            # "Rob pressed A" is a label; a real notice beats both, which
-            # _show settles.
-            await self._show(
-                interaction,
-                clip,
-                RESUMED_NOTE
-                if resuming
-                else self.press_note(field, repeat, interaction.user),
+            await self._run_press(interaction, field, repeat)
+        await self._drain()
+
+    async def _run_press(
+        self,
+        interaction: discord.Interaction,
+        field: typing.Optional[str],
+        repeat: int = 1,
+    ) -> None:
+        """
+        Emulate one press and put its clip on the message. One edit, always.
+
+        **Must be called with :attr:`lock` held**, which is the whole of the
+        one-core-at-a-time discipline as far as this module is concerned: the
+        queue holds intent, and this is the only place any of it is turned
+        into emulator work.
+
+        ``interaction`` is whichever click this press came from -- the one
+        that arrived while the session was free, or a deferred one taken off
+        the queue. A component defer is a DEFERRED_UPDATE_MESSAGE, so a
+        queued click's ``edit_original_response`` is still available when its
+        turn comes, and a queued press therefore makes exactly the same
+        single edit an immediate one does.
+        """
+        # A hibernated session has a core to load and a save state to
+        # restore before it can emulate anything, which is the one delay
+        # worth explaining. It is said *with* the clip rather than before
+        # it, because a press only gets one edit now; see _ack_now.
+        resuming = not self.live
+        await self._ack_now(interaction)
+        try:
+            clip = await self.cog.run_press(self, field, repeat)
+        except EmulatorError as error:
+            log.warning(
+                "Emulation failed in channel %s: %s", self.channel_id, error
             )
+            await self._recover(interaction, str(error))
+            return
+        except Exception:
+            log.exception("Unexpected emulator failure in channel %s", self.channel_id)
+            await self._recover(interaction, "The emulator hit an unexpected error.")
+            return
+        self.touch()
+        # The press names itself, and whoever made it, on the message --
+        # on the very same edit that carries the clip (see
+        # :meth:`press_note`). The resume line beats it when there is
+        # one, because "the game was asleep and is back" is news and
+        # "Rob pressed A" is a label; a real notice beats both, which
+        # _show settles.
+        await self._show(
+            interaction,
+            clip,
+            RESUMED_NOTE
+            if resuming
+            else self.press_note(field, repeat, interaction.user),
+        )
+
+    async def _drain(self) -> None:
+        """
+        Work through the presses that arrived while this one was running.
+
+        Called by the press that was holding the lock, once, as it finishes.
+        One runner at a time (:attr:`_draining` says so, and :attr:`busy`
+        reads it), so two presses finishing back to back cannot both start
+        draining and emulate the same entry twice.
+
+        The lock is **let go between entries** on purpose. Holding it for the
+        whole drain would be simpler, but `[p]retroreboot`, `[p]retrosleep`
+        and `[p]retroend` all wait on that same lock, and in a channel where
+        people are still clicking they would wait for as long as the clicking
+        went on. asyncio.Lock hands itself to waiters in order, so releasing
+        between entries lets a command that is already waiting win -- and it
+        then discards the queue, which is what ends this loop.
+
+        A press that arrives during one of those gaps still queues rather
+        than running: :attr:`busy` is true while ``_draining`` is.
+
+        Every entry is popped *under* the lock and checked against the queue
+        epoch, so an entry that was taken off the front just as the game was
+        reset or undone is dropped rather than emulated into a state nobody
+        aimed it at.
+        """
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            while not self.closed:
+                async with self.lock:
+                    if self.closed or not self.queue:
+                        break
+                    entry = self.queue.popleft()
+                    if entry.epoch != self._queue_epoch:
+                        # Discarded while it was at the front. See
+                        # forget_queue(); the count is already recorded.
+                        continue
+                    await self._run_press(
+                        entry.interaction, entry.field, entry.repeat
+                    )
+        finally:
+            self._draining = False
 
     @staticmethod
     async def _silent_ack(interaction: discord.Interaction) -> None:
@@ -1699,16 +2159,29 @@ class RetroView(discord.ui.View):
         ``edit_original_response`` below then makes the one edit that swaps
         the clip in and redraws the buttons.
 
-        Overlapping clicks are unaffected: the lock in :meth:`_press` drops
-        them through :meth:`_silent_ack`, which is the same defer, so a second
-        presser never sees "interaction failed" and never sees a message
-        either.
+        Overlapping clicks are unaffected: :meth:`_press` queues them and
+        acknowledges each with :meth:`_silent_ack`, which is this same defer,
+        so a second presser never sees "interaction failed" and never sees a
+        message either.
+
+        Which is also why this has to tolerate an interaction that is
+        *already* deferred: a queued press was acknowledged when it was
+        taken down, and Discord (and discord.py) refuse a second response to
+        the same interaction. The defer is skipped in that case and the one
+        edit still happens, so a queued press and an immediate one behave
+        identically -- one response, one edit.
         """
         if self.message is None and interaction.message is not None:
             # After a restart the view is rebuilt from Config and has never
             # seen its message; the interaction carries it.
             self.message = interaction.message
             self.message_id = interaction.message.id
+        response = getattr(interaction, "response", None)
+        try:
+            if response is not None and response.is_done():
+                return
+        except Exception:  # pragma: no cover - is_done() cannot fail
+            log.debug("Could not read an interaction's response state.", exc_info=True)
         try:
             await interaction.response.defer()
         except discord.HTTPException:
@@ -1752,11 +2225,14 @@ class RetroView(discord.ui.View):
         a press any more, which is what stops a line going stale: the one
         edit a press makes always writes the whole ``content``, so the press
         before last cannot still be on screen.
+
+        Whichever wins, it is assembled by :meth:`_line`, so the header and
+        the queue suffix go out with it. That is the whole reason a queued
+        press needs no message of its own.
         """
         self._set_disabled(False)
-        content = self._content()
-        if content is None:
-            content = note
+        notice, self.notice = self.notice, None
+        content = self._line(notice or note)
         try:
             # edit_original_response targets the message the component is on,
             # which response.defer() acknowledged without touching.
@@ -1775,14 +2251,22 @@ class RetroView(discord.ui.View):
             # The game itself is fine, so say so rather than leaving the
             # controls looking broken. The traceback goes to the log: this is
             # how an invalid button emoji shows up in production.
+            # The HTTP status and Discord's own error code go to the log,
+            # which is where somebody who can act on them will look. What the
+            # player gets is what they can act on: the game is fine, press
+            # again. "HTTP 400" told them nothing and read like a crash.
             log.exception(
-                "Failed to update the Libretro screen in channel %s.", self.channel_id
+                "Failed to update the Libretro screen in channel %s "
+                "(HTTP %s, code %s).",
+                self.channel_id,
+                getattr(error, "status", "?"),
+                getattr(error, "code", "?"),
             )
             await self._whisper(
                 interaction,
-                "Discord would not accept the new clip "
-                f"(HTTP {getattr(error, 'status', '?')}). The game is safe "
-                "and was saved; try another press.",
+                "Discord would not accept the new clip, so the picture above "
+                "is the one before it. The game itself is fine and was saved "
+                "\N{EM DASH} press a button to carry on.",
             )
 
     async def _recover(self, interaction: discord.Interaction, reason: str) -> None:
@@ -1803,23 +2287,32 @@ class RetroView(discord.ui.View):
         nothing on screen, then the single ``edit_original_response`` that
         swaps the clip in. See :meth:`_ack_now` for why it cannot be two.
 
-        An empty history is the ordinary case rather than an error -- the
-        button is greyed out for it, and a bot restart empties it -- so a
-        click that gets through anyway is answered privately and the message
-        is not touched at all: one interaction response, zero edits.
+        An empty history is the ordinary case rather than an error, because
+        the history is memory-only: every message that has outlived a bot
+        restart has nothing to undo until somebody presses something. The
+        button stays clickable for exactly that case (see :class:`_UndoButton`)
+        and the answer is private -- one interaction response, zero edits.
+
+        An undo is deliberately **not** queueable. A click that arrives while
+        a press is being emulated is acknowledged and dropped rather than
+        taken down, because "one press back" queued three presses deep means
+        undoing a press its author never saw. What an undo that *does* run
+        does is throw the queue away; see :meth:`run_undo`.
         """
-        if self.closed or self.lock.locked():
+        # :attr:`running` rather than :attr:`busy`: a queue with nobody
+        # working through it is not a reason to refuse an undo, and an undo
+        # that runs is exactly what should throw that queue away.
+        if self.closed or self.running:
             await self._silent_ack(interaction)
             return
         if not self.history:
             try:
                 await interaction.response.send_message(
-                    "There is nothing to undo yet. Undo steps back through "
-                    f"the last {UNDO_DEPTH} presses, and that history is kept "
-                    "in memory only \N{EM DASH} so it is empty until somebody "
-                    "presses something, and the bot has restarted since the "
-                    "last press here. The game itself is exactly where you "
-                    "left it.",
+                    "There is nothing to undo here yet: Undo steps back "
+                    f"through the last {UNDO_DEPTH} presses, and that history "
+                    "is kept in memory only, so a bot restart empties it. "
+                    "Press any button and Undo works again from there. The "
+                    "game itself is exactly where you left it.",
                     ephemeral=True,
                 )
             except discord.HTTPException:
@@ -1851,10 +2344,11 @@ class RetroView(discord.ui.View):
         Whether this user may stop or reset the session.
 
         Anyone in the channel can play; ending someone else's game
-        (`[p]retrostop`) and rebooting it (`[p]retroreset`) are the two things
-        that are not open to everybody, because both of them cost the whole
-        channel its progress-in-flight. One check for both, rather than two
-        that could drift.
+        (`[p]retrosleep`), rebooting it (`[p]retroreboot`) and finishing with
+        it (`[p]retroend`) are the three things that are not open to
+        everybody, because all of them cost the whole channel its
+        progress-in-flight. One check for all three, rather than three that
+        could drift.
 
         ``guild_permissions`` is duck-typed rather than gated on
         ``isinstance(user, discord.Member)``, exactly as

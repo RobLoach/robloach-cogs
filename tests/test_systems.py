@@ -395,6 +395,32 @@ def test_the_emoji_set_is_exactly_the_seven_the_cog_renders():
     assert S.emoji_problem(S.UNDO_EMOJI) is None
 
 
+def test_the_wait_button_is_an_hourglass_rather_than_a_fast_forward():
+    """The Wait button lets time pass; it does not speed anything up.
+
+    It was \u23e9 BLACK RIGHT-POINTING DOUBLE TRIANGLE, which every client
+    draws as fast-forward -- a promise of a feature this cog does not have,
+    on a button whose whole job is "let one clip's worth of time go by with
+    no input". \u23f3 says that instead.
+
+    And it goes through the reviewed table like everything else: a bare
+    codepoint with no U+FE0F is a `400 Invalid emoji` on the send, which is
+    the class of bug that took the cog out in production once.
+    """
+    assert S.WAIT_EMOJI == "\u23f3", repr(S.WAIT_EMOJI)
+    assert S.emoji_problem(S.WAIT_EMOJI) is None
+    assert S.WAIT_EMOJI in S.all_button_emoji()
+    # Emoji_Presentation=Yes, so it must *not* carry a variation selector --
+    # which is the other half of the check, and the half a copy-paste gets
+    # wrong.
+    assert S.EMOJI_CODEPOINTS[0x23F3] is False
+    assert not S.WAIT_EMOJI.endswith(S.VARIATION_SELECTOR_16)
+    # The fast-forward codepoint is gone from the table as well: nothing
+    # draws it, and validate_emoji() refuses an entry no button uses.
+    assert 0x23E9 not in S.EMOJI_CODEPOINTS
+    assert S.validate_emoji()
+
+
 def test_no_stop_or_replay_emoji_survives_anywhere():
     assert not hasattr(S, "STOP_EMOJI")
     assert not hasattr(S, "REPLAY_EMOJI")

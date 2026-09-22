@@ -412,11 +412,11 @@ async def test_a_real_eight_deep_history_is_about_a_hundred_kilobytes(real, city
     assert max(len(blob) for blob in view.history) < raw // 4
 
 
-# -- retroreset, against the real core ----------------------------------------
+# -- retroreboot, against the real core ---------------------------------------
 
 
-async def test_retroreset_reboots_a_real_core_through_the_cog(real, city):
-    """`[p]retroreset` on the real thing, end to end.
+async def test_retroreboot_reboots_a_real_core_through_the_cog(real, city):
+    """`[p]retroreboot` (formerly `[p]retroreset`) on the real thing.
 
     FakeEmulator's reset is a frame counter going back to zero, which proves
     the plumbing and nothing about the machine; this is the statement the
@@ -455,7 +455,7 @@ async def test_retroreset_reboots_a_real_core_through_the_cog(real, city):
     played_picture = last_picture(playing.clip())
     assert differing_bytes(played_wram, booted_wram) > 0, "the play moved nothing"
 
-    await command(real, "retroreset")(cog, ctx)
+    await command(real, "retroreboot")(cog, ctx)
 
     # 1. The machine is back at boot, and a long way from where the play got.
     reset_wram, reset_sram = machine(emulator)

@@ -109,7 +109,11 @@ async def test_the_notice_rides_on_the_next_clip_exactly_once(retro, battery):
     shown = view._content()
     assert "in-game save survived" in (shown or "")
     assert view.notice is None
-    assert view._content() is None, "and the message goes back to carrying no text"
+    # And the message goes back to carrying nothing but the header, which is
+    # the stable "what game is this" prefix rather than a line about a
+    # restore. See RetroView.header.
+    assert view._content() == retro.line(view)
+    assert "in-game save survived" not in view._content()
 
 
 async def test_a_bad_state_with_no_battery_starts_over_without_claiming_otherwise(
