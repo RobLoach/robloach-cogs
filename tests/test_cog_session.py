@@ -477,20 +477,26 @@ async def test_the_first_post_is_a_clip_with_one_line_and_no_embed(retro):
     posted = list(channel.messages.values())[-1]
     assert posted.kwargs.get("embed") is None
     assert getattr(posted.kwargs.get("file"), "filename", "").endswith(".webp")
-    assert posted.kwargs.get("content") == "**layout** \N{MIDDLE DOT} Game Boy"
+    assert posted.kwargs.get("content") == "**layout**"
     assert posted.kwargs["content"] == retro.line(view)
     assert view._content() == retro.line(view)
 
 
-async def test_the_line_names_the_game_and_its_console_before_anything_else(retro):
-    """The header, spelled out, against a known game on a known console."""
+async def test_the_line_names_the_game_before_anything_else(retro):
+    """The whole line, spelled out, against a known game.
+
+    The console used to sit between the two -- ``**ucity** \N{MIDDLE DOT} Game
+    Boy \N{EM DASH} Tester pressed A.`` -- and is gone: the picture, the boot
+    logo and the controller underneath all say which console it is, and the
+    game's name is the thing none of them say. See HEADER.
+    """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(8410, "ucity")
     interaction = retro.interaction(view, message=view.message)
     await view._press(interaction, "a")
     assert (
         interaction.log[-1][1]["content"]
-        == "**ucity** \N{MIDDLE DOT} Game Boy \N{EM DASH} Tester pressed A."
+        == "**ucity** \N{MIDDLE DOT} Tester pressed A."
     )
 
 
@@ -507,7 +513,7 @@ async def test_the_header_says_when_the_session_is_asleep(retro):
 
     await retro.cog.hibernate(view, "Put to sleep.")
     assert not view.live
-    assert view.header == "**sleepy** \N{MIDDLE DOT} Game Boy \N{MIDDLE DOT} asleep"
+    assert view.header == "**sleepy** \N{MIDDLE DOT} asleep"
     # ...and that header is on the message the sleep edited, unasked.
     said = retro.message_edit(view)["content"]
     assert said.startswith(view.header) and "Put to sleep." in said
@@ -706,7 +712,12 @@ async def test_a_save_state_is_written_every_third_press(retro):
 
 
 def queued_names(view):
-    """What is waiting, as ``"who button"`` strings."""
+    """What is waiting, as the listing spells it: button names only.
+
+    The presser used to be named in front of each one and is not any more;
+    see QUEUE_ENTRY, and ``Pending.who`` -- which is still captured -- for
+    what putting it back would use.
+    """
     return [view.queued_label(entry) for entry in view.queue]
 
 
@@ -729,7 +740,7 @@ async def test_a_press_that_lands_mid_emulation_is_queued_rather_than_dropped(re
         # ...but the intent is kept. Three different people, because one
         # person only ever gets one slot; see the per-user test below.
         assert len(view.queue) == 1, "one slot per person, and these share one"
-    assert queued_names(view) == ["Tester B"]
+    assert queued_names(view) == ["B"]
 
 
 async def test_the_queue_is_bounded_and_says_how_deep(retro):
@@ -770,15 +781,18 @@ async def test_one_person_gets_one_waiting_press_however_fast_they_click(retro):
         # Rob's first choice, once, and Ada behind him: a fast clicker cannot
         # fill the queue on their own.
         assert queued_names(view) == [
-            "Rob \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}",
-            "Ada A",
+            "\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}",
+            "A",
         ]
+        # Whose each one is, is still on the entry even though the listing no
+        # longer prints it; see QUEUE_ENTRY.
+        assert [entry.who for entry in view.queue] == ["Rob", "Ada"]
 
 
 async def test_the_running_press_says_what_is_queued_behind_it(retro):
     """The whole acknowledgement, and it costs no extra edit.
 
-    "Rob pressed A. *Queued: Ada ⬅️*" -- one line, on the one edit Rob's
+    "Rob pressed A. *Queued: ⬅️*" -- one line, on the one edit Rob's
     press was making anyway. An ephemeral "your press is queued" would be a
     second message per click, and any edit of this message would re-render
     the attachment and visibly rewind the clip.
@@ -813,7 +827,7 @@ async def test_the_running_press_says_what_is_queued_behind_it(retro):
         view,
         "Rob pressed A.",
         suffixes=[
-            retro.queued("Ada \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}")
+            retro.queued("\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}")
         ],
     )
     # One edit for Rob's press, exactly as before the queue existed.
@@ -1068,10 +1082,14 @@ async def test_only_one_press_is_ever_inside_the_emulator(retro):
 async def test_a_queued_press_from_somebody_unnameable_still_reads(retro):
     """A plain User, or somebody who has left the guild since clicking.
 
-    The name is sanitised *at the moment of the click* and kept on the queue
-    entry rather than re-derived from a member object that may have gone, and
-    an entry with no usable name is listed by its button alone rather than as
-    " A".
+    The listing is button names only now (see QUEUE_ENTRY), so an entry from
+    somebody with no usable name reads exactly like everybody else's rather
+    than as " A" -- which is what it used to have to be careful about.
+
+    The name is still sanitised *at the moment of the click* and kept on the
+    entry, because it cannot be recovered afterwards: that is what putting
+    the names back in the listing would use, and what stops it having to
+    re-derive one from a member object that has since gone.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9022, "goneaway")
@@ -1081,12 +1099,13 @@ async def test_a_queued_press_from_somebody_unnameable_still_reads(retro):
     async with view.lock:
         assert view.enqueue_press(retro.interaction(view, user=ex_member), "a")
         assert view.enqueue_press(retro.interaction(view, user=anonymous), "b")
-        assert queued_names(view) == ["Ex Member A", "B"]
-        assert view.queue_note() == retro.queued("Ex Member A", "B")
+        assert queued_names(view) == ["A", "B"]
+        assert view.queue_note() == retro.queued("A", "B")
+        assert [entry.who for entry in view.queue] == ["Ex Member", ""]
         # The name on the entry is a snapshot: losing the user object later
-        # cannot turn the listing into " pressed A."
+        # cannot take it back off.
         view.queue[0].interaction.user = None
-        assert queued_names(view) == ["Ex Member A", "B"]
+        assert view.queue[0].who == "Ex Member"
 
 
 async def test_a_press_on_a_retired_message_is_neither_run_nor_queued(retro):
@@ -1130,6 +1149,372 @@ async def test_a_queued_press_on_a_sleeping_session_wakes_it_first(retro):
     # ordinary press on a session that is now awake.
     assert view.live
     assert ada.log[-1][1]["content"] == retro.line(view, "Ada pressed B.")
+
+
+# -- A clip is not replaced before it has been watched -------------------------
+#
+# A clip costs 42-92ms to make and 1005ms to watch, so presses that arrive
+# back to back -- which is every queue drain, since queued presses run with no
+# human delay between them -- each replaced the previous clip after about a
+# tenth of it had played. The seam is exact (capture_plan and the pre-roll see
+# to that) but nobody ever saw it, so the picture appeared to lurch.
+#
+# So the *edit* waits until the clip it is replacing has had its playing time
+# on screen. See the note above MAX_PACE_SECONDS in retro/RetroView.py for the
+# rule, the cap and the numbers behind them.
+#
+# The gate spends its time in exactly one place -- the module-level
+# `pace_wait` -- and `RetroEnv` swaps that for a recorder, so these tests read
+# the delay that was *asked for* rather than paying for it. `retro.pace_waits`
+# is every delay any view asked for, and `view.last_pace_seconds` is the last
+# one. The three tests that are about the waiting itself put the real wait
+# back with `retro.real_pacing()`.
+
+
+def playing_now(view):
+    """Pretend the clip on the message has only just gone out."""
+    view.note_posted(view.clip_playback())
+
+
+def played_out(view):
+    """Pretend it went out long enough ago to have finished playing."""
+    view.note_posted(view.clip_playback())
+    view._posted_at -= view.clip_playback() + 1.0
+
+
+async def fill_the_queue(retro, view, waiting):
+    """Run one press with ``waiting`` more queued behind it, and drain it all.
+
+    The presses have to be taken down from *inside* the running one, exactly
+    as real clicks arrive: a press only queues while the session is busy, and
+    a queue with nobody working through it is not a state anybody reaches.
+
+    Returns the running press's interaction and the queued ones, in order.
+    """
+    people = [FakeUser(uid=600 + index, name=f"P{index}") for index in range(waiting)]
+    queued = [
+        retro.interaction(view, user=person, message=view.message)
+        for person in people
+    ]
+    original = view.run_press
+    once = []
+
+    def slow(field, repeat=1):
+        if not once:
+            once.append(True)
+            for interaction in queued:
+                assert view.enqueue_press(interaction, "a")
+        return original(field, repeat)
+
+    running = retro.interaction(view, message=view.message)
+    view.run_press = slow
+    try:
+        await view._press(running, "b")
+    finally:
+        view.run_press = original
+    return running, queued
+
+
+async def test_a_press_with_nothing_playing_is_not_held_back(retro):
+    """The common case -- one person, one press at a time -- is untouched."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9200, "unpaced")
+    played_out(view)
+
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    assert view.last_pace_seconds == 0.0
+    assert retro.pace_waits == [], retro.pace_waits
+    assert view.pace_delay() > 0.0, "but its own clip is now the one playing"
+
+
+async def test_a_clip_is_not_replaced_until_the_one_on_screen_has_played(retro):
+    """The whole fix, in one press.
+
+    A second press landing a moment after the first used to replace a clip
+    that had played a fraction of the way through. Now the emulation happens
+    straight away and only the edit waits, for what is left of the clip.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9201, "paced")
+    playback = view.clip_playback()
+    assert playback == pytest.approx(1.005, abs=0.001), playback
+    playing_now(view)
+
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    # Everything the press spent producing the clip counts against the wait,
+    # so it is a shade under the whole playing time and never more than it.
+    assert 0.0 < view.last_pace_seconds <= playback
+    assert view.last_pace_seconds == pytest.approx(playback, abs=0.05)
+    assert retro.pace_waits == [view.last_pace_seconds]
+
+
+async def test_a_clip_that_has_already_played_through_is_replaced_at_once(retro):
+    """Pacing is a deadline, not a delay: the time already spent counts."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9202, "halfway")
+    playback = view.clip_playback()
+
+    playing_now(view)
+    view._posted_at -= playback * 0.75
+    assert view.pace_delay() == pytest.approx(playback * 0.25, abs=0.02)
+
+    view._posted_at -= playback * 0.25
+    assert view.pace_delay() == 0.0
+
+
+async def test_a_wait_too_short_to_see_is_not_taken_at_all(retro):
+    """Under one picture of the clip, so nothing visible is lost by going."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9203, "sliver")
+    playing_now(view)
+    view._posted_at -= view.clip_playback() - (retro.viewmod.MIN_PACE_SECONDS / 2)
+
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert view.last_pace_seconds == 0.0
+    assert retro.pace_waits == []
+
+
+@pytest.mark.parametrize(
+    "seconds, capped",
+    [(0.2, False), (0.8, False), (1.0, False), (2.0, True), (15.0, True)],
+)
+async def test_a_long_clip_is_paced_up_to_the_cap_and_no_further(
+    retro, seconds, capped
+):
+    """The bound, at both extremes of `[p]retroset cliplength`.
+
+    0.2s clips pace almost instantly; a 15s clip would otherwise make a queue
+    unbearable, so a single edit is never held for more than
+    MAX_PACE_SECONDS. The cap is above a default clip's real playing time
+    (1.005s, not 1s) on purpose, so the length this cog is actually played at
+    is always paced in full.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9204, "long")
+    view.clip_seconds = seconds
+    playback = view.clip_playback()
+    playing_now(view)
+
+    delay = view.pace_delay()
+    cap = retro.viewmod.MAX_PACE_SECONDS
+    assert delay <= cap
+    if capped:
+        assert delay == cap
+    else:
+        assert delay == pytest.approx(playback, abs=0.01)
+        assert playback <= cap, "the default clip length must never be capped"
+
+
+async def test_a_full_queue_cannot_add_more_than_its_bound(retro):
+    """What a whole drain can cost, stated as the arithmetic it is.
+
+    The queue is bounded (MAX_QUEUED_PRESSES) and every edit's wait is
+    bounded (MAX_PACE_SECONDS), so the pacing a drain can add is bounded by
+    their product -- inside the ~4 seconds MAX_QUEUED_PRESSES already sizes
+    itself on.
+    """
+    viewmod = retro.viewmod
+    worst = viewmod.MAX_QUEUED_PRESSES * viewmod.MAX_PACE_SECONDS
+    assert worst <= 4.0, worst
+
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9205, "bound")
+    playing_now(view)
+    await fill_the_queue(retro, view, viewmod.MAX_QUEUED_PRESSES)
+
+    # One wait per edit: the press that ran, then every queued one. The
+    # running press's own wait is its author's latency and was paid whether
+    # anybody queued behind it or not; what the *queue* adds is the rest, and
+    # that is what has to stay inside the bound.
+    assert len(retro.pace_waits) == viewmod.MAX_QUEUED_PRESSES + 1
+    assert all(delay <= viewmod.MAX_PACE_SECONDS for delay in retro.pace_waits)
+    assert sum(retro.pace_waits[1:]) <= worst
+    assert not view.queue and not view._draining
+
+
+async def test_a_paced_press_still_makes_exactly_one_edit(retro):
+    """The invariant pacing must not buy its way out of.
+
+    Waiting is not a thing anybody can see, so it cannot cost a second edit
+    or a second response: the press is deferred, it waits, and then it makes
+    the one edit it always made.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9206, "onepaced")
+    playing_now(view)
+
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+
+    assert view.last_pace_seconds > 0.0, "this press really did wait"
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
+    assert interaction.log[-1][1]["has_attachments"]
+
+
+async def test_the_queue_drains_with_real_pacing_and_still_finishes(retro):
+    """The real wait, at the shortest clip length, end to end.
+
+    Short clips so the test costs tenths of a second rather than seconds, and
+    real waiting so that "the drain finishes" is a statement about the gate
+    rather than about the recorder. Every clip gets its full playing time,
+    because 0.2s is well under the cap.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9207, "draining")
+    view.clip_seconds = 0.2
+    playback = view.clip_playback()
+    retro.real_pacing()
+
+    playing_now(view)
+    started = time.monotonic()
+    first, waiting = await fill_the_queue(retro, view, 3)
+    elapsed = time.monotonic() - started
+
+    # Every press made its own single edit, in order, and the queue is empty.
+    for interaction in [first] + waiting:
+        assert interaction.kinds() == ["response.defer", "edit_original_response"]
+    assert not view.queue and not view._draining
+    # Four edits, four clips each held for their playing time -- so the drain
+    # really did take about that long, and nowhere near forever.
+    assert elapsed >= 3 * playback, elapsed
+    assert elapsed < 4 * playback + 1.0, elapsed
+
+
+async def test_pacing_never_holds_the_emulator_lock(retro):
+    """One core, every channel: a wait here must cost nobody else anything.
+
+    The clip is finished with by the time the gate waits -- `Retro.run_press`
+    has returned and given the cog's emulator lock back -- so another channel
+    can wake its own game and press a button *during* the wait. Which is
+    exactly what this does, from inside the wait itself.
+    """
+    await retro.install_cores("gambatte")
+    other, other_ctx, _ = await retro.posted_game(9208, "otherchannel")
+    view, _, _ = await retro.posted_game(9209, "thischannel")
+    assert view.live and not other.live, "one core, and this channel has it"
+
+    playing_now(view)
+    seen = {}
+    elsewhere = retro.interaction(other, message=other.message)
+
+    async def wait(release, delay):
+        seen["delay"] = delay
+        seen["emulator_lock"] = retro.cog.emulator_lock.locked()
+        # A whole press on another channel, mid-wait: it wakes that session,
+        # which evicts this one, and makes its own single edit.
+        await other._press(elsewhere, "a")
+
+    retro.pace_wait(wait)
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+
+    assert seen["delay"] > 0.0, "this press really was being paced"
+    assert seen["emulator_lock"] is False, "the one core was held all the way"
+    assert elsewhere.kinds() == ["response.defer", "edit_original_response"]
+    assert other.live, "the other channel got the core"
+    # And this press still made its one edit afterwards.
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]
+
+
+#: How this session can be taken away while a press is holding its edit back.
+#: Each one has to cancel the pacing *before* it reaches for anything, or it
+#: would queue up behind a purely cosmetic delay. See RetroView.cancel_pacing.
+TEARDOWNS = [
+    ("sleep", lambda retro, view, ctx: sleep_command(retro)(retro.cog, ctx)),
+    ("end", lambda retro, view, ctx: retro.cogmod.Retro.retroend.callback(retro.cog, ctx)),
+    ("reboot", lambda retro, view, ctx: reset_command(retro)(retro.cog, ctx)),
+    ("evicted", lambda retro, view, ctx: retro.cog.hibernate(view, "Evicted.")),
+    ("unload", lambda retro, view, ctx: retro.cog.cog_unload()),
+]
+
+
+@pytest.mark.parametrize("name, teardown", TEARDOWNS, ids=[n for n, _ in TEARDOWNS])
+async def test_teardown_never_waits_on_pacing(retro, name, teardown):
+    """Sleeping, ending, rebooting, eviction and unloading, all immediate.
+
+    The real wait, so "it was cut short" is a measurement rather than a
+    promise: the gate is asked for the better part of a second and gives it
+    up as soon as the teardown says there is no point.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9210, "torndown")
+    playing_now(view)
+    retro.real_pacing()
+    timings = {}
+    running = []
+
+    async def wait(release, delay):
+        timings["delay"] = delay
+        running.append(asyncio.create_task(teardown(retro, view, ctx)))
+        # Long enough for the teardown to reach its cancel_pacing() and then
+        # block on whatever it wants; far shorter than the wait being cut.
+        await asyncio.sleep(0.02)
+        started = time.monotonic()
+        await retro._real_pace_wait(release, delay)
+        timings["waited"] = time.monotonic() - started
+
+    retro.pace_wait(wait)
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await asyncio.gather(*running)
+
+    assert timings["delay"] > 0.5, timings
+    assert timings["waited"] < 0.1, timings
+    # No timer left behind: the wait is an await inside the press it belongs
+    # to rather than a scheduled callback, so when the press is over so is
+    # it, and nothing of this cog's is still pending.
+    assert not view.lock.locked() and not view._draining
+    current = asyncio.current_task()
+    assert [t for t in asyncio.all_tasks() if t is not current] == []
+
+
+async def test_an_undo_that_lands_during_pacing_is_dropped_rather_than_waiting(retro):
+    """Undo is not queueable, and pacing does not make it so.
+
+    A click that arrives while a press is running -- which now includes the
+    moment it is holding its edit back -- is acknowledged and dropped, as it
+    always was. It does not wait, and it does not edit.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9211, "undoduring")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    retro.pace_waits.clear()
+    playing_now(view)
+    clicked = {}
+
+    async def wait(release, delay):
+        undo = retro.interaction(view, message=view.message)
+        await retro.control(view, "undo").callback(undo)
+        clicked["kinds"] = undo.kinds()
+
+    retro.pace_wait(wait)
+    await view._press(retro.interaction(view, message=view.message), "b")
+
+    assert clicked["kinds"] == ["response.defer"], clicked
+
+
+async def test_an_undo_s_own_clip_is_never_paced(retro):
+    """A correction is not held back to finish showing the thing it corrects.
+
+    The clip on the message is of a press that is about to stop having
+    happened, so waiting for it to play through would be showing somebody the
+    very thing they asked to take away. Same for `[p]retroreboot`.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9212, "undopace")
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    retro.pace_waits.clear()
+    playing_now(view)
+    await retro.control(view, "undo").callback(
+        retro.interaction(view, message=view.message)
+    )
+    assert retro.pace_waits == [], retro.pace_waits
+
+    playing_now(view)
+    await reset_command(retro)(retro.cog, ctx)
+    assert retro.pace_waits == [], retro.pace_waits
 
 
 # -- Which button was pressed -------------------------------------------------

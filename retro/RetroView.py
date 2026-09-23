@@ -22,6 +22,7 @@ from .emulator import (
     clip_frame_count,
     frame_count,
     input_budget,
+    playback_seconds,
 )
 from .systems import (
     CONTROL_BUTTONS,
@@ -157,18 +158,29 @@ RESUMED_NOTE = "Woke up where you left off."
 #: press wakes it, and the edit that press makes drops the mark again.
 ASLEEP_MARK = "asleep"
 
-#: How the game and the console are named on the line above the clip. A
-#: stable prefix rather than a status card: the first clip of a cold boot used
-#: to go out with *no* text at all, and after that the only text was the press
-#: line, so somebody scrolling past saw an animation, a grid of buttons and
-#: "Rob pressed A." with nothing anywhere saying what game it was.
+#: How the game is named on the line above the clip. A stable prefix rather
+#: than a status card: the first clip of a cold boot used to go out with *no*
+#: text at all, and after that the only text was the press line, so somebody
+#: scrolling past saw an animation, a grid of buttons and "Rob pressed A."
+#: with nothing anywhere saying what game it was.
 #:
 #: It rides on the content that is already rewritten by every press, so it
 #: costs nothing: no card, no embed, no extra edit. One line, always.
-HEADER = "**{game}** \N{MIDDLE DOT} {console}"
+#:
+#: **The console used to be in here** and is not any more. The line read
+#: ``**µCity** · Game Boy — Rob pressed A.`` and now reads
+#: ``**µCity** · Rob pressed A.``: the game's name is the thing nobody could
+#: work out from the picture, and the console is the thing everybody can --
+#: it is on screen in the boot logo, in the shape of the frame, and in the
+#: controller laid out underneath. It was costing a third of a short line to
+#: repeat it on every press. `[p]retro` on its own still lists every console
+#: this bot emulates, which is where somebody actually asks.
+HEADER = "**{game}**"
 
-#: What separates the header from whatever just happened.
-HEADER_SEPARATOR = " \N{EM DASH} "
+#: What separates the header from whatever just happened. The same middle dot
+#: that separates the pieces of the header, so the whole line is one list of
+#: short facts rather than a header and a sentence joined by a dash.
+HEADER_SEPARATOR = " \N{MIDDLE DOT} "
 
 # How much of a game's name goes in the header. Game names come from a ROM
 # filename that has already been through Retro._sanitize_filename (which caps
@@ -197,13 +209,15 @@ MAX_GAME_NAME = 48
 #   a scheduler: a fast clicker cannot fill the queue on their own, so a
 #   roomful of people take it in turns without anybody arranging it. A second
 #   click from somebody who already has one waiting is refused and the first
-#   one stands -- the message has already told them their press is queued (see
+#   one stands -- the message has already shown their press in the queue (see
 #   RetroView.queue_note), and quietly swapping it for something else would
 #   make that acknowledgement a lie for a second.
 # * **every waiting press is visible.** An input nobody can see is an input
 #   that feels lost, which is the whole complaint. The queue is listed as a
 #   suffix on the very line the running press is already rewriting, so it
-#   costs no extra edit -- see RetroView.queue_note and _ack_now.
+#   costs no extra edit -- see RetroView.queue_note and _ack_now. The listing
+#   names the buttons and not the people any more; see QUEUE_ENTRY for what
+#   that costs.
 # * **the queue is intent, never work.** A pending entry is a button name and
 #   a deferred interaction; nothing touches the emulator until the runner
 #   takes the lock again for it. The one-core-at-a-time discipline is
@@ -225,15 +239,125 @@ QUEUED_WAIT = "wait"
 #: to it rather than a second announcement.
 QUEUE_NOTE = "*Queued: {queued}*"
 
-#: One entry in that listing, with and without a name to use.
-QUEUE_ENTRY = "{who} {button}"
-QUEUE_ENTRY_ANONYMOUS = "{button}"
+#: One entry in that listing: the button, and only the button.
+#:
+#: It used to be ``"{who} {button}"`` -- ``*Queued: Ada ⬅️*`` -- and the name
+#: is gone to keep the whole line short enough to read at a glance next to
+#: the picture. What that costs is worth knowing: with one waiting press per
+#: person (see MAX_QUEUED_PRESSES) the name was how somebody confirmed that
+#: the press in the list was *theirs* rather than somebody else's identical
+#: one. A queue of "⬅️, ⬅️" no longer says which of the two is yours.
+#:
+#: Putting it back is this string and :meth:`RetroView.queued_label`, which
+#: is why :attr:`Pending.who` is still captured at the moment of the click.
+QUEUE_ENTRY = "{button}"
 
 #: Said once, on the next line the session writes, when something threw the
 #: queue away: a reset, an undo, a stop. Without it the presses simply
 #: vanish, which is the bug this whole mechanism exists to fix -- so the one
 #: case where dropping them is *right* has to say so out loud.
 DROPPED_NOTE = "*{count} queued press{plural} dropped*"
+
+# -- Pacing: a clip is not replaced before it has been watched ----------------
+#
+# A clip costs far less to make than it does to watch. Measured on the real
+# thing -- gambatte running Libbet, one second clips, libretro.py 0.6.0, on a
+# Raspberry Pi 5 -- three presses back to back:
+#
+#     clip   emulated + encoded in   plays for
+#       1              92 ms          1005 ms
+#       2              68 ms          1005 ms
+#       3              42 ms          (one picture, static screen)
+#
+# So producing a clip is 11-24x faster than playing it. Nothing noticed that
+# while a press needed a human to decide on it: by the time somebody had
+# looked at the picture and clicked again, the clip had long since played
+# through and was holding its last frame (clips are encoded with ``loop=1``;
+# see encode_animation). The press *queue* removed the human from the gap --
+# queued presses drain one after another with nothing between them but the
+# lock -- so each new clip replaced the previous one after about a tenth of
+# it had played. What that looks like is the picture lurching: the animation
+# never reaches the frame the next clip carries on from, so the game appears
+# to jump back a little on every press. The seam itself is exact (see
+# capture_plan and PREROLL_SECONDS, which between them make the last picture
+# of one clip the state the next one starts from), and the pacing below is
+# what makes it exact *on screen* rather than only in the emulation.
+#
+# The rule: **an edit that replaces a clip waits until that clip has had its
+# playing time on screen.** The playing time is known exactly before the edit
+# is made -- it is the sum of the frame durations the encoder was handed; see
+# clips.playback_seconds, which is the same arithmetic RetroEmulator.record
+# writes into the clip's ANMF chunks -- so it is a deadline rather than a
+# guess, and the time already spent emulating, encoding and uploading the new
+# clip counts against it.
+#
+# Four things bound the cost of that, and all four matter:
+#
+# * **nothing playing, no wait.** The deadline is in the past for any press
+#   that arrives more than a clip after the last one, which is every ordinary
+#   single press. It is the common case and it is untouched.
+# * **the emulator is never held waiting.** The wait happens after
+#   ``Retro.run_press`` has returned, so the cog's emulator lock -- the one
+#   core, shared by every channel -- is free throughout, and another
+#   channel can start a game or press a button during it. Only the *edit*
+#   waits.
+# * **MAX_PACE_SECONDS caps a single wait**, so a long clip cannot turn a
+#   queue into a minute of staring.
+# * **teardown never waits at all.** Sleeping, ending, rebooting, undoing,
+#   eviction and cog unload all call :meth:`RetroView.cancel_pacing` before
+#   they take anything, which releases a wait already in progress and stops
+#   the next one from starting. No timer is left behind: the wait is an
+#   ``await`` inside the press it belongs to, not a scheduled callback.
+#
+# What the cap is worth, at the three clip lengths that matter. A full queue
+# is MAX_QUEUED_PRESSES waiting behind the one running, so the pacing a whole
+# drain can add is at most MAX_QUEUED_PRESSES * MAX_PACE_SECONDS:
+#
+#   cliplength   clip plays for   wait per edit      full queue adds
+#     0.2s          0.201s          0.2s (in full)      0.6s
+#     1s (default)  1.005s          1.005s (in full)    3.0s
+#     15s (max)     15.0s           1.25s (capped)      3.75s
+#
+# 1.25 seconds is therefore the smallest cap that still paces a default clip
+# *in full* (a one second clip plays for 1.005s, so a cap of 1.0 would clip
+# the last 5ms off every single one of them) while keeping a full queue
+# inside the four seconds the queue was already designed around -- see
+# MAX_QUEUED_PRESSES, which sizes itself on "about four seconds of latency,
+# which is the most that is still recognisably 'I pressed that'".
+#
+# Capping each wait rather than budgeting the drain as a whole is deliberate:
+# a budget spent on the first edit would give the head of the queue its full
+# second and let the tail lurch exactly as it does today, and the lurch is
+# the complaint. A cap gives every clip in a drain the same time on screen.
+MAX_PACE_SECONDS = 1.25
+
+#: A wait shorter than this is not worth taking. One picture of a clip is
+#: 67ms at CLIP_FPS, so 50ms cannot cost a visible frame, and a Discord edit
+#: takes longer than that anyway -- the wait would be spent before the
+#: request it is delaying had been sent.
+MIN_PACE_SECONDS = 0.05
+
+
+async def pace_wait(release: asyncio.Event, delay: float) -> None:
+    """
+    Wait ``delay`` seconds, or until ``release`` says there is no point.
+
+    ``release`` is the session's :attr:`RetroView._pace_release`, set by
+    :meth:`RetroView.cancel_pacing` when the game is being torn down or moved
+    somewhere the clip on screen no longer describes. It is checked by
+    waiting on it rather than by polling, so teardown is immediate.
+
+    A module-level function, and the only place pacing actually spends time,
+    so that a test can watch the wait -- or act during it, which is how "the
+    emulator lock is not held while this is happening" is proved -- instead
+    of paying for it. Nothing in the cog rebinds it.
+    """
+    try:
+        await asyncio.wait_for(release.wait(), delay)
+    except (asyncio.TimeoutError, TimeoutError):
+        # The ordinary ending: the clip finished playing and nothing
+        # interrupted us.
+        pass
 
 
 class Pending(typing.NamedTuple):
@@ -245,10 +369,12 @@ class Pending(typing.NamedTuple):
     none is done to build one.
 
     ``who`` is the author's display name, sanitised at the moment they
-    clicked (see :func:`presser_name`), rather than the user object: the
-    listing has to keep reading correctly for somebody who has left the guild
-    between clicking and being run, and re-deriving a name from a member
-    object that has since gone is exactly how that produces " pressed A.".
+    clicked (see :func:`presser_name`), rather than the user object: a name
+    has to keep reading correctly for somebody who has left the guild between
+    clicking and being run, and re-deriving one from a member object that has
+    since gone is exactly how that produces " pressed A.". The listing no
+    longer prints it (see QUEUE_ENTRY) and this is what putting it back would
+    use -- it cannot be recovered later, so it is taken while it is true.
 
     ``epoch`` is the session's queue generation when this was accepted. Bumped
     by :meth:`RetroView.forget_queue`, so an entry that was already taken off
@@ -1053,6 +1179,22 @@ class RetroView(discord.ui.View):
         # session writes can say so once. See DROPPED_NOTE.
         self.queue_dropped: int = 0
 
+        # When the clip now on the message went out, on the monotonic clock,
+        # and how long it plays for. A playback of 0 means "nothing is
+        # playing", which is both the state before the first clip and what
+        # teardown puts this back to. See the pacing note above
+        # MAX_PACE_SECONDS.
+        self._posted_at: float = 0.0
+        self._posted_playback: float = 0.0
+        # Set to release a pacing wait that is already in progress, and
+        # cleared by the edit that posts the next clip. Only ever set on the
+        # event loop; see cancel_pacing and forget_pacing.
+        self._pace_release: asyncio.Event = asyncio.Event()
+        #: How long the last edit was actually held back for, in seconds, and
+        #: zero for an edit that went straight out. Read by the tests, and by
+        #: nothing in the cog.
+        self.last_pace_seconds: float = 0.0
+
         self._build_controls()
         self._update_repeat_label()
 
@@ -1201,6 +1343,9 @@ class RetroView(discord.ui.View):
         """
         self.closed = True
         self.forget_queue()
+        # And a press that is sitting out the clip on screen stops sitting:
+        # there is nothing left for it to pace against. See cancel_pacing.
+        self.cancel_pacing()
         self._set_disabled(True)
 
     def touch(self) -> None:
@@ -1228,6 +1373,21 @@ class RetroView(discord.ui.View):
         """How many emulated frames one clip covers on this console."""
         fps = self.fps if emulator is None else emulator.fps
         return clip_frame_count(fps, self.clip_seconds)
+
+    def clip_playback(self, emulator: typing.Optional[RetroEmulator] = None) -> float:
+        """
+        How long one of this session's clips plays for, in seconds.
+
+        The sum of the durations the encoder is handed rather than the clip
+        length that was asked for, so it is what the clip really does on
+        screen: at the default second a Game Boy clip is 60 frames, emulates
+        1.0046 seconds and plays for 1.005. See :func:`playback_seconds`.
+
+        This is the number a clip is paced against; see the note above
+        MAX_PACE_SECONDS.
+        """
+        fps = self.fps if emulator is None else emulator.fps
+        return playback_seconds(fps, self.clip_frames(emulator))
 
     def press_plan(
         self, taps: int = 1, emulator: typing.Optional[RetroEmulator] = None
@@ -1516,7 +1676,12 @@ class RetroView(discord.ui.View):
         return dropped
 
     def queued_label(self, entry: Pending) -> str:
-        """One waiting press, named the way the press line names a button."""
+        """
+        One waiting press, named the way the press line names a button.
+
+        The presser's name is deliberately not in it any more; see
+        QUEUE_ENTRY, which is also where putting it back would start.
+        """
         if entry.field is None:
             button = QUEUED_WAIT
         else:
@@ -1524,8 +1689,7 @@ class RetroView(discord.ui.View):
             taps = len(self.press_plan(entry.repeat)) if entry.repeat > 1 else 1
             if taps > 1:
                 button = f"{button} x{taps}"
-        template = QUEUE_ENTRY if entry.who else QUEUE_ENTRY_ANONYMOUS
-        return template.format(who=entry.who, button=button)
+        return QUEUE_ENTRY.format(button=button)
 
     def queue_note(self) -> str:
         """
@@ -1556,6 +1720,108 @@ class RetroView(discord.ui.View):
         if not dropped:
             return ""
         return DROPPED_NOTE.format(count=dropped, plural="" if dropped == 1 else "es")
+
+    # -- Pacing the clips ---------------------------------------------------
+    #
+    # See the note above MAX_PACE_SECONDS for the measurements and the rule.
+    # Three small methods and one await, and none of them touches a lock.
+
+    def note_posted(self, playback: float) -> None:
+        """
+        Remember that a clip is now on screen, and for how long it plays.
+
+        Called by every edit that puts a clip on the message -- the first one
+        of a session, a press, an undo, a reboot -- immediately *after* the
+        edit has gone through, because that is when the clip starts playing
+        in somebody's client rather than when it was encoded.
+
+        Also clears the release flag: a new clip is a fresh start, and the
+        reason the last wait was cut short does not apply to this one.
+        """
+        self._posted_at = time.monotonic()
+        self._posted_playback = max(0.0, float(playback))
+        self._pace_release.clear()
+
+    def forget_pacing(self) -> None:
+        """
+        Stop pacing against whatever is on screen: it no longer describes the
+        game.
+
+        Used by the paths that move the machine somewhere the clip on the
+        message is not -- an undo, a reboot -- so that the clip *they* post
+        goes out immediately rather than waiting behind the one they have
+        just made wrong.
+
+        Safe from a worker thread, which is why it is separate from
+        :meth:`cancel_pacing`: it writes one float and nothing else. It
+        cannot release a wait that is already in progress, and it does not
+        have to -- both callers run under :attr:`lock`, which a waiting press
+        is holding.
+        """
+        self._posted_playback = 0.0
+
+    def cancel_pacing(self) -> None:
+        """
+        Stop pacing, and release a wait that is already in progress.
+
+        **Every teardown path calls this before it takes anything.** Sleeping
+        a session, ending it, rebooting it, evicting it for another channel
+        and unloading the cog all reach for :attr:`lock` or free the core,
+        and a press that is sitting out a clip's playing time is holding that
+        lock; without this they would wait for up to MAX_PACE_SECONDS behind
+        a purely cosmetic delay. Releasing the wait lets that press make its
+        one edit and get out of the way immediately.
+
+        Event loop only (:class:`asyncio.Event` is not thread-safe). A worker
+        thread wants :meth:`forget_pacing`.
+
+        Never raises, and safe to call on a session that is not pacing, which
+        is almost always.
+        """
+        self.forget_pacing()
+        self._pace_release.set()
+
+    def pace_delay(self) -> float:
+        """
+        How long an edit has to wait before it may replace the clip on screen.
+
+        Zero -- meaning "go now" -- whenever nothing is playing, the session
+        is finished with, or the clip has already played through. Otherwise
+        the time left on it, capped at MAX_PACE_SECONDS.
+        """
+        if self.closed or self._posted_playback <= 0.0:
+            return 0.0
+        left = (self._posted_at + self._posted_playback) - time.monotonic()
+        return min(max(0.0, left), max(0.0, MAX_PACE_SECONDS))
+
+    async def pace(self) -> None:
+        """
+        Sit out the rest of the clip on screen, so the next one replaces it
+        whole.
+
+        Called by :meth:`_run_press` between the clip coming back from the
+        emulator and the edit that posts it -- i.e. with the emulator lock
+        already given back, so a wait here costs this channel some latency
+        and costs every other channel nothing at all.
+
+        Records what it waited in :attr:`last_pace_seconds`, and spends it in
+        :func:`pace_wait`, which is the one place any of this takes time.
+        """
+        delay = self.pace_delay()
+        if delay < MIN_PACE_SECONDS or self._pace_release.is_set():
+            # Nothing playing, a clip that has already played through, a wait
+            # too short to be worth a round trip through the event loop, or a
+            # teardown that has already said not to bother.
+            self.last_pace_seconds = 0.0
+            return
+        self.last_pace_seconds = delay
+        log.debug(
+            "Holding the next clip for %.3fs in channel %s so the one on "
+            "screen plays through.",
+            delay,
+            self.channel_id,
+        )
+        await pace_wait(self._pace_release, delay)
 
     def run_undo(self) -> bytes:
         """
@@ -1603,6 +1869,12 @@ class RetroView(discord.ui.View):
         # working through the queue and nothing can be added between the
         # discard and the clip.
         self.forget_queue()
+        # An undo's own clip is never paced: the clip on the message is of a
+        # press that is about to stop having happened, so holding the
+        # correction back to let it finish playing would be showing somebody
+        # the thing they just asked to take away. See forget_pacing -- this
+        # runs in a worker thread, which is why it is not cancel_pacing.
+        self.forget_pacing()
         blob = self.history.pop()
         self._history_bytes -= len(blob)
         try:
@@ -1659,6 +1931,10 @@ class RetroView(discord.ui.View):
         if emulator is None:
             raise EmulatorError("The emulator is not running.")
         self.forget_queue()
+        # A reboot's clip is not paced either, for the same reason an undo's
+        # is not: the clip on the message is of a game that no longer exists.
+        # See forget_pacing; this runs in a worker thread.
+        self.forget_pacing()
         # Before anything is thrown away: this is the moment Undo puts back.
         self.remember_state(emulator)
         emulator.reset()
@@ -1702,13 +1978,14 @@ class RetroView(discord.ui.View):
         """
         What game this is, and on what, in the few characters it deserves.
 
-        ``**µCity** · Game Boy``, plus ``· asleep`` while there is no core
-        loaded. It is the *stable* part of the one line the message carries,
-        and it exists because the line used to be nothing but "Rob pressed
-        A." -- and, on the first clip of a cold boot, nothing at all. Anybody
-        scrolling into the channel saw an animation, a grid of unlabelled
-        arrows and a name, with nothing anywhere saying what was being
-        played.
+        ``**µCity**``, plus ``· asleep`` while there is no core loaded. It is
+        the *stable* part of the one line the message carries, and it exists
+        because the line used to be nothing but "Rob pressed A." -- and, on
+        the first clip of a cold boot, nothing at all. Anybody scrolling into
+        the channel saw an animation, a grid of unlabelled arrows and a name,
+        with nothing anywhere saying what was being played.
+
+        The console is deliberately no longer part of it; see HEADER.
 
         Deliberately not a status card: the card this cog used to have was
         removed, and this is one line rather than a second attempt at it. See
@@ -1719,20 +1996,21 @@ class RetroView(discord.ui.View):
         hyphens Discord reads as markup. See :func:`escape_label`.
         """
         name = str(self.game_name or "Game")[:MAX_GAME_NAME]
-        line = HEADER.format(game=escape_label(name), console=self.system.name)
+        line = HEADER.format(game=escape_label(name))
         if not self.live:
-            line = f"{line} \N{MIDDLE DOT} {ASLEEP_MARK}"
+            line = f"{line}{HEADER_SEPARATOR}{ASLEEP_MARK}"
         return line
 
     def _line(self, text: typing.Optional[str] = None) -> str:
         """
         The whole of the one line the message carries, assembled.
 
-        Three pieces, in this order, and every one of them rides on an edit
-        that was already being made:
+        ``**µCity** · Rob pressed A. *Queued: ⬅️*``: three pieces, in this
+        order, and every one of them rides on an edit that was already being
+        made:
 
-        1. the :attr:`header` -- what game, what console, and whether it is
-           asleep. Always there;
+        1. the :attr:`header` -- what game, and whether it is asleep. Always
+           there;
         2. ``text`` -- what just happened. Which button was pressed and by
            whom, that the session woke up, that a save state could not be
            restored, that the emulator failed;
@@ -1807,6 +2085,13 @@ class RetroView(discord.ui.View):
 
         ``attachments`` is deliberately not passed, so Discord keeps the clip
         that is already on the message.
+
+        A client re-renders on any edit, so the clip it keeps does start
+        playing again -- and this deliberately does *not* re-arm the pacing
+        gate for it (see :meth:`note_posted`). The only caller is a
+        hibernate, which has just cancelled pacing on purpose, and whose next
+        press is a wake: a core to load and a save state to restore, which
+        takes far longer than any clip plays for.
         """
         message = await self.resolve_message()
         if message is None:
@@ -1848,6 +2133,8 @@ class RetroView(discord.ui.View):
                 # NO_PINGS.
                 allowed_mentions=NO_PINGS,
             )
+            # The next press paces itself against this clip; see note_posted.
+            self.note_posted(self.clip_playback())
         except discord.HTTPException:
             log.warning(
                 "Failed to put a new clip on the Libretro message in channel %s.",
@@ -1898,6 +2185,9 @@ class RetroView(discord.ui.View):
             reference=ctx.message.to_reference(fail_if_not_exists=False),
         )
         self.message_id = self.message.id
+        # The first clip is playing from here, so the first press is paced
+        # against it exactly as every later one is; see note_posted.
+        self.note_posted(self.clip_playback())
         return self.message
 
     def _boot(
@@ -2018,6 +2308,12 @@ class RetroView(discord.ui.View):
         queued click's ``edit_original_response`` is still available when its
         turn comes, and a queued press therefore makes exactly the same
         single edit an immediate one does.
+
+        The one edit may be *held back* -- see :meth:`pace` -- until the clip
+        it is replacing has had its playing time on screen. That is a delay
+        to this one edit and to nothing else: the emulator is finished with
+        by then, so no other channel waits, and the press still makes
+        exactly one edit whether it waited or not.
         """
         # A hibernated session has a core to load and a save state to
         # restore before it can emulate anything, which is the one delay
@@ -2038,6 +2334,14 @@ class RetroView(discord.ui.View):
             await self._recover(interaction, "The emulator hit an unexpected error.")
             return
         self.touch()
+        # The clip is made; the edit that shows it may still have to wait.
+        # A clip takes a tenth of a second to produce and a second to
+        # watch, so without this a queued press replaced a clip that had
+        # played about a tenth of the way through and the picture lurched.
+        # The emulator lock was given back by ``cog.run_press`` above, so
+        # nothing else is held up by this -- see the note above
+        # MAX_PACE_SECONDS.
+        await self.pace()
         # The press names itself, and whoever made it, on the message --
         # on the very same edit that carries the clip (see
         # :meth:`press_note`). The resume line beats it when there is
@@ -2076,6 +2380,16 @@ class RetroView(discord.ui.View):
         epoch, so an entry that was taken off the front just as the game was
         reset or undone is dropped rather than emulated into a state nobody
         aimed it at.
+
+        This is also where pacing earns its keep: a drain is the one place
+        clips are produced with no human delay between them, so without it
+        each one replaced the last after about a tenth of a second of a
+        second-long animation. Each entry's *edit* now waits out the clip it
+        is replacing (see :meth:`pace`), which is what turns a drain from a
+        lurch into a run of clips that each play through. The lock is held
+        across that wait, and every teardown path calls
+        :meth:`cancel_pacing` before it reaches for the lock, so nothing
+        waits on pacing but the picture.
         """
         if self._draining:
             return
@@ -2215,6 +2529,10 @@ class RetroView(discord.ui.View):
                 # never notify them or anybody else; see NO_PINGS.
                 allowed_mentions=NO_PINGS,
             )
+            # This clip is now the one playing, so it is the one the next
+            # edit is paced against. After the edit, not before: what is
+            # being timed is the picture on somebody's screen.
+            self.note_posted(self.clip_playback())
         except discord.HTTPException as error:
             # The game itself is fine, so say so rather than leaving the
             # controls looking broken. The traceback goes to the log: this is

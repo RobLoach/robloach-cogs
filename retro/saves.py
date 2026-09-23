@@ -497,6 +497,11 @@ class SavesMixin(MixinMeta):
             f"Saved and put to sleep while {doing}. Press a button to pick "
             "the game back up."
         )
+        # And, exactly as `[p]retrosleep` does, before reaching for that
+        # lock: a press sitting out the clip on screen holds it, and no save
+        # command should wait on a cosmetic delay. See
+        # RetroView.cancel_pacing.
+        view.cancel_pacing()
         try:
             # The view's own lock, exactly as `[p]retrosleep` takes it, so a
             # press that is already being emulated finishes before the core is

@@ -7,6 +7,10 @@ discord.py, without Red and without a libretro core:
 * :func:`capture_plan` -- which emulated frames become pictures and how long
   each picture stands, which is what makes one clip carry on from the last
   with no frames lost in between;
+* :func:`clip_plan` and :func:`playback_seconds` -- the same plan in
+  milliseconds, i.e. how long the clip really plays for. That is the number
+  the cog paces its message edits against, and it has to be knowable before
+  there is a clip to measure;
 * :func:`clip_size` -- how big the posted picture is, which is where the
   per-console upscale was measured away.
 
@@ -142,6 +146,79 @@ def test_input_is_released_before_the_last_picture_is_taken(fps, seconds):
     assert budget <= indices[-1]
     assert budget % step == 0
     assert budget < frames
+
+
+# -- How long a clip plays for ------------------------------------------------
+#
+# The same plan in milliseconds, which is what the encoder is handed and
+# therefore what ends up in the clip's ANMF chunks. It is also what the cog
+# paces its message edits against -- a clip is not replaced until it has had
+# this long on screen (see MAX_PACE_SECONDS in retro/RetroView.py) -- so the
+# number has to be knowable before there is a clip to measure, which is the
+# whole reason it is arithmetic rather than a read of the bytes.
+
+
+def test_a_clip_plan_is_the_capture_plan_in_milliseconds():
+    fps, frames = FPS["gb"], 60
+    step = C.capture_step(fps)
+    covered = [amount for _, amount in C.capture_plan(frames, step)]
+    plan = C.clip_plan(fps, frames)
+
+    assert [index for index, _ in plan] == [
+        index for index, _ in C.capture_plan(frames, step)
+    ]
+    assert [ms for _, ms in plan] == [
+        max(1, round(1000 * amount / fps)) for amount in covered
+    ]
+    # Fourteen whole 67ms pictures, then the 3-frame and 1-frame tail.
+    assert [ms for _, ms in plan] == [67] * 14 + [50, 17]
+
+
+def test_a_default_game_boy_clip_plays_for_1_005_seconds():
+    """The number the pacing gate holds an edit for, spelled out.
+
+    Not a round second: 60 frames at 59.727 fps is 1.0046 seconds of
+    emulation, and each picture's duration is a whole number of milliseconds,
+    so the clip that goes out plays for 1.005. Pacing uses the encoded figure
+    rather than the configured one because the encoded figure is what a
+    Discord client actually spends.
+    """
+    assert C.playback_seconds(FPS["gb"], 60) == 1.005
+
+
+@pytest.mark.parametrize("fps", sorted(FPS.values()))
+@pytest.mark.parametrize(
+    "seconds", [0.2, 0.25, 0.5, 0.8, 1.0, 1.3, 2.0, 4.0, 15.0]
+)
+@pytest.mark.parametrize("clip_fps", [10, 15, 20])
+def test_a_clip_plays_for_as_long_as_it_emulated(fps, seconds, clip_fps):
+    """Within the millisecond rounding, at every length and every rate.
+
+    This is what makes pacing honest: if the playing time drifted from the
+    emulated time, holding an edit for the playing time would either cut the
+    animation off or leave the picture sitting still.
+    """
+    frames = C.clip_frame_count(fps, seconds)
+    emulated = frames / fps
+    played = C.playback_seconds(fps, frames, clip_fps)
+
+    assert played == sum(ms for _, ms in C.clip_plan(fps, frames, clip_fps)) / 1000.0
+    assert abs(played - emulated) / emulated < 0.01, (played, emulated)
+    # Never zero, whatever was asked for: a clip with no duration would be a
+    # clip the pacing gate thought was already over.
+    assert played > 0.0
+
+
+@pytest.mark.parametrize("fps", [0, -1, 0.0, float("nan")])
+def test_a_nonsense_frame_rate_does_not_divide_by_zero(fps):
+    """A core that reports nothing useful gets arithmetic, not a traceback.
+
+    RetroEmulator.fps already defaults such a core to DEFAULT_FPS, so this is
+    a guard for a direct caller (and for the view's own fallback while a
+    session is hibernated), in the same shape as preroll_budget's.
+    """
+    assert C.playback_seconds(fps, 60) > 0.0
+    assert all(ms >= 1 for _, ms in C.clip_plan(fps, 60))
 
 
 # -- Where a clip starts: the pre-roll ----------------------------------------

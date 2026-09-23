@@ -111,7 +111,7 @@ whichever one won the race. The section "Overlapping presses are queued, not
 dropped" in `test_cog_session.py` is all of it:
 
 * `test_the_running_press_says_what_is_queued_behind_it` -- the running
-  press's single edit carries `*Queued: Ada ⬅️*`, and the queued press then
+  press's single edit carries `*Queued: ⬅️*`, and the queued press then
   makes its own `["response.defer", "edit_original_response"]`;
 * `test_two_simultaneous_presses_both_happen_one_edit_each` -- which used to
   assert that the loser produced *nothing at all*. That was the bug;
@@ -127,16 +127,69 @@ dropped" in `test_cog_session.py` is all of it:
   silently is the bug the queue exists to fix, so the one case where dropping
   is right has to say so.
 
-**The line above the clip now starts with the game and the console**, so
-almost every content assertion goes through `fakes.RetroEnv.line(view, text)`
-rather than comparing a bare sentence. That helper *spells the format out*
-instead of reading it back off the view -- a test that agreed with whatever
-`RetroView._line` did would assert nothing -- and the literal form is pinned
-once, against a known game, in
-`test_the_line_names_the_game_and_its_console_before_anything_else`.
+## Pacing: a clip is not replaced before it has been watched
+
+A clip takes 42-92ms to make and 1005ms to watch, so a queue drain used to
+replace each one after about 5% of it had played. The fix is that the *edit*
+waits; the rule, the 1.25 second cap and the numbers behind them are in the
+note above `MAX_PACE_SECONDS` in `retro/RetroView.py`.
+
+**The gate spends its time in exactly one place** -- the module-level
+`pace_wait` in `retro/RetroView.py` -- and `RetroEnv` swaps that for a
+recorder in every cog test. So the whole gate runs (the deadline, the cap, the
+floor, the cancellation) while nothing actually waits, and the tests assert on
+the delay that was *asked for* rather than on elapsed time:
+
+* `retro.pace_waits` is every delay any view in this test asked for, in order;
+* `view.last_pace_seconds` is the last one, and `0.0` for an edit that went
+  straight out;
+* `retro.real_pacing()` puts the wait that really sleeps back, for the three
+  tests that are about waiting. Those use a 0.2 second clip length so the
+  whole drain costs tenths of a second.
+
+That is why the fast suite still runs in about the same time it did. Paying
+for it would be a real second per press, several hundred times over.
+
+The section "A clip is not replaced before it has been watched" in
+`test_cog_session.py` is all of it, and the four statements worth knowing are:
+
+* `test_a_press_with_nothing_playing_is_not_held_back` -- the common case, one
+  person pressing one button at a time, must stay instant;
+* `test_pacing_never_holds_the_emulator_lock` -- a whole press on *another
+  channel*, run from inside the wait itself. There is one libretro core for
+  the whole bot, and a recent bug was a lock held across Discord calls, so
+  "only the edit waits" is checked by having somebody else get in;
+* `test_teardown_never_waits_on_pacing` -- parametrised over sleep, end,
+  reboot, eviction and unload, with the *real* wait, so "it was cut short" is
+  a measurement. Each of those calls `view.cancel_pacing()` before it reaches
+  for the view's lock, because a press that is holding its edit back is
+  holding that lock;
+* `test_a_paced_press_still_makes_exactly_one_edit` -- waiting is not
+  something anybody can see, so it must not cost a second edit or a second
+  response.
+
+The arithmetic underneath is in `test_clips.py` (`clip_plan` and
+`playback_seconds`: how long a clip plays for, knowable before there is a clip
+to measure) and the identity between that arithmetic and the bytes is asserted
+against a real core in `test_emulator.py` -- the durations in the WebP's ANMF
+chunks add up to exactly what the cog paced against.
+
+**The line above the clip starts with the game**, so almost every content
+assertion goes through `fakes.RetroEnv.line(view, text)` rather than comparing
+a bare sentence. That helper *spells the format out* instead of reading it
+back off the view -- a test that agreed with whatever `RetroView._line` did
+would assert nothing -- and the literal form is pinned once, against a known
+game, in `test_the_line_names_the_game_before_anything_else`:
+`**ucity** · Tester pressed A.`, one middle dot throughout.
 `test_the_header_says_when_the_session_is_asleep` covers the other half:
 `· asleep` goes on by the edit that puts the game to sleep and comes off by
 the edit the waking press makes, so neither state costs an extra edit.
+
+The console used to sit between the two (`**ucity** · Game Boy — ...`) and the
+queue listing used to name the presser (`*Queued: Ada ⬅️*`). Both are gone from
+the line; `Pending.who` is still captured at the moment of the click, and
+`test_a_queued_press_from_somebody_unnameable_still_reads` is what would
+notice if it stopped being.
 
 **Saying who pressed which button rides on that same edit.** Every action
 writes one line of `content` -- `Rob pressed A.`, `Rob pressed ⬅️.`,

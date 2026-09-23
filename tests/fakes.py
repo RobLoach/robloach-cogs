@@ -973,6 +973,19 @@ class RetroEnv:
         #: Every cog_data_path() call the cog made, so a test can prove the
         #: fake was reached rather than merely installed.
         self.data_path_calls = []
+        # Pacing, recorded rather than spent. A clip is not replaced until it
+        # has had its playing time on screen (see MAX_PACE_SECONDS), which at
+        # the default clip length is a real second per press -- far too much
+        # to pay in a suite that makes hundreds of them. So the one place
+        # pacing spends time is swapped for a recorder: the gate itself still
+        # runs, every delay it asks for is kept here and in
+        # ``view.last_pace_seconds``, and nothing waits. The tests that are
+        # about the waiting put the real thing back with real_pacing().
+        self._real_pace_wait = self.viewmod.pace_wait
+        #: Every pacing delay any view in this test asked for, in seconds.
+        self.pace_waits = []
+        self.pace_wait(self._record_pace_wait)
+
         self.patch("cog_data_path", self._cog_data_path)
         self.patch("Config", types.SimpleNamespace(get_conf=self.configs.get_conf))
         self.patch("RetroEmulator", FakeEmulator)
@@ -1012,6 +1025,27 @@ class RetroEnv:
         self.patched[name] = tuple(where)
         self.fakes[name] = value
         return tuple(where)
+
+    # -- pacing
+    def pace_wait(self, wait, monkeypatch=None):
+        """Install ``wait`` as the coroutine the pacing gate waits with.
+
+        ``retro.RetroView`` is not one of COG_MODULES (it is the view, not
+        the cog), so this is patched here rather than through self.patch();
+        RetroView.pace() looks the name up in its own module on every wait,
+        so replacing it takes effect for views that already exist.
+        """
+        monkeypatch = monkeypatch or self._monkeypatch
+        monkeypatch.setattr(self.viewmod, "pace_wait", wait)
+        return wait
+
+    async def _record_pace_wait(self, release, delay):
+        """Note that a wait was asked for, and do not wait."""
+        self.pace_waits.append(delay)
+
+    def real_pacing(self, monkeypatch=None):
+        """Put the wait that really sleeps back, for a test about waiting."""
+        return self.pace_wait(self._real_pace_wait, monkeypatch)
 
     def _cog_data_path(self, cog_instance=None, raw_name=None):
         """Red's cog_data_path: <root>/<class name>, created on the way out."""
@@ -1087,22 +1121,34 @@ class RetroEnv:
 
     @staticmethod
     def header(view, asleep=False):
-        """``**ucity** · Game Boy``, plus ``· asleep`` when it is."""
-        line = f"**{view.game_name}** \N{MIDDLE DOT} {view.system.name}"
+        """``**ucity**``, plus ``· asleep`` when it is.
+
+        The console used to be in here and is not any more; see HEADER.
+        """
+        line = f"**{view.game_name}**"
         return f"{line} \N{MIDDLE DOT} asleep" if asleep else line
 
     def line(self, view, text=None, asleep=False, suffixes=()):
-        """The whole content: header, what happened, then any suffixes."""
+        """The whole content: header, what happened, then any suffixes.
+
+        ``**ucity** · Tester pressed A. *Queued: ⬅️*`` -- one middle dot
+        throughout, rather than a dot inside the header and an em dash in
+        front of the sentence.
+        """
         parts = [self.header(view, asleep)]
         if text:
             parts.append(text)
-        whole = " \N{EM DASH} ".join(parts)
+        whole = " \N{MIDDLE DOT} ".join(parts)
         for suffix in suffixes:
             whole = f"{whole} {suffix}"
         return whole
 
     def queued(self, *entries):
-        """The ``*Queued: ...*`` suffix for these ``"who button"`` strings."""
+        """The ``*Queued: ...*`` suffix for these button names.
+
+        Buttons only: the listing no longer names who is waiting. See
+        QUEUE_ENTRY.
+        """
         return self.viewmod.QUEUE_NOTE.format(queued=", ".join(entries))
 
     def button(self, view, custom_id):

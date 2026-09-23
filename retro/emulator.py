@@ -47,6 +47,7 @@ from .clips import (
     capture_step,
     clamp_clip_seconds,
     clip_frame_count,
+    clip_plan,
     clip_scale,
     clip_size,
     describe_seconds,
@@ -56,6 +57,7 @@ from .clips import (
     format_seconds,
     frame_count,
     input_budget,
+    playback_seconds,
     preroll_budget,
 )
 
@@ -81,6 +83,7 @@ __all__ = [
     "capture_step",
     "clamp_clip_seconds",
     "clip_frame_count",
+    "clip_plan",
     "clip_scale",
     "clip_size",
     "describe_definitions",
@@ -89,6 +92,7 @@ __all__ = [
     "format_seconds",
     "frame_count",
     "input_budget",
+    "playback_seconds",
     "preroll_budget",
     "probe_core_options",
     # Split out into retro/clips.py and re-exported here, which is the only
@@ -1217,7 +1221,6 @@ class RetroEmulator:
         if frames is None:
             frames = self.clip_frames(CLIP_SECONDS)
         frames = max(1, int(frames))
-        step = capture_step(core_fps, fps)
 
         # frame index -> buttons that go down / come up on that frame, keyed
         # by the frame of the whole window (pre-roll included), which is what
@@ -1258,10 +1261,17 @@ class RetroEmulator:
         held: set = set()
         # One duration per captured picture rather than one for the clip, so
         # the clip plays for exactly as long as it emulated: a picture stands
-        # until the next one is taken, which is ``step`` frames for all but
-        # the tail. Giving the shorter tail pictures a full 67ms each made a
+        # until the next one is taken, which is ``capture_step`` frames for
+        # all but the tail. Giving the shorter tail pictures a full 67ms each made a
         # half second clip play 7% slow.
-        plan = dict(capture_plan(frames, step))
+        #
+        # :func:`clip_plan` rather than capture_plan plus the conversion,
+        # because the cog has to know the same total *before* it has a clip:
+        # an edit does not replace the clip already on the message until that
+        # one has had its playing time on screen (see MAX_PACE_SECONDS in
+        # retro/RetroView.py), and "how long does it play for" must be the
+        # same question there as here.
+        plan = dict(clip_plan(core_fps, frames, fps))
         durations: typing.List[int] = []
         # `index` counts the clip's own frames, which is what `plan`, the
         # durations and every docstring here are in terms of; `window` counts
@@ -1291,12 +1301,12 @@ class RetroEmulator:
                     # Either the picture moved on -- in which case this frame
                     # is what the clip should open on -- or the bound ran out.
                     reference = None
-                covered = plan.get(index)
-                if covered is not None:
+                duration = plan.get(index)
+                if duration is not None:
                     if size is None:
                         size = self.output_size(scale=scale)
                     images.append(self._frame_image(size))
-                    durations.append(max(1, round(1000 * covered / core_fps)))
+                    durations.append(duration)
                 index += 1
         finally:
             self._pressed = frozenset()

@@ -563,6 +563,52 @@ def capture_plan(
     ]
 
 
+def clip_plan(
+    fps: float, frames: int, clip_fps: int = CLIP_FPS
+) -> typing.List[typing.Tuple[int, int]]:
+    """
+    :func:`capture_plan` in milliseconds: which frames, shown for how long.
+
+    ``[(frame index, that picture's duration in ms), ...]``, oldest first --
+    exactly the durations ``RetroEmulator.record`` hands the encoder, and
+    therefore exactly what ends up in the clip's ANMF chunks. A picture
+    stands for ``covered`` emulated frames and is shown for as long as those
+    frames took to emulate, which is what makes the clip play for as long as
+    the window it photographed (see CLIP_FPS for the 0.4% the millisecond
+    rounding costs).
+
+    The floor of 1ms is the encoder's: WebP reads a duration of 0 as "as fast
+    as the decoder can manage". It is applied here so that what this returns
+    is what really gets written.
+
+    ``fps`` is clamped to at least 1, which is what every other function here
+    does with a frame rate it has to divide by.
+    """
+    rate = max(1.0, float(fps))
+    step = capture_step(rate, clip_fps)
+    return [
+        (index, max(1, round(1000 * covered / rate)))
+        for index, covered in capture_plan(frames, step)
+    ]
+
+
+def playback_seconds(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> float:
+    """
+    How long the clip of a window this long plays for, in seconds.
+
+    The sum of :func:`clip_plan`'s durations, i.e. the clip's real playing
+    time rather than the nominal ``frames / fps``: a 60 frame Game Boy clip
+    emulates 1.0046 seconds and plays for 1.005, because each picture's
+    duration is a whole number of milliseconds.
+
+    This is the number the message edits are paced against -- a clip is not
+    replaced until it has had this long on screen -- which is why it is worth
+    being the *encoded* duration rather than an approximation of it. See
+    MAX_PACE_SECONDS in retro/RetroView.py.
+    """
+    return sum(duration for _, duration in clip_plan(fps, frames, clip_fps)) / 1000.0
+
+
 def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     """
     The last frame of a clip that a button may still be released on.

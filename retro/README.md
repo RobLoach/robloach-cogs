@@ -619,20 +619,28 @@ The clip and the buttons are most of the interface, and the text is **one
 line**, always, made of three parts that all ride on the single edit a press
 was making anyway:
 
-> **µCity** · Game Boy — Rob pressed A. *Queued: Ada ⬅️*
+> **µCity** · Rob pressed A. *Queued: ⬅️*
 
-1. **what game this is, and on what.** A short stable prefix. The first clip
-   of a cold boot used to go out with no text at all, and after that the only
-   text was the press line, so somebody scrolling into a channel saw an
-   animation, a grid of unlabelled arrows and "Rob pressed A." with nothing
-   anywhere saying what was being played. It is not the status card this cog
-   used to have and that is not coming back — it is a prefix on a line that
-   already existed. While the session is asleep it reads
-   `**µCity** · Game Boy · asleep`;
+1. **what game this is.** A short stable prefix. The first clip of a cold
+   boot used to go out with no text at all, and after that the only text was
+   the press line, so somebody scrolling into a channel saw an animation, a
+   grid of unlabelled arrows and "Rob pressed A." with nothing anywhere
+   saying what was being played. It is not the status card this cog used to
+   have and that is not coming back — it is a prefix on a line that already
+   existed. While the session is asleep it reads `**µCity** · asleep`;
 2. **what just happened** — who pressed which button, or whatever had to be
    said instead (see below);
 3. **what is queued** behind it, which is the whole acknowledgement a queued
    press gets. See [Queued presses](#queued-presses).
+
+**The console used to be in that line and is not any more.** It read
+`**µCity** · Game Boy — Rob pressed A.`, and the console was the third of a
+short line that everybody could already see: it is in the boot logo, in the
+shape of the frame, and in the controller laid out underneath. The game's
+name is the part none of those give away. `[p]retro` on its own still lists
+every console this bot can emulate, and `[p]retroset settings` still says
+which core a session is on, which is where somebody asks the question on
+purpose.
 
 ### Queued presses
 
@@ -660,7 +668,12 @@ Four rules, and each of them is there for a reason:
   the very line the running press is already rewriting, so it costs **no extra
   edit** — an ephemeral "your press is queued" would be a second message per
   click (removed once already for being spam) and any further edit of this
-  message would re-render the attachment and visibly rewind the clip;
+  message would re-render the attachment and visibly rewind the clip. The
+  listing names the **buttons**, not the people: `*Queued: ⬅️, A*`. It used to
+  read `*Queued: Ada ⬅️, Sam A*`, and dropping the names is what keeps the
+  whole line readable at a glance beside the picture — at the cost that, with
+  one waiting press each, the name was how you confirmed that the `⬅️` in the
+  list was *yours* and not somebody else's identical one;
 * **the queue is intent, never work.** A waiting entry is a button name and a
   deferred interaction. Nothing touches the emulator until its turn comes and
   the session's lock is taken again for it, so the one-core-at-a-time rule is
@@ -682,11 +695,70 @@ undo the undo one button at a time. Because a press that vanishes silently is
 the bug this whole mechanism fixes, the one case where dropping is right says
 so out loud, once, on the next line the session writes:
 
-> **µCity** · Game Boy — Rob undid the last press. *2 queued presses dropped*
+> **µCity** · Rob undid the last press. *2 queued presses dropped*
 
 **Undo is deliberately not queueable.** A click that arrives while a press is
 being emulated is acknowledged and dropped rather than taken down: "one press
 back" queued three presses deep means undoing a press its author never saw.
+
+### One clip at a time, at the speed you can watch them
+
+**A clip is not replaced until it has had its playing time on screen.** A clip
+costs far less to make than it does to watch, and once the queue above removed
+the human from between two presses that stopped being harmless. Measured on
+gambatte running Libbet, one second clips, on a Raspberry Pi 5 — three presses
+back to back, as a queue drains them:
+
+| clip | produced in | plays for | was on screen for |
+| --- | --- | --- | --- |
+| 1 | 41 ms | 1005 ms | 68 ms |
+| 2 | 67 ms | 1005 ms | 54 ms |
+| 3 | 42 ms | 1005 ms | 42 ms |
+
+Each clip was replaced after about **5%** of it had played. The seam between
+two clips is exact — the section above is all about making the last picture of
+one clip the state the next one starts from — but nobody was ever shown it,
+because the animation never reached that picture before the next clip landed
+on top of it. What that looks like from the channel's side is the picture
+lurching, and it was reported as the clip "going back a bit".
+
+So the **edit** now waits for the clip it is replacing to finish playing. The
+same drain, unchanged in every other respect:
+
+| | 4 clips (one press plus a full queue of three) | each clip on screen |
+| --- | --- | --- |
+| before | 207 ms | 42–68 ms of 1005 ms |
+| after | 3.08 s | 1006–1007 ms |
+
+Four things keep that from costing anything it should not:
+
+* **a press that arrives when nothing is playing is still instant.** One
+  person pressing a button and watching the result — which is most play — is
+  untouched: 42 ms, exactly as before. The wait is a deadline rather than a
+  delay, so the time the press spent emulating, encoding and uploading counts
+  against it;
+* **nothing else waits.** Only the edit is held back; the emulation and the
+  encoding have already happened, and the single libretro core has already
+  been given back, so another channel can start a game or press a button
+  during the wait;
+* **no edit is held for more than 1.25 seconds.** A default clip really plays
+  for 1.005s, so at the length this cog is played at every clip is paced in
+  full — but `[p]retroset cliplength` reaches 15 seconds, and pacing a full
+  queue of those strictly would be 45 seconds of waiting. Capped, the worst a
+  queue can add is 3.75 seconds, which is inside the four seconds the queue
+  depth is already sized on. At the 0.2 second minimum the wait is 0.2
+  seconds and pacing is effectively free;
+* **nothing that takes the game away waits at all.** `[p]retrosleep`,
+  `[p]retroend`, `[p]retroreboot`, **Undo**, an idle timeout, another channel
+  taking the emulator and unloading the cog all cut a wait short the moment
+  they start. **Undo** and `[p]retroreboot` do not pace their *own* clips
+  either: those replace a picture of something that has just stopped having
+  happened, and holding the correction back to finish showing it would be
+  showing you the very thing you asked to take away.
+
+It is not a setting. The number that matters — how long a clip plays for — is
+already `[p]retroset cliplength`, and the cap exists to stop that setting's
+own extremes from becoming unusable rather than to be tuned alongside it.
 
 **Who pressed which button is written on the message.** Every action replaces
 the one line above the clip with a sentence naming both — in one voice for all
@@ -895,8 +967,8 @@ while the game is being rebooted by `[p]retroreboot` is dropped, because the
 queue goes with the reboot.
 
 The clip and **one line** of text are all that is posted: no status card, no
-caption. The line always names the game and its console, then says who pressed
-which button unless there is something more important to say — the game having
+caption. The line always names the game, then says who pressed which button
+unless there is something more important to say — the game having
 gone to sleep and come back, or a save state that could not be restored — and
 the next press rewrites it either way. See
 [What the message says](#what-the-message-says).

@@ -596,6 +596,11 @@ def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
         assert 0 < durations[-1] <= frame_ms, durations[-1]
     emulated = 1000 * frames / emulator.fps
     assert abs(sum(durations) - emulated) / emulated < 0.01, (sum(durations), emulated)
+    # And the cog can work that total out *before* it has a clip, which is
+    # what lets it hold the next edit back until this one has played through
+    # (see MAX_PACE_SECONDS in retro/RetroView.py). Merged frames or not, the
+    # arithmetic and the bytes agree exactly.
+    assert sum(durations) == round(1000 * E.playback_seconds(emulator.fps, frames))
     # Every picture of the clip is worth having: a fifth of a second is four
     # of them, not one.
     assert captured >= 2 and len(data) > 0

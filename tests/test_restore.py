@@ -61,10 +61,10 @@ def announced(view):
     spent on the message the first clip arrived on, while a wake's is still
     pending and rides on the clip of the press that woke it.
 
-    The header (``**game** · Game Boy``) is stripped off, because it is on
-    every line the session ever writes and says nothing about a restore. What
-    is left is None when the restore had nothing to announce -- which is the
-    assertion most of this module makes.
+    The header (``**game**``) is stripped off, because it is on every line
+    the session ever writes and says nothing about a restore. What is left is
+    None when the restore had nothing to announce -- which is the assertion
+    most of this module makes.
     """
     if view.notice is not None:
         return view.notice
@@ -72,7 +72,7 @@ def announced(view):
     content = (getattr(message, "kwargs", None) or {}).get("content")
     if content is None:
         return None
-    head, separator, tail = content.partition(" \N{EM DASH} ")
+    head, separator, tail = content.partition(" \N{MIDDLE DOT} ")
     if not separator:
         # Nothing but the header, i.e. nothing was said.
         return None

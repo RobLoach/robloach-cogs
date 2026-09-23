@@ -1209,6 +1209,7 @@ class Retro(
         left to read. Never raises, and safe on a session that is already
         asleep.
         """
+        view.cancel_pacing()
         emulator, view.emulator = getattr(view, "emulator", None), None
         if emulator is None:
             return
@@ -1228,6 +1229,7 @@ class Retro(
         Safe on a session that is already asleep, which is the common case
         by the time this is reached.
         """
+        view.cancel_pacing()
         emulator, view.emulator = getattr(view, "emulator", None), None
         if emulator is None:
             return
@@ -1633,6 +1635,13 @@ class Retro(
         # directions into a game that has just come back from a save state is
         # worse than dropping them. The count rides out on the line below.
         view.forget_queue()
+        # And a press that is holding its edit back to let the clip on screen
+        # play through stops holding it: this session is going away, and
+        # nothing about it should wait on a cosmetic delay. Every other
+        # teardown path does this before it takes the view's own lock; this
+        # one is the funnel for sleeping, eviction and unloading, all of
+        # which only hold the emulator lock. See RetroView.cancel_pacing.
+        view.cancel_pacing()
         emulator, view.emulator = view.emulator, None
         if emulator is not None:
             # This local is now the only reference to the core, so every way
@@ -2950,6 +2959,11 @@ class Retro(
         # on the game's message, where a nickname full of markdown would
         # otherwise reformat it. See RetroView.presser_name.
         who = presser_name(ctx.author)
+        # Before the lock, not after it: a press that is holding its edit
+        # back to let the clip on screen play through is holding this very
+        # lock, and sleeping the game must not queue up behind a cosmetic
+        # delay. See RetroView.cancel_pacing.
+        view.cancel_pacing()
         try:
             async with view.lock:
                 await self.hibernate(
@@ -3076,6 +3090,12 @@ class Retro(
         # rebooted underneath it -- and so that a runner working through the
         # press queue lets go between two of them and this gets in. Rebooting
         # discards the queue; see RetroView.run_reset.
+        #
+        # It must not, however, wait out a clip's playing time to get that
+        # lock: a press holding its edit back for pacing is told to stop
+        # first, and the reboot's own clip is not paced either (see
+        # RetroView.run_reset).
+        view.cancel_pacing()
         async with ctx.typing():
             try:
                 async with view.lock:
