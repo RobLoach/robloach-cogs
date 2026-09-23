@@ -25,8 +25,9 @@ from .abc import MixinMeta
 log = logging.getLogger("red.robloach.retro")
 
 # Cached ROMs (and their save states) are keyed by game, so a channel can
-# switch between games and keep each one's progress. This caps how many of
-# them a single channel keeps on disk.
+# switch between games and keep each one's progress. This caps how many
+# cached ROMs a single channel keeps on disk -- the ROMs only, never the
+# saves; see _prune_cached_games.
 MAX_CACHED_GAMES_PER_CHANNEL = 5
 
 # -- The disk budget -----------------------------------------------------------
@@ -68,6 +69,12 @@ MAX_DISK_BUDGET_MB = 1024 * 1024
 # is a rename, so it costs nothing and cannot half-happen.
 BACKUP_SUFFIX = ".bak"
 
+# Where `[p]retrosaves rollback` parks the live file while it swaps the two
+# generations (see SavesMixin._rollback_saves). Only ever on disk for the
+# instants between two renames -- unless the process dies there, which is why
+# _sweep_partial_writes knows how to put a stranded one back at the next load.
+ROLLBACK_SUFFIX = ".rollback"
+
 
 class StorageMixin(MixinMeta):
     """The data directory: paths, reads, atomic writes, and the budget."""
@@ -75,8 +82,33 @@ class StorageMixin(MixinMeta):
     # -- Files --------------------------------------------------------------
 
     def _data_dir(self, name: str) -> Path:
-        path = cog_data_path(self) / name
-        path.mkdir(parents=True, exist_ok=True)
+        """
+        The folder for one kind of file, made the first time it is asked for.
+
+        This sits under every path helper, so it is on the hottest paths the
+        cog has -- every press that autosaves builds four save paths through
+        it. It used to ``mkdir(parents=True, exist_ok=True)`` on every call
+        (and ``cog_data_path`` mkdirs the root on every call of its own),
+        which is a fistful of syscalls per path for directories that exist
+        for the life of the install; the paths already created are remembered
+        on the instance instead, so the common case is a dictionary lookup.
+
+        The memo can lie: a test, or somebody tidying the disk, can delete a
+        directory the instance remembers creating. That must never cost a
+        save, so :meth:`_write_atomic` re-makes the parent directory itself
+        as its own safety net -- on the write path only, where one extra
+        syscall is noise. The read paths already treat a missing directory
+        as "nothing there" everywhere they look.
+        """
+        try:
+            dirs = self._data_dirs
+        except AttributeError:
+            dirs = self._data_dirs = {}
+        path = dirs.get(name)
+        if path is None:
+            path = cog_data_path(self) / name
+            path.mkdir(parents=True, exist_ok=True)
+            dirs[name] = path
         return path
 
     def _roms_dir(self) -> Path:
@@ -276,6 +308,11 @@ class StorageMixin(MixinMeta):
         """
         temporary = path.with_suffix(path.suffix + ".tmp")
         try:
+            # The one place the directory is guaranteed rather than assumed:
+            # _data_dir memoizes what it has created, and a directory deleted
+            # out from under a running cog must cost a couple of syscalls
+            # here, on the write path, rather than the save.
+            path.parent.mkdir(parents=True, exist_ok=True)
             with open(temporary, "wb") as handle:
                 handle.write(data)
                 if keep_backup:
@@ -308,7 +345,7 @@ class StorageMixin(MixinMeta):
 
     def _sweep_partial_writes(self) -> int:
         """
-        Delete the ``.tmp`` files a killed process left behind. Blocking.
+        Clean up after writes a killed process left half-done. Blocking.
 
         Returns how many bytes were reclaimed. _write_atomic cleans up after
         itself now, but it cannot clean up after ``SIGKILL``, a power cut, or
@@ -316,11 +353,19 @@ class StorageMixin(MixinMeta):
         is invisible to everything except the disk budget, which counts it.
         So the data directory is swept once, at load.
 
-        Safe because a ``.tmp`` is never a file anybody can use: it is not a
-        playable ROM (_cached_rom skips it), not a save (_stored_slugs and
-        both pruners skip it), and never read back by anything. Load is also
-        the one moment when no write of this cog's can be in flight, so
-        nothing living can be deleted out from under itself.
+        Two kinds of leftover, with opposite cures:
+
+        * a ``.tmp`` is deleted. It is never a file anybody can use: not a
+          playable ROM (_cached_rom skips it), not a save (_stored_slugs and
+          both pruners skip it), and never read back by anything.
+        * a ``.rollback`` is *recovered* -- see :meth:`_recover_rollback`.
+          It is a real save that `[p]retrosaves rollback` parked between two
+          renames, and if the process died there it may be the only copy of
+          the channel's newest progress, so deleting it would be the sweep
+          destroying the very thing the swap was built to protect.
+
+        Load is also the one moment when no write of this cog's can be in
+        flight, so nothing living can be touched out from under itself.
 
         Never raises: it is on the cog load path and a cog that will not load
         is worse than a few megabytes nobody can account for.
@@ -328,10 +373,17 @@ class StorageMixin(MixinMeta):
         freed = 0
         found = 0
         try:
-            orphans = list(cog_data_path(self).rglob("*.tmp"))
+            root = cog_data_path(self)
+            orphans = list(root.rglob("*.tmp"))
+            stranded = list(root.rglob("*" + ROLLBACK_SUFFIX))
         except OSError:
             log.warning("Could not sweep the Retro data directory.", exc_info=True)
             return 0
+        for path in stranded:
+            reclaimed = self._recover_rollback(path)
+            if reclaimed:
+                freed += reclaimed
+                found += 1
         for path in orphans:
             try:
                 if path.is_symlink() or not path.is_file():
@@ -355,6 +407,69 @@ class StorageMixin(MixinMeta):
                 found,
             )
         return freed
+
+    def _recover_rollback(self, path: Path) -> int:
+        """
+        Put one stranded ``.rollback`` file back into its save set. Blocking.
+
+        ``SavesMixin._rollback_saves`` swaps a live save with its previous
+        generation through three renames: (1) live -> ``<name>.rollback``,
+        (2) ``.bak`` -> live, (3) ``<name>.rollback`` -> ``.bak``. Each
+        rename is atomic, so a crash can only land *between* them, and each
+        gap identifies itself at the next load by which ordinary slot is
+        empty:
+
+        * **after (1)**: the live slot is empty and the spare holds the
+          *newest* generation. It goes back to the live slot -- the rollback
+          never happened, which is the honest reading of a swap that did not
+          finish, and nothing is lost.
+        * **after (2)**: the backup slot is empty; the swap has effectively
+          happened and the spare holds what used to be live. It goes into
+          the backup slot, finishing the swap, which is what the crashed
+          command was told it did.
+        * **both slots occupied**: no crash point of the swap leaves this
+          shape, so the spare is a leftover from before this recovery
+          existed, orphaned and then played past -- both generations it
+          could have belonged to have been written since. It is deleted,
+          and those are the only bytes this returns as reclaimed.
+
+        Whichever gap it was, both generations survive; until this runs the
+        worst a boot sees is one missing slot, which the restore chain
+        answers by falling through to the next thing it has. Never raises,
+        for the same reason as the sweep around it.
+        """
+        try:
+            if path.is_symlink() or not path.is_file():
+                return 0
+            name = path.name[: -len(ROLLBACK_SUFFIX)]
+            if not name:
+                # A file literally called ".rollback" belongs to nothing the
+                # cog wrote; leave it rather than crash the load sweep on it.
+                return 0
+            live = path.with_name(name)
+            backup = self._backup_path(live)
+            if not live.exists():
+                path.replace(live)
+                log.info("Recovered %s from an interrupted rollback.", live)
+                return 0
+            if not backup.exists():
+                path.replace(backup)
+                log.info(
+                    "Finished an interrupted rollback: %s is the previous "
+                    "generation again.",
+                    backup,
+                )
+                return 0
+            size = int(path.stat().st_size)
+            path.unlink()
+            return size
+        except OSError:
+            log.warning(
+                "Could not recover the stranded rollback file %s",
+                path,
+                exc_info=True,
+            )
+            return 0
 
     def _read_file(self, path: Path) -> typing.Optional[bytes]:
         """The contents of one save file, or None if it is not usable."""
@@ -391,24 +506,30 @@ class StorageMixin(MixinMeta):
         self, channel_id: int, keep_slug: str
     ) -> typing.List[str]:
         """
-        Drop the oldest cached ROM+save sets for a channel.
+        Drop the oldest cached ROMs for a channel, keeping every save.
 
         Files are keyed by slug so every game a channel plays keeps its own
         save and can be resumed later, but a channel that works through a
         pile of ROMs should not keep them all forever.
 
-        This is the count-based cache policy the cog has always had: the
-        MAX_CACHED_GAMES_PER_CHANNEL most recent games in a channel are kept
-        whole, and a game that falls off the end takes its saves (and their
-        previous generations) with it, so no battery save outlives the ROM it
-        belongs to. The *disk budget* below is the other, separate limit, and
-        it deliberately never touches a save -- see _prune_roms_for_budget.
+        This is the count-based half of the cache policy: the
+        MAX_CACHED_GAMES_PER_CHANNEL most recently played games in a channel
+        keep their cached ROM, and a game that falls off the end loses the
+        ROM *only*. Its save state and battery save (and the previous
+        generation of each) stay exactly where they are -- the same rule the
+        disk budget's pruner follows (_prune_roms_for_budget), and the same
+        promise the cog makes out loud everywhere it mentions making room: a
+        ROM re-downloads, a save does not come back, so no save is ever
+        deleted to make room. Starting the game again by name or URL picks
+        the saves straight back up. (This pruner used to take all four save
+        files with it, which quietly destroyed exactly the progress that
+        messaging said was safe.)
 
         Returns the ROM filenames that were deleted, so the caller can drop
         the session and Resume-button records that pointed at them; see
-        ``Retro._forget_pruned_roms``. A record whose cached ROM has gone can
-        only apologise when it is clicked, and it would otherwise sit in
-        Config for the life of the install.
+        ``Retro._forget_pruned_roms``. The records still go even though the
+        saves stay: resuming is impossible without the ROM, and a record
+        whose cached ROM has gone can only apologise when it is clicked.
         """
         deleted: typing.List[str] = []
         try:
@@ -438,10 +559,10 @@ class StorageMixin(MixinMeta):
             if seen < MAX_CACHED_GAMES_PER_CHANNEL:
                 continue
             try:
+                # The ROM and nothing else. The game's four save files are
+                # deliberately left where they are; see the docstring.
                 path.unlink(missing_ok=True)
                 deleted.append(path.name)
-                for save in self._save_paths(channel_id, slug):
-                    save.unlink(missing_ok=True)
             except OSError:
                 log.warning("Could not prune the cached ROM %s", path, exc_info=True)
         return deleted

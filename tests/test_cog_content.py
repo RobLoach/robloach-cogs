@@ -8,6 +8,7 @@ not usable.
 import asyncio
 import contextlib
 import io
+import os
 import time
 import types
 import zipfile
@@ -258,6 +259,77 @@ async def test_an_unreadable_cores_directory_is_survivable(retro, monkeypatch):
     monkeypatch.setattr(Path, "iterdir", boom)
     assert retro.cog._scan_cores_dir() == {}
     assert await retro.cog._installed_cores() == {}
+
+
+async def test_the_cores_scan_is_cached_until_the_directory_changes(retro, monkeypatch):
+    # Every lookup stats the directory; only a *changed* directory is walked
+    # again. The cache only trusts a directory that has been quiet for a
+    # couple of seconds (see CORES_MTIME_SETTLE_SECONDS), so age the mtime
+    # to get a listing that is allowed to be cached.
+    cores_dir = retro.cog._cores_dir()
+    dropped = cores_dir / "gambatte_libretro.so"
+    dropped.write_bytes(b"\x7fELF")
+    stale = time.time() - 60
+    os.utime(cores_dir, (stale, stale))
+    assert await retro.cog._installed_cores() == {"gambatte": dropped}
+
+    listed = []
+    real_iterdir = Path.iterdir
+
+    def counting_iterdir(self):
+        listed.append(self)
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", counting_iterdir)
+    assert await retro.cog._installed_cores() == {"gambatte": dropped}
+    assert listed == [], "the unchanged cores directory was walked again"
+
+    # Dropping a core in moves the directory's mtime, and the very next
+    # lookup notices and rescans: detected, not registered, still holds.
+    other = cores_dir / "snes9x_libretro.so"
+    other.write_bytes(b"\x7fELF")
+    assert await retro.cog._installed_cores() == {"gambatte": dropped, "snes9x": other}
+    assert listed, "the changed cores directory was served from the cache"
+
+
+async def test_a_core_dropped_within_the_mtime_tick_is_found_on_the_next_lookup(retro):
+    # Filesystems round directory mtimes (FAT to two whole seconds), so a
+    # core dropped in right after a scan can leave the mtime looking
+    # unchanged. The scan refuses to cache a listing of a directory that
+    # changed moments ago, so the follow-up lookup walks it again and finds
+    # the core. Simulate the coarse tick exactly: scan, drop a core in, and
+    # put the mtime back to the value the scan saw.
+    cores_dir = retro.cog._cores_dir()
+    before = cores_dir.stat()
+    assert await retro.cog._installed_cores() == {}
+
+    dropped = cores_dir / "gambatte_libretro.so"
+    dropped.write_bytes(b"\x7fELF")
+    os.utime(cores_dir, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert await retro.cog._installed_cores() == {"gambatte": dropped}
+
+
+async def test_a_download_is_seen_even_if_the_directory_mtime_never_moves(
+    retro, buildbot
+):
+    # Belt and braces in _download_core: the cog's own write must never
+    # gamble on mtime granularity, so it drops the scan cache by hand. Prime
+    # a cache old enough to be trusted, download, then force the mtime back
+    # to the cached value -- the new core has to be seen anyway.
+    cores_dir = retro.cog._cores_dir()
+    stale = time.time() - 60
+    os.utime(cores_dir, (stale, stale))
+    assert await retro.cog._installed_cores() == {}
+    before = cores_dir.stat()
+
+    ok, _, message = await retro.cog._download_core("gambatte")
+    assert ok, message
+    os.utime(cores_dir, ns=(before.st_atime_ns, before.st_mtime_ns))
+    # The download also records itself in settings; clear that so only the
+    # directory scan can be what finds the core.
+    await retro.cog.config.cores.set({})
+    installed = await retro.cog._installed_cores()
+    assert installed == {"gambatte": cores_dir / "gambatte_libretro.so"}
 
 
 async def test_the_settings_embed_describes_the_whole_install(retro):

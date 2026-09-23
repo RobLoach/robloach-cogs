@@ -22,7 +22,10 @@ So every outbound fetch in this cog goes through :func:`guarded_get`, which:
   past the check (see :class:`GuardedResolver` for the residual gap);
 * follows redirects itself, a bounded number of times, checking every hop the
   same way -- a public URL that answers ``302 Location: http://127.0.0.1/`` is
-  refused at the second hop, and so is one that redirects to ``file:///``.
+  refused at the second hop, and so is one that redirects to ``file:///``;
+* spends the caller's ``timeout`` across the *whole* chain rather than
+  restarting it at every hop, so a server that dribbles out slow redirects
+  cannot hold the bot for six times as long as the caller allowed.
 
 Everything it refuses raises :class:`BlockedURL`, which deliberately carries
 no detail: the caller turns it into one sentence that is the same whether the
@@ -30,9 +33,11 @@ address was blocked, the connection was refused, or the request timed out, so
 the reply cannot be used as a scanner's oracle. The reason is logged instead.
 """
 
+import asyncio
 import ipaddress
 import logging
 import socket
+import time
 import typing
 from contextlib import asynccontextmanager
 from urllib.parse import urljoin, urlsplit
@@ -300,6 +305,12 @@ async def guarded_get(
     ``[p]retroset allowprivateurls``) and is off everywhere by default. With
     it on, the *addresses* are no longer refused -- the scheme check and the
     redirect bound still apply.
+
+    ``timeout`` (an ``aiohttp.ClientTimeout``, or a bare number of seconds) is
+    a budget for the whole fetch -- every redirect hop and the final body --
+    not for each hop. Running out of it mid-chain raises
+    ``asyncio.TimeoutError``, exactly what aiohttp raises when a single slow
+    request runs out of time, so callers need no extra handling.
     """
     guard = GuardedResolver(inner=resolver, allow_private=allow_private)
     factory = session_factory if session_factory is not None else aiohttp.ClientSession
@@ -312,15 +323,43 @@ async def guarded_get(
         # Nothing here reuses a connection: one fetch, then the session goes.
         force_close=True,
     )
+    # One deadline for the whole chain, fixed before the first request. A
+    # ClientTimeout(total=...) left on the session restarts for every request,
+    # and each redirect hop is its own request -- so a hostile or broken chain
+    # of slow redirects would get (max_redirects + 1) fresh budgets, pinning a
+    # ROM fetch for around twelve minutes instead of two. Each hop below is
+    # instead given only what remains of the caller's total; a budget that
+    # runs out between hops raises asyncio.TimeoutError, the same exception
+    # aiohttp raises when one request overruns, so the callers' handling (and
+    # the single REFUSAL sentence in Discord) is unchanged.
+    total = timeout if isinstance(timeout, (int, float)) else getattr(timeout, "total", None)
+    deadline = None if total is None else time.monotonic() + total
     async with factory(connector=connector, timeout=timeout, headers=headers) as session:
         current = str(url)
         for hop in range(max_redirects + 1):
             check_scheme(current)
+            request_kwargs: typing.Dict[str, typing.Any] = {}
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError(
+                        f"the {total} second budget ran out after {hop} redirect(s)"
+                    )
+                # The per-request timeout overrides the session's, so this hop
+                # gets the remainder of the budget as its total. The other
+                # limits the caller set (connect, per-read) are per-attempt by
+                # nature and are carried over as they are.
+                request_kwargs["timeout"] = aiohttp.ClientTimeout(
+                    total=remaining,
+                    connect=getattr(timeout, "connect", None),
+                    sock_connect=getattr(timeout, "sock_connect", None),
+                    sock_read=getattr(timeout, "sock_read", None),
+                )
             # allow_redirects=False: aiohttp would happily follow a redirect
             # into a private address on its own. Each hop is checked here
             # instead, which is also the only way to refuse a non-http(s)
             # redirect target with an explanation rather than a stack trace.
-            response = await session.get(current, allow_redirects=False)
+            response = await session.get(current, allow_redirects=False, **request_kwargs)
             target = _redirect_target(response)
             if target is None:
                 try:

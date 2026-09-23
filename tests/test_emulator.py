@@ -397,6 +397,53 @@ def test_recording_converts_one_frame_per_picture_and_no_more(emu, gambatte, uci
     assert calls == [], f"{len(calls)} pixel-by-pixel conversions in one recording"
 
 
+# -- 1c. Capture and encode are two halves -------------------------------------
+#
+# record() is record_frames() -- everything that needs the core -- handed to
+# encode_clip(), which needs no core at all. The cog serializes every touch of
+# the emulator behind one lock, and the encode is the most expensive CPU step
+# of a button press, so the split is what lets a caller release the lock
+# before encoding. The contract that makes that safe is proved here: the
+# captured data is complete (encoding it after the emulator is *stopped* still
+# works), the pictures are native-sized (the memory half of the fix), and the
+# bytes that come out are the bytes record() has always produced.
+
+
+def test_record_is_exactly_capture_then_encode(emu, gambatte, ucity):
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(2))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    presses = [("right", 0, frames_for_ms(emulator, 160))]
+    state = emulator.save_state()
+
+    # Restored before *both* recordings so they start level; see
+    # test_a_recorded_clip_is_the_same_whichever_grab_made_it for why.
+    emulator.load_state(state)
+    whole = emulator.record(frames, presses=presses)
+
+    emulator.load_state(state)
+    captured = emulator.record_frames(frames, presses=presses)
+    native = emulator._frame_size()
+    posted = emulator.output_size()
+
+    # The capture carries everything the encode needs: pictures at the
+    # core's own resolution (a Game Boy clip in memory is 160x144 a frame,
+    # not 320x288), clip_plan's durations, and the posted size pinned from
+    # the first frame.
+    assert captured.size == posted != native
+    assert all(picture.size == native for picture in captured.images)
+    assert captured.durations == [ms for _, ms in E.clip_plan(emulator.fps, frames)]
+    assert len(captured.images) == len(captured.durations)
+
+    # ...and the encode is a pure function of it. The emulator is stopped
+    # first, which is the proof that no core access hides in encode_clip --
+    # i.e. that a caller really can drop the emulator lock between the two
+    # halves -- and the bytes are identical to the one-call form, which is
+    # what keeps record() an honest thin wrapper.
+    emulator.stop()
+    assert E.encode_clip(captured) == whole
+
+
 # -- 2. Frame arithmetic ------------------------------------------------------
 
 
@@ -639,11 +686,19 @@ def photographed(emulator, frames, presses=(), budget=None, monkeypatch=None):
     """Record a clip and report the pictures it actually *took*.
 
     ``record`` is driven for real -- no second copy of its loop here -- and
-    :meth:`RetroEmulator._frame_image` is wrapped on the way through, because
-    it is called exactly once per photographed picture. The encoded file
-    cannot answer this on its own: libwebp merges runs of identical pictures
-    and adds their durations together, so a clip of a static screen comes
-    back as one stored frame however many were captured.
+    :meth:`RetroEmulator._native_frame_image` is wrapped on the way through,
+    because it is called exactly once per photographed picture. The encoded
+    file cannot answer this on its own: libwebp merges runs of identical
+    pictures and adds their durations together, so a clip of a static screen
+    comes back as one stored frame however many were captured.
+
+    The hashes are of the *native* frames, which is what a recording now
+    stores (the NEAREST enlargement happens once per distinct picture at
+    encode time, see encode_clip). That changes nothing about what the
+    hashes can say: the enlargement is deterministic and pinned to one size
+    per clip, so two frames are equal at native size exactly when they are
+    equal posted -- as long as everything compared against them (see
+    held_picture) is hashed at native size too.
 
     ``budget`` of 0 turns the pre-roll off, which is the "before" column of
     every table below; None leaves it as it ships. Returns
@@ -652,24 +707,28 @@ def photographed(emulator, frames, presses=(), budget=None, monkeypatch=None):
     if budget is not None:
         monkeypatch.setattr(E, "preroll_budget", lambda *a, **k: budget)
     shots = []
-    original = type(emulator)._frame_image
+    original = type(emulator)._native_frame_image
 
-    def spy(self, size=None, **kwargs):
-        picture = original(self, size, **kwargs)
+    def spy(self):
+        picture = original(self)
         shots.append(hashlib.sha1(picture.tobytes()).hexdigest()[:10])
         return picture
 
-    type(emulator)._frame_image = spy
+    type(emulator)._native_frame_image = spy
     try:
         payload = emulator.record(frames, presses=list(presses))
     finally:
-        type(emulator)._frame_image = original
+        type(emulator)._native_frame_image = original
     return payload, shots, emulator.last_preroll_frames
 
 
 def held_picture(emulator):
-    """The picture the previous clip left standing in the channel."""
-    return hashlib.sha1(emulator._frame_image().tobytes()).hexdigest()[:10]
+    """The picture the previous clip left standing in the channel.
+
+    Hashed at the core's own resolution, like the shots ``photographed``
+    reports, so the two are comparable.
+    """
+    return hashlib.sha1(emulator._native_frame_image().tobytes()).hexdigest()[:10]
 
 
 def opening_repeats(shots, held):
@@ -1045,8 +1104,9 @@ def test_the_preroll_leaves_the_seam_with_no_repeat_and_no_gap(
                 frozenset({button}) if index in schedule else frozenset()
             )
             emulator.advance(1)
+            # Native, because photographed()'s shots are; see its docstring.
             reference.append(
-                hashlib.sha1(emulator._frame_image(size).tobytes()).hexdigest()[:10]
+                hashlib.sha1(emulator._native_frame_image().tobytes()).hexdigest()[:10]
             )
     finally:
         emulator._pressed = frozenset()

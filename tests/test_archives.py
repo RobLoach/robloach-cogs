@@ -96,6 +96,23 @@ def test_macos_junk_is_ignored_and_not_even_listed():
     assert ".DS_Store" not in found.members
 
 
+def test_junk_is_spotted_through_backslashes_nesting_and_dot_folders():
+    # All three sort before game.gb, so any one of them slipping past the
+    # junk filter would become the ROM the user's game boots from.
+    found = extract(
+        zipped(
+            [
+                ("__MACOSX\\alpha.gb", b"x" * 99),  # Windows-repacked
+                ("a/__MacOSX/beta.gb", b"y" * 99),  # nested, mixed case
+                ("a/.hidden/gamma.gb", b"z" * 99),  # dot *folder*
+                ("game.gb", ROM),
+            ]
+        )
+    )
+    assert found.name == "game.gb"
+    assert found.members == ("game.gb",)
+
+
 # -- Nothing usable inside ----------------------------------------------------
 
 
@@ -243,13 +260,18 @@ def test_extract_all_drops_archive_junk():
         [
             ("real.bin", b"x" * 8),
             ("__MACOSX/._real.bin", b"junk"),
+            ("__MACOSX\\real.bin", b"junk"),
+            ("sub/__MACOSX/real.bin", b"junk"),
             (".DS_Store", b"junk"),
             ("folder/.hidden", b"junk"),
+            ("folder/.hidden/deep.bin", b"junk"),
         ]
     )
     found = A.extract_all(data, **ALL_LIMITS)
     assert [f.path for f in found.files] == ["real.bin"]
-    # Junk is dropped rather than reported: nobody meant to install it.
+    # Junk is dropped rather than reported: nobody meant to install it. The
+    # backslashed and nested __MACOSX members matter here -- an unsafe *name*
+    # would be skipped and counted, junk must not be.
     assert found.skipped == ()
 
 
@@ -267,6 +289,17 @@ def test_extract_all_drops_archive_junk():
         "weird;name.bin",
         "name\nwith\nnewlines.bin",
         "x" * 80,
+        # DOS device aliases: NT resolves these before touching the directory,
+        # on the stem alone, so the extension is no disguise.
+        "CON",
+        "aux.rom",
+        "COM1.bin",
+        "dc/nul.bin",
+        # A trailing dot or space is stripped by Windows on write, storing the
+        # file under a name that was never validated.
+        "trailing.",
+        "trailing ",
+        "dotted./inside.bin",
     ],
 )
 def test_extract_all_refuses_an_unsafe_member(member):
@@ -289,6 +322,30 @@ def test_extract_all_refuses_an_unsafe_member(member):
         ("a\x00b.bin", None),
         (".hidden", None),
         ("a/b/c/d/e.bin", None),
+        # DOS device names, however cased or dressed up with an extension.
+        ("CON", None),
+        ("prn", None),
+        ("aux.rom", None),
+        ("NUL.bin.rom", None),
+        ("COM1.bin", None),
+        ("com0.bin", None),
+        ("lpt9", None),
+        ("con .rom", None),  # NT ignores the trailing space in the stem too
+        ("dc/AUX.bin", None),
+        # ...but only the exact stem is a device: these are honest names.
+        ("console.bin", "console.bin"),
+        ("communist.rom", "communist.rom"),
+        ("lpt10.bin", "lpt10.bin"),
+        ("aux2.bin", "aux2.bin"),
+        # A trailing dot or space would be stripped by Windows on write.
+        ("foo.", None),
+        ("foo ", None),
+        ("dir./a.bin", None),
+        # Single- and two-character components still pass.
+        ("a", "a"),
+        ("ab", "ab"),
+        ("x" * 64, "x" * 64),
+        ("x" * 65, None),
     ],
 )
 def test_safe_member_path(name, expected):
@@ -369,6 +426,38 @@ def test_extract_all_skips_a_single_member_over_the_per_file_cap():
     found = A.extract_all(data, max_total_size=MAX, max_file_size=1024, max_files=10)
     assert [f.path for f in found.files] == ["small.bin"]
     assert found.skipped == ("big.bin",)
+
+
+def test_extract_all_skips_a_case_insensitive_duplicate():
+    # Both names are individually safe, but on the case-insensitive disks of
+    # Windows/macOS hosts the second write would clobber the first. Sorted
+    # order means the uppercase one is always the survivor.
+    data = zipped([("BIOS.bin", b"first"), ("bios.bin", b"second")])
+    found = A.extract_all(data, **ALL_LIMITS)
+    assert [f.path for f in found.files] == ["BIOS.bin"]
+    assert found.files[0].data == b"first"
+    assert len(found.skipped) == 1
+    assert found.skipped[0].startswith("bios.bin ")
+    assert "case" in found.skipped[0]
+
+
+def test_extract_all_spots_a_case_collision_in_a_folder_name():
+    data = zipped(
+        [("DC/boot.bin", b"upper"), ("dc/boot.bin", b"lower"), ("dc/extra.bin", b"ok")]
+    )
+    found = A.extract_all(data, **ALL_LIMITS)
+    assert [f.path for f in found.files] == ["DC/boot.bin", "dc/extra.bin"]
+    assert len(found.skipped) == 1
+    assert found.skipped[0].startswith("dc/boot.bin ")
+
+
+def test_a_case_variant_of_a_member_that_was_not_taken_is_still_taken():
+    # Only *accepted* members claim a name: the empty BIOS.bin is skipped for
+    # being empty, so bios.bin collides with nothing and is kept.
+    data = zipped([("BIOS.bin", b""), ("bios.bin", b"real")])
+    found = A.extract_all(data, **ALL_LIMITS)
+    assert [f.path for f in found.files] == ["bios.bin"]
+    assert found.skipped == ("BIOS.bin",)
 
 
 def test_extract_all_skips_an_empty_member():

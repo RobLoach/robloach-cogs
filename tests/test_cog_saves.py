@@ -156,6 +156,33 @@ async def test_a_save_whose_rom_was_pruned_is_still_listed(retro):
     assert "ROM pruned" in said, "the save outlives the ROM and is still managed"
 
 
+async def test_the_listing_gathers_its_files_off_the_event_loop(retro):
+    """The stats and globs behind a listing must not stall every press.
+
+    ``_saved_games`` runs on `[p]retrosaves`, and everything filesystem-shaped
+    in it -- five glob passes plus a stat per file -- used to run directly on
+    the event loop, where a big states directory froze every session in every
+    channel for the length of a directory listing.
+    """
+    import threading
+
+    cog = retro.cog
+    cog._state_path(9206, "threaded").write_bytes(b"STATE:1")
+    main = threading.get_ident()
+    seen = {}
+    real = cog._stored_slugs
+
+    def spy(channel_id):
+        seen["thread"] = threading.get_ident()
+        return real(channel_id)
+
+    cog._stored_slugs = spy
+    entries = await cog._saved_games(9206)
+
+    assert [entry.slug for entry in entries] == ["threaded"]
+    assert seen["thread"] != main, "the directory walk ran on the event loop"
+
+
 async def test_a_long_listing_is_paginated(retro):
     cog = retro.cog
     for index in range(40):
@@ -282,6 +309,9 @@ async def test_export_sends_the_battery_save_byte_for_byte(battery):
     assert set(uploaded) == {"ucity.srm"}, "the state is not sent unless asked for"
     assert uploaded["ucity.srm"] == marker
     assert "in-game save" in ctx.said()
+    # Streamed from the file on disk, not copied through memory first: the
+    # attachment's stream is the open file itself (a BytesIO has no name).
+    assert getattr(ctx.uploads[0].fp, "name", None)
 
 
 async def test_export_both_sends_the_state_as_well_with_a_warning(battery):
@@ -611,6 +641,44 @@ async def test_deleting_a_game_with_nothing_saved_does_not_even_ask(battery):
     assert "nothing saved" in ctx.said()
 
 
+# -- Rollback: swap with the previous generation --------------------------------
+
+
+async def test_rollback_is_a_swap_and_its_own_undo(retro):
+    """Rolling back twice puts everything exactly as it was.
+
+    The command promises a swap, not a delete: what is rolled back from lands
+    in the backup slot, so a rollback that turned out to be a mistake is
+    undone by running it again. And a completed swap leaves no ``.rollback``
+    parking file behind for the sweeper to find.
+    """
+    cog = retro.cog
+    state = cog._state_path(9256, "swapper")
+    sram = cog._sram_path(9256, "swapper")
+    state.write_bytes(b"STATE:2")
+    cog._backup_path(state).write_bytes(b"STATE:1")
+    sram.write_bytes(b"\x02" * 512)
+    cog._backup_path(sram).write_bytes(b"\x01" * 512)
+    owner = FakeUser(uid=1)
+
+    ctx = retro.context(retro.channel(9256), author=owner)
+    await command(retro, "retrosaves_rollback")(cog, ctx, game="swapper")
+
+    assert state.read_bytes() == b"STATE:1"
+    assert cog._backup_path(state).read_bytes() == b"STATE:2"
+    assert sram.read_bytes() == b"\x01" * 512
+    assert cog._backup_path(sram).read_bytes() == b"\x02" * 512
+    said = ctx.said()
+    assert "rolled back" in said and "again puts it back" in said
+
+    again = retro.context(retro.channel(9256), author=owner)
+    await command(retro, "retrosaves_rollback")(cog, again, game="swapper")
+
+    assert state.read_bytes() == b"STATE:2"
+    assert sram.read_bytes() == b"\x02" * 512
+    assert not list(cog._data_dir("states").glob("*.rollback"))
+
+
 # -- Importing ----------------------------------------------------------------
 
 
@@ -720,6 +788,144 @@ async def test_a_battery_save_is_installed_and_takes_the_old_state_with_it(batte
     assert cog._sram_path(9266, "ucity").read_bytes() == incoming
     assert not cog._state_path(9266, "ucity").is_file()
     assert "old save state was removed with it" in ctx.said()
+
+
+async def test_the_import_question_never_promises_a_rollback_it_cannot_do(battery):
+    # Two fates, and the question keeps them straight: the overwritten
+    # in-game save is rotated into the backup slot (rollback recovers it),
+    # while the save state a battery-only import removes is deleted outright,
+    # both generations of it -- so the only honest advice is to export first.
+    view, _, channel = await playing(battery, 9273, "ucity")
+    cog = battery.cog
+    view.emulator.load_sram(marker_bytes(SRAM_BYTES))
+    await cog._write_state(view)
+    FakeConfirm.reset(answer=False)
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[FakeAttachment(marker_bytes(SRAM_BYTES, seed=3), "ucity.srm")],
+    )
+
+    await command(battery, "retrosaves_import")(cog, ctx, game="ucity")
+
+    assert FakeConfirm.asked == 1
+    said = ctx.said()
+    assert "kept as the previous generation" in said, "the in-game save's fate"
+    assert "outright" in said, "the save state's fate is a deletion"
+    assert "cannot be rolled back" in said
+    assert "export both ucity" in said, "the copy worth taking includes the state"
+
+
+async def test_a_full_import_keeps_what_it_overwrites_one_generation_deep(battery):
+    """The promise the confirmation makes, held to: rollback undoes an import.
+
+    Both halves of a full import are written with the backup rotation, so
+    what was there lands in the backup slots and one `[p]retrosaves rollback`
+    puts the pre-import save back exactly.
+    """
+    view, _, channel = await playing(battery, 9274, "ucity")
+    cog = battery.cog
+    old_sram = marker_bytes(SRAM_BYTES)
+    view.emulator.load_sram(old_sram)
+    # Asleep first, so the files on disk are settled and the import's own
+    # pause rewrites nothing.
+    await cog.hibernate(view, None)
+    state_path = cog._state_path(9274, "ucity")
+    sram_path = cog._sram_path(9274, "ucity")
+    old_state = state_path.read_bytes()
+
+    new_state = b"STATE:777".ljust(64, b"\0")
+    new_sram = marker_bytes(SRAM_BYTES, seed=9)
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[
+            FakeAttachment(new_sram, "ucity.srm"),
+            FakeAttachment(new_state, "ucity.state"),
+        ],
+    )
+    await command(battery, "retrosaves_import")(cog, ctx, game="ucity")
+
+    assert state_path.read_bytes() == new_state
+    assert sram_path.read_bytes() == new_sram
+    assert cog._backup_path(state_path).read_bytes() == old_state
+    assert cog._backup_path(sram_path).read_bytes() == old_sram
+
+    roll = battery.context(channel, author=FakeUser(uid=view.starter_id))
+    await command(battery, "retrosaves_rollback")(cog, roll, game="ucity")
+    assert state_path.read_bytes() == old_state
+    assert sram_path.read_bytes() == old_sram
+
+
+async def test_a_press_during_the_import_check_cannot_undo_the_import(battery):
+    """The TOCTOU the import used to have, made deterministic.
+
+    _pause_for_saves puts the game to sleep, but the core-boot validation
+    between it and the write takes whole seconds, and the session's controls
+    stay live the entire time: a press in that window wakes the game from the
+    old files, and its next automatic save would silently write those old
+    files back over the import. _mutate_saves closes it by re-hibernating
+    under the view's own lock and writing before letting it go.
+    """
+    view, _, channel = await playing(battery, 9275, "ucity")
+    cog = battery.cog
+    old = marker_bytes(SRAM_BYTES)
+    view.emulator.load_sram(old)
+    for _ in range(4):
+        await cog.run_press(view, "a")
+    assert cog._sram_path(9275, "ucity").read_bytes() == old
+
+    real_check = cog._check_import
+
+    async def check_and_then_a_press_lands(entry, state, sram, prefix=""):
+        problem = await real_check(entry, state, sram, prefix)
+        # The moment the race lives in: the check is done, the write has not
+        # happened, and a player presses a button.
+        await cog.run_press(view, "a")
+        assert view.live, "the press really did wake the game mid-command"
+        return problem
+
+    cog._check_import = check_and_then_a_press_lands
+    incoming = marker_bytes(SRAM_BYTES, seed=99)
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[FakeAttachment(incoming, "ucity.srm")],
+    )
+
+    await command(battery, "retrosaves_import")(cog, ctx, game="ucity")
+
+    assert not view.live, "the rewoken session was put back to sleep for the write"
+    assert cog._sram_path(9275, "ucity").read_bytes() == incoming
+
+    # Playing on wakes from the imported save rather than writing the old
+    # one back over it.
+    for _ in range(4):
+        await cog.run_press(view, "a")
+    assert view.emulator.save_sram() == incoming
+    assert cog._sram_path(9275, "ucity").read_bytes() == incoming
+
+
+async def test_mutate_saves_touches_the_files_only_while_nothing_is_live(battery):
+    """The helper's contract, asserted directly: mutate runs with the game asleep."""
+    view, _, channel = await playing(battery, 9276, "ucity")
+    cog = battery.cog
+    assert view.live
+    entries = await cog._saved_games(channel.id)
+    entry = next(e for e in entries if e.slug == "ucity")
+    seen = {}
+
+    def mutate():
+        seen["live"] = view.live
+        return "changed"
+
+    ctx = battery.context(channel)
+    paused, result = await cog._mutate_saves(ctx, entry, "being tested", mutate)
+
+    assert (paused, result) == (True, "changed")
+    assert seen["live"] is False, "the files were changed under a core that could autosave"
 
 
 async def test_importing_over_an_existing_save_asks_first(battery):

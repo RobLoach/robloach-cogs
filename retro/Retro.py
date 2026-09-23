@@ -28,6 +28,7 @@ this one, so `retro.Retro.<NAME>` keeps meaning what it always did.
 """
 
 import asyncio
+import concurrent.futures
 import io
 import logging
 import re
@@ -356,6 +357,16 @@ class Retro(
         self.retired: typing.Dict[int, RetiredView] = {}
         # Serializes every core operation across all channels.
         self.emulator_lock: asyncio.Lock = asyncio.Lock()
+        # And the one thread every one of them runs on; see
+        # run_in_emulator_thread, which is what the whole cog calls.
+        self._emulator_executor: typing.Optional[
+            concurrent.futures.ThreadPoolExecutor
+        ] = None
+        # Message edits that were put off because the emulator lock was held
+        # when they were decided on; see _queue_refresh and _flush_refreshes.
+        self._pending_refresh: typing.List[
+            typing.Tuple[RetroView, typing.Optional[str]]
+        ] = []
         # The per-channel half of the start rate limit. `[p]retro` carries a
         # per-user cooldown as a decorator, which discord.py can only give a
         # command one of; this is the second bucket, checked by hand at the
@@ -453,6 +464,19 @@ class Retro(
             retired.alive = False
             self._release_view(retired)
         self.retired.clear()
+        # Every core has been freed by the loop above, so the emulator thread
+        # has nothing left to do and no core can outlive it. Not waited on:
+        # this runs on the event loop, and an unload must not block on a
+        # worker that a cancelled hibernate may have left mid-call.
+        executor, self._emulator_executor = self._emulator_executor, None
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False)
+            except Exception:
+                log.debug("Could not shut the emulator thread down.", exc_info=True)
+        # Nothing is left to edit these messages: the views have been closed
+        # and handed back, and a fresh load rebuilds them.
+        self._pending_refresh.clear()
         if cancelled is not None:
             # Re-raised rather than swallowed: the task really was cancelled
             # and its caller is entitled to know. Everything above has
@@ -901,6 +925,25 @@ class Retro(
             self._free_emulator(emulator)
         self._release_view(view)
 
+    def _forget_session_view(self, channel_id: int, view: RetroView) -> bool:
+        """
+        Take a channel's session entry out, but only if it is still this one.
+
+        Every teardown path wants this rather than a bare ``pop``. A pop says
+        "this channel has no session", which is a lie if something else has
+        taken the channel over in the meantime -- a Resume click, or another
+        start -- and an expensive one: the session that really is live is
+        then absent from :attr:`sessions`, which is the only place
+        _evict_locked looks, so its core can never be freed and the one
+        MAX_LIVE_EMULATORS slot is spent for the life of the process.
+
+        Returns whether anything was removed.
+        """
+        if self.sessions.get(int(channel_id)) is view:
+            del self.sessions[int(channel_id)]
+            return True
+        return False
+
     def _drop_retired_views(self, channel_id: int) -> None:
         """Take every Resume button of one channel out of service."""
         for message_id, view in list(self.retired.items()):
@@ -1214,7 +1257,7 @@ class Retro(
         if emulator is None:
             return
         await self._write_state(view, emulator)
-        await asyncio.to_thread(emulator.stop)
+        await self.run_in_emulator_thread(emulator.stop)
 
     def _hibernate_now(self, view: RetroView) -> None:
         """
@@ -1254,6 +1297,106 @@ class Retro(
 
     # -- Emulator lifecycle -------------------------------------------------
 
+    def run_in_emulator_thread(self, func, *args):
+        """
+        Run one blocking core operation, on the thread the cores live on.
+
+        **Every call into a libretro core goes through here**, and they all
+        go through the *same* thread. ``asyncio.to_thread``, which this
+        replaces everywhere, hands the work to the default executor's pool:
+        the calls were correctly serialized by :attr:`emulator_lock`, but
+        successive ones for the same loaded core could each land on a
+        different thread. A libretro core is a C shared object, and ones that
+        keep state in thread-local storage, spawn helpers bound to the thread
+        that made them, or simply assert they are called from the thread that
+        initialised them are entitled to misbehave -- up to segfaulting the
+        bot -- even though no two calls ever overlap.
+
+        One worker, created on first use so a cog that is loaded and never
+        played costs nothing, and shut down in :meth:`cog_unload`. It is not
+        a second lock and must not be mistaken for one: the executor
+        guarantees *which* thread, :attr:`emulator_lock` still guarantees
+        *one at a time*, and both are needed.
+
+        Returns an awaitable, exactly as ``asyncio.to_thread`` does.
+        """
+        if self._emulator_executor is None:
+            self._emulator_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="retro-emulator"
+            )
+        return asyncio.get_running_loop().run_in_executor(
+            self._emulator_executor, lambda: func(*args)
+        )
+
+    async def _refresh_live_controls(self) -> None:
+        """
+        Redraw every session's controls to match a setting that just changed.
+
+        Only `[p]retroset cliplength` needs it, and only because that setting
+        decides whether the repeat button exists at all: a stale button on a
+        message nobody has pressed since is a click Discord routes to a
+        custom_id this view no longer has, which the player sees as Discord's
+        own red "This interaction failed". Never raises -- a setting that
+        took effect is not undone by a message that could not be edited.
+
+        The clip on each message is deliberately kept (``refresh`` does not
+        pass ``attachments``), so this costs one edit per live game and no
+        re-upload.
+        """
+        for view in list(self.sessions.values()):
+            if getattr(view, "closed", False):
+                continue
+            try:
+                await view.refresh()
+            except Exception:
+                log.debug(
+                    "Could not redraw the controls in channel %s.",
+                    getattr(view, "channel_id", None),
+                    exc_info=True,
+                )
+
+    def _queue_refresh(self, view: RetroView, reason: typing.Optional[str]) -> None:
+        """
+        Put off a message edit until the emulator lock is free.
+
+        Editing a Discord message is a network round trip, and one made while
+        holding :attr:`emulator_lock` stalls the single core for as long as
+        Discord takes to answer -- which is every other channel's presses,
+        for a rate limit that had nothing to do with them. The decision to
+        edit is made under the lock (it is part of hibernating a session);
+        the edit itself is not, so it is recorded here and made by
+        :meth:`_flush_refreshes` afterwards.
+
+        A reason of None means there is nothing to say, so nothing is
+        recorded: eviction and sleeping say something, retiring does not.
+        """
+        if reason is None:
+            return
+        self._pending_refresh.append((view, reason))
+
+    async def _flush_refreshes(self) -> None:
+        """
+        Make the edits :meth:`_queue_refresh` put off. Never raises.
+
+        Called by everything that lets go of :attr:`emulator_lock`. Missing a
+        call is not a correctness bug, only a late edit: the entries stay put
+        and the next flush makes them, and the hibernation loop flushes as a
+        backstop so nothing can sit unsent indefinitely.
+        """
+        pending, self._pending_refresh = self._pending_refresh, []
+        for view, reason in pending:
+            try:
+                await view.refresh(reason)
+            except Exception:
+                # A message that has been deleted, or a channel the bot has
+                # lost access to. The session itself is already saved and its
+                # core already freed; this is only the line on the message.
+                log.warning(
+                    "Could not say that channel %s's game went to sleep.",
+                    getattr(view, "channel_id", None),
+                    exc_info=True,
+                )
+
     async def run_press(
         self, view: RetroView, field: typing.Optional[str], repeat: int = 1
     ) -> bytes:
@@ -1262,16 +1405,38 @@ class Retro(
 
         Raises EmulatorError if the session cannot be woken or the core
         fails. Called by the view from its button callbacks.
+
+        The autosave every SAVE_STATE_EVERY_PRESSES presses is *captured*
+        under the lock and *written* after it. Reading the machine state out
+        of a core is sub-millisecond (see the table above
+        UNDO_COMPRESSION_LEVEL); writing it is a couple of hundred kilobytes
+        of fsync'd disk plus a Red Config write, and doing that under the
+        lock made every third press in one channel delay presses in all the
+        others -- and its own clip, which is the one somebody is waiting for.
         """
         async with self.emulator_lock:
             await self._wake_locked(view)
-            clip = await asyncio.to_thread(view.run_press, field, repeat)
+            frames = await self.run_in_emulator_thread(
+                view.capture_press, field, repeat
+            )
             view.touch()
             view.press_count += 1
-            if view.press_count % SAVE_STATE_EVERY_PRESSES == 0:
-                await self._write_state(view)
-                await self._save_record(view)
-            return clip
+            autosave = view.press_count % SAVE_STATE_EVERY_PRESSES == 0
+            progress = (
+                await self.run_in_emulator_thread(self._capture_progress, view)
+                if autosave
+                else None
+            )
+        # Out of the lock. Encoding the clip is the most expensive step of a
+        # press and touches no core (see RetroView._encode), so it happens
+        # here: while this channel's WebP is being written, the next channel
+        # is already emulating.
+        clip = await asyncio.to_thread(view._encode, frames)
+        await self._flush_refreshes()
+        if progress is not None:
+            await self._write_captured(view, progress)
+            await self._save_record(view)
+        return clip
 
     async def run_undo(self, view: RetroView) -> bytes:
         """
@@ -1297,11 +1462,16 @@ class Retro(
         """
         async with self.emulator_lock:
             await self._wake_locked(view)
-            clip = await asyncio.to_thread(view.run_undo)
+            frames = await self.run_in_emulator_thread(view.capture_undo)
             view.touch()
-            await self._write_state(view)
-            await self._save_record(view)
-            return clip
+            # Captured here, written below: see run_press, which explains why
+            # neither the encode nor the disk belongs under the lock.
+            progress = await self.run_in_emulator_thread(self._capture_progress, view)
+        clip = await asyncio.to_thread(view._encode, frames)
+        await self._flush_refreshes()
+        await self._write_captured(view, progress)
+        await self._save_record(view)
+        return clip
 
     async def run_reset(self, view: RetroView) -> bytes:
         """
@@ -1331,15 +1501,24 @@ class Retro(
         """
         async with self.emulator_lock:
             await self._wake_locked(view)
-            clip = await asyncio.to_thread(view.run_reset)
+            frames = await self.run_in_emulator_thread(view.capture_reset)
             view.touch()
-            await self._save_record(view)
-            return clip
+        clip = await asyncio.to_thread(view._encode, frames)
+        await self._flush_refreshes()
+        await self._save_record(view)
+        return clip
 
     async def hibernate(self, view: RetroView, reason: typing.Optional[str] = None) -> None:
-        """Save the game, free the emulator, and keep the controls usable."""
+        """
+        Save the game, free the emulator, and keep the controls usable.
+
+        The message is edited *after* the lock is given back (see
+        :meth:`_queue_refresh`), so a session going to sleep cannot hold the
+        one core while Discord thinks about a message edit.
+        """
         async with self.emulator_lock:
             await self._hibernate_locked(view, reason)
+        await self._flush_refreshes()
 
     async def _retire(self, view: RetroView, reason: str) -> None:
         """
@@ -1461,7 +1640,7 @@ class Retro(
         view.message_id = message_id or None
         view.message = getattr(interaction, "message", None)
 
-        progress, notice = self._saved_progress(channel_id, view.slug)
+        progress, notice = await self._saved_progress(channel_id, view.slug)
         emulator = RetroEmulator(
             core_path,
             rom_path,
@@ -1476,7 +1655,7 @@ class Retro(
             async with self.emulator_lock:
                 # One core at a time, here as everywhere else.
                 await self._evict_locked(exclude=view)
-                clip = await asyncio.to_thread(view._boot, emulator, progress)
+                clip = await self.run_in_emulator_thread(view._boot, emulator, progress)
                 # The new session becomes the channel's *inside the lock*,
                 # with its core already attached, and before anything that
                 # can await. This used to happen after the lock had been
@@ -1501,8 +1680,7 @@ class Retro(
             # from here (see _free_emulator) and there is nothing to report
             # to: the interaction is going away with the task. The Resume
             # button is left as it is, which is also how the message looks.
-            if self.sessions.get(channel_id) is view:
-                del self.sessions[channel_id]
+            self._forget_session_view(channel_id, view)
             view.emulator = None
             self._free_emulator(emulator)
             view.closed = True
@@ -1512,11 +1690,10 @@ class Retro(
             log.warning(
                 "Could not resume %s in channel %s: %s", view.slug, channel_id, error
             )
-            if self.sessions.get(channel_id) is view:
-                del self.sessions[channel_id]
+            self._forget_session_view(channel_id, view)
             view.emulator = None
             try:
-                await asyncio.to_thread(emulator.stop)
+                await self.run_in_emulator_thread(emulator.stop)
             except Exception:
                 log.exception("Could not stop a failed resume's emulator.")
             view.closed = True
@@ -1525,6 +1702,10 @@ class Retro(
             self._arm_retired(record)
             await self._restore_retired_message(interaction, retired, record, error)
             return
+
+        # The lock is free, so the edits the eviction above put off go out
+        # now; see _flush_refreshes.
+        await self._flush_refreshes()
 
         # It is up and the channel has already changed hands. The game it
         # replaces is retired exactly as starting a different game by name
@@ -1656,7 +1837,7 @@ class Retro(
                 # Always write the save state *before* the core is freed:
                 # after emulator.stop() the machine state is gone for good.
                 await self._write_state(view, emulator)
-                await asyncio.to_thread(emulator.stop)
+                await self.run_in_emulator_thread(emulator.stop)
                 stopped = True
             finally:
                 if not stopped:
@@ -1668,8 +1849,12 @@ class Retro(
         # The controls stay enabled so the next press can wake the session
         # back up; nothing about the buttons changes when a game sleeps.
         await self._save_record(view)
-        if reason is not None:
-            await view.refresh(reason)
+        # Recorded rather than made: this runs with the emulator lock held --
+        # it is called from eviction, from `[p]retrosleep` and from the idle
+        # sweep -- and a message edit is a Discord round trip. It used to be
+        # awaited here, so every channel's presses queued behind one
+        # channel's edit. See _queue_refresh and _flush_refreshes.
+        self._queue_refresh(view, reason)
 
     async def _wake_locked(self, view: RetroView) -> None:
         """Load the core and the last save state for a hibernated session."""
@@ -1697,7 +1882,7 @@ class Retro(
         # holds whatever the player saved from inside the game). The notice is
         # dropped here on purpose -- waking a session up is not an event worth
         # narrating, so only a *failed* restore says anything.
-        progress, _ = self._saved_progress(view.channel_id, view.slug)
+        progress, _ = await self._saved_progress(view.channel_id, view.slug)
 
         emulator = RetroEmulator(
             core_path,
@@ -1716,7 +1901,7 @@ class Retro(
         try:
             # The same restore chain a fresh start runs, from the same
             # function, so waking and starting cannot drift apart.
-            view.boot_outcome = await asyncio.to_thread(
+            view.boot_outcome = await self.run_in_emulator_thread(
                 restore_into, emulator, progress, view.slug
             )
             self._settle_boot(view, progress, None)
@@ -1725,7 +1910,7 @@ class Retro(
         except Exception:
             # A core that will not take the state, or will not boot. Freed in
             # a thread, as everywhere else on a path that can still await.
-            await asyncio.to_thread(emulator.stop)
+            await self.run_in_emulator_thread(emulator.stop)
             settled = True
             raise
         finally:
@@ -1735,11 +1920,11 @@ class Retro(
                 self._free_emulator(emulator)
         await self._learn_options(view.core, emulator)
 
-    def _saved_progress(
+    async def _saved_progress(
         self, channel_id: int, slug: str
     ) -> typing.Tuple[Progress, typing.Optional[str]]:
         """
-        What this channel already has saved for one game.
+        What this channel already has saved for one game, read off the loop.
 
         Returns ``(the progress, the line to say if it all works)``. Read on
         every start, not only on a wake: a channel that played this game
@@ -1752,7 +1937,18 @@ class Retro(
         backups cost a couple of hundred kilobytes of read that is usually
         wasted, which is a great deal cheaper than being unable to offer them
         at the moment the newest file turns out to be bad.
+
+        In a worker thread, because four files of a couple of megabytes each
+        is not something to read on the event loop -- and one of the three
+        callers (:meth:`_wake_locked`) does it with the emulator lock held,
+        where blocking costs every channel rather than only this one.
         """
+        return await asyncio.to_thread(self._saved_progress_now, channel_id, slug)
+
+    def _saved_progress_now(
+        self, channel_id: int, slug: str
+    ) -> typing.Tuple[Progress, typing.Optional[str]]:
+        """The blocking half of :meth:`_saved_progress`."""
         state_path, state_backup, sram_path, sram_backup = self._save_paths(
             channel_id, slug
         )
@@ -1941,6 +2137,96 @@ class Retro(
             return False
         return True
 
+    def _capture_progress(
+        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
+    ) -> typing.Tuple[typing.Optional[bytes], typing.Optional[bytes]]:
+        """
+        Read both halves of a game's progress out of the core. Never raises.
+
+        Returns ``(state, sram)``, either of which may be None: a cartridge
+        with no battery has no SRAM, and a core that will not serialize has
+        no state. Blocking, and a *core* operation -- so it belongs on the
+        emulator thread, under the emulator lock, exactly where the press it
+        follows already is.
+
+        The companion to :meth:`_write_captured`, and the split between them
+        is what keeps the disk off the lock: this half is sub-millisecond
+        (see the measurements above UNDO_COMPRESSION_LEVEL), the other half
+        is fsync'd disk. :meth:`_write_progress` still does both at once for
+        the teardown paths, which have no lock to give back.
+        """
+        emulator = emulator if emulator is not None else view.emulator
+        if emulator is None or not emulator.started:
+            return (None, None)
+        try:
+            sram = emulator.save_sram() or None
+        except Exception:
+            log.warning(
+                "Could not read the battery save for %s.", view.slug, exc_info=True
+            )
+            sram = None
+        try:
+            state = emulator.save_state()
+        except Exception:
+            log.warning(
+                "Could not read the save state for %s.", view.slug, exc_info=True
+            )
+            state = None
+        return (state, sram)
+
+    async def _write_captured(
+        self,
+        view: RetroView,
+        captured: typing.Tuple[typing.Optional[bytes], typing.Optional[bytes]],
+    ) -> bool:
+        """
+        Write what :meth:`_capture_progress` read, off the event loop.
+
+        **SRAM first**, the same order and for the same reason as
+        :meth:`_write_progress`: if only one of the two gets written it
+        should be the one that survives a core update. Each write rotates the
+        file it replaces to ``<name>.bak`` first, so the generation before
+        this one is always there to fall back to.
+
+        Never raises -- it is on the press path, and a full disk must cost a
+        save rather than somebody's game. Returns whether the state landed.
+        """
+        state, sram = captured
+        if state is None and sram is None:
+            return False
+        return await asyncio.to_thread(self._write_captured_now, view, state, sram)
+
+    def _write_captured_now(
+        self,
+        view: RetroView,
+        state: typing.Optional[bytes],
+        sram: typing.Optional[bytes],
+    ) -> bool:
+        """The blocking half of :meth:`_write_captured`. Never raises."""
+        if sram:
+            try:
+                self._write_atomic(
+                    self._sram_path(view.channel_id, view.slug), sram, True
+                )
+            except OSError:
+                log.warning(
+                    "Could not write the battery save for %s.",
+                    view.slug,
+                    exc_info=True,
+                )
+        if state is None:
+            return False
+        try:
+            self._write_atomic(
+                self._state_path(view.channel_id, view.slug), state, True
+            )
+        except Exception:
+            log.warning(
+                "Could not write the save state for %s.", view.slug, exc_info=True
+            )
+            return False
+        return True
+
     def _write_sram_now(self, view: RetroView, emulator: RetroEmulator) -> bool:
         """
         Write the cartridge's battery save next to the save state. Never raises.
@@ -2031,6 +2317,11 @@ class Retro(
             try:
                 await asyncio.sleep(IDLE_CHECK_SECONDS)
                 await self._hibernate_idle()
+                # The backstop for _queue_refresh: every path that lets go of
+                # the emulator lock flushes its own, so this normally finds
+                # nothing. It is here so that a path which forgets to costs a
+                # late edit rather than an edit nobody ever makes.
+                await self._flush_refreshes()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2292,6 +2583,13 @@ class Retro(
                     filename = Path(urlparse(url).path).name
                 if not filename:
                     filename = Path(str(resp.url.path)).name
+                # Every one of those three is written by whoever is answering
+                # the request, so a Content-Disposition of `../../evil.gb` is
+                # theirs to send. _sanitize_filename strips the path off
+                # before any of this reaches the disk, and this takes the
+                # last component here as well: defence in depth costs one
+                # call, and the name is handled by more than one caller.
+                filename = Path(filename).name
         except net.BlockedURL as error:
             # The reason goes to the log and nowhere else. The reply below is
             # the same one a refused connection and a timeout get.
@@ -2511,14 +2809,21 @@ class Retro(
         is removed, whatever was emulated is written to the save state, and
         the core is freed. Without this a failed send would leave an emulator
         loaded forever, and MAX_LIVE_EMULATORS is one.
+
+        The entry is removed only if it is still *this* view's. An
+        unconditional pop would evict whatever took the channel over while
+        this start was failing -- a Resume click, say -- and that session is
+        live, so popping it leaves a loaded core nothing can reach.
         """
-        self.sessions.pop(getattr(ctx.channel, "id", view.channel_id), None)
+        self._forget_session_view(
+            getattr(ctx.channel, "id", view.channel_id), view
+        )
         try:
             await self._write_state(view, emulator)
         except Exception:
             log.exception("Could not save the state of an abandoned session.")
         try:
-            await asyncio.to_thread(emulator.stop)
+            await self.run_in_emulator_thread(emulator.stop)
         except Exception:
             log.exception("Could not stop the emulator of an abandoned session.")
         view.emulator = None
@@ -2688,13 +2993,14 @@ class Retro(
                 "pressing its buttons is never rate limited.",
             )
             return
-        room, note = await self._make_room(0, prefix=ctx.clean_prefix)
-        if note:
-            # Either the refusal, or the report of what was pruned to avoid
-            # one. Both are worth saying out loud.
-            await self._safe_send(ctx, note)
-        if not room:
-            return
+        # There is deliberately no disk check here any more, only the one in
+        # _start_session that knows the real size. _make_room measures the
+        # whole data directory (a recursive walk and a stat per file, growing
+        # with every channel that has ever played), and doing it twice per
+        # start bought nothing: MAX_ROM_SIZE already bounds what a download
+        # can cost, the pruning the pre-flight did is pruning the real check
+        # does a moment later, and a fetch refused before it starts is the
+        # rare case rather than the one to optimise for.
 
         async with ctx.typing():
             rom = await self._fetch_rom(ctx, url)
@@ -2730,7 +3036,7 @@ class Retro(
         # Catch obviously-broken content before handing it to the core. The
         # most common failure is a URL that serves an HTML page (for example
         # a GitHub "blob" page) instead of the ROM file itself.
-        if data.lstrip()[:1] == b"<":
+        if data[:64].lstrip()[:1] == b"<":
             await ctx.send(
                 "That looks like a web page, not a ROM. If you used a URL, "
                 "make sure it is a direct download link to the file."
@@ -2756,7 +3062,10 @@ class Retro(
                 f"Replaced by **{game_name}**. **{existing.game_name}** was "
                 "saved \N{EM DASH} press Resume to come back to it.",
             )
-            self.sessions.pop(ctx.channel.id, None)
+            # Only if it is still the one that was retired: _retire awaits
+            # message edits, and a Resume click landing during them installs
+            # a live session an unconditional pop would make unreachable.
+            self._forget_session_view(ctx.channel.id, existing)
 
         await self._start_session(ctx, game_name, slug, filename, data, source, system)
 
@@ -2798,8 +3107,12 @@ class Retro(
             return
         # The oldest of this channel's cached games fall off the end here, and
         # the records that pointed at them go with them.
+        # In a thread: it globs, stats every cached ROM and unlinks the
+        # ones that fall off the end, and it sits in the middle of starting a
+        # game. The atomic ROM write just above is threaded for the same
+        # reason; this one was simply missed.
         await self._forget_pruned_roms(
-            self._prune_cached_games(ctx.channel.id, slug)
+            await asyncio.to_thread(self._prune_cached_games, ctx.channel.id, slug)
         )
 
         core_path = await self._core_path(system.core)
@@ -2832,7 +3145,7 @@ class Retro(
         # rather than booting over the top of it. Same fallback chain as
         # waking a hibernated session: save state, then the cartridge's
         # battery save, then the beginning.
-        progress, restored_notice = self._saved_progress(ctx.channel.id, slug)
+        progress, restored_notice = await self._saved_progress(ctx.channel.id, slug)
 
         emulator = RetroEmulator(
             core_path,
@@ -2840,19 +3153,18 @@ class Retro(
             system_dir=self._system_dir(),
             options=await self._core_options(system.core),
         )
+        previous: typing.Optional[RetroView] = None
         try:
             async with ctx.typing():
                 async with self.emulator_lock:
-                    # Only one core at a time; park whatever else is playing
-                    # (saving it first) and say so, so the other channel's
-                    # players are not left wondering what happened.
+                    # Only one core at a time; park whatever else is playing,
+                    # saving it first. What to say about that is worked out
+                    # here and said below: a courtesy message is a Discord
+                    # round trip, and one made under this lock holds up every
+                    # other channel's presses.
                     evicted = await self._evict_locked(exclude=view)
                     notice = self._eviction_notice(ctx, evicted)
-                    if notice:
-                        # A courtesy message: if Discord refuses it, the game
-                        # should still start.
-                        await self._safe_send(ctx, notice)
-                    await view.start(
+                    clip = await view.boot(
                         ctx,
                         emulator,
                         progress,
@@ -2860,6 +3172,40 @@ class Retro(
                             booted, progress, restored_notice
                         ),
                     )
+                    # The channel changes hands *inside the lock*, with the
+                    # core already attached, and before anything that can
+                    # await -- exactly as resume_retired does, and for the
+                    # same reason it was made to. This used to happen before
+                    # the boot and outside the lock, which left a window
+                    # where a Resume click in this channel (interactions go
+                    # through no max_concurrency) could take the lock first,
+                    # install its own session, and have this one overwrite
+                    # the dictionary entry afterwards -- a live core reachable
+                    # from nothing, which is the state MAX_LIVE_EMULATORS
+                    # exists to make impossible.
+                    previous = self.sessions.get(ctx.channel.id)
+                    if previous is view:
+                        previous = None
+                    self.sessions[ctx.channel.id] = view
+            # The lock is free from here: the core is up and belongs to this
+            # session, and everything below is Discord.
+            await self._flush_refreshes()
+            if notice:
+                # A courtesy message: if Discord refuses it, the game should
+                # still start.
+                await self._safe_send(ctx, notice)
+            if previous is not None:
+                # Something got in between the checks at the top of `[p]retro`
+                # and the lock. It has already been saved and had its core
+                # freed by the eviction above, so all that is left is to give
+                # its message a Resume button.
+                await self._retire(
+                    previous,
+                    f"Replaced by **{game_name}**. **{previous.game_name}** "
+                    "was saved \N{EM DASH} press Resume to come back to it.",
+                )
+            async with ctx.typing():
+                await view.post(ctx, clip)
         except EmulatorError as error:
             await self._abandon_session(ctx, view, emulator)
             await self._safe_send(ctx, f"The game could not be started: {error}")
@@ -2886,7 +3232,9 @@ class Retro(
             # for the life of the process. Nothing is awaited on the way out
             # -- a cancelled task cannot rely on that -- so the state is
             # written and the core freed synchronously.
-            self.sessions.pop(getattr(ctx.channel, "id", view.channel_id), None)
+            self._forget_session_view(
+                getattr(ctx.channel, "id", view.channel_id), view
+            )
             self._write_state_now(view, emulator)
             self._free_emulator(emulator)
             view.emulator = None
@@ -2976,6 +3324,14 @@ class Retro(
             # saved and the emulator is freed.
             log.exception("Failed to put the Libretro session to sleep cleanly.")
             await self._force_hibernate(view)
+        # A click that landed while the lock above was held is queued, and
+        # nothing is coming to run it: a sleeping session has no runner, so
+        # the entry would sit there making `busy` true for ever and the
+        # controller would answer nothing at all (see RetroView.busy).
+        # Dropped rather than drained, which is also what this command
+        # promises: draining would wake the game straight back up, and the
+        # next line the session writes says how many went.
+        view.forget_queue()
         await ctx.send(
             "The game has been saved and put to sleep. Press any button on "
             f"it to carry on, or `{ctx.clean_prefix}retroend` to finish with "
@@ -3025,7 +3381,9 @@ class Retro(
             f"Finished{' by ' + who if who else ''} \N{EM DASH} "
             f"**{view.game_name}** was saved. Press Resume to come back to it.",
         )
-        self.sessions.pop(ctx.channel.id, None)
+        # See _forget_session_view: `_retire` awaits, so the channel may not
+        # be this session's any more by the time it returns.
+        self._forget_session_view(ctx.channel.id, view)
         log.info(
             "Retired %s in channel %s at %s's request.",
             view.slug,
@@ -3120,6 +3478,15 @@ class Retro(
             ctx.channel.id,
             getattr(ctx.author, "id", "?"),
         )
+        # `run_reset` discarded the queue as it rebooted, but a click that
+        # landed after that and before the lock was given back is still in
+        # it, with nothing coming to run it -- which is what left a
+        # controller permanently "busy" and answering nothing (see
+        # RetroView.busy). Dropped rather than drained, because this command
+        # drops the queue by design: those presses were aimed at a game
+        # mid-play and this is the title screen. The count rides out on the
+        # line below.
+        view.forget_queue()
         # The reboot clip goes on the game's own message, with the line that
         # says who did what -- one edit, like a press, and named the same way
         # a press is even though this is a command rather than a button.
@@ -3402,6 +3769,15 @@ class Retro(
         await self.config.clip_seconds.set(seconds)
         for view in self.sessions.values():
             view.clip_seconds = seconds
+        # Redraw every live game's message now rather than leaving it until
+        # somebody presses something. This is the setting that can take the
+        # repeat button away (see RetroView._update_repeat_label), and a
+        # button that is still drawn on a message Discord has not re-rendered
+        # routes a click to a custom_id the view no longer has -- which
+        # discord.py drops silently, so the *player* sees Discord's own red
+        # "This interaction failed". Editing the message closes that window
+        # instead of waiting for the next press to close it.
+        await self._refresh_live_controls()
         fit = self._describe_press_fit(seconds, await self.config.hold_ms())
         await ctx.send(
             f"Clips now show {describe_seconds(seconds)} of play.{' ' + fit if fit else ''}"

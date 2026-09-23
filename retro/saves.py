@@ -9,7 +9,6 @@ per user; the paths all come from retro/storage.py.
 """
 
 import asyncio
-import io
 import logging
 import typing
 from pathlib import Path
@@ -22,7 +21,7 @@ from redbot.core.utils.views import ConfirmView
 from .abc import MixinMeta
 from .emulator import MAX_SRAM_SIZE, EmulatorError, RetroEmulator
 from .RetroView import RetroView, may_manage
-from .storage import BACKUP_SUFFIX, MAX_CACHED_GAMES_PER_CHANNEL
+from .storage import BACKUP_SUFFIX, MAX_CACHED_GAMES_PER_CHANNEL, ROLLBACK_SUFFIX
 from .systems import system_by_key, system_for_extension
 
 log = logging.getLogger("red.robloach.retro")
@@ -289,6 +288,14 @@ class SavesMixin(MixinMeta):
         the files on disk supply the rest. A game whose ROM has been pruned
         and whose Resume button has been forgotten still appears, under its
         slug, because its save is still there and still worth managing.
+
+        The files are the slow part -- several directory globs and a ``stat``
+        per file -- so the whole gather runs in one worker thread rather than
+        on the event loop, where a big states directory used to stall every
+        press in every channel for the length of a directory listing each
+        time somebody typed `[p]retrosaves`. Only reads happen in the
+        thread, and only of things that are safe to read from one: the
+        filesystem, and plain attributes of the session.
         """
         channel_id = int(channel_id)
         session = self.sessions.get(channel_id)
@@ -315,14 +322,18 @@ class SavesMixin(MixinMeta):
                 "core": record.get("core") or "",
                 "starter_id": record.get("starter_id"),
             }
-        entries = [
-            self._save_info(channel_id, slug, meta.get(slug) or {}, session)
-            for slug in sorted(set(meta) | self._stored_slugs(channel_id))
-        ]
-        # The game being played first, then by when it was last saved, so the
-        # top of the list is what somebody is most likely asking about.
-        entries.sort(key=lambda e: (not e.current, -e.last_written, e.slug))
-        return entries
+        def gather() -> typing.List[SaveInfo]:
+            entries = [
+                self._save_info(channel_id, slug, meta.get(slug) or {}, session)
+                for slug in sorted(set(meta) | self._stored_slugs(channel_id))
+            ]
+            # The game being played first, then by when it was last saved, so
+            # the top of the list is what somebody is most likely asking
+            # about.
+            entries.sort(key=lambda e: (not e.current, -e.last_written, e.slug))
+            return entries
+
+        return await asyncio.to_thread(gather)
 
     def _save_info(
         self,
@@ -493,24 +504,43 @@ class SavesMixin(MixinMeta):
         view.forget_history()
         if not view.live:
             return False
-        reason = (
-            f"Saved and put to sleep while {doing}. Press a button to pick "
-            "the game back up."
-        )
         # And, exactly as `[p]retrosleep` does, before reaching for that
         # lock: a press sitting out the clip on screen holds it, and no save
         # command should wait on a cosmetic delay. See
         # RetroView.cancel_pacing.
         view.cancel_pacing()
+        # The view's own lock, exactly as `[p]retrosleep` takes it, so a
+        # press that is already being emulated finishes before the core is
+        # taken away from it.
+        async with view.lock:
+            return await self._hibernate_for_saves(view, entry, doing)
+
+    async def _hibernate_for_saves(
+        self, view: RetroView, entry: SaveInfo, doing: str
+    ) -> bool:
+        """
+        Save a live session and free its core. Hold ``view.lock`` to call.
+
+        The working half of :meth:`_pause_for_saves`, split out so
+        :meth:`_mutate_saves` can run it again *while already holding the
+        lock* just before it touches the files. Checks ``live`` itself,
+        because by the time the lock has been acquired the answer may have
+        changed either way: the press that held it may have been the one
+        that woke the game up. Returns whether anything was put to sleep.
+        """
+        view.forget_history()
+        if not view.live:
+            return False
+        reason = (
+            f"Saved and put to sleep while {doing}. Press a button to pick "
+            "the game back up."
+        )
         try:
-            # The view's own lock, exactly as `[p]retrosleep` takes it, so a
-            # press that is already being emulated finishes before the core is
-            # taken away from it.
-            async with view.lock:
-                await self.hibernate(view, reason)
+            await self.hibernate(view, reason)
         except Exception:
-            # And the same belt and braces, from the same helper: everything
-            # below assumes the files on disk are the only copy.
+            # And the same belt and braces as `[p]retrosleep`, from the same
+            # helper: everything after this assumes the files on disk are the
+            # only copy.
             log.exception(
                 "Could not hibernate %s cleanly before changing its saves.",
                 entry.slug,
@@ -523,6 +553,51 @@ class SavesMixin(MixinMeta):
             view.channel_id,
         )
         return True
+
+    async def _mutate_saves(
+        self,
+        ctx: commands.Context,
+        entry: SaveInfo,
+        doing: str,
+        mutate: typing.Callable[[], typing.Any],
+    ) -> typing.Tuple[bool, typing.Any]:
+        """
+        Change one game's save files while no live core can undo the change.
+
+        :meth:`_pause_for_saves` alone is not quite enough, because pausing
+        and writing are separate awaits and the session's controls stay live
+        in between: any button press in that gap wakes the game *from the
+        old files*, and the woken core's next automatic save then writes
+        those old files straight back over whatever the command changed --
+        silently, which is the worst way for a delete, a rollback or an
+        import to fail. `[p]retrosaves import` has the widest gap (a
+        multi-second core boot validates the incoming save between its pause
+        and its write), but every command that touches the files has one.
+
+        So the files are only ever touched from in here: pause first, then
+        take the view's own lock -- the same lock every button press holds
+        for the whole of its press -- hibernate again if a press slipped in
+        and woke the game, and run ``mutate`` (blocking, so it goes to a
+        worker thread) before letting the lock go. Nothing can boot from, or
+        save over, the files while it runs. Returns ``(anything was put to
+        sleep, whatever mutate returned)``; whatever mutate raises passes
+        through.
+        """
+        paused = await self._pause_for_saves(ctx, entry, doing)
+        view = self.sessions.get(int(getattr(ctx.channel, "id", 0)))
+        if view is None or view.slug != entry.slug:
+            # Nothing to race with. A session for this game *appearing*
+            # mid-thread means somebody started it fresh, and a fresh start
+            # boots from whatever files this leaves behind, which is the
+            # order every command already promises.
+            return paused, await asyncio.to_thread(mutate)
+        # Same as _pause_for_saves: never wait out a cosmetic delay for the
+        # lock.
+        view.cancel_pacing()
+        async with view.lock:
+            if await self._hibernate_for_saves(view, entry, doing):
+                paused = True
+            return paused, await asyncio.to_thread(mutate)
 
     async def _confirm(self, ctx: commands.Context, question: str) -> bool:
         """
@@ -923,12 +998,17 @@ class SavesMixin(MixinMeta):
                 )
                 continue
             try:
-                data = await asyncio.to_thread(path.read_bytes)
+                # The path, not the payload: given a path, discord.File opens
+                # the file and streams it into the upload (closing it when the
+                # send is done), so a multi-megabyte save state is never
+                # copied through memory just to be attached. Opening it is
+                # also the readability check -- the size above came from the
+                # same directory listing the command started from.
+                files.append(discord.File(path, filename=filename))
             except OSError as error:
                 log.warning("Could not read %s to export it.", path, exc_info=True)
                 notes.append(f"The {label} could not be read: {error}")
                 continue
-            files.append(discord.File(io.BytesIO(data), filename=filename))
             sent.append(f"the {label} (`{filename}`, {self._humanize_bytes(size)})")
 
         if not files:
@@ -1001,16 +1081,22 @@ class SavesMixin(MixinMeta):
             )
             return
 
-        # Before the file is touched, never after: a running core would write
-        # its own save state back over this on the very next press.
-        paused = await self._pause_for_saves(ctx, entry, "its save state was reset")
-        try:
+        def drop_state_files() -> None:
             # The previous generation goes with it. Leaving it would be a
             # command that appears to do nothing: the restore chain would fall
             # straight through to the backup and the game would come back at
             # almost exactly the moment that was just dropped.
             for path in self._save_paths(ctx.channel.id, entry.slug)[:2]:
-                await asyncio.to_thread(path.unlink, True)
+                path.unlink(missing_ok=True)
+
+        try:
+            # Deleted with the session paused and its lock held, never under
+            # a running core: a live core holds its own copy of the state and
+            # would write it back over this on the very next press. See
+            # _mutate_saves.
+            paused, _ = await self._mutate_saves(
+                ctx, entry, "its save state was reset", drop_state_files
+            )
         except OSError as error:
             log.warning("Could not delete a Retro save state.", exc_info=True)
             await self._safe_send(ctx, f"The save state could not be deleted: {error}")
@@ -1100,11 +1186,15 @@ class SavesMixin(MixinMeta):
             return
 
         # Same rule as everything else in this group: the live core holds the
-        # authoritative copy and would write it straight back over this.
-        paused = await self._pause_for_saves(ctx, entry, "its save was rolled back")
+        # authoritative copy and would write it straight back over this, so
+        # the swap runs via _mutate_saves, with the session asleep and its
+        # lock held so no press can wake it mid-swap.
         try:
-            swapped = await asyncio.to_thread(
-                self._rollback_saves, ctx.channel.id, entry.slug
+            paused, swapped = await self._mutate_saves(
+                ctx,
+                entry,
+                "its save was rolled back",
+                lambda: self._rollback_saves(ctx.channel.id, entry.slug),
             )
         except OSError as error:
             log.warning("Could not roll a Retro save back.", exc_info=True)
@@ -1150,11 +1240,21 @@ class SavesMixin(MixinMeta):
         promotion, so the command is its own undo: the file being rolled back
         from lands in the backup slot instead of being deleted.
 
-        Done through a third name so that neither file is ever lost if the
-        process dies between the two renames -- the worst case leaves a
-        ``.bak`` and a ``.rollback`` and no live file, and the restore chain
-        then falls through to the battery save rather than to nothing. Each
-        rename is atomic on its own.
+        Done through a third name (ROLLBACK_SUFFIX) so that neither file is
+        ever lost if the process dies mid-swap, and so that every crash point
+        is put right at the next cog load by ``_sweep_partial_writes``. Each
+        rename is atomic on its own, so a crash can only land between them,
+        and each gap is recoverable from the shape it leaves (the full
+        reasoning is on :meth:`StorageMixin._recover_rollback`):
+
+        * between (1) live -> spare and (2) backup -> live, the live slot is
+          empty and the spare holds the newest save; the sweep puts it back.
+        * between (2) and (3) spare -> backup, the backup slot is empty and
+          the spare holds what used to be live; the sweep finishes the swap.
+
+        Until that sweep runs, the worst a boot sees is one missing slot,
+        which the restore chain answers by falling through to whatever it
+        still has -- never a lost generation.
         """
         swapped: typing.List[str] = []
         state, state_backup, sram, sram_backup = self._save_paths(channel_id, slug)
@@ -1164,7 +1264,7 @@ class SavesMixin(MixinMeta):
         ):
             if not backup.is_file():
                 continue
-            spare = live.with_name(live.name + ".rollback")
+            spare = live.with_name(live.name + ROLLBACK_SUFFIX)
             try:
                 if live.is_file():
                     live.replace(spare)
@@ -1255,9 +1355,14 @@ class SavesMixin(MixinMeta):
             )
             return
 
-        paused = await self._pause_for_saves(ctx, entry, "its save data was deleted")
-        removed = await asyncio.to_thread(
-            self._delete_saves, ctx.channel.id, entry.slug
+        # Via _mutate_saves, so a press arriving while the confirmation sat
+        # on screen cannot have woken a core that would write everything
+        # straight back; see the helper.
+        paused, removed = await self._mutate_saves(
+            ctx,
+            entry,
+            "its save data was deleted",
+            lambda: self._delete_saves(ctx.channel.id, entry.slug),
         )
         if removed is None:
             await self._safe_send(
@@ -1360,28 +1465,58 @@ class SavesMixin(MixinMeta):
             return
         state, sram = incoming
 
+        # Two fates for what is already there, and the question must not mix
+        # them up. A file that is *overwritten* is rotated into the backup
+        # slot first (see _write_import), so `rollback` really can bring it
+        # back. The save state a battery-save-only import removes is
+        # *deleted*, both generations of it, and cannot -- so promising the
+        # rollback there would be promising something the command cannot do.
         replacing = []
         if sram is not None and entry.has_sram:
             replacing.append(
                 f"its in-game save ({self._humanize_bytes(entry.sram_size)})"
             )
-        if entry.has_state:
-            # Even a battery-save-only import takes the state with it; see
-            # below and the note in the docstring.
+        if state is not None and entry.has_state:
             replacing.append(
                 f"its save state ({self._humanize_bytes(entry.state_size)})"
             )
-        if replacing:
-            question = (
-                f"Importing this will overwrite {humanize_list(replacing)} for "
-                f"**{entry.game_name}**. What is there now is kept as the "
-                f"previous generation, so `{ctx.clean_prefix}retrosaves "
-                f"rollback {entry.slug}` can swap back to it \N{EM DASH} but "
-                "only until the next automatic save rotates it out, so "
-                f"`{ctx.clean_prefix}retrosaves export {entry.slug}` is the "
-                "way to keep a copy. Go ahead?"
+        deleting_state = state is None and (
+            entry.has_state or entry.has_state_backup
+        )
+        if replacing or deleting_state:
+            sentences = []
+            if replacing:
+                sentences.append(
+                    f"Importing this will overwrite {humanize_list(replacing)} "
+                    f"for **{entry.game_name}**. What is there now is kept as "
+                    f"the previous generation, so `{ctx.clean_prefix}retrosaves "
+                    f"rollback {entry.slug}` can swap back to it \N{EM DASH} "
+                    "but only until the next automatic save rotates it out."
+                )
+            if deleting_state:
+                sized = (
+                    f" ({self._humanize_bytes(entry.state_size)})"
+                    if entry.has_state
+                    else ""
+                )
+                sentences.append(
+                    (
+                        "It will also delete its"
+                        if replacing
+                        else f"Importing this will delete **{entry.game_name}**'s"
+                    )
+                    + f" save state{sized} outright, the previous generation "
+                    "of it included \N{EM DASH} a save state is the whole "
+                    "machine and either copy would be restored over the top "
+                    "of the in-game save you are bringing in. A deleted save "
+                    "state cannot be rolled back."
+                )
+            keep = "both " if deleting_state and entry.has_state else ""
+            sentences.append(
+                f"`{ctx.clean_prefix}retrosaves export {keep}{entry.slug}` "
+                "first is the way to keep a copy. Go ahead?"
             )
-            if not await self._confirm(ctx, question):
+            if not await self._confirm(ctx, " ".join(sentences)):
                 await self._safe_send(
                     ctx, f"Left **{entry.game_name}**'s save alone."
                 )
@@ -1402,9 +1537,20 @@ class SavesMixin(MixinMeta):
             return
 
         try:
-            written = await asyncio.to_thread(
-                self._write_import, ctx.channel.id, entry.slug, state, sram
+            # Via _mutate_saves rather than straight to a thread: the check
+            # above took whole seconds of core boot, and any button press
+            # during it woke the session from the old files. Written under a
+            # core that came back like that, the import would be silently
+            # overwritten by its very next automatic save -- so the session
+            # is put back to sleep, under its own lock, and stays there until
+            # the imported files are on disk.
+            paused_again, written = await self._mutate_saves(
+                ctx,
+                entry,
+                "a save was imported",
+                lambda: self._write_import(ctx.channel.id, entry.slug, state, sram),
             )
+            paused = paused or paused_again
         except OSError as error:
             log.warning("Could not write an imported Retro save.", exc_info=True)
             await self._safe_send(
@@ -1606,20 +1752,24 @@ class SavesMixin(MixinMeta):
             # put to sleep, exactly as starting a game would do.
             await self._evict_locked()
             try:
-                return await asyncio.to_thread(
+                outcome = await self.run_in_emulator_thread(
                     self._try_import, emulator, entry, state, sram
                 )
             except EmulatorError as error:
                 log.warning("Could not check an imported save: %s", error)
-                return (
+                outcome = (
                     f"**{entry.game_name}** could not be started to check the "
                     f"save against it: {error}"
                 )
             finally:
                 try:
-                    await asyncio.to_thread(emulator.stop)
+                    await self.run_in_emulator_thread(emulator.stop)
                 except Exception:
                     log.exception("Could not stop the import-check emulator.")
+        # Whatever this check put to sleep is told so now, with the lock given
+        # back rather than while it is held; see Retro._flush_refreshes.
+        await self._flush_refreshes()
+        return outcome
 
     def _try_import(
         self,
@@ -1672,11 +1822,18 @@ class SavesMixin(MixinMeta):
         """
         Put validated saves in place. Blocking. Returns what it wrote.
 
+        Everything *overwritten* is rotated into its backup slot first, so
+        `[p]retrosaves rollback` genuinely brings it back.
+
         A battery save imported on its own takes the existing save state with
-        it. A state is the whole machine and is restored *before* SRAM is even
-        looked at (see :func:`RetroView.restore_into`), so leaving the old one
-        there would restore the game over the top of the save that was just
-        brought in -- the import would look as though it had done nothing.
+        it -- deleted, not rotated. A state is the whole machine and is
+        restored *before* SRAM is even looked at (see
+        :func:`RetroView.restore_into`), so leaving the old one anywhere the
+        restore chain looks would restore the game over the top of the save
+        that was just brought in; the import would look as though it had done
+        nothing. That makes the old state the one thing an import destroys
+        for good, and the confirmation in ``retrosaves_import`` says exactly
+        that instead of promising a rollback it cannot deliver.
         """
         state_path, state_backup, sram_path, _ = self._save_paths(channel_id, slug)
         written: typing.List[str] = []
@@ -1692,7 +1849,11 @@ class SavesMixin(MixinMeta):
         elif sram is not None:
             # Both generations of the state go, for the reason in the
             # docstring: either of them would be restored over the top of the
-            # battery save that was just imported.
+            # battery save that was just imported. Deleted, not parked in the
+            # backup slot -- the restore chain boots from a lone
+            # ``.state.bak`` exactly as happily as from a live state, so
+            # "keeping" the old state there would make this import a silent
+            # no-op on the next boot.
             state_path.unlink(missing_ok=True)
             state_backup.unlink(missing_ok=True)
         return written

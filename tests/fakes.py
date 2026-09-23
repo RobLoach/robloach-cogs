@@ -20,6 +20,7 @@ import collections
 import io
 import sys
 import types
+import typing
 import zipfile
 from pathlib import Path
 
@@ -67,6 +68,19 @@ def _tiny_animation(seed, frames=FAKE_CLIP_FRAMES, size=(8, 8)):
         image.putpixel((0, 0), ((seed + index) % 251, index % 241, 7))
         images.append(image)
     return encode_animation(images, FAKE_FRAME_MS)
+
+
+class _FakeCapture(typing.NamedTuple):
+    """A captured-but-not-encoded fake clip.
+
+    The real one (clips.CapturedClip) carries Pillow images for the encoder
+    to enlarge; this one carries the finished bytes, because a fake clip is
+    made whole. What matters is that it is a distinct *kind* of thing from a
+    clip, so a cog that forgot to encode one would post this instead of
+    bytes and every clip assertion in the suite would say so.
+    """
+
+    payload: bytes
 
 
 class FakeEmulator:
@@ -181,6 +195,21 @@ class FakeEmulator:
         self.advance(1)
 
     def record(self, frames=None, *, scale=2, fps=15, presses=None):
+        return self.encode_captured(
+            self.record_frames(frames, scale=scale, fps=fps, presses=presses)
+        )
+
+    def record_frames(self, frames=None, *, scale=2, fps=15, presses=None):
+        """The capture half, as the real emulator splits it.
+
+        The real one hands back frames for the caller to encode, so that the
+        cog can capture with its emulator lock held and encode with it given
+        back (see RetroEmulator.record_frames and clips.encode_clip). This
+        fake has no frames to hand over, so it carries the bytes it would
+        have produced and ``encode_captured`` gives them straight back --
+        which keeps a fake clip byte-for-byte what it always was, while
+        still making the cog go through both halves.
+        """
         self._require()
         self.last_presses = list(presses or ())
         self.frame += frames or 300
@@ -189,8 +218,20 @@ class FakeEmulator:
             # open a clip and look at its last picture the way the channel
             # does. The frame count is the emulated frame number, so one clip
             # is still distinguishable from another.
-            return _tiny_animation(self.frame)
-        return b"RIFF\0\0\0\0WEBPVP8X" + f"frame={self.frame}".encode().ljust(58, b"\0")
+            return _FakeCapture(_tiny_animation(self.frame))
+        return _FakeCapture(
+            b"RIFF\0\0\0\0WEBPVP8X"
+            + f"frame={self.frame}".encode().ljust(58, b"\0")
+        )
+
+    @staticmethod
+    def encode_captured(captured):
+        """Hand back the bytes ``record_frames`` already made.
+
+        Deliberately tolerant of being handed real bytes: a test that builds
+        a clip some other way should not have to know about _FakeCapture.
+        """
+        return getattr(captured, "payload", captured)
 
     def screenshot(self, scale=2):
         self._require()

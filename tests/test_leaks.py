@@ -593,7 +593,12 @@ async def test_a_cancelled_start_still_frees_the_core(retro, monkeypatch):
 
     channel = retro.channel(9800)
     ctx = retro.context(channel)
-    monkeypatch.setattr(retro.viewmod.RetroView, "start", boot_then_cancel)
+    # `boot`, not `start`: the cog runs the two halves of starting a game on
+    # opposite sides of the emulator lock (the core comes up under it, the
+    # message goes out after it), and the half that leaves a core loaded is
+    # this one. Patching `start` proved nothing here once the cog stopped
+    # calling it.
+    monkeypatch.setattr(retro.viewmod.RetroView, "boot", boot_then_cancel)
     with pytest.raises(asyncio.CancelledError):
         await retro.start_game(ctx, "cancelme")
 
@@ -670,8 +675,10 @@ async def test_a_rom_the_core_will_not_digest_leaves_nothing_behind(retro, when)
     with real cores and genuinely corrupted cartridges: here the fake is
     simply made to fail the way a core does, at the two points it can --
     refusing the content (``start``) and falling over while the first clip is
-    being recorded (``record``). Both land in ``_start_session``'s
-    EmulatorError branch and ``_abandon_session``.
+    being recorded (``record_frames`` -- the capture half, which is the half
+    that runs the core; encoding the frames afterwards touches nothing).
+    Both land in ``_start_session``'s EmulatorError branch and
+    ``_abandon_session``.
     """
     await retro.install_cores("gambatte")
     fake = retro.fakes["RetroEmulator"]
@@ -687,7 +694,7 @@ async def test_a_rom_the_core_will_not_digest_leaves_nothing_behind(retro, when)
 
     method, replacement = {
         "load": ("start", refuse_the_rom),
-        "run": ("record", die_mid_run),
+        "run": ("record_frames", die_mid_run),
     }[when]
     original = getattr(fake, method)
     setattr(fake, method, replacement)
@@ -1632,6 +1639,115 @@ async def test_cog_load_sweeps_the_orphans_itself(retro):
         await cog.cog_unload()
 
     assert not orphan.exists(), "cog_load did not sweep the data directory"
+
+
+# -- Interrupted rollbacks -----------------------------------------------------
+#
+# `[p]retrosaves rollback` swaps a save with its previous generation through
+# three renames, parking the live file at ``<name>.rollback`` in between. A
+# crash can only land between two atomic renames, and each gap identifies
+# itself by which ordinary slot is empty -- so the sweep can always put the
+# stranded file back instead of leaving (or deleting) what may be the only
+# copy of the channel's newest save. See StorageMixin._recover_rollback.
+
+
+def test_a_rollback_stranded_before_the_swap_is_put_back(retro):
+    """Crash after rename (1): the live slot is empty, the spare is newest."""
+    cog = retro.cog
+    live = cog._state_path(9986, "stranded")
+    backup = cog._backup_path(live)
+    backup.write_bytes(b"STATE:1")
+    spare = live.with_name(live.name + ".rollback")
+    spare.write_bytes(b"STATE:2")
+
+    cog._sweep_partial_writes()
+
+    assert live.read_bytes() == b"STATE:2", "the newest save went back to its slot"
+    assert backup.read_bytes() == b"STATE:1", "the previous generation was untouched"
+    assert not spare.exists()
+
+
+def test_a_rollback_stranded_mid_swap_is_finished(retro):
+    """Crash after rename (2): the backup slot is empty, the spare was live."""
+    cog = retro.cog
+    live = cog._state_path(9987, "stranded")
+    live.write_bytes(b"STATE:1")  # the old backup, already promoted
+    spare = live.with_name(live.name + ".rollback")
+    spare.write_bytes(b"STATE:2")
+
+    cog._sweep_partial_writes()
+
+    assert live.read_bytes() == b"STATE:1"
+    assert cog._backup_path(live).read_bytes() == b"STATE:2", "the swap was finished"
+    assert not spare.exists()
+
+
+def test_a_rollback_orphaned_next_to_a_full_set_is_reclaimed(retro):
+    """Both slots occupied: no crash point of the swap leaves this shape.
+
+    The spare is a leftover that was then played past -- both generations it
+    could have belonged to have been written since -- so it is the one case
+    where deletion is safe, and the bytes count as reclaimed.
+    """
+    cog = retro.cog
+    live = cog._state_path(9988, "orphaned")
+    live.write_bytes(b"STATE:3")
+    cog._backup_path(live).write_bytes(b"STATE:2")
+    spare = live.with_name(live.name + ".rollback")
+    spare.write_bytes(b"x" * 1024)
+
+    freed = cog._sweep_partial_writes()
+
+    assert not spare.exists()
+    assert freed == 1024
+    assert live.read_bytes() == b"STATE:3"
+    assert cog._backup_path(live).read_bytes() == b"STATE:2"
+
+
+# -- The data directories are made once, and a write never trusts that ---------
+
+
+def test_the_data_directories_are_made_once_not_per_call(retro, monkeypatch):
+    """_data_dir sits under every path helper, on every press's autosave.
+
+    It used to mkdir() on every call, a pair of syscalls per path for a
+    directory that exists for the life of the install; the names created are
+    remembered on the instance instead, so the common case is a pure join.
+    """
+    from pathlib import Path
+
+    cog = retro.cog
+    cog._data_dir("states")
+    made = []
+    real = Path.mkdir
+
+    def counting(self, *args, **kwargs):
+        made.append(self)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", counting)
+    for _ in range(5):
+        cog._data_dir("states")
+
+    assert made == [], "a hot path paid mkdir syscalls for a directory it had made"
+
+
+def test_a_deleted_data_directory_cannot_break_a_save_write(retro):
+    """The memo can lie, and a lying memo must never cost a save.
+
+    A test (or somebody tidying the disk) can delete a directory the
+    instance remembers creating, so _write_atomic re-makes the parent itself
+    -- one extra syscall on the write path, none on the reads.
+    """
+    import shutil
+
+    states = retro.cog._data_dir("states")
+    target = retro.cog._state_path(9989, "survivor")
+    shutil.rmtree(states)
+
+    retro.cog._write_atomic(target, b"STATE:1".ljust(64, b"\0"), True)
+
+    assert target.read_bytes().rstrip(b"\0") == b"STATE:1"
 
 
 def test_a_save_state_is_flushed_to_the_platter_before_it_is_renamed(retro, monkeypatch):

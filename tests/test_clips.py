@@ -12,7 +12,12 @@ discord.py, without Red and without a libretro core:
   the cog paces its message edits against, and it has to be knowable before
   there is a clip to measure;
 * :func:`clip_size` -- how big the posted picture is, which is where the
-  per-console upscale was measured away.
+  per-console upscale was measured away;
+* :func:`encode_clip` -- the no-core half of recording, which turns the
+  native-size pictures ``record_frames`` captured into the posted bytes.
+  Those tests are the one part of this file that needs Pillow, and they skip
+  without it rather than costing the rest of the file its
+  nothing-installed-at-all property.
 
 tests/test_emulator.py holds the same two statements against real cores:
 continuity is proved there by recording two consecutive clips off a Game Boy
@@ -396,3 +401,114 @@ def test_a_core_reporting_no_aspect_ratio_falls_back_to_the_frame_s_own():
         assert C.clip_size(256, 224, aspect) == (512, 448)
         assert C.clip_size(320, 240, aspect) == (320, 240)
     assert C.clip_size(160, 144, 0.0) == (320, 288)
+
+
+# -- Encoding a captured clip ---------------------------------------------------
+#
+# encode_clip is the half of RetroEmulator.record that needs no core: it takes
+# the native-size pictures record_frames captured (a CapturedClip) and
+# produces the posted bytes, enlarging each distinct picture once on the way.
+# What matters is pixel identity with what record() always produced -- resize
+# every frame, then encode_animation -- because record() is now nothing but
+# these two halves glued together. Pillow is the one dependency, so these
+# tests skip without it rather than dragging it into the rest of this file,
+# which runs with nothing installed at all.
+
+
+def _pictures(count, size=(16, 12), seed=3):
+    """``count`` small RGB images, every one distinct, plus the Image module."""
+    Image = pytest.importorskip("PIL.Image", reason="encoding a clip needs Pillow")
+    images = []
+    for index in range(count):
+        image = Image.new("RGB", size, (20, 40, 60))
+        image.putpixel((index % size[0], 0), ((seed * (index + 1)) % 251, 90, 7))
+        images.append(image)
+    return Image, images
+
+
+def test_encode_clip_is_the_resize_record_used_to_do_then_encode_animation():
+    """Pixel identity of the split against the old inline resize.
+
+    record() used to enlarge every captured frame to the posted size and hand
+    the lot to encode_animation; encode_clip does the same NEAREST resize at
+    encode time instead. Same resize, same encoder, same arguments -- so the
+    bytes must match exactly, which is what lets record() stay a thin wrapper
+    without changing a single posted clip.
+    """
+    Image, images = _pictures(4)
+    durations = [67, 67, 50, 17]
+    size = (32, 24)
+    old_way = C.encode_animation(
+        [image.resize(size, Image.NEAREST) for image in images], durations
+    )
+    new_way = C.encode_clip(C.CapturedClip(images, durations, size))
+    assert new_way == old_way
+    assert new_way[:4] == b"RIFF" and new_way[8:12] == b"WEBP"
+
+
+def test_a_picture_already_at_the_posted_size_is_not_resized_or_copied():
+    # A frame whose native size *is* the posted size (a square-pixel core at
+    # 1x) goes to the encoder untouched, so the common TV-console case pays
+    # for no comparison bytes either.
+    Image, images = _pictures(3)
+    durations = [67, 50, 17]
+    same = C.encode_clip(C.CapturedClip(images, durations, images[0].size))
+    assert same == C.encode_animation(images, durations)
+
+
+def test_a_run_of_identical_pictures_costs_one_resize_and_the_same_bytes():
+    """The dedup, and that it is invisible in the output.
+
+    libwebp merges identical consecutive frames anyway (that is why a static
+    screen costs a handful of bytes), so enlarging each copy of a picture the
+    encoder was about to fold away was pure waste -- a one second clip of a
+    menu is sixteen captures of one picture. The bytes comparison that spots
+    the run must only skip work, never change what the encoder is given.
+    """
+    Image, distinct = _pictures(2)
+    still, moved = distinct
+    images = [still, still.copy(), still.copy(), moved]
+    durations = [67, 67, 50, 17]
+    size = (32, 24)
+
+    resizes = []
+    original = Image.Image.resize
+
+    def counting(self, *args, **kwargs):
+        resizes.append(1)
+        return original(self, *args, **kwargs)
+
+    Image.Image.resize = counting
+    try:
+        deduped = C.encode_clip(C.CapturedClip(images, durations, size))
+    finally:
+        Image.Image.resize = original
+
+    assert len(resizes) == 2, "three copies of one picture should resize once"
+    naive = C.encode_animation(
+        [image.resize(size, Image.NEAREST) for image in images], durations
+    )
+    assert deduped == naive
+
+
+def test_a_mid_clip_geometry_change_still_encodes_frames_of_one_size():
+    """SET_GEOMETRY mid-clip: the pinned size wins, in one resize per frame.
+
+    The posted size is decided from the first captured frame (see
+    CapturedClip.size); a picture of any other geometry -- the SNES switching
+    to hi-res part-way through a clip -- is taken from its own resolution to
+    the posted one in a single NEAREST step, exactly as the capture-time
+    resize did, so no animation frame can disagree with its siblings about
+    the size and no pixel is ever resized twice on the way.
+    """
+    Image, _ = _pictures(1)
+    lores = Image.new("RGB", (16, 12), (10, 20, 30))
+    hires = Image.new("RGB", (32, 24), (40, 50, 60))
+    hires.putpixel((31, 23), (1, 2, 3))
+    size = (20, 12)
+    data = C.encode_clip(C.CapturedClip([lores, hires], [67, 17], size))
+    expected = C.encode_animation(
+        [lores.resize(size, Image.NEAREST), hires.resize(size, Image.NEAREST)],
+        [67, 17],
+    )
+    assert data == expected

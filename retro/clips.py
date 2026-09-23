@@ -122,7 +122,7 @@ MIN_AFTERMATH_FRAMES = 1
 # recording: the pre-roll is emulated in front of it, so the clip still plays
 # for exactly as long as the window it photographed emulated, and every frame
 # the pre-roll ran through is a frame the player had already seen (that is the
-# stopping condition). See RetroEmulator.record.
+# stopping condition). See RetroEmulator.record_frames.
 #
 # Measured on a Raspberry Pi 5 against the real cores at the default 160ms
 # hold, boot + 3 seconds, one button held from frame 0 -- how many emulated
@@ -523,7 +523,7 @@ def capture_plan(
 
     Returns ``[(frame index, emulated frames that picture stands for), ...]``,
     oldest first, where the index is the 0-based frame of the recording --
-    exactly what ``RetroEmulator.record`` counts with. The picture taken on
+    exactly what ``RetroEmulator.record_frames`` counts with. The picture taken on
     index ``i`` shows the game after ``i + 1`` emulated frames, and stands
     until the next picture is taken, so the durations always add up to
     ``frames`` and the clip plays for as long as it emulated.
@@ -570,7 +570,7 @@ def clip_plan(
     :func:`capture_plan` in milliseconds: which frames, shown for how long.
 
     ``[(frame index, that picture's duration in ms), ...]``, oldest first --
-    exactly the durations ``RetroEmulator.record`` hands the encoder, and
+    exactly the durations ``RetroEmulator.record_frames`` captures with, and
     therefore exactly what ends up in the clip's ANMF chunks. A picture
     stands for ``covered`` emulated frames and is shown for as long as those
     frames took to emulate, which is what makes the clip play for as long as
@@ -651,7 +651,7 @@ def preroll_budget(
     The pre-roll plays the press out without photographing it, until the
     picture stops being the one the previous clip left in the channel; this is
     the ceiling on how far it will look. See PREROLL_SECONDS for the
-    measurements, and :meth:`RetroEmulator.record` for the mechanism.
+    measurements, and :meth:`RetroEmulator.record_frames` for the mechanism.
 
     Three things cap it, and the smallest wins:
 
@@ -916,3 +916,72 @@ def encode_animation(images, duration_ms) -> bytes:
     except Exception as exc:
         raise EmulatorError(f"The clip could not be encoded: {exc}") from exc
     return buffer.getvalue()
+
+
+class CapturedClip(typing.NamedTuple):
+    """A recorded-but-not-yet-encoded clip: what ``record_frames`` hands over.
+
+    Everything :func:`encode_clip` needs and nothing that touches a core,
+    which is the point of splitting the two: capturing frames needs the
+    emulator (and therefore whatever lock serializes access to it), encoding
+    them does not, so a caller can capture under the lock, release it, and
+    encode -- the most expensive CPU step of a button press -- while the next
+    press is already emulating.
+    """
+
+    #: The captured pictures as Pillow images, oldest first, each at the
+    #: core's own resolution rather than the posted size. That is what makes
+    #: holding a clip's worth of them cheap: the posted picture is up to
+    #: MAX_CLIP_SCALE times the frame in each direction (a Game Boy's 160x144
+    #: posts at 320x288), so output-sized frames cost scale-squared the
+    #: memory of native ones for no information at all -- the enlargement
+    #: only ever repeats pixels.
+    images: typing.List
+    #: Milliseconds each picture is shown for, one entry per image; see
+    #: :func:`clip_plan`, whose durations these are.
+    durations: typing.List[int]
+    #: The ``(width, height)`` the clip is posted at (see :func:`clip_size`),
+    #: decided from the first captured frame and pinned there, so a core that
+    #: changes resolution mid-clip (libretro's SET_GEOMETRY; the SNES does)
+    #: cannot change the answer part-way through.
+    size: typing.Tuple[int, int]
+
+
+def encode_clip(captured: CapturedClip) -> bytes:
+    """Turn a :class:`CapturedClip` into the WebP bytes the cog posts.
+
+    The other half of ``RetroEmulator.record``, and deliberately a plain
+    function of the captured data rather than a method: it needs no core, so
+    a caller serializing emulator access can run it with the lock released.
+
+    Each picture is enlarged from the core's resolution to ``captured.size``
+    with NEAREST here -- the same single resize the recording used to do per
+    frame at capture time, so the bytes that come out are identical -- and
+    only once per *run* of identical pictures: libwebp already merges
+    identical consecutive frames (which is why a static screen costs a
+    handful of bytes, see :func:`encode_animation`), so resizing every copy
+    of a picture the encoder was about to fold away was pure waste. Spotting
+    a run costs one ``tobytes()`` per native-sized frame, which is far
+    cheaper than the resize it skips.
+
+    A picture whose size is not ``captured.size`` -- every frame of a 1x
+    console, and any frame from a mid-clip geometry change -- goes straight
+    from its own resolution to the posted one in that single step, never
+    through a chain, so no frame handed to the encoder can disagree with its
+    siblings about the size.
+    """
+    images, durations, size = captured
+    Image = _pillow()
+    size = tuple(size)
+    posted = []
+    last_key = None
+    last_resized = None
+    for image in images:
+        if image.size != size:
+            key = (image.size, image.tobytes())
+            if key != last_key:
+                last_key = key
+                last_resized = image.resize(size, Image.NEAREST)
+            image = last_resized
+        posted.append(image)
+    return encode_animation(posted, durations)

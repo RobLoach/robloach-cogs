@@ -47,8 +47,11 @@ ZIP_MAGIC = b"PK\x03\x04"
 # How many names an error message lists before it gives up and counts.
 MAX_LISTED_MEMBERS = 8
 
-# Archive noise that is never the file anyone wanted.
-JUNK_PREFIXES = ("__MACOSX/", "__macosx/")
+# Archive noise that is never the file anyone wanted. Compared per path
+# *component* (case-insensitively, after separators are normalised), because
+# macOS's resource-fork folder shows up nested (``sub/__MACOSX/._rom.gb``)
+# and Windows repackers write it with backslashes (``__MACOSX\``).
+JUNK_COMPONENTS = frozenset({"__macosx"})
 
 # How many folders deep a member may sit before it is refused. Real firmware
 # sets nest one or two deep at most (``dc/dc_boot.bin``, ``np2kai/FONT.ROM``);
@@ -60,8 +63,24 @@ MAX_MEMBER_DEPTH = 4
 # (``disksys.rom``, ``scph5501.bin``) and silently storing a file under a
 # mangled name would produce a BIOS the core can never find -- worse than
 # refusing it and saying so. The leading character must be alphanumeric, which
-# is also what keeps dotfiles and ``..`` out.
-SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ +-]{0,63}")
+# is also what keeps dotfiles and ``..`` out. The *final* character may not be
+# a dot or a space either: Windows (a supported host) strips those when
+# writing, so ``foo.`` would silently land on disk as ``foo`` -- exactly the
+# mangling this regex exists to refuse.
+SAFE_COMPONENT = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._ +-]{0,62}[A-Za-z0-9_+-])?")
+
+# Names that NT resolves as device aliases *before* it ever looks at a
+# directory -- and it does so on the stem alone, so ``aux.rom`` is the AUX
+# device wearing a costume. On a Windows-hosted bot, writing one would block
+# on (or write into) a device rather than produce a file any core could ever
+# read back, so these fail validation like any other unsafe name. COM0/LPT0
+# are included for the modern parser's sake; the superscript variants
+# (``COM¹``…) cannot get past SAFE_COMPONENT's ASCII-only character set.
+DOS_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{digit}" for digit in range(10)}
+    | {f"lpt{digit}" for digit in range(10)}
+)
 
 
 class ArchiveError(Exception):
@@ -96,8 +115,10 @@ class ExtractedArchive(typing.NamedTuple):
     """Everything usable :func:`extract_all` found in one archive."""
 
     files: typing.Tuple[ExtractedFile, ...]
-    #: Members that were refused (unsafe name, symlink, device node, too big),
-    #: so the caller can say how many were left behind.
+    #: Members that were refused (unsafe name, symlink, device node, too big,
+    #: a name that collides with an earlier member once case is ignored), so
+    #: the caller can say how many were left behind. A collision entry
+    #: carries its reason in parentheses after the member's name.
     skipped: typing.Tuple[str, ...]
     #: Every file member, sorted, whether it was taken or not.
     members: typing.Tuple[str, ...]
@@ -125,11 +146,23 @@ def is_zip(data: bytes) -> bool:
 
 
 def _is_junk(name: str) -> bool:
-    if name.startswith(JUNK_PREFIXES):
+    # Normalise separators before looking, exactly as safe_member_path does:
+    # a junk test on the raw name would wave through ``__MACOSX\._rom.gb``
+    # from a Windows-repacked archive, and a prefix test would wave through
+    # the nested ``sub/__MACOSX/._rom.gb`` -- either of which could then sort
+    # first and become the member a user's game is started from.
+    parts = str(name).replace("\\", "/").split("/")
+    if any(part.casefold() in JUNK_COMPONENTS for part in parts):
         return True
-    base = name.replace("\\", "/").rsplit("/", 1)[-1]
-    # Dotfiles in an archive are resource forks and editor droppings.
-    return not base or base.startswith(".")
+    # A dot-component anywhere is resource forks and editor droppings
+    # (``.DS_Store``, ``._rom.gb``, ``sub/.git/whatever``) -- the directory
+    # being hidden makes its contents droppings too. ``.`` and ``..`` are
+    # exempt: those are traversal syntax, not droppings, and belong to
+    # safe_member_path, which refuses them *loudly* (skipped and counted)
+    # rather than pretending they were never there.
+    if any(part.startswith(".") and part not in (".", "..") for part in parts):
+        return True
+    return not parts[-1]
 
 
 def describe_members(
@@ -149,11 +182,15 @@ def safe_member_path(name: str) -> typing.Optional[str]:
     Turn a member's name into a relative path that is safe to join, or None.
 
     Every component is validated against :data:`SAFE_COMPONENT`, which refuses
-    ``..``, ``.``, empty components, dotfiles, NUL bytes and anything outside a
-    small, boring character set. Both slash flavours are treated as separators,
-    so a Windows-built archive full of ``bios\\dc\\dc_boot.bin`` is handled the
-    same as a Unix one, and an absolute path or a drive letter is refused
-    outright rather than quietly relativised.
+    ``..``, ``.``, empty components, dotfiles, NUL bytes, anything outside a
+    small, boring character set, and a trailing dot or space (which Windows
+    would strip on write, storing the file under a name nobody validated).
+    Components whose stem is a DOS device name (``CON``, ``aux.rom``) are
+    refused too -- see :data:`DOS_DEVICE_NAMES`. Both slash flavours are
+    treated as separators, so a Windows-built archive full of
+    ``bios\\dc\\dc_boot.bin`` is handled the same as a Unix one, and an
+    absolute path or a drive letter is refused outright rather than quietly
+    relativised.
     """
     raw = str(name).replace("\\", "/")
     if not raw or "\x00" in raw:
@@ -167,6 +204,10 @@ def safe_member_path(name: str) -> typing.Optional[str]:
         return None
     for part in parts:
         if not SAFE_COMPONENT.fullmatch(part):
+            return None
+        # NT's device-name check uses the stem alone and ignores trailing
+        # spaces, so match both quirks (``NUL.bin``, ``con .rom``).
+        if part.split(".", 1)[0].rstrip(" ").casefold() in DOS_DEVICE_NAMES:
             return None
     return "/".join(parts)
 
@@ -331,6 +372,12 @@ def extract_all(
     skipped and counted rather than aborting the whole archive, because one
     stray symlink in an otherwise good BIOS pack should not cost the pack.
 
+    A member whose path matches an already-taken one when case is ignored is
+    skipped too: ``BIOS.bin`` and ``bios.bin`` are both individually fine, but
+    on the case-insensitive filesystems of Windows and macOS hosts the second
+    write would silently clobber the first, and which file survived would
+    depend on nothing but sort order.
+
     Three separate caps apply, and the *total* one is enforced twice -- once
     against the archive's own metadata before anything is decompressed, and
     again against the bytes actually produced, since a zip bomb lies about the
@@ -341,6 +388,9 @@ def extract_all(
     """
     taken: typing.List[ExtractedFile] = []
     skipped: typing.List[str] = []
+    # Casefolded path of every member taken so far, mapped back to the name
+    # it was taken under, so a collision can say what it collided with.
+    claimed_paths: typing.Dict[str, str] = {}
     total = 0
 
     with _open(data) as archive:
@@ -379,6 +429,18 @@ def extract_all(
             if path is None or not _is_regular_file(info):
                 skipped.append(info.filename)
                 continue
+            # Two members may differ only by case (``BIOS.bin``/``bios.bin``)
+            # and still each be safe on their own; on a case-insensitive
+            # disk the caller's second write would clobber the first, so the
+            # later member (sorted order, so always the same one) is skipped.
+            earlier = claimed_paths.get(path.casefold())
+            if earlier is not None:
+                skipped.append(
+                    f"{info.filename} (differs from `{earlier}` only by "
+                    "letter case; on a case-insensitive disk it would "
+                    "overwrite it)"
+                )
+                continue
             if info.file_size > max_file_size:
                 skipped.append(info.filename)
                 continue
@@ -416,6 +478,7 @@ def extract_all(
                 skipped.append(info.filename)
                 continue
             total += len(payload)
+            claimed_paths[path.casefold()] = info.filename
             taken.append(ExtractedFile(path, info.filename, payload))
 
     if not taken:

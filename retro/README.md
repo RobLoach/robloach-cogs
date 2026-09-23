@@ -304,7 +304,14 @@ message's controls are swapped for a single **▶️ Resume**, and its text says
 
 > Replaced by **µCity**. **Libbet** was saved — press Resume to come back to it.
 
-Pressing it starts that game again in that channel, right on that message: the
+Clicking one of the *old* controls on such a message — the ones that are no
+longer the channel's game — moves nothing, and says so privately rather than
+doing nothing visible at all: the game was saved, and it is either further
+down the channel or behind this message's own Resume button. Once per person,
+not once per click, because somebody who has not noticed the channel moved on
+will tap several buttons before deciding the bot is broken.
+
+Pressing Resume starts that game again in that channel, right on that message: the
 game it replaces is saved and retired in turn (and gets a Resume button of its
 own), anything live elsewhere is hibernated first, and the save state comes
 back. It keeps working after a bot restart, because what it needs is stored
@@ -320,7 +327,7 @@ the whole of this section:
 | | what it is | when it goes |
 | --- | --- | --- |
 | the **session** and **Resume** records | a pointer: *this message, in this channel, was playing this game* | by itself, as soon as it cannot resume anything |
-| the **save state** and **in-game save** | the player's progress, keyed by channel **and game** | only when somebody asks (`[p]retrosaves delete`), or when the per-channel game cap drops that game entirely |
+| the **save state** and **in-game save** | the player's progress, keyed by channel **and game** | only when somebody asks (`[p]retrosaves delete`) |
 
 Because progress is keyed by channel and game rather than by message,
 **dropping a record loses the button and nothing else**. If the channel's game
@@ -332,7 +339,11 @@ automatically in four cases:
 
 * **the cached ROM it named was pruned**, by the disk budget or by the
   per-channel cap of five games. A Resume button without its ROM can only
-  apologise;
+  apologise. **The save it points at is kept either way**: the cap drops the
+  cached ROM and nothing else, so a sixth game does not cost the oldest one
+  its progress, and `[p]retro <name>` re-downloads the ROM and picks the save
+  straight back up. It used to take all four save files with it, which was
+  the one place the promise below was not kept;
 * **the channel or thread was deleted**;
 * **the bot left the server** (or was thrown out of it);
 * **the bot can no longer see the channel at all**, which is the same thing
@@ -662,7 +673,13 @@ Four rules, and each of them is there for a reason:
   queue on their own. A second click from somebody who already has one waiting
   is refused and the first one stands — the message has already told them
   their press is queued, and quietly swapping it for something else would make
-  that acknowledgement a lie for a second;
+  that acknowledgement a lie for a second. **A refusal is said, privately**:
+  whoever clicked is told that they already have one waiting (or that all
+  three slots are taken), which nobody else sees and which costs no edit of
+  the game's message. It used to be answered with the same contentless
+  acknowledgement an accepted press gets, so a refused click and a queued one
+  looked identical — which is the "controller feels dead" complaint the queue
+  was built to answer, reintroduced at its edge;
 * **every waiting press is visible.** An input nobody can see is an input that
   feels lost, which is the whole complaint. The queue is listed as a suffix on
   the very line the running press is already rewriting, so it costs **no extra
@@ -698,8 +715,22 @@ so out loud, once, on the next line the session writes:
 > **µCity** · Rob undid the last press. *2 queued presses dropped*
 
 **Undo is deliberately not queueable.** A click that arrives while a press is
-being emulated is acknowledged and dropped rather than taken down: "one press
-back" queued three presses deep means undoing a press its author never saw.
+being emulated is dropped rather than taken down: "one press back" queued
+three presses deep means undoing a press its author never saw. It answers
+privately — "a press is still being emulated, click Undo again when its clip
+appears" — rather than doing nothing visible at all.
+
+**A press that lands while the game is being undone, rebooted or put to sleep
+is dealt with rather than left in the queue.** Those three take the session's
+lock without going through the press path, and a click landing while they hold
+it is taken down like any other. An undo runs them afterwards (they are
+ordinary next presses); a reboot and a sleep drop them, which is what both of
+those commands already promise, and say how many went. Left alone, one such
+entry sat in the queue with nothing coming to run it, which made every later
+click queue behind it for ever — a controller that answered nothing at all
+until the game hibernated. A press that finds a queue with no runner now
+starts one itself, so the state cannot persist even if some future path
+forgets.
 
 ### One clip at a time, at the speed you can watch them
 
@@ -740,7 +771,14 @@ Four things keep that from costing anything it should not:
 * **nothing else waits.** Only the edit is held back; the emulation and the
   encoding have already happened, and the single libretro core has already
   been given back, so another channel can start a game or press a button
-  during the wait;
+  during the wait. That is the rule everywhere, not just here: the one core
+  is held for **emulation and nothing else**. Turning the frames into a clip
+  is the most expensive step of a press and needs no core, so it happens with
+  the core already handed on; so does writing the save state every third
+  press, so does posting the first message of a game, and so does the edit
+  that tells another channel its game went to sleep. Each of those used to be
+  done while holding the core, which meant one channel's slow Discord request
+  or fsync was latency charged to every other channel's presses;
 * **no edit is held for more than 1.25 seconds.** A default clip really plays
   for 1.005s, so at the length this cog is played at every clip is paced in
   full — but `[p]retroset cliplength` reaches 15 seconds, and pacing a full
