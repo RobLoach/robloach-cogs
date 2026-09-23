@@ -356,13 +356,19 @@ async def test_the_settings_embed_describes_the_whole_install(retro):
 
 async def test_the_settings_embed_says_what_a_short_clip_does_to_a_press(retro):
     await retro.cog.config.clip_seconds.set(0.2)
+    # A 400ms hold, because the default 160ms one now fits even at the clip
+    # length floor: a 12 frame clip's input budget is frame 11 rather than the
+    # frame 8 it was before capture_plan started photographing the end of each
+    # span. 400ms is 24 frames, which still does not fit, and the ceiling is
+    # still announced rather than left to be discovered.
+    await retro.cog.config.hold_ms.set(400)
     ctx = retro.context(retro.channel(8602))
     await retro.cogmod.Retro.retroset_settings.callback(retro.cog, ctx)
 
     values = " ".join(field.value for field in ctx.sent[-1]["embed"].fields)
     assert "0.2 seconds of play" in values, values
     # The hold is a ceiling, and at a fifth of a second it is not honoured.
-    assert "held for about 133ms rather than the 160ms" in values, values
+    assert "held for about 183ms rather than the 400ms" in values, values
     # And the repeat button is absent rather than greyed out at this length;
     # see MIN_REPEAT_TAPS in retro/RetroView.py.
     assert "repeat button is not shown at this length" in values, values

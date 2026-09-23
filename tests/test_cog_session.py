@@ -109,12 +109,22 @@ async def test_retroset_cliplength_says_what_a_short_clip_does_to_a_press(retro)
     assert "repeat button taps 2 times" in ctx.sent[-1], ctx.sent[-1]
 
     await cliplength(retro.cog, ctx, 0.2)
-    assert "held for about 133ms" in ctx.sent[-1], ctx.sent[-1]
+    # The *default* hold fits even at the floor now: a 12 frame clip's input
+    # budget is frame 11 (see clips.input_budget, whose cadence moved when
+    # capture_plan started photographing the end of each span), which is more
+    # than the ten frames 160ms asks for. It used to be frame 8, i.e. ~133ms.
+    assert "held for about" not in ctx.sent[-1], ctx.sent[-1]
     # Not "greyed out" any more: at one tap the button is not drawn at all,
     # and the reply says so and says it comes back. See MIN_REPEAT_TAPS.
     assert "is not shown at this length" in ctx.sent[-1], ctx.sent[-1]
     assert "comes back" in ctx.sent[-1], ctx.sent[-1]
     assert "greyed out" not in ctx.sent[-1], ctx.sent[-1]
+
+    # A hold the floor really cannot honour still says so, which is what the
+    # note is for: 400ms is 24 frames and the clip can only spare 11.
+    await retro.cog.config.hold_ms.set(400)
+    await cliplength(retro.cog, ctx, 0.2)
+    assert "held for about 183ms rather than the 400ms" in ctx.sent[-1], ctx.sent[-1]
 
 
 async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro):

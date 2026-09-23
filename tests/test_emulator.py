@@ -464,7 +464,7 @@ def test_frames_are_counted_from_the_core_s_own_frame_rate(emu, gambatte, ucity)
 # purpose: 0.2 is MIN_CLIP_SECONDS and 5.0 is MAX_CLIP_SECONDS, which came
 # down from an unmeasured 15 (see the tables above MAX_CLIP_SECONDS in
 # retro/clips.py). A ceiling nothing records at is a ceiling nobody has
-# checked, and 5 seconds of Game Boy is 299 frames and 76 pictures.
+# checked, and 5 seconds of Game Boy is 299 frames and 75 pictures.
 CLIP_LENGTHS = [0.2, 0.5, 0.8, 1.0, 4.0, 5.0]
 
 
@@ -481,11 +481,15 @@ def test_a_fractional_clip_length_is_a_real_number_of_frames(
 
     step = capture_step(emulator)
     budget = input_budget(emulator, frames)
-    # Input has to be released on a frame that is actually photographed, and
-    # at least one picture of the clip has to be left over to show it.
-    assert budget % step == 0
+    plan = E.capture_plan(frames, step)
+    # Input has to be released on a frame that is actually photographed and
+    # worth a whole step of playback, and at least one picture of the clip has
+    # to be left over to show it. The cadence is the *end* of each span, so a
+    # captured frame is one short of a multiple of the step.
+    assert (budget + 1) % step == 0
+    assert dict(plan)[budget] == step
     assert 1 <= budget <= frames - 1
-    assert -(-frames // step) >= 2, "two pictures is the least that animates"
+    assert len(plan) >= 2, "two pictures is the least that animates"
 
 
 def test_a_longer_hold_really_does_reach_the_core(emu, gambatte, ucity):
@@ -576,11 +580,12 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
     # the step lands around frame 26 of 60 and the clip shows the rest.
     assert tiles(160, input_budget(poke, clip)) == 1, "the step finishes inside the clip"
 
-    # The shortest clip the settings allow still registers the press: the
-    # hold is cut to the 8 frames a 12 frame clip can show being released,
-    # which is ~134ms and still over the ~100ms a game needs to see a press.
-    # A walk cycle is 16 frames and the clip is 12, so the tile it walks to
-    # is credited during the *next* clip -- the press is not lost, it lands a
+    # The shortest clip the settings allow still registers the press: a 12
+    # frame clip's input budget is frame 11, so the whole 160ms (ten frames)
+    # fits and is not cut at all -- it used to be clamped to the 8 frames the
+    # old capture cadence could show being released, i.e. ~134ms. A walk cycle
+    # is 16 frames and the clip is 12 either way, so the tile it walks to is
+    # credited during the *next* clip -- the press is not lost, it lands a
     # clip later, which is the honest cost of a 0.2 second clip.
     short = poke.clip_frames(E.MIN_CLIP_SECONDS)
     assert tiles(160, short) == 0, "unexpectedly quick: recheck the comment above"
@@ -641,15 +646,18 @@ def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
     assert 1 <= len(durations) <= captured
     assert all(duration > 0 for duration in durations)
     if len(durations) == captured:
-        # Every picture stands until the next one is taken, which is a whole
-        # step except in the tail: a 30 frame clip is seven 67ms pictures,
-        # then frame 29 for 33ms and the closing frame 30 for 17ms. Calling
-        # any of those a full 67ms played a half-second clip 7% slow.
+        # Every picture stands for the frames ending on it, which is a whole
+        # step except for the appended closing one: a 30 frame clip is seven
+        # 67ms pictures and then frame 30 for 33ms. Calling that short one a
+        # full 67ms played a half-second clip 7% slow.
         expected = [
             max(1, round(1000 * covered / emulator.fps)) for _, covered in plan
         ]
         assert durations == expected, (durations, expected)
-        assert set(durations[:-2]) <= {frame_ms} or captured <= 2, set(durations)
+        # Only the closing picture can ever be short, which is tighter than
+        # it used to be: the old frame-0 cadence left a ragged two-picture
+        # tail, so this had to allow for durations[-2] as well.
+        assert set(durations[:-1]) <= {frame_ms} or captured <= 1, set(durations)
         assert 0 < durations[-1] <= frame_ms, durations[-1]
     emulated = 1000 * frames / emulator.fps
     assert abs(sum(durations) - emulated) / emulated < 0.01, (sum(durations), emulated)
@@ -658,7 +666,7 @@ def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
     # (see MAX_PACE_SECONDS in retro/RetroView.py). Merged frames or not, the
     # arithmetic and the bytes agree exactly.
     assert sum(durations) == round(1000 * E.playback_seconds(emulator.fps, frames))
-    # Every picture of the clip is worth having: a fifth of a second is four
+    # Every picture of the clip is worth having: a fifth of a second is three
     # of them, not one.
     assert captured >= 2 and len(data) > 0
 
@@ -753,9 +761,10 @@ def test_a_clip_of_a_moving_game_opens_on_a_picture_nobody_has_seen(
     """uCity animates every frame, so one frame is enough to move the picture.
 
     The control for the whole seam section below: on a game that is never
-    still, the clip's opening picture -- taken one emulated frame after the
+    still, the clip's opening picture -- taken a whole capture step after the
     previous clip's closing one -- is already new, and so is the one after it.
-    A game that *is* still is a different matter and is covered further down.
+    A game that reacts more slowly is a different matter and is covered
+    further down, by the latency probes.
     """
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
@@ -773,10 +782,18 @@ def test_a_clip_of_a_moving_game_opens_on_a_picture_nobody_has_seen(
 # -- 3a. The seam: where one clip stops and the next one starts ---------------
 #
 # A picture is taken *after* an emulated frame, so the last picture of a clip
-# is its window's last frame and the first picture of the next clip is the
-# very next one. That one-frame seam is the whole contract: press, clip,
-# press, clip is an unbroken run of console frames with nothing shown twice
-# and nothing run past unseen.
+# is its window's last frame and the next clip picks the console up on the
+# very next one. That is the whole contract: press, clip, press, clip is an
+# unbroken run of console frames with nothing emulated twice and nothing run
+# past unaccounted for, and the still left in the channel is exactly where the
+# next clip resumes.
+#
+# The next clip's first *picture* is a capture step later than that, not a
+# frame: capture_plan photographs the end of each span so that a press
+# scheduled on frame 0 has had time to land. The frames in between are
+# emulated and counted in that picture's duration, never skipped -- which is
+# the difference between this and the pre-roll below, and which the frame
+# counts these tests take are what prove.
 #
 # It was not always kept. A clip that opened with a press used to run a
 # bounded **pre-roll** first -- the press down, the core running,
@@ -806,8 +823,10 @@ def test_a_clip_of_a_moving_game_opens_on_a_picture_nobody_has_seen(
 #
 # What the tests below pin, against real cores:
 #
-# * the seam is exactly one emulated frame, with a press and without one;
-# * a game that is moving never repeats a picture across it;
+# * the windows are adjacent, with a press and without one, and the pictures
+#   keep a uniform step across the boundary;
+# * a game that is moving never repeats a picture across it, and a game that
+#   answers within a step of the press does not either;
 # * a game that is *not* moving repeats it and still gets a full length clip,
 #   which is the case a lead-in trim would have turned into a 17ms flash;
 # * the clip's own frame rate cannot move any of this.
@@ -900,18 +919,27 @@ def test_the_seam_between_two_clips_is_exactly_one_emulated_frame(
 
     Two clips back to back, then the same window rewound and emulated one
     frame at a time with exactly the same input, for a reference picture per
-    absolute frame. The first clip has to finish on reference frame N and the
-    second has to open on reference frame N+1 -- adjacent, neither repeated
-    nor skipped -- whether the clips have a press in them or not, and whether
-    the game is animating or sitting still.
+    absolute frame. The first clip has to finish on reference frame N, so the
+    still picture left in the channel is the state the second clip picks the
+    console up on; the second clip's own window is N+1 onwards, and every
+    picture of both clips has to be its reference frame -- nothing repeated,
+    nothing skipped -- whether the clips have a press in them or not, and
+    whether the game is animating or sitting still.
+
+    The second clip's first *picture* is a step past N rather than N+1,
+    because capture_plan photographs the end of each span (which is what gives
+    a press at frame 0 time to land). Frames N+1 .. N+step-1 are emulated all
+    the same and stand behind that picture's duration; the `timeline` count
+    below is what proves it.
     """
     core, rom_name, button, boot, _moves = SEAM_PROBES[probe]
     emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
     emulator.advance(emulator.frames_for_seconds(boot))
     frames = emulator.clip_frames(E.CLIP_SECONDS)
+    step = capture_step(emulator)
     hold = frames_for_ms(emulator, 160)
     presses = [(button, 0, hold)] if pressed else []
-    captured = len(E.capture_plan(frames, capture_step(emulator)))
+    captured = len(E.capture_plan(frames, step))
     state = emulator.save_state()
 
     emulator.load_state(state)
@@ -939,13 +967,14 @@ def test_the_seam_between_two_clips_is_exactly_one_emulated_frame(
     assert first_shots[-1] == reference[frames - 1], (
         "the first clip does not finish on its own last emulated frame"
     )
-    assert second_shots[0] == reference[frames], (
-        "the second clip does not open on the very next emulated frame"
+    plan = [index for index, _ in E.capture_plan(frames, step)]
+    assert second_shots[0] == reference[frames + plan[0]], (
+        "the second clip does not open on the end of its first span"
     )
+    assert plan[0] == step - 1, "the opening picture is not a whole step in"
     # ...and it opens on that frame rather than merely matching it by
     # accident on a screen where several frames look alike: the whole of both
     # clips is the reference run, in order, with nothing missing.
-    plan = [index for index, _ in E.capture_plan(frames, capture_step(emulator))]
     assert first_shots == [reference[index] for index in plan]
     assert second_shots == [reference[frames + index] for index in plan]
     # Neither clip lost a picture to any of this, and both are still clips.
@@ -957,11 +986,18 @@ def test_the_seam_between_two_clips_is_exactly_one_emulated_frame(
 def test_the_clip_frame_rate_does_not_move_the_seam(emu, gambatte, ucity, clip_fps):
     """"Is there something we can do in the framerate to fix it?" -- no.
 
-    capture_plan photographs frame 0 and the final frame at every cadence, so
-    the seam is one emulated frame at 10, 15, 20 and 60 fps alike; all
-    CLIP_FPS changes is how many pictures fill the middle of a clip. uCity is
-    the probe because it moves every frame, so an off-by-one at either end
-    would show up as a picture that does not match its reference.
+    capture_plan photographs the window's final frame at every cadence, so the
+    picture left in the channel is the state the next clip resumes from at 10,
+    15, 20 and 60 fps alike, and the next window still begins on the very next
+    emulated frame. uCity is the probe because it moves every frame, so an
+    off-by-one at either end would show up as a picture that does not match
+    its reference.
+
+    What the rate *does* change is how many pictures fill a clip and, with
+    them, how far into its window the opening picture is taken -- one step,
+    which at 60 fps is a single frame. That is the wrong direction for the
+    reaction-latency problem this cog actually had, and it is why the answer
+    was the sampling phase rather than CLIP_FPS.
     """
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
@@ -974,10 +1010,10 @@ def test_the_clip_frame_rate_does_not_move_the_seam(emu, gambatte, ucity, clip_f
     _second, second_shots = photographed(emulator, frames, clip_fps=clip_fps)
 
     emulator.load_state(state)
-    reference = frame_by_frame(emulator, set(), "a", frames + 1)
+    reference = frame_by_frame(emulator, set(), "a", frames + step)
 
     assert first_shots[-1] == reference[frames - 1]
-    assert second_shots[0] == reference[frames]
+    assert second_shots[0] == reference[frames + step - 1]
     # The cadence really did change, or the above says nothing about it.
     assert len(first_shots) == len(E.capture_plan(frames, step))
     assert reference[frames - 1] != reference[frames], "nothing moved at all"
@@ -1070,6 +1106,100 @@ def test_a_completely_static_screen_still_produces_a_whole_clip(assets, emu, pro
     assert len(payload) > 0
 
 
+#: Probes for reaction latency: (core, ROM, button, boot seconds, the first
+#: emulated frame after the button goes down whose picture differs at all).
+#:
+#: Measured on a Raspberry Pi 5 with the button held from frame 0, after one
+#: press has already been made so the screen is where a *second* press finds
+#: it. These are what chose the capture phase: capture_plan takes its first
+#: picture at the end of the first span, i.e. after ``step`` emulated frames
+#: (four at the default CLIP_FPS), so every core whose latency is at or under
+#: the step opens its clip on the game already reacting.
+#:
+#: mgba is the exception and is in the table to say so honestly: eleven frames
+#: is nearly three pictures, so a GBA clip can still open on one or two copies
+#: of the held picture. No sampling phase can fix that without skipping game
+#: time, which is what the pre-roll did and why it is gone.
+PRESS_LATENCY = {
+    "ucity": ("gambatte", "ucity.gbc", "down", 3, 1),
+    "nestest-down": ("fceumm", "nestest.nes", "down", 3, 2),
+    "snes": ("snes9x", "snes_rotzoom.sfc", "a", 3, 4),
+    "gba": ("mgba", "measure_gba.gba", "a", 3, 11),
+}
+
+
+@pytest.mark.parametrize("probe", sorted(PRESS_LATENCY))
+def test_a_clip_opens_on_the_game_already_reacting_to_the_press(assets, emu, probe):
+    """The report, and the fix: "it still looks like it starts before I moved".
+
+    A clip's opening picture used to be taken on frame 0 of its window -- one
+    emulated frame after the button went down, which on every core but an
+    already-animating one is a frame on which nothing has happened yet. So the
+    new clip opened by re-showing the still the previous clip had left in the
+    channel, for a whole step of playback, on every single press.
+
+    capture_plan now photographs the *end* of the first span instead, giving
+    the console ``step`` frames to answer, and this is that stated against the
+    real cores: record a clip with a press in it, then a second one the same
+    way, and require the second clip's first picture to differ from the
+    picture the first one finished on. The latency is measured off the core
+    here rather than trusted from the table, so a core build that reacts
+    differently says so instead of quietly passing.
+
+    Cores slower than the step are excluded rather than asserted -- mgba's
+    eleven frames is nearly three pictures, and one repeated opening picture
+    remains possible there. That is the game's own latency and showing it is
+    the honest answer; see the seam block in retro/clips.py.
+    """
+    core, rom_name, button, boot, table_latency = PRESS_LATENCY[probe]
+    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
+    emulator.advance(emulator.frames_for_seconds(boot))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    step = capture_step(emulator)
+    hold = frames_for_ms(emulator, 160)
+    presses = [(button, 0, hold)]
+    plan = [index for index, _ in E.capture_plan(frames, step)]
+
+    # One press first, so the screen is where a *second* press finds it, and
+    # so "the picture the previous clip left in the channel" is a real one.
+    _first, first_shots = photographed(emulator, frames, presses)
+    held = first_shots[-1]
+    state = emulator.save_state()
+
+    # How long this core really takes to answer, read off it a frame at a
+    # time with exactly the input the recording gives it.
+    emulator.load_state(state)
+    reference = frame_by_frame(emulator, set(range(hold)), button, frames)
+    latency = opening_repeats(reference, held) + 1
+
+    emulator.load_state(state)
+    _second, shots = photographed(emulator, frames, presses)
+
+    # The clip really is the reference run sampled at the plan's frames, so
+    # everything below is about *which* frames rather than about luck.
+    assert shots == [reference[index] for index in plan]
+
+    if latency != table_latency:
+        pytest.skip(
+            f"{core}/{rom_name} answers {button} on frame {latency} under this "
+            f"build, not the {table_latency} the table was measured at; "
+            "re-measure PRESS_LATENCY rather than loosening this"
+        )
+    if latency > step:
+        pytest.skip(
+            f"{core}/{rom_name} takes {latency} frames to react and a picture "
+            f"is only {step}, so an opening repeat is expected and honest here"
+        )
+
+    # The fix, in one line: the first thing the player sees is not the thing
+    # they were already looking at.
+    assert shots[0] != held, "the clip opens on the previous clip's last picture"
+    assert opening_repeats(shots, held) == 0
+    # ...and it is the sampling phase that did it, not luck about this core:
+    # the opening picture is a whole step into the window.
+    assert plan[0] == step - 1, "the opening picture is not a whole step in"
+
+
 def test_a_games_own_reaction_latency_is_shown_rather_than_skipped(
     assets, emu, libbet
 ):
@@ -1077,13 +1207,15 @@ def test_a_games_own_reaction_latency_is_shown_rather_than_skipped(
 
     Libbet's title screen answers Start on its third frame. With the pre-roll
     the clip skipped the two frames before that and opened on the change; now
-    it opens one frame after the previous clip ended, holds the unchanged
-    picture for exactly as long as the game really takes, and then moves.
+    the clip's window starts on the frame after the previous one ended and the
+    opening picture is taken at the end of the first span, so those two frames
+    are emulated, counted, and shown -- either inside the opening picture's
+    duration (they are, at the default step of four) or as a held picture if
+    the step is shorter than the latency.
 
-    That is a run of identical opening pictures, which the encoder merges into
-    one stored frame with their durations added together, so it is a held
-    picture and not a stutter -- and, crucially, the console is not a quarter
-    of a second ahead of what has been posted.
+    Either way the count is exact: the clip opens on the held picture for
+    precisely the pictures whose frames fall before the game answers, no more
+    (nothing is dragged out) and no fewer (nothing is skipped to hide it).
     """
     emulator = emu(assets.need_core("gambatte"), libbet)
     emulator.advance(emulator.frames_for_seconds(LIBBET_BOOT_SECONDS))
@@ -1153,16 +1285,17 @@ def test_the_hold_is_honoured_in_full_and_released_before_the_last_picture(
     assert not timeline[-1], "the clip's last frame is emulated with nothing held"
 
 
-def test_a_clip_with_no_input_in_it_photographs_from_its_very_first_frame(
+def test_a_clip_with_no_input_in_it_covers_its_window_from_the_first_frame(
     assets, emu, libbet
 ):
     """Wait, Undo, a boot and a reset: the same seam as everything else.
 
-    A recording with no schedule in it has never done anything but photograph
-    from its first frame, and that was already the one-frame seam -- it is the
-    clips *with* a press that used to differ. Libbet on its static screen is
-    the probe that would notice a stray skip: it is the one ROM here where
-    something waiting for the picture to change would run for ever.
+    A recording with no schedule in it emulates its window from frame 0 and
+    accounts for every frame of it, which was already true before the capture
+    phase moved -- it is the clips *with* a press that the phase is about.
+    Libbet on its static screen is the probe that would notice a stray skip:
+    it is the one ROM here where something waiting for the picture to change
+    would run for ever.
     """
     emulator = emu(assets.need_core("gambatte"), libbet)
     emulator.advance(emulator.frames_for_seconds(LIBBET_BOOT_SECONDS))
@@ -1184,22 +1317,26 @@ def test_a_clip_with_no_input_in_it_photographs_from_its_very_first_frame(
 def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, image, gambatte, ucity):
     """The other half of "seamless movement", proved against a real core.
 
-    A clip's pictures are every ``step``-th emulated frame *plus the last
-    one* (see capture_plan), so the picture a clip finishes on -- and holds,
-    since clips play through once -- is the exact state the next clip starts
-    from. Before the closing frame was photographed a 60 frame clip stopped
-    on frame 57 while 58, 59 and 60 were emulated and never shown, so the
-    still picture sitting in the channel between presses was three frames
-    behind the console.
+    A clip's pictures are the end of every ``step``-frame span *plus the last
+    frame of the window* (see capture_plan), so the picture a clip finishes on
+    -- and holds, since clips play through once -- is the exact state the next
+    clip starts from. Before the closing frame was photographed a 60 frame
+    clip stopped on frame 57 while 58, 59 and 60 were emulated and never
+    shown, so the still picture sitting in the channel between presses was
+    three frames behind the console.
 
     So: record two consecutive clips, then rewind and emulate the same frames
     one at a time to get a reference picture for each. The first clip's last
-    picture has to be reference frame N, and the second clip's first picture
-    reference frame N + 1 -- adjacent, neither repeated nor skipped.
+    picture has to be reference frame N -- the frame the next window picks up
+    from -- and the second clip's first picture reference frame N + step,
+    since it is taken at the end of that window's first span. Nothing in
+    between is repeated or skipped; it is emulated and counted in that
+    picture's duration.
     """
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
     frames = emulator.clip_frames(E.CLIP_SECONDS)
+    step = capture_step(emulator)
     size = emulator.output_size()
     state = emulator.save_state()
 
@@ -1211,19 +1348,20 @@ def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, image, gamba
 
     emulator.load_state(state)
     reference = []
-    for _ in range(frames + 1):
+    for _ in range(frames + step):
         emulator.advance(1)
         reference.append(emulator._frame_image(size).tobytes())
 
     assert first[-1].tobytes() == reference[frames - 1], (
         "the first clip does not end on its own last emulated frame"
     )
-    assert second[0].tobytes() == reference[frames], (
-        "the second clip does not open on the very next emulated frame"
+    assert second[0].tobytes() == reference[frames + step - 1], (
+        "the second clip does not open on the end of its own first span"
     )
-    # And the two really are different pictures, or none of the above means
+    # And the pictures really are different, or none of the above means
     # anything: a static screen would satisfy it by accident.
     assert reference[frames - 1] != reference[frames], "nothing moved at all"
+    assert reference[frames - 1] != reference[frames + step - 1]
 
 
 @pytest.mark.parametrize("key, core, rom_name, button", CASES, ids=[c[0] for c in CASES])

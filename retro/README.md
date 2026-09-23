@@ -525,10 +525,10 @@ A second is the default because a turn is a round trip: press, wait for the
 clip, watch it, press again. It used to be four seconds, and three of those
 were usually the game sitting still after the press had already played out —
 while costing three times as long to record. A one second Game Boy clip is 60
-emulated frames captured as 16 pictures (fewer once identical ones are
+emulated frames captured as 15 pictures (fewer once identical ones are
 merged), a few kilobytes, and about 47ms of work on a Raspberry Pi 5;
-four seconds is 239 frames and 61 pictures. Playback matches emulated time
-either way — a one second clip plays for 1.004s and a 0.5 second one for
+four seconds is 239 frames and 60 pictures. Playback matches emulated time
+either way — a one second clip plays for 1.005s and a 0.5 second one for
 0.502s.
 
 **One clip carries on exactly where the last one stopped.** A clip
@@ -541,20 +541,29 @@ had already emulated, so every press began with a small invisible jump.
 
 **A clip starts exactly one emulated frame after the last one ended.** A
 picture is taken *after* an emulated frame, so the last picture of a clip is
-its window's final frame and the first picture of the next clip is the very
-next frame of the console. Press, clip, press, clip is one unbroken run: no
-moment is shown twice and none is run past unseen, and the console can never
-get ahead of what has been posted.
+its window's final frame and the next clip picks the console up on the very
+next frame. Press, clip, press, clip is one unbroken run: no moment is
+emulated twice and none is run past unaccounted for, and the console can never
+get ahead of what has been posted. The still left sitting in the channel is
+exactly where the next clip resumes.
 
-That rule was broken for a while by the fix for an earlier report of the same
-symptom. A press does not show up the instant the button goes down — the hold
-is 160ms and a game takes a moment longer than that to react — so on a game
-that sits still until it is prodded (an overworld, a menu, a text box, which
-is most of what this cog is played on) the clip's opening picture was
-byte-identical to the one the previous clip had left in the channel. That was
-reported as "the clip seems to replay a bit from the previous clip", and the
-answer was a bounded **pre-roll**: the button went down and the console ran,
-*unphotographed*, until the picture stopped being the held one.
+The *pictures* are a cadence laid over that run, one every fourth frame, and
+the cadence does not break at a boundary either: a one second Game Boy clip
+photographs absolute frames 4, 8 … 60 and the next one 64, 68 … 120. Four
+frames between every pair of pictures, the pair that straddles the seam
+included.
+
+Both halves have been got wrong, and the history is worth keeping because
+every attempt was aimed at the same report.
+
+**First, the pre-roll.** A press does not show up the instant the button goes
+down — the hold is 160ms and a game takes a moment longer than that to react —
+so on a game that sits still until it is prodded (an overworld, a menu, a text
+box, which is most of what this cog is played on) the clip's opening picture
+was byte-identical to the one the previous clip had left in the channel. That
+was reported as "the clip seems to replay a bit from the previous clip", and
+the answer was a bounded **pre-roll**: the button went down and the console
+ran, *unphotographed*, until the picture stopped being the held one.
 
 It did not fix the report, and it cost the seam to not fix it. Four
 consecutive one second clips per row, at the default hold, on a Raspberry Pi
@@ -574,38 +583,72 @@ The seam was `1 + the frames the pre-roll used`, exactly, in every row. And on
 the three static rows — the ones this cog is actually played on — the pre-roll
 ran its whole 15 frame bound, found no change, opened the clip on the repeated
 picture *anyway*, and charged 251ms of game time per press for it. So the
-pre-roll is gone, and the seam is one frame everywhere.
+pre-roll is gone, and one clip resumes on the frame after the last one
+everywhere.
 
-**What that trades away.** The only way to escape a repeated opening picture
-is to skip forward until the picture changes, and on a screen that never
-changes that is either a jump (what the pre-roll did) or an unbounded one
-(worse). So a game's own reaction latency is now *shown* rather than skipped:
-the clip opens on the held picture and stays there for exactly as long as the
-game really takes to answer, then moves. Measured as opening pictures that are
-the held one again, out of the sixteen a one second clip takes:
+**Second, the opening picture itself.** Removing the pre-roll left the report
+standing, because a clip still opened on frame 0 of its window — the state one
+emulated frame after the button went down, which is the one frame on which
+nothing can have happened yet. Measured as the first emulated frame whose
+picture differs at all, with the button held from frame 0:
+
+| Core / ROM | Button | First frame that differs |
+| --- | --- | --- |
+| gambatte / µCity | ↓ | 1 (it animates every frame anyway) |
+| fceumm / nestest | ↓ | 2 |
+| snes9x / rotozoom | A | 4 |
+| mgba / homebrew | A | 11 |
+
+So on everything but an already-moving game, the opening picture was the
+previous clip's closing picture over again, held for a whole 67ms.
+
+A clip now photographs the **end** of each sampling span rather than its
+start: frames 4, 8 … 60 of a one second Game Boy clip instead of 1, 5 … 57,
+60. That gives the console a whole picture's worth of emulation — four frames,
+67ms — to answer the button before the shutter, and it costs no game time and
+skips no frame, which is exactly the difference between it and the pre-roll.
+The frames before the first picture are emulated and counted in that picture's
+duration. As a bonus the ragged tail is gone: a one second clip is fifteen
+even pictures instead of sixteen with a 50ms and a 17ms one on the end.
+
+Measured the same way as the table above, after one press so the screen is
+where a *second* press finds it — opening pictures that are the held one
+again, out of the sixteen the old cadence took and the fifteen this one does:
 
 | Core / ROM | Button | Before | Now |
 | --- | --- | --- | --- |
-| fceumm / nestest | ↓ | 0 of 16 | 1 of 16 (67ms) |
-| gambatte / µCity | ← | 4 of 16 | 8 of 16, once its menu stops animating |
-| gambatte / Libbet | ↓ | 11 of 16 | 16 of 16, once its screen settles |
-| fceumm / nestest | Start | 16 of 16 | 16 of 16 (unchanged) |
-| gambatte / dmg-acid2 | A | 16 of 16 | 16 of 16 (unchanged) |
+| fceumm / nestest | ↓ | 1 of 16 | **0 of 15** |
+| gambatte / Libbet | Start | 1 of 16 | **0 of 15** |
+| gambatte / µCity | ↓ | 0 of 16 | 0 of 15 |
+| fceumm / nestest | Start | 16 of 16 | 15 of 15 |
+| gambatte / Libbet | ↓ (ignored) | 16 of 16 | 15 of 15 |
+| gambatte / dmg-acid2 | A | 16 of 16 | 15 of 15 |
 
-The encoder merges a run of identical pictures into one stored frame and adds
-their durations together, so that is a held picture rather than a stutter —
-and it is the truth about the game. In exchange, nothing is ever shown twice
-across a seam on a game that *is* moving, and the console is never a quarter
-of a second ahead of the pictures.
+**What that still trades away.** The bottom three rows are games that do not
+answer the button at all, and they must stay that way: the only way to escape
+a repeated opening picture there is to skip forward until the picture changes,
+which on a screen that never changes is either a jump (what the pre-roll did)
+or an unbounded wait (worse). So a game's own reaction latency is *shown*
+rather than skipped. The encoder merges a run of identical pictures into one
+stored frame and adds their durations together, so that is a held picture
+rather than a stutter — and it is the truth about the game.
+
+A core slower than one picture can still open on a repeat: mgba's eleven
+frames is nearly three pictures, so a Game Boy Advance clip may hold its
+opening picture once or twice before the game answers. There is no honest way
+to remove that, only to show it.
 
 **The frame rate is not a lever on any of this**, which is the first thing
-tried. A clip photographs its frame 0 and its final frame whatever the
-sampling cadence is, so the seam is one frame at 10, 15, 20 and 60 fps alike —
-measured against all five rows above. All the clip's frame rate changes is how
-many pictures fill the middle.
+tried. A clip photographs its window's final frame whatever the sampling
+cadence is, so the still left in the channel is where the next clip resumes at
+10, 15, 20 and 60 fps alike — measured against all five rows above. What the
+rate *does* change is how long the opening picture waits for the console to
+answer, and it changes it the wrong way: a higher rate is a sharper animation
+and an earlier shutter. That is why the answer was the sampling phase and not
+the frame rate.
 
 A clip with no input in it — **Wait**, **Undo**, a boot, `[p]retroreboot` —
-always had the one-frame seam and is unchanged.
+always resumed on the very next frame and is unchanged.
 
 **A clip plays for exactly as long as it emulated** — start to finish, with
 nothing dropped off either end. Not "about as long", and not "as much of it as
@@ -616,9 +659,10 @@ wants to trim everything and leave the single picture it is obliged to keep —
 a 1005ms clip played as a 17ms flash.
 
 `tests/test_emulator.py` holds all of it against real cores: the timing rule,
-the tables above, the static screen that must still get a whole clip, and the
-one-frame seam between two presses in a row (proved by rewinding and emulating
-the same window a frame at a time). If a press still feels slow to land,
+the tables above, the static screen that must still get a whole clip, the
+opening picture that must show the game already reacting, and the adjacency of
+two presses in a row (proved by rewinding and emulating the same window a
+frame at a time). If a press still feels slow to land,
 `[p]retroset hold` is the dial
 — a shorter hold reacts sooner, at the risk of a game not noticing the press
 at all below about 100ms.
@@ -1083,11 +1127,12 @@ clip a ceiling on the input inside it, and the ceiling is announced when you
 set either value:
 
 * the **hold** is cut to fit. At the 0.2s floor a clip is 12 emulated frames
-  and the last one photographed is frame 8, so a 400ms hold becomes about
-  134ms — still well over the ~100ms a game needs to notice a press.
+  and the last one worth a whole picture of playback is frame 11, so a 400ms
+  hold becomes about 183ms. The default 160ms hold fits whole even there and
+  is never cut at any setting.
 * the **×3** button taps as many times as fit. Three 160ms taps 250ms apart
-  need 1.4 seconds, so the spacing is squeezed first (218ms at a one second
-  clip, 117ms at 0.8s — three taps closer together are still three taps) and
+  need 1.4 seconds, so the spacing is squeezed first (234ms at a one second
+  clip, 134ms at 0.8s — three taps closer together are still three taps) and
   only then is a tap dropped. Its label always counts the taps it will really
   do, and below two taps **the button is not shown at all** — see below.
 
@@ -1122,11 +1167,11 @@ Coming back says nothing: the button is right there saying what it does.
 | --- | --- | --- |
 | 0.2s (the floor) | 1 | not shown |
 | 0.4s | 1 | not shown |
-| 0.47s | 1 | not shown |
-| 0.48s | 2 | `A ×2` |
+| 0.45s | 1 | not shown |
+| 0.46s | 2 | `A ×2` |
 | 0.5s | 2 | `A ×2` |
-| 0.67s | 2 | `A ×2` |
-| 0.68s | 3 | `A ×3` |
+| 0.72s | 2 | `A ×2` |
+| 0.73s | 3 | `A ×3` |
 | 1s (the default) | 3 | `A ×3` |
 | 5s (the ceiling) | 3 | `A ×3` |
 

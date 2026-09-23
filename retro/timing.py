@@ -129,8 +129,8 @@ BOOT_SECONDS = 3
 # never reaches the frame the next clip carries on from, so the game appears
 # to jump back a little on every press. The seam itself is exact (see
 # capture_plan and the seam block above it in retro/clips.py, which between
-# them make the last picture of one clip the emulated frame before the first
-# picture of the next one), and the pacing below is
+# them make the last picture of one clip the console's state on the emulated
+# frame before the next clip's window begins), and the pacing below is
 # what makes it exact *on screen* rather than only in the emulation.
 #
 # The rule: **an edit that replaces a clip waits until that clip has had its
@@ -230,12 +230,19 @@ def press_plan(
     A plain press is one pair starting at frame 0; the repeat button asks for
     ``REPEAT_TAPS`` of them.
 
+    Frame 0 is before the clip's first emulated frame and is deliberately
+    *not* photographed: ``clips.capture_plan`` takes its first picture at the
+    end of the first span, so the button has had a whole picture's worth of
+    emulation -- four frames, 67ms on a Game Boy -- to take effect by the time
+    the player sees anything. Starting the press any later would only push the
+    game's own reaction out of the clip.
+
     Everything it returns is released by :func:`input_budget`, i.e. by the
-    last frame of the clip that is actually captured, so the clip's final
-    picture always shows the game *after* the input. That is the whole reason
-    this is not two lines: a clip used to be four seconds, where a 160ms hold
-    and three taps 250ms apart fitted with two seconds to spare, and at a
-    fifth of a second neither fits at all.
+    last frame of the clip that is worth a whole step of playback, so the
+    clip's final picture always shows the game *after* the input. That is the
+    whole reason this is not two lines: a clip used to be four seconds, where
+    a 160ms hold and three taps 250ms apart fitted with two seconds to spare,
+    and at a fifth of a second neither fits at all.
 
     Two things give, in this order:
 
@@ -246,14 +253,15 @@ def press_plan(
       fit. Two taps is a worthwhile repeat button; one is just the confirm
       button, and the view does not draw a button for it at all -- see
       MIN_REPEAT_TAPS and :meth:`RetroView._update_repeat_label`. Measured at
-      DEFAULT_FPS with the default 160ms hold, the boundaries are 0.48s for
-      the second tap and 0.68s for the third.
+      DEFAULT_FPS with the default 160ms hold, the boundaries are 0.47s for
+      the second tap and 0.73s for the third.
 
     The hold itself is clamped last-ditch: it can never be longer than the
-    budget, so a 0.2s clip (12 frames, budget 8) with a 400ms hold holds the
-    button for 8 frames -- about 134ms -- and shows one picture of the
-    release. The configured hold is a ceiling, not a promise, and
-    `[p]retroset hold` says so when the clip is too short to honour it.
+    budget, so a 0.2s clip (12 frames, budget 11) with a 400ms hold holds the
+    button for 11 frames -- about 184ms -- and the clip's closing picture is
+    the one that shows the release. The configured hold is a ceiling, not a
+    promise, and `[p]retroset hold` says so when the clip is too short to
+    honour it.
     """
     frames = clip_frame_count(fps, clip_seconds)
     budget = input_budget(fps, frames)

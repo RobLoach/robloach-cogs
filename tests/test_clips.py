@@ -43,9 +43,15 @@ FPS = {"gb": 59.727, "nes": 60.0988, "pal": 50.0}
 
 
 def test_a_one_second_game_boy_clip_is_this_exact_shape():
-    # 60 emulated frames at a capture step of 4: fifteen pictures on the
-    # cadence (frames 1, 5, ... 57) plus the closing frame 60, which is the
-    # one the clip holds and the one the next clip carries on from.
+    # 60 emulated frames at a capture step of 4: fifteen pictures, one at the
+    # end of every span (frames 4, 8, ... 60, counting from one), no ragged
+    # tail at all, and the last of them is the frame the clip holds and the
+    # one the next clip carries on from.
+    #
+    # It used to be sixteen -- indices 0, 4, ... 56, 59, durations
+    # [4]*14 + [3, 1] -- which opened every clip on the state one emulated
+    # frame after the button went down, i.e. before any game but an already
+    # animating one had moved. See capture_plan.
     frames = C.clip_frame_count(FPS["gb"], 1.0)
     step = C.capture_step(FPS["gb"])
     assert (frames, step) == (60, 4)
@@ -53,9 +59,23 @@ def test_a_one_second_game_boy_clip_is_this_exact_shape():
     plan = C.capture_plan(frames, step)
     indices = [index for index, _ in plan]
     covered = [amount for _, amount in plan]
-    assert indices == [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 59]
-    assert covered == [4] * 14 + [3, 1]
+    assert indices == [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59]
+    assert len(indices) == 15
+    assert covered == [4] * 15
     assert sum(covered) == frames
+
+
+def test_a_half_second_game_boy_clip_keeps_the_cadence_and_pays_in_the_tail():
+    """The other worked example: 30 frames, which is not a multiple of 4.
+
+    Seven whole pictures on the cadence and a 2-frame one on the closing
+    frame, which is the only picture a clip ever has that is worth less than a
+    step. The durations still add up to the window.
+    """
+    plan = C.capture_plan(30, 4)
+    assert [index for index, _ in plan] == [3, 7, 11, 15, 19, 23, 27, 29]
+    assert [amount for _, amount in plan] == [4, 4, 4, 4, 4, 4, 4, 2]
+    assert sum(amount for _, amount in plan) == 30
 
 
 @pytest.mark.parametrize("fps", sorted(FPS.values()))
@@ -64,31 +84,40 @@ def test_a_one_second_game_boy_clip_is_this_exact_shape():
 )
 @pytest.mark.parametrize("clip_fps", [10, 15, 20])
 def test_a_capture_plan_always_holds_both_ends_and_all_the_time(fps, seconds, clip_fps):
-    """The three invariants every clip length has to satisfy."""
+    """The four invariants every clip length has to satisfy."""
     frames = C.clip_frame_count(fps, seconds)
     step = C.capture_step(fps, clip_fps)
     plan = C.capture_plan(frames, step)
     indices = [index for index, _ in plan]
     covered = [amount for _, amount in plan]
 
-    # 1. Both ends are photographed. Frame 0 so a press scheduled at the
-    #    start of the clip is already in the first picture, and the last
-    #    frame so the picture the clip holds is where the next one begins.
-    assert indices[0] == 0
+    # 1. The first picture is the end of the first span, so a press scheduled
+    #    on frame 0 has had `step` whole frames to take effect before the
+    #    player is shown anything. This is the fix: it used to be frame 0,
+    #    which is the one frame on which nothing can have happened yet.
+    assert indices[0] == step - 1 or step > frames
+    assert covered[0] == min(step, frames)
+
+    # 2. The last frame is still photographed, so the picture the clip holds
+    #    is the state the next clip carries on from.
     assert indices[-1] == frames - 1
 
-    # 2. No picture is taken twice and none is skipped over.
+    # 3. No picture is taken twice and none is skipped over.
     assert indices == sorted(set(indices))
     assert all(amount >= 1 for amount in covered)
 
-    # 3. The durations account for every emulated frame, so the clip plays
+    # 4. The durations account for every emulated frame, so the clip plays
     #    for exactly as long as it emulated.
     assert sum(covered) == frames
 
-    # ...and everything between the ends is on the regular cadence, so the
-    # timing is uniform apart from the tail.
-    assert all(index % step == 0 for index in indices[:-1])
-    assert all(amount == step for amount in covered[:-2]) or len(covered) <= 2
+    # ...and every picture but the appended closing one is on the regular
+    # cadence and worth a whole step, so the timing is uniform apart from that
+    # single tail picture -- and there is no tail at all when `frames` is a
+    # multiple of `step`.
+    assert all((index + 1) % step == 0 for index in indices[:-1])
+    assert all(amount == step for amount in covered[:-1])
+    if frames % step == 0:
+        assert covered == [step] * (frames // step)
 
 
 @pytest.mark.parametrize("fps", sorted(FPS.values()))
@@ -97,10 +126,11 @@ def test_consecutive_clips_leave_no_frame_unphotographed(fps, seconds):
     """Clip boundaries are seamless, in absolute emulated frames.
 
     A picture taken on a clip's frame ``i`` shows the console after ``i + 1``
-    emulated frames, so laying two clips end to end and translating both
-    plans into absolute frame numbers has to give one unbroken run: the last
-    picture of the first clip and the first picture of the second must be
-    adjacent frames, neither repeated nor skipped.
+    emulated frames and stands for the run of frames ending on it, so laying
+    two clips end to end and translating both plans into absolute frame
+    numbers has to tile 1..2N with no hole and no overlap: the first clip must
+    close on frame N and the second must pick the console straight up on N+1,
+    whether or not N+1 is the frame it *photographs*.
 
     Before the closing frame was always photographed this failed by up to
     ``step - 1`` frames: a 60 frame clip stopped on frame 57 and the next one
@@ -113,8 +143,22 @@ def test_consecutive_clips_leave_no_frame_unphotographed(fps, seconds):
 
     first = [index + 1 for index, _ in plan]
     second = [frames + index + 1 for index, _ in plan]
-    assert second[0] == first[-1] + 1, (first[-3:], second[:3])
     assert first[-1] == frames, "the first clip must end on its own last frame"
+    # Every emulated frame of both windows is covered by exactly one picture's
+    # duration, and the coverage runs straight through the boundary.
+    covered = []
+    for offset in (0, frames):
+        for index, amount in plan:
+            covered.extend(range(offset + index + 2 - amount, offset + index + 2))
+    assert covered == list(range(1, 2 * frames + 1))
+
+    # The *pictures* keep their cadence across the boundary too, which is what
+    # stops the seam being a visible stutter: the gap from the first clip's
+    # closing picture to the second clip's opening one is one whole step, the
+    # same as the gap between any two pictures inside a clip. It used to be 1,
+    # against a 4-frame internal cadence.
+    if frames % step == 0:
+        assert second[0] - first[-1] == step, (first[-3:], second[:3])
 
 
 @pytest.mark.parametrize("frames", [1, 2, 3, 5, 6, 7, 12, 13, 60, 61, 239])
@@ -122,17 +166,52 @@ def test_consecutive_clips_leave_no_frame_unphotographed(fps, seconds):
 def test_a_capture_plan_survives_any_frame_count(frames, step):
     plan = C.capture_plan(frames, step)
     assert plan, (frames, step)
-    assert plan[0][0] == 0
+    assert plan[0][0] == min(step, frames) - 1
     assert plan[-1][0] == frames - 1
     assert sum(amount for _, amount in plan) == frames
     assert len(plan) <= frames, "a picture per frame at most"
 
 
-def test_a_frame_count_already_on_the_cadence_adds_no_extra_picture():
-    # k * step + 1 frames: the last frame is already on the cadence, so every
-    # picture but the closing one is a whole step and nothing is appended.
+@pytest.mark.parametrize("step", [2, 3, 4, 5, 6])
+def test_a_window_shorter_than_one_picture_is_that_one_picture(step):
+    """``frames < step``: the cadence yields nothing, so only the close is left.
+
+    Unreachable from the settings -- MIN_CLIP_FRAMES is 6 and the largest step
+    any console here produces is 6 -- but capture_plan is a plain function and
+    record() is callable directly, so it has to degrade rather than raise or
+    hand back an empty plan. The one picture is the window's last frame and it
+    stands for every frame there was.
+    """
+    for frames in range(1, step):
+        plan = C.capture_plan(frames, step)
+        assert plan == [(frames - 1, frames)], (frames, step, plan)
+
+
+def test_the_least_a_clip_may_ever_be_is_still_an_animation():
+    """MIN_CLIP_FRAMES, at the step the default CLIP_FPS produces.
+
+    Six frames at a step of four is two pictures -- emulated frames 4 and 6 --
+    which is the least that is still an animation rather than a screenshot,
+    and there is still an input budget inside it.
+    """
+    plan = C.capture_plan(C.MIN_CLIP_FRAMES, 4)
+    assert plan == [(3, 4), (5, 2)]
+    assert sum(amount for _, amount in plan) == C.MIN_CLIP_FRAMES
+    assert len(plan) >= 2, "a one-picture 'animation' is a screenshot"
+    assert 1 <= C.input_budget(59.727, C.MIN_CLIP_FRAMES) < C.MIN_CLIP_FRAMES
+
+
+def test_a_frame_count_that_fills_whole_pictures_adds_no_extra_one():
+    # A whole multiple of step: every picture is a whole step and nothing is
+    # appended. (It used to be k * step + 1 that came out clean, because the
+    # cadence started on frame 0.)
+    plan = C.capture_plan(60, 4)
+    assert [index for index, _ in plan] == list(range(3, 60, 4))
+    assert [amount for _, amount in plan] == [4] * 15
+
+    # ...and one frame more is the same fifteen pictures plus a 1-frame close.
     plan = C.capture_plan(61, 4)
-    assert [index for index, _ in plan] == list(range(0, 61, 4))
+    assert [index for index, _ in plan] == list(range(3, 60, 4)) + [60]
     assert [amount for _, amount in plan] == [4] * 15 + [1]
 
 
@@ -141,19 +220,28 @@ def test_a_frame_count_already_on_the_cadence_adds_no_extra_picture():
 def test_input_is_released_before_the_last_picture_is_taken(fps, seconds):
     """What input_budget promises, restated against the capture plan.
 
-    The budget is the last frame on the regular cadence, so it is *before*
-    the closing photograph as well: a press released on it is up for both of
-    the clip's final pictures.
+    The budget is the last frame on the regular cadence -- ``k * step - 1``
+    now that capture_plan photographs the end of each span -- so it is a
+    photographed frame, it is worth a whole step of playback, and any closing
+    picture appended after it is after the release too.
     """
     frames = C.clip_frame_count(fps, seconds)
     step = C.capture_step(fps)
     budget = C.input_budget(fps, frames)
-    indices = [index for index, _ in C.capture_plan(frames, step)]
+    plan = C.capture_plan(frames, step)
+    indices = [index for index, _ in plan]
 
     assert budget in indices, (budget, indices[-4:])
     assert budget <= indices[-1]
-    assert budget % step == 0
+    assert (budget + 1) % step == 0
     assert budget < frames
+    # The picture taken on the budget is worth a whole step, which is the
+    # whole reason the budget is not simply `frames - 1`.
+    assert dict(plan)[budget] == step
+    # ...and the aftermath is between one and `step` emulated frames, always
+    # at least one whole picture of it.
+    assert 1 <= frames - budget <= step
+    assert len([index for index in indices if index >= budget]) >= 1
 
 
 # -- How long a clip plays for ------------------------------------------------
@@ -178,8 +266,10 @@ def test_a_clip_plan_is_the_capture_plan_in_milliseconds():
     assert [ms for _, ms in plan] == [
         max(1, round(1000 * amount / fps)) for amount in covered
     ]
-    # Fourteen whole 67ms pictures, then the 3-frame and 1-frame tail.
-    assert [ms for _, ms in plan] == [67] * 14 + [50, 17]
+    # Fifteen whole 67ms pictures and no tail: 60 is a multiple of the step.
+    # It used to be [67]*14 + [50, 17], the 3-frame and 1-frame tail the old
+    # frame-0 cadence left behind.
+    assert [ms for _, ms in plan] == [67] * 15
 
 
 def test_a_default_game_boy_clip_plays_for_1_005_seconds():
@@ -280,11 +370,13 @@ def test_a_setting_stored_above_the_new_ceiling_is_clamped_on_read():
 
 
 def test_the_ceiling_is_a_length_a_game_boy_can_actually_record():
-    # 5 seconds at 59.727 fps is 299 frames and 76 pictures, and it plays for
-    # 5.008 -- the same millisecond rounding a one second clip pays.
+    # 5 seconds at 59.727 fps is 299 frames and 75 pictures (74 whole ones and
+    # a 3-frame close), and it plays for 5.008 -- the same millisecond
+    # rounding a one second clip pays, and the same total the 76 pictures of
+    # the old frame-0 cadence added up to.
     frames = C.clip_frame_count(FPS["gb"], C.MAX_CLIP_SECONDS)
     assert frames == 299
-    assert len(C.capture_plan(frames, C.capture_step(FPS["gb"]))) == 76
+    assert len(C.capture_plan(frames, C.capture_step(FPS["gb"]))) == 75
     assert C.playback_seconds(FPS["gb"], frames) == 5.008
 
 
@@ -292,18 +384,24 @@ def test_the_ceiling_is_a_length_a_game_boy_can_actually_record():
 #
 # The rule the whole cog hangs on, stated with no core in the room: the
 # picture at plan index ``i`` is the game after ``i + 1`` emulated frames, so
-# the last picture of a clip is frame ``frames`` of its window and the first
-# picture of the next clip is frame 1 of the next window -- one frame later,
-# exactly, whatever the console's rate, whatever the clip length and whatever
-# CLIP_FPS is. RetroEmulator.record_frames is the half that has to emulate
-# that faithfully, and tests/test_emulator.py holds it to it against real
-# cores; the arithmetic is here.
+# the last picture of a clip is frame ``frames`` of its window and the next
+# clip picks the console up on frame ``frames + 1`` -- whatever the console's
+# rate, whatever the clip length and whatever CLIP_FPS is.
+# RetroEmulator.record_frames is the half that has to emulate that
+# faithfully, and tests/test_emulator.py holds it to it against real cores;
+# the arithmetic is here.
+#
+# The next clip's first *picture* is a step later than that, not a frame,
+# because capture_plan photographs the end of each span -- which is the fix
+# for "the new clip still looks like it starts before I moved" and is what
+# makes the picture cadence uniform across the boundary as well as inside it.
+# The frames in between are emulated and counted, never skipped.
 #
 # It is written out as absolute frame numbers rather than asserted on the
-# indices directly, because "index 0 of the next clip" is the thing that looks
-# obviously adjacent and is not: it was ``1 + the frames the pre-roll used``
-# frames later for as long as the pre-roll existed, and on a menu screen that
-# was sixteen. See the seam block in retro/clips.py.
+# indices directly, because the boundary is the thing that has been got wrong
+# twice: the pre-roll skipped ``1 + the frames it used`` of them (sixteen on a
+# menu screen), and the frame-0 cadence photographed a frame on which nothing
+# could have happened yet. See the seam block in retro/clips.py.
 
 
 def photographed_at(fps, frames, clip_fps=C.CLIP_FPS, first=1):
@@ -325,18 +423,27 @@ def test_the_seam_between_two_clips_is_exactly_one_emulated_frame(
     """No repeat and no gap, at every length, rate and cadence there is.
 
     Two clips back to back: the first covers absolute frames 1..N and the
-    second N+1..2N. The last picture of the first has to be frame N and the
-    first picture of the second has to be frame N+1 -- adjacent, so the
-    console cannot show a moment twice and cannot run on ahead of the
-    pictures.
+    second N+1..2N. The last picture of the first has to be frame N, so the
+    still picture left in the channel is exactly where the second clip picks
+    the console up -- the console cannot show a moment twice and cannot run on
+    ahead of the pictures.
+
+    The second clip's first picture is a whole ``step`` after that rather than
+    one frame after it, which is the point: the press is scheduled on the
+    window's frame 0 and the shutter waits for the console to answer it.
     """
     frames = C.clip_frame_count(fps, seconds)
+    step = C.capture_step(fps, clip_fps)
     first = photographed_at(fps, frames, clip_fps)
     second = photographed_at(fps, frames, clip_fps, first=frames + 1)
 
-    assert first[0] == 1, "a clip opens on its window's first emulated frame"
+    assert first[0] == min(step, frames), "a clip opens on the end of its first span"
     assert first[-1] == frames, "a clip closes on its window's last one"
-    assert second[0] - first[-1] == 1, (first[-1], second[0])
+    # The windows are adjacent even though the photographs are a step apart:
+    # the second clip's window begins on the frame after the first clip's last
+    # picture, and its opening picture stands for that frame onwards.
+    assert second[0] - first[-1] == min(step, frames), (first[-1], second[0])
+    assert second[0] - min(step, frames) == first[-1], "a frame went missing"
     # ...and the run of the two clips together is strictly increasing with no
     # frame photographed twice, which is the same statement said the other way.
     run = first + second
@@ -348,25 +455,38 @@ def test_the_seam_between_two_clips_is_exactly_one_emulated_frame(
 def test_the_clip_frame_rate_cannot_move_the_seam(fps):
     """"Is there something we can do in the framerate to fix it?" -- no.
 
-    The seam is set by which *ends* capture_plan photographs, and it
-    photographs both of them at every cadence: index 0 and index ``frames-1``
-    are in the plan whether a picture covers one emulated frame or sixty. So
-    raising CLIP_FPS buys more pictures in the middle of a clip and moves the
-    seam not at all, which is what the real cores measured too (see the seam
-    block in retro/clips.py).
+    The seam is set by the fact that capture_plan always photographs index
+    ``frames - 1``, which it does at every cadence, whether a picture covers
+    one emulated frame or sixty. So the still picture left in the channel is
+    the window's last frame at every CLIP_FPS and the next window begins on
+    the very next frame; raising the rate buys more pictures and moves that
+    not at all, which is what the real cores measured too (see the seam block
+    in retro/clips.py).
+
+    What CLIP_FPS *does* move is how long the opening picture waits for the
+    console to answer the press -- one step -- and it moves it the wrong way:
+    a higher rate is a sharper animation and an earlier shutter. That is why
+    the answer to the report was the sampling phase and not the frame rate.
     """
     frames = C.clip_frame_count(fps, 1.0)
-    seams = set()
+    closes = set()
+    opens = set()
     counts = set()
     for clip_fps in (1, 5, 10, 12, 15, 20, 30, 60, 120):
         first = photographed_at(fps, frames, clip_fps)
         second = photographed_at(fps, frames, clip_fps, first=frames + 1)
-        seams.add(second[0] - first[-1])
+        closes.add(first[-1])
+        opens.add(second[0] - first[-1])
         counts.add(len(first))
 
-    assert seams == {1}, seams
+    assert closes == {frames}, closes
     # ...and the cadence really was being varied, or the above proves nothing.
     assert len(counts) > 1, counts
+    # The opening picture's wait is one step, by construction, at every rate.
+    assert opens == {
+        min(C.capture_step(fps, clip_fps), frames)
+        for clip_fps in (1, 5, 10, 12, 15, 20, 30, 60, 120)
+    }
 
 
 @pytest.mark.parametrize("fps", sorted(FPS.values()))
@@ -385,13 +505,14 @@ def test_a_clip_s_pictures_tile_its_whole_window_with_no_hole(fps, seconds):
 
     assert sum(covered for _, covered in plan) == frames
     assert all(covered >= 1 for _, covered in plan)
-    # Every picture stands for the frames between it and the next one, so the
-    # window is tiled with no overlap and no hole.
-    edges = [index for index, _ in plan] + [frames]
+    # Every picture stands for the frames between the previous shutter and its
+    # own, so the window is tiled with no overlap and no hole.
+    edges = [-1] + [index for index, _ in plan]
     assert edges == sorted(set(edges))
     assert [b - a for a, b in zip(edges[:-1], edges[1:], strict=True)] == [
         covered for _, covered in plan
     ]
+    assert edges[-1] == frames - 1
 
 
 # -- How big the posted picture is --------------------------------------------

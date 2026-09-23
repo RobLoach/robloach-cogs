@@ -247,19 +247,24 @@ def test_the_repeat_button_taps_this_console_s_confirm_button(view, system):
 #
 # The table is every clip length that changes the answer, against every
 # console, because this is what every player's controller looks like. The
-# boundaries (measured at DEFAULT_FPS with the default 160ms hold) are 0.48s
-# for the second tap and 0.68s for the third.
+# boundaries (measured at DEFAULT_FPS with the default 160ms hold) are 0.46s
+# for the second tap and 0.73s for the third. They were 0.48 and 0.68: the
+# input budget moved when capture_plan started photographing the end of each
+# span, which shifts the last frame on the capture cadence by one step in
+# phase and so jitters both boundaries by a few hundredths in either
+# direction. None of the lengths anybody actually sets changed answer -- 0.5s
+# is still two taps and 0.8s, 1s and 4s are still three.
 
 #: clip seconds -> (taps, whether the button is drawn, the "xN" it says)
 REPEAT_BY_LENGTH = [
     (0.2, 1, False, None),   # the settings floor
     (0.3, 1, False, None),
     (0.4, 1, False, None),
-    (0.47, 1, False, None),  # the last length with only one tap
-    (0.48, 2, True, "x2"),   # ...and the first with two
+    (0.45, 1, False, None),  # the last length with only one tap
+    (0.46, 2, True, "x2"),   # ...and the first with two
     (0.5, 2, True, "x2"),
-    (0.67, 2, True, "x2"),
-    (0.68, 3, True, "x3"),   # the first with all three
+    (0.72, 2, True, "x2"),
+    (0.73, 3, True, "x3"),   # the first with all three
     (0.8, 3, True, "x3"),
     (1.0, 3, True, "x3"),    # the default
     (4.0, 3, True, "x3"),
@@ -941,7 +946,12 @@ def test_the_default_hold_is_under_a_game_boy_walk_cycle():
 GB_FPS = 59.727
 
 #: clip seconds -> (emulated frames, last frame input may be released on)
-CLIP_SHAPES = {0.2: (12, 8), 0.5: (30, 28), 0.8: (48, 44), 1.0: (60, 56), 4.0: (239, 236)}
+#:
+#: The budgets moved when capture_plan started photographing the end of each
+#: span instead of the start: the capture cadence is now ``k * step - 1``, so
+#: the last frame on it is one step further along in phase. They were
+#: 8, 28, 44, 56 and 236.
+CLIP_SHAPES = {0.2: (12, 11), 0.5: (30, 27), 0.8: (48, 47), 1.0: (60, 59), 4.0: (239, 235)}
 
 
 @pytest.mark.parametrize("seconds", sorted(CLIP_SHAPES))
@@ -953,10 +963,12 @@ def test_a_clip_is_this_many_frames_and_leaves_a_picture_for_the_aftermath(secon
     assert E.input_budget(GB_FPS, frames) == budget
     step = E.capture_step(GB_FPS)
     assert step == 4, "15fps against a 59.73fps core is every fourth frame"
-    # The budget is a *captured* frame, which is the point of it: releasing a
-    # button on frame 59 of a 60 frame clip would never be photographed,
-    # because the last picture was taken on frame 56.
-    assert budget % step == 0 and budget <= frames - 1
+    # The budget is a *captured* frame worth a whole step of playback, which
+    # is the point of it: a release seen only in the appended closing picture
+    # of a 61 frame clip would flash past in 17ms.
+    plan = dict(E.capture_plan(frames, step))
+    assert (budget + 1) % step == 0 and budget <= frames - 1
+    assert plan.get(budget) == step, (budget, sorted(plan)[-3:])
     assert frames - budget <= step, "no more of the clip is reserved than has to be"
 
 
@@ -964,13 +976,15 @@ def test_a_clip_is_never_fewer_frames_than_an_animation_needs():
     from retro import emulator as E
 
     step = E.capture_step(60.0)
-    pictures = -(-E.MIN_CLIP_FRAMES // step)
+    pictures = len(E.capture_plan(E.MIN_CLIP_FRAMES, step))
     assert pictures >= 2, "a one-picture 'animation' is a screenshot"
     assert E.input_budget(60.0, E.MIN_CLIP_FRAMES) >= 1, "and room for a press"
     assert E.clip_frame_count(60.0, 0.001) == E.MIN_CLIP_FRAMES
     assert E.clip_frame_count(1.0, 0.2) == E.MIN_CLIP_FRAMES, "a nonsense fps"
     # ...and the floor never bites at a length the settings can reach, on any
-    # console here (50fps PAL through 60.10fps NES).
+    # console here (50fps PAL through 60.10fps NES). The budget at the floor
+    # is 8 frames on a PAL core and 11 on the NTSC ones, which is comfortably
+    # past the ten frames the default 160ms hold asks for.
     for fps in (50.0, 59.727, 60.0, 60.0988):
         assert E.clip_frame_count(fps, E.MIN_CLIP_SECONDS) > E.MIN_CLIP_FRAMES
         assert E.input_budget(fps, E.clip_frame_count(fps, E.MIN_CLIP_SECONDS)) >= 8
@@ -982,14 +996,15 @@ def test_a_clip_is_never_fewer_frames_than_an_animation_needs():
         # Four seconds: exactly what it always did, three taps 250ms apart.
         (4.0, [(0, 10), (25, 10), (50, 10)]),
         # One second: 3 x 160ms + 2 x 250ms is 1.4s of schedule, so the
-        # spacing is squeezed to 13 frames (218ms) and all three taps stay.
-        (1.0, [(0, 10), (23, 10), (46, 10)]),
-        (0.8, [(0, 10), (17, 10), (34, 10)]),
+        # spacing is squeezed to 14 frames (234ms) and all three taps stay.
+        (1.0, [(0, 10), (24, 10), (48, 10)]),
+        (0.8, [(0, 10), (18, 10), (36, 10)]),
         # Half a second cannot fit three, even touching, so it does two.
-        (0.5, [(0, 10), (18, 10)]),
-        # A fifth of a second fits one tap, and the hold itself is cut from
-        # ten frames to the eight the clip can show being released.
-        (0.2, [(0, 8)]),
+        (0.5, [(0, 10), (17, 10)]),
+        # A fifth of a second fits one tap, and the default hold now fits
+        # inside it whole: a 12 frame clip's budget is frame 11, not the
+        # frame 8 it was before capture_plan moved the cadence.
+        (0.2, [(0, 10)]),
     ],
 )
 def test_three_taps_are_squeezed_then_dropped_to_fit_the_clip(seconds, expected):
@@ -1027,25 +1042,36 @@ def test_the_tap_count_can_depend_on_the_core_so_the_label_is_rewritten():
     """Why the repeat button's label is written again once a core is up.
 
     While a session is hibernated there is no core to ask, so the label falls
-    back to DEFAULT_FPS. Every NTSC console here agrees with that fallback
-    about how many taps fit, at every clip length the settings allow -- but a
-    50 fps PAL core does not, so the label is rewritten from the core's own
-    rate on boot, on wake and on every redraw.
+    back to DEFAULT_FPS. A 50 fps PAL core disagrees with that fallback at
+    eleven of the clip lengths the settings allow, and the NTSC consoles now
+    disagree at one apiece, so the label is rewritten from the core's own rate
+    on boot, on wake and on every redraw.
+
+    The NTSC disagreement is new and is the capture cadence's doing: the input
+    budget is ``(frames // step) * step - 1`` now that capture_plan
+    photographs the end of each span, which lands differently on the 27 frames
+    a 59.727 fps core gives a 0.46s clip and the 28 a 60 fps one does. It is
+    one length out of 1,481 and it costs nothing, because the label is
+    rewritten from the real rate the moment a core exists -- which is exactly
+    what this test is here to justify.
     """
     from retro import emulator as E
 
     lengths = [tenths / 100 for tenths in range(20, 1501)]
-    for fps in (59.727, 60.0988):
-        for seconds in lengths:
-            fallback = timingmod.press_plan(E.DEFAULT_FPS, seconds, 160, timingmod.REPEAT_TAPS)
-            real = timingmod.press_plan(fps, seconds, 160, timingmod.REPEAT_TAPS)
-            assert len(fallback) == len(real), (fps, seconds)
+    ntsc = [
+        (fps, seconds)
+        for fps in (59.727, 60.0988)
+        for seconds in lengths
+        if len(timingmod.press_plan(E.DEFAULT_FPS, seconds, 160, timingmod.REPEAT_TAPS))
+        != len(timingmod.press_plan(fps, seconds, 160, timingmod.REPEAT_TAPS))
+    ]
+    assert ntsc == [(59.727, 0.46)], ntsc
 
     pal = [s for s in lengths
            if len(timingmod.press_plan(E.DEFAULT_FPS, s, 160, timingmod.REPEAT_TAPS))
            != len(timingmod.press_plan(50.0, s, 160, timingmod.REPEAT_TAPS))]
     assert pal, "a PAL core used to disagree; if it no longer can, say so here"
-    # A 50 fps core fits *more* taps around 0.45s, because a 160ms hold is
+    # A 50 fps core fits *more* taps around 0.42s, because a 160ms hold is
     # eight of its frames rather than ten and leaves proportionally more of
     # the clip free. Either way the fallback is a guess and the core is not.
     assert len(timingmod.press_plan(50.0, pal[0], 160, timingmod.REPEAT_TAPS)) == 2
@@ -1058,9 +1084,16 @@ def test_a_press_is_only_ever_cut_short_by_a_clip_that_cannot_show_it():
     wanted = E.frame_count(GB_FPS, 0.4)
     # A four second clip honours a 400ms hold to the frame...
     assert timingmod.press_plan(GB_FPS, 4.0, 400, 1) == [(0, wanted)]
-    # ...and a fifth of a second holds for the eight frames it can show.
-    assert timingmod.press_plan(GB_FPS, 0.2, 400, 1) == [(0, 8)]
-    assert 8 < wanted
+    # ...and a fifth of a second holds for the eleven frames it can show.
+    assert timingmod.press_plan(GB_FPS, 0.2, 400, 1) == [(0, 11)]
+    assert 11 < wanted
+    # The *default* hold is no longer cut anywhere: the clip-length floor is
+    # 12 frames with a budget of 11, and 160ms is ten of them. That is why
+    # this has to ask for 400ms to see a hold being clamped at all.
+    for seconds in (0.2, 0.5, 1.0, 5.0):
+        assert timingmod.press_plan(GB_FPS, seconds, 160, 1) == [
+            (0, E.frame_count(GB_FPS, 0.16))
+        ]
 
 
 @pytest.mark.parametrize("seconds", [0.2, 0.3, 0.4, 0.5, 0.8, 1.0, 2.0, 4.0, 5.0])

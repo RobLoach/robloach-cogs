@@ -49,11 +49,11 @@ class EmulatorError(RuntimeError):
 #
 # On the timing: animated WebP stores each frame's duration in *milliseconds*,
 # so 15 fps against a 59.73 fps core is 4 emulated frames per clip frame and
-# exactly 67ms per frame -- a 1 second clip is 60 emulated frames and 16
-# pictures (fifteen on the cadence plus the closing frame, see capture_plan)
-# and measures 1.004s, which is 0.4% slow and invisible. 20 fps would land on
-# a round 50ms and match the emulated time exactly, at about 39% more bytes
-# and 32% more encoding time, so 15 stays the default.
+# exactly 67ms per frame -- a 1 second clip is 60 emulated frames and 15
+# pictures, one per whole step with no tail (see capture_plan), and measures
+# 1.005s, which is 0.4% slow and invisible. 20 fps would land on a round 50ms
+# and match the emulated time exactly, at about 39% more bytes and 32% more
+# encoding time, so 15 stays the default.
 #
 # Lowering it was measured and rejected. Now that a frame is posted at the
 # console's own resolution (see MIN_CLIP_WIDTH) the encode is small enough
@@ -61,12 +61,18 @@ class EmulatorError(RuntimeError):
 # making the animation visibly choppier. One second of real motion, best of
 # three on a Raspberry Pi 5, encode time and bytes:
 #
-#              15 fps (16 pics)   12 fps (13)     10 fps (11)
+#              15 fps (15 pics)   12 fps (12)     10 fps (10)
 #   NES         32.5ms / 1,682    24.0ms / 1,400  17.6ms / 1,202
 #   SNES        71.4ms / 26,934   55.6ms / 23,428 49.8ms / 20,956
 #
 # So 10 fps saves 15ms on a NES clip and 22ms on a SNES one, out of the 77ms
 # and 128ms a whole clip takes end to end. Not worth a third of the frames.
+#
+# Those times were measured while capture_plan still opened every clip on
+# frame 0, which made each column one picture longer (16, 13 and 11). The
+# ragged tail is gone and the counts above are what the plan produces now, so
+# the timings are a hair pessimistic and the comparison between the columns --
+# which is what chose 15 -- is unaffected.
 CLIP_SECONDS = 1.0
 CLIP_FPS = 15
 
@@ -75,12 +81,13 @@ CLIP_FPS = 15
 # the turn.
 #
 # The floor is 0.2s rather than something smaller because of what a clip is
-# made of. At 59.73 fps it is 12 emulated frames: three pictures at CLIP_FPS,
-# so still an animation, and an input budget of 8 frames (see input_budget)
-# which is ~134ms of button hold -- above the ~100ms where a game polling its
-# controller a few times a second can miss a press entirely. Halve it again
-# and the clip is two pictures and the hold is four frames, i.e. a press that
-# may not register at all and a "clip" nobody can read.
+# made of. At 59.73 fps it is 12 emulated frames: three pictures at CLIP_FPS
+# (frames 3, 7 and 11), so still an animation, and an input budget of 11
+# frames (see input_budget) which is ~184ms of button hold -- well above the
+# ~100ms where a game polling its controller a few times a second can miss a
+# press entirely. Halve it again and the clip is 6 frames, two pictures and a
+# budget of three frames, i.e. a press that may not register at all and a
+# "clip" nobody can read.
 #
 # The ceiling is 5s, and used to be 15 with nothing behind it. Three costs
 # grow with the clip -- encode time, the uncompressed working set and the
@@ -93,15 +100,20 @@ CLIP_FPS = 15
 #
 #                        pics   emulate   encode    total   native RAM
 #   gambatte / uCity, which animates every frame (320x288 posted)
-#     1s                   16     48ms     24ms      72ms     1.1 MiB
-#     4s                   61    105ms     54ms     160ms     4.0 MiB
-#     5s                   76    131ms     64ms     195ms     5.0 MiB
-#     15s                 225    366ms    205ms     571ms    14.8 MiB
+#     1s                   15     48ms     24ms      72ms     1.1 MiB
+#     4s                   60    105ms     54ms     160ms     4.0 MiB
+#     5s                   75    131ms     64ms     195ms     5.0 MiB
+#     15s                 224    366ms    205ms     571ms    14.8 MiB
 #   fceumm / nestest with a direction held (293x224 posted)
-#     1s                   16     48ms      8ms      57ms     2.6 MiB
-#     4s                   61    192ms     24ms     216ms    10.0 MiB
-#     5s                   76    243ms     28ms     272ms    12.5 MiB
-#     15s                 226    802ms     83ms     885ms    37.1 MiB
+#     1s                   15     48ms      8ms      57ms     2.6 MiB
+#     4s                   60    192ms     24ms     216ms    10.0 MiB
+#     5s                   75    243ms     28ms     272ms    12.5 MiB
+#     15s                 225    802ms     83ms     885ms    37.1 MiB
+#
+# (The times were measured while capture_plan opened every clip on frame 0,
+# i.e. with one more picture per row than the pics column now says. The tail
+# it added was one emulated frame long and the rows are a hair pessimistic
+# because of it; nothing about the shape of the trade moves.)
 #
 # Encode time is linear in pictures past the first clip (which carries a
 # fixed few milliseconds of setup): 0.84-0.91ms a picture on the Game Boy and
@@ -112,8 +124,8 @@ CLIP_FPS = 15
 # 597x448 (see MIN_CLIP_WIDTH) and which the WEBP_METHOD table above measures
 # at 342ms of encode for a one second clip and 1,863ms for a four second one
 # at the settings this ships with. At the same per-picture rate 15 seconds is
-# 225 pictures and roughly 7 seconds of encode, for one button press, on the
-# thread every channel's emulation shares. 5 seconds is 76 pictures and
+# 224 pictures and roughly 7 seconds of encode, for one button press, on the
+# thread every channel's emulation shares. 5 seconds is 75 pictures and
 # roughly 2.3 -- still the slowest thing this cog does, but bounded, and only
 # reachable by someone who asked for it.
 #
@@ -124,10 +136,10 @@ CLIP_FPS = 15
 # console that has the biggest frames:
 #
 #                    1s         5s        15s
-#   SNES hi-res    10.5 MiB   49.9 MiB   147.7 MiB
-#   Game Boy        1.1 MiB    5.0 MiB    14.8 MiB
+#   SNES hi-res     9.8 MiB   49.2 MiB   147.0 MiB
+#   Game Boy        1.0 MiB    4.9 MiB    14.8 MiB
 #
-# 148 MiB of images for one press is not a thing a bot sharing a host should
+# 147 MiB of images for one press is not a thing a bot sharing a host should
 # be askable for from a chat box.
 #
 # Third, the turn, which is the same argument that made CLIP_SECONDS one
@@ -149,19 +161,21 @@ MAX_CLIP_SECONDS = 5.0
 
 # The fewest emulated frames a clip may be, whatever it was asked for. At
 # CLIP_FPS against a 60 fps core one picture is four frames, so six frames is
-# three pictures (frames 1, 5 and -- because the closing frame is always
-# photographed, see capture_plan -- 6), which is more than the least that is
-# still an animation, and leaves room for a press plus the aftermath frame
-# below. MIN_CLIP_SECONDS is well clear of it on every console here (0.2s is
-# 10 frames even on a 50 fps PAL core), so this is a floor for a core that
-# reports a strange frame rate and for direct callers of record(), not
-# something the settings can reach.
+# two pictures (emulated frames 4 and -- because the closing frame is always
+# photographed, see capture_plan -- 6), which is the least that is still an
+# animation, and leaves room for a press plus the aftermath frame below.
+# MIN_CLIP_SECONDS is well clear of it on every console here (0.2s is 10
+# frames even on a 50 fps PAL core, which is three pictures), so this is a
+# floor for a core that reports a strange frame rate and for direct callers of
+# record(), not something the settings can reach.
 MIN_CLIP_FRAMES = 6
 
 # How many emulated frames at the end of a clip are kept clear of input, so
 # the last picture shows the game *after* the press rather than still under
-# it. Counted in captured frames by input_budget(), which is what makes it
-# one visible picture rather than one invisible frame.
+# it. input_budget() turns it into a frame on the capture cadence, which is
+# what makes it one visible picture rather than one invisible frame: the
+# budget is photographed by definition, and the clip's appended closing
+# picture -- which can be worth a single emulated frame -- comes after it.
 MIN_AFTERMATH_FRAMES = 1
 
 # -- The seam: where one clip stops and the next one starts -------------------
@@ -169,15 +183,25 @@ MIN_AFTERMATH_FRAMES = 1
 # A picture is taken *after* an emulated frame, never before one, so the
 # picture at index ``i`` is the game after ``i + 1`` frames and the last
 # picture of a clip is the game after all ``frames`` of them (see
-# :func:`capture_plan`, which always photographs both ends). The next clip
-# emulates one frame and photographs it. **The seam is therefore exactly one
-# emulated frame, every time, on every console**: press, clip, press, clip is
-# one unbroken run of console frames with nothing shown twice, nothing skipped,
-# and no way for the console to get ahead of what has been posted.
+# :func:`capture_plan`, which always photographs the closing frame). The next
+# clip picks the console up on the very next frame. **The emulation is
+# therefore one unbroken run, every time, on every console**: press, clip,
+# press, clip covers frames 1..N, N+1..2N, 2N+1..3N with nothing emulated
+# twice, nothing skipped, and no way for the console to get ahead of what has
+# been posted. The still picture left in the channel is the state the next
+# clip starts from, exactly.
+#
+# The *pictures* are a cadence laid over that run, one every ``step`` frames,
+# and the cadence does not break at a clip boundary either: a 60 frame Game
+# Boy clip photographs absolute frames 4, 8 ... 60 and the next one 64, 68 ...
+# 120. Four frames between every pair of pictures, including the pair that
+# straddles the seam. (It used to be 1, 5 ... 57, 60 then 61, 65 ..., so the
+# gaps around a boundary went 3, 1, 4 -- a stutter built into the arithmetic,
+# on top of the one the opening picture caused. See capture_plan.)
 #
 # That is the contract, it is what ``[p]retro``'s Wait button always did, and
-# it is worth stating in one place because the thing that used to live here
-# broke it.
+# it is worth stating in one place because two of the things that used to live
+# here broke it.
 #
 # **The pre-roll, and why it is gone.** A clip that opened with a press used to
 # run the press out *unphotographed* -- up to a quarter of a second of it --
@@ -217,37 +241,59 @@ MIN_AFTERMATH_FRAMES = 1
 # So the pre-roll is removed rather than retuned. No bound could have saved it:
 # the only way to escape a repeated opening picture is to skip forward until
 # the picture changes, and on a screen that never changes that is either a
-# jump (what it did) or an unbounded one (worse). What is left is the honest
-# reading -- the game *has not moved*, and the clip says so.
+# jump (what it did) or an unbounded one (worse).
 #
-# What that costs, measured the same way, in pictures of the sixteen a one
-# second clip photographs that are the held one again before anything moves:
+# **Sampling the end of each span, and why that is not the pre-roll again.**
+# Removing the pre-roll left the report standing on most games, because
+# :func:`capture_plan` still opened every clip on frame 0 -- the one frame on
+# which, by construction, nothing can have happened yet. The press goes down
+# before frame 0 and the shutter fell one frame later. Measured here as the
+# first emulated frame whose picture differs at all, button held from frame 0:
+# gambatte/uCity 1, fceumm/nestest 2, snes9x 4, mgba 11. So on everything but
+# a game that was already animating, the opening picture was the closing
+# picture of the previous clip, byte for byte, held for a whole step.
 #
-#   fceumm / nestest      down     0 -> 1    (nothing -> 67ms of held picture)
-#   gambatte / uCity      down     4 -> 8    on the seam where uCity's menu
-#                                            has just stopped animating
-#   gambatte / Libbet     down    11 -> 16   on the seam where its screen has
-#                                            just settled
-#   fceumm / nestest      start   16 -> 16   unchanged, and dmg-acid2 the
-#                                            same: a screen that never moves
-#                                            was all repeat either way
+# capture_plan now photographs each span at its *end* instead, which gives the
+# console ``step`` frames -- 67ms at CLIP_FPS -- to answer the button before
+# the first picture is taken. This costs no game time and skips no frame:
+# frames 0..step-2 are still emulated and are still counted in the first
+# picture's duration. That is the difference from the pre-roll, which paid for
+# its clean opening picture in skipped console frames and blew the seam open.
 #
-# So a clip gains between nothing and a few pictures of visible latency at its
-# start, which is the latency the game really has, and the encoder folds that
-# run of identical pictures into one stored frame with their durations added
-# together (see :func:`encode_animation`) -- it is a held picture, not a
-# stutter. In exchange every clip starts one frame after the last one ended,
-# the console never runs a quarter of a second ahead of the pictures, and a
+# Measured on this Raspberry Pi 5, one second clips, default 160ms hold, after
+# a first press so the screen is where a *second* press finds it -- opening
+# pictures that are the held one again, out of the sixteen the old plan took
+# and the fifteen this one does:
+#
+#   fceumm / nestest      down     1 of 16  ->  0 of 15   the reported case
+#   gambatte / Libbet     start    1 of 16  ->  0 of 15   answers on frame 3
+#   gambatte / uCity      down     0 of 16  ->  0 of 15   already animating
+#   fceumm / nestest      start   16 of 16  -> 15 of 15   ignores the button
+#   gambatte / Libbet     down    16 of 16  -> 15 of 15   ignores the button
+#   gambatte / dmg-acid2  a       16 of 16  -> 15 of 15   never moves at all
+#
+# The bottom three are the honest reading and must stay that way: the game has
+# not moved, and the clip says so rather than skipping forward looking for a
+# change it will never find. The encoder folds that run of identical pictures
+# into one stored frame with their durations added together (see
+# :func:`encode_animation`), so it is a held picture and not a stutter, and a
 # clip of a static screen is still a full length clip -- not the 17ms flash
 # that the *trim* of leading duplicates, tried and rejected before the
 # pre-roll, turned it into.
 #
+# A core slower than ``step`` can still open on a repeated picture: mgba's 11
+# frames is nearly three pictures' worth, so a GBA clip may hold its opening
+# picture once or twice before the game answers. That is the game's own
+# latency and there is no honest way to remove it -- only to show it.
+#
 # **The frame rate is not a lever on any of this**, which is the first thing
-# that was tried. :func:`capture_plan` puts a picture on frame 0 and on the
-# final frame whatever the cadence is, so the seam is one frame at every
-# CLIP_FPS -- measured at 10, 15, 20 and 60 against all five rows above, and
-# the seam column is identical in all four. All CLIP_FPS changes is how many
-# pictures fill the middle.
+# that was tried. :func:`capture_plan` photographs the final frame whatever
+# the cadence is, so the emulation is unbroken at every CLIP_FPS -- measured
+# at 10, 15, 20 and 60 against all five rows above. All CLIP_FPS changes is
+# how many pictures fill a clip and, with them, how many frames of reaction
+# time the opening picture is given: a higher rate is a sharper animation and
+# a slightly earlier shutter, which is a trade in the wrong direction on a
+# slow core and the reason 15 is not raised to answer mgba.
 
 # Animated WebP, encoded losslessly, is the one format a clip is ever posted
 # in, and GIF is not worth reintroducing as an alternative: measured on a 4
@@ -616,51 +662,69 @@ def capture_plan(
 
     Returns ``[(frame index, emulated frames that picture stands for), ...]``,
     oldest first, where the index is the 0-based frame of the recording --
-    exactly what ``RetroEmulator.record_frames`` counts with. The picture taken on
-    index ``i`` shows the game after ``i + 1`` emulated frames, and stands
-    until the next picture is taken, so the durations always add up to
+    exactly what ``RetroEmulator.record_frames`` counts with. The picture taken
+    on index ``i`` shows the game after ``i + 1`` emulated frames and stands
+    for the run of frames *ending* on it, so the durations always add up to
     ``frames`` and the clip plays for as long as it emulated.
 
-    Two frames are always photographed, whatever ``step`` is, and between them
-    they are the whole of why clip boundaries are seamless -- see the seam
-    block above, which is the one-frame rule these two halves add up to:
+    **Each span is photographed at its end, not its start.** A 60 frame Game
+    Boy clip at ``step`` 4 is frames 3, 7, 11 ... 59 -- fifteen pictures, every
+    one of them worth exactly four emulated frames. It used to be 0, 4, 8 ...
+    56, 59: sixteen pictures with a ragged ``3, 1`` tail, and an opening
+    picture taken after a single emulated frame.
 
-    * **frame 0**, so a press scheduled at the start of the clip is already
-      landing in the first picture the player sees, and so the clip opens one
-      emulated frame after the previous clip's closing picture rather than
-      some multiple of ``step`` later;
-    * **the last frame**, so the picture the clip finishes on -- and holds,
-      since clips are encoded with ``loop=1`` -- is the exact state the *next*
-      clip carries on from. Without it the clip stopped on the last frame that
-      happened to fall on the ``step`` cadence (frame 57 of a 60 frame Game
-      Boy clip) while frames 58, 59 and 60 were emulated but never shown, so
-      the still picture sitting in the channel between presses was three
-      frames behind the console.
+    That one frame was the whole of a reported stutter. A press is scheduled
+    on frame 0 (see ``timing.press_plan``), and one frame after a button goes
+    down almost nothing has happened yet -- measured as the first emulated
+    frame whose picture differs at all, with the button held from frame 0:
 
-    Neither of them depends on ``step``, which is why the clip's frame rate
-    cannot move the seam: at any ``step`` at all, the last picture of one clip
-    is emulated frame ``frames`` of its window and the first picture of the
-    next is frame 1 of the following window.
+        gambatte / uCity      down    1     (it animates every frame anyway)
+        fceumm / nestest      down    2
+        snes9x / rotozoom     a       4
+        mgba / GBA homebrew   a      11
 
-    Everything in between is on the regular ``step`` cadence, so the clip's
-    timing is uniform except for the tail: a 60 frame clip at ``step`` 4 is
-    fourteen 4-frame pictures, then a 3-frame one (frame 57) and a 1-frame one
-    (frame 60). The last picture is the one that gets held after playback, so
-    its short nominal duration costs nothing.
+    So on everything but a game that is already moving, the picture taken on
+    frame 0 was byte-identical to the one the previous clip had left standing
+    in the channel, and the clip opened by showing it again for a whole step of
+    playback. Sampling at the *end* of the span gives the console ``step``
+    frames -- 67ms at CLIP_FPS -- to answer the button before the shutter, which
+    is enough for every core above but the Game Boy Advance, where one repeated
+    opening picture is still possible and is the game's own latency being told
+    honestly. Nothing is skipped to achieve this: frames 0, 1 and 2 are still
+    emulated, and still counted in the first picture's duration.
 
-    When the last frame is already on the cadence -- ``frames`` of
-    ``k * step + 1`` -- nothing is added and every picture but the last is a
-    whole step.
+    **The last frame is always photographed**, whatever ``step`` is -- appended
+    when it is not already on the cadence -- because the picture the clip
+    finishes on, and holds (clips are encoded with ``loop=1``), is the exact
+    state the *next* clip carries on from. Without it the clip stopped on the
+    last frame that happened to fall on the cadence while the frames after it
+    were emulated but never shown, so the still picture sitting in the channel
+    between presses was up to ``step - 1`` frames behind the console. That is
+    the seam, it does not depend on ``step``, and it is why the clip's frame
+    rate is not a lever on any of this -- see the seam block above.
+
+    The timing is therefore uniform except for that appended tail: 60 frames at
+    ``step`` 4 is fifteen 4-frame pictures and no tail at all, and 30 frames is
+    ``4,4,4,4,4,4,4,2`` -- seven whole pictures and a 2-frame one on frame 29.
+    Nothing is appended when ``frames`` is a whole multiple of ``step``.
+
+    Short windows degrade sanely rather than specially: with ``frames`` below
+    ``step`` the cadence yields nothing at all and the clip is the single
+    closing picture, standing for every frame there was (``frames=2``,
+    ``step=4`` is ``[(1, 2)]``).
     """
     frames = max(1, int(frames))
     step = max(1, int(step))
-    indices = list(range(0, frames, step))
-    if indices[-1] != frames - 1:
+    indices = list(range(step - 1, frames, step))
+    if not indices or indices[-1] != frames - 1:
         indices.append(frames - 1)
-    bounds = indices[1:] + [frames]
+    # Each picture stands for the frames between the previous shutter and its
+    # own, so the first one covers frame 0 up to and including itself -- which
+    # is what makes the durations tile the window with no hole and no overlap.
+    previous = [-1] + indices[:-1]
     return [
-        (index, following - index)
-        for index, following in zip(indices, bounds, strict=True)
+        (index, index - earlier)
+        for index, earlier in zip(indices, previous, strict=True)
     ]
 
 
@@ -673,10 +737,11 @@ def clip_plan(
     ``[(frame index, that picture's duration in ms), ...]``, oldest first --
     exactly the durations ``RetroEmulator.record_frames`` captures with, and
     therefore exactly what ends up in the clip's ANMF chunks. A picture
-    stands for ``covered`` emulated frames and is shown for as long as those
-    frames took to emulate, which is what makes the clip play for as long as
-    the window it photographed (see CLIP_FPS for the 0.4% the millisecond
-    rounding costs).
+    stands for the ``covered`` emulated frames ending on it and is shown for
+    as long as those frames took to emulate, which is what makes the clip play
+    for as long as the window it photographed (see CLIP_FPS for the 0.4% the
+    millisecond rounding costs). A 60 frame Game Boy clip is fifteen 67ms
+    pictures and nothing else.
 
     The floor of 1ms is the encoder's: WebP reads a duration of 0 as "as fast
     as the decoder can manage". It is applied here so that what this returns
@@ -720,24 +785,36 @@ def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     mid-press does not show the player what their press did. Only every
     ``capture_step``-th frame is captured, so this is the last frame on that
     cadence (less MIN_AFTERMATH_FRAMES - 1 further pictures), not simply
-    ``frames - 1``: releasing a button on frame 59 of a 60 frame clip would
-    only ever be seen in the closing picture, which is held rather than
-    played.
+    ``frames - 1``: :func:`capture_plan` may append a closing picture worth as
+    little as one emulated frame, and a release seen only there is a release
+    that flashes past in 17ms.
 
-    :func:`capture_plan` also photographs the clip's final frame, so there is
-    always *more* aftermath on screen than this reserves, never less -- the
-    closing picture is taken after the budget and therefore after the
-    release too.
+    The cadence is ``step - 1, 2 * step - 1, ...`` (see :func:`capture_plan`,
+    which photographs the *end* of each span), so the last frame on it is
+    ``(frames // step) * step - 1`` -- 59 of a 60 frame Game Boy clip, 27 of a
+    30 frame one, 235 of the 239 a four second clip runs. It used to be one
+    step earlier in the phase, because the cadence used to start on frame 0;
+    the guarantee underneath is unchanged, and so is its worst case.
 
-    At four seconds this is 236 of 239 frames and no schedule ever came near
-    it. At a fifth of a second it is 8 of 12, and it is what stops a 400ms
+    That guarantee: frames ``budget`` through ``frames - 1`` are clear of
+    input, which is ``frames % step + 1`` emulated frames -- between one and
+    ``step`` of them -- and the picture taken *on* the budget is the first one
+    that shows the release. It is photographed by definition, and the appended
+    closing picture (when there is one) comes after it, so the aftermath is
+    always at least one whole picture and sometimes two. One emulated frame is
+    not enough for most games to have *drawn* the release -- see the latency
+    table in :func:`capture_plan` -- so this is a floor on where input may
+    stop, not a claim about pixels.
+
+    At four seconds this is 235 of 239 frames and no schedule ever came near
+    it. At a fifth of a second it is 11 of 12, and it is what stops a 400ms
     hold, or the repeat button's three taps, from running off the end of the
     recording.
     """
     frames = max(1, int(frames))
     step = capture_step(fps, clip_fps)
     reserved = max(1, int(MIN_AFTERMATH_FRAMES)) - 1
-    return max(1, ((frames - 1) // step - reserved) * step)
+    return max(1, (frames // step - reserved) * step - 1)
 
 
 # -- How big the posted picture is -------------------------------------------
@@ -752,7 +829,7 @@ def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
 # an attached image down to the message column, so a 597x448 SNES clip is
 # shrunk again in the client while costing ~4x the encode of a native-sized
 # one. Measured on a Raspberry Pi 5, one second of real motion per console,
-# best of three (a 1s clip is 60 emulated frames and 16 pictures):
+# best of three (a 1s clip is 60 emulated frames and 15 pictures):
 #
 #                     pixels     emulate   Pillow   encode    total    bytes
 #   Game Boy   1x    160x144      20.7ms    6.4ms    6.9ms   31.6ms    3,576

@@ -1181,35 +1181,42 @@ class RetroEmulator:
         shows the game reacting to the input rather than only its end state.
         Overlapping entries are fine: they are simply held at the same time.
         A press scheduled at frame 0 goes down *before* the first emulated
-        frame, so the first picture the player sees is already the game
-        responding.
+        frame, and the first picture is not taken until ``core_fps / fps``
+        frames later, so by the time the player sees anything the console has
+        had a whole picture's worth of time to answer the button.
 
-        Every ``core_fps / fps``-th emulated frame is captured, plus the very
-        last one -- see :func:`capture_plan`, which is what makes one clip
-        carry on from the previous one with no frames lost in between. The
-        default one second (60 emulated Game Boy frames) at 15 fps is a 16
-        picture clip. Identical consecutive frames cost almost nothing -- the
-        encoder merges them and adds their durations together -- so a game
-        sitting on a static screen produces a handful of kilobytes, and a
-        short clip of one can legitimately come back out as a single frame
-        holding the whole clip's duration.
+        The capture cadence is the *end* of each span -- frames ``step - 1``,
+        ``2 * step - 1`` and so on, plus the window's very last frame -- which
+        is what makes the opening picture show the press landing and the
+        closing picture the state the next clip carries on from. See
+        :func:`capture_plan`, which carries the measurements. The default one
+        second (60 emulated Game Boy frames) at 15 fps is a 15 picture clip,
+        every picture worth exactly four emulated frames. Identical
+        consecutive frames cost almost nothing -- the encoder merges them and
+        adds their durations together -- so a game sitting on a static screen
+        produces a handful of kilobytes, and a short clip of one can
+        legitimately come back out as a single frame holding the whole clip's
+        duration.
 
         A press is fitted to the recording by the caller (see
         :func:`input_budget` and ``RetroView.press_plan``); what happens here
         is only the final safety clamp, which keeps a press inside the window
         but does not promise the release will be *seen*.
 
-        **Every frame is emulated exactly once and photographed in order.**
-        The loop advances the core by one frame and *then* takes the picture,
-        so the picture the plan calls index ``i`` is the game after ``i + 1``
-        frames, and the last one is the game after all ``frames`` of them.
-        Nothing is run past unphotographed and nothing is photographed twice,
-        which is the whole of why the next clip -- whose first picture is one
-        emulated frame later -- joins onto this one with no repeat and no gap.
-        See the seam block in retro/clips.py, which carries the per-core
-        measurements, and which is also where the pre-roll that used to sit in
-        front of this loop is written up: it skipped between 1 and 16 frames
-        at every seam and did not fix what it was written for.
+        **Every frame is emulated exactly once, in order, and every one of
+        them is accounted for by some picture's duration.** The loop advances
+        the core by one frame and *then* takes the picture when the plan asks
+        for one, so the picture the plan calls index ``i`` is the game after
+        ``i + 1`` frames, and the last one is the game after all ``frames`` of
+        them. A frame the plan skips is still emulated and still counted in
+        the duration of the next picture taken, so nothing is run past
+        unaccounted for and nothing is photographed twice -- which is the
+        whole of why the next clip, which picks the console up on the very
+        next frame, joins onto this one with no repeat and no gap. See the
+        seam block in retro/clips.py, which carries the per-core measurements,
+        and which is also where the pre-roll that used to sit in front of this
+        loop is written up: it skipped between 1 and 16 frames at every seam
+        and did not fix what it was written for.
 
         A clip with a press in it is therefore emulated frame for frame like
         any other, so ``input_budget``'s promise -- that the button is up
@@ -1256,9 +1263,9 @@ class RetroEmulator:
         held: set = set()
         # One duration per captured picture rather than one for the clip, so
         # the clip plays for exactly as long as it emulated: a picture stands
-        # until the next one is taken, which is ``capture_step`` frames for
-        # all but the tail. Giving the shorter tail pictures a full 67ms each made a
-        # half second clip play 7% slow.
+        # for the frames ending on it, which is ``capture_step`` of them for
+        # all but the appended closing one. Giving that shorter closing
+        # picture a full 67ms made a half second clip play 7% slow.
         #
         # :func:`clip_plan` rather than capture_plan plus the conversion,
         # because the cog has to know the same total *before* it has a clip:

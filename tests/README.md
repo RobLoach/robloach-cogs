@@ -275,9 +275,10 @@ The matching statement for the *content* of a clip is
 `test_one_clip_carries_on_from_the_last_with_no_frames_lost` in
 `test_emulator.py`: it records two consecutive clips off a real Game Boy,
 then rewinds the save state and emulates the same frames one at a time, and
-requires the first clip's last picture and the second clip's first picture to
-be adjacent emulated frames. `tests/test_clips.py` makes the same statement
-about `capture_plan` at every clip length and frame rate, with no core.
+requires the first clip's last picture to be its window's final emulated frame
+and the second clip's first picture to be one capture step into the next
+window. `tests/test_clips.py` makes the same statement about `capture_plan` at
+every clip length and frame rate, with no core.
 
 **A clip plays for exactly as long as it emulated**, and that rule is
 unconditional -- see `test_a_clip_plays_for_as_long_as_it_emulated`, whose
@@ -287,30 +288,47 @@ wants to trim the whole clip and leave a 17ms flash.
 
 **A clip starts exactly one emulated frame after the last one ended.** A
 picture is taken *after* an emulated frame, so the last picture of a clip is
-its window's final frame and the first picture of the next clip is the next
-frame of the console -- no repeat, no gap, and no way for the console to run
-ahead of what has been posted. That was broken for a while by a bounded
-**pre-roll**, which ran a clip's opening press out unphotographed until the
-picture stopped being the one the previous clip had left in the channel: it
-put 1 to 16 frames into every seam and, on the static screens this cog is
-actually played on, opened the clip on the repeated picture anyway. It is
-gone; the measurements are in the seam block in `retro/clips.py` and in
-section 3a of `test_emulator.py`.
+its window's final frame and the next clip picks the console up on the next
+frame of it -- no repeat, no gap, and no way for the console to run ahead of
+what has been posted. The next clip's first *picture* is one capture step
+further on, because `capture_plan` photographs the end of each span so that a
+press scheduled on frame 0 has had time to land; the frames in between are
+emulated and counted in that picture's duration, never skipped.
 
-Five tests carry it, and between them they are the whole argument:
+Both halves have been got wrong. A bounded **pre-roll** ran a clip's opening
+press out unphotographed until the picture stopped being the one the previous
+clip had left in the channel: it put 1 to 16 frames into every seam and, on
+the static screens this cog is actually played on, opened the clip on the
+repeated picture anyway. Removing it left the report standing, because the
+capture cadence still started on frame 0 -- one emulated frame after the
+button went down, which is the one frame on which nothing can have happened
+yet. Both are written up with their measurements in the seam block in
+`retro/clips.py` and in section 3a of `test_emulator.py`.
+
+Six tests carry it, and between them they are the whole argument:
 
 * `test_the_seam_between_two_clips_is_exactly_one_emulated_frame` is the
   statement itself, over every probe and both with a press and without one.
   Two clips are recorded back to back, then the same window is rewound and
   emulated one frame at a time with identical input, and every picture of
   both clips has to be its reference frame -- so the first clip ends on frame
-  N and the second opens on N+1. It also counts the frames the recordings
+  N and the second opens on N+step. It also counts the frames the recordings
   emulated (by wrapping `advance`), which is the half a frozen screen cannot
   satisfy by accident;
+* `test_a_clip_opens_on_the_game_already_reacting_to_the_press` is the fix for
+  the reported stutter, per core: it measures how long the core really takes
+  to answer the button (frame by frame, off the core itself) and then requires
+  the second clip's opening picture to differ from the picture the first one
+  finished on. `PRESS_LATENCY` above it carries the per-core numbers -- 1 for
+  µCity, 2 for nestest, 4 for snes9x, 11 for mgba -- and mgba is deliberately
+  skipped rather than asserted, since eleven frames is nearly three pictures
+  and one repeated opening picture is still honest there;
 * `test_the_clip_frame_rate_does_not_move_the_seam` answers the question the
   report asked ("is there something we can do in the framerate?") at 10, 15,
-  20 and 60 fps: `capture_plan` photographs frame 0 and the final frame at
-  every cadence, so the seam does not move;
+  20 and 60 fps: `capture_plan` photographs the final frame at every cadence,
+  so the picture left in the channel is where the next clip resumes whatever
+  the rate. Raising the rate takes the shutter *earlier* into the window,
+  which is the wrong direction for reaction latency;
 * `test_a_moving_game_never_repeats_a_picture_across_the_seam` is the
   pictures half, on the one probe that animates by itself;
 * `test_a_completely_static_screen_still_produces_a_whole_clip` is the cost,
@@ -321,15 +339,18 @@ Five tests carry it, and between them they are the whole argument:
   a ROM turns out not to be static under the core build in use;
 * `test_a_games_own_reaction_latency_is_shown_rather_than_skipped` pins the
   trade in the other direction: Libbet answers Start on its third frame, and
-  the clip now holds the unchanged picture for exactly that long instead of
-  skipping it -- no more (nothing is dragged out) and no fewer (nothing is
-  hidden).
+  the clip holds the unchanged picture for exactly the pictures whose frames
+  fall before that -- no more (nothing is dragged out) and no fewer (nothing
+  is hidden). At the default step of four those three frames fit inside the
+  opening picture's own duration, so the count is zero; on a slower core it
+  would not be, and the arithmetic is the same either way.
 
 `test_the_hold_is_honoured_in_full_and_released_before_the_last_picture` reads
 the input back off the frames the core really saw and pins that the window is
 the clip and nothing else, and
-`test_a_clip_with_no_input_in_it_photographs_from_its_very_first_frame` is
-Wait, Undo, a boot and `[p]retroreboot`, which always had the one-frame seam.
+`test_a_clip_with_no_input_in_it_covers_its_window_from_the_first_frame` is
+Wait, Undo, a boot and `[p]retroreboot`, which always resumed on the very next
+frame.
 The arithmetic underneath all of it is covered with no core at all in
 `test_clips.py` (`test_the_seam_between_two_clips_is_exactly_one_emulated_frame`
 and `test_the_clip_frame_rate_cannot_move_the_seam`, over every frame rate,
