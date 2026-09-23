@@ -133,18 +133,23 @@ QUEUED_WAIT = "wait"
 #: to it rather than a second announcement.
 QUEUE_NOTE = "*Queued: {queued}*"
 
-#: One entry in that listing: the button, and only the button.
+#: One person's run of waiting presses: their name, then their buttons in
+#: order, separated by nothing at all -- ``Rob ⬆️⬆️⬇️⬇️``.
 #:
-#: It used to be ``"{who} {button}"`` -- ``*Queued: Ada ⬅️*`` -- and the name
-#: is gone to keep the whole line short enough to read at a glance next to
-#: the picture. What that costs is worth knowing: with one waiting press per
-#: person (see MAX_QUEUED_PRESSES) the name was how somebody confirmed that
-#: the press in the list was *theirs* rather than somebody else's identical
-#: one. A queue of "⬅️, ⬅️" no longer says which of the two is yours.
+#: The name is back, and a run is grouped rather than listed one entry at a
+#: time, because one person may now hold every slot (see MAX_QUEUED_PRESSES).
+#: Four separate entries reading ``⬆️, ⬆️, ⬇️, ⬇️`` says four unrelated
+#: things happened; ``Rob ⬆️⬆️⬇️⬇️`` says what it actually is, which is one
+#: person walking. Grouping also keeps the line short at the length that
+#: matters: the queue is at most MAX_QUEUED_PRESSES deep, so the worst case
+#: is one name and three buttons.
 #:
-#: Putting it back is this string and :meth:`RetroView.queued_label`, which
-#: is why :attr:`Pending.who` is still captured at the moment of the click.
-QUEUE_ENTRY = "{button}"
+#: Consecutive entries by the same person are grouped; a different person
+#: starts a new group, so ``Rob ⬆️⬆️, Ada ⬅️`` is two people and the order
+#: is still the order they will run in. A name that :func:`presser_name`
+#: could not read at all is left out and only the buttons are shown.
+QUEUE_ENTRY = "{who} {buttons}"
+QUEUE_ENTRY_ANONYMOUS = "{buttons}"
 
 #: Said once, on the next line the session writes, when something threw the
 #: queue away: a reset, an undo, a stop. Without it the presses simply

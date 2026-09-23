@@ -94,6 +94,7 @@ from .text import (  # noqa: F401  (re-exported)
     MAX_PRESSER_NAME,
     NO_PINGS,
     QUEUE_ENTRY,
+    QUEUE_ENTRY_ANONYMOUS,
     QUEUE_NOTE,
     QUEUED_WAIT,
     REPEAT_GONE_NOTE,
@@ -149,20 +150,23 @@ DEFAULT_TIMEOUT_MINUTES = 10
 #   queued press is emulated against a game state its author has not seen
 #   yet. Three waiting plus the one running is about four seconds of latency,
 #   which is the most that is still recognisably "I pressed that".
-# * **one waiting press per person.** Round-robin rather than
-#   first-come-first-served, and it falls out of the rule rather than needing
-#   a scheduler: a fast clicker cannot fill the queue on their own, so a
-#   roomful of people take it in turns without anybody arranging it. A second
-#   click from somebody who already has one waiting is refused and the first
-#   one stands -- the message has already shown their press in the queue (see
-#   RetroView.queue_note), and quietly swapping it for something else would
-#   make that acknowledgement a lie for a second.
+# * **first come, first served, whoever it is.** There is deliberately no
+#   per-person limit any more. There used to be one -- one waiting press
+#   each -- on the theory that it made a roomful of people take turns
+#   without a scheduler. What it actually did was break the commonest way
+#   one person plays: a direction is rarely pressed once. Walking four tiles
+#   is four clicks in a row, and the second, third and fourth were all
+#   refused because the first was still waiting, so the controller went back
+#   to feeling dead for exactly the person using it most. Taking turns is
+#   what the cap above already does -- three waiting is three waiting
+#   whoever queued them, and a fast clicker filling all three only ever
+#   costs themselves the next three seconds.
 # * **every waiting press is visible.** An input nobody can see is an input
 #   that feels lost, which is the whole complaint. The queue is listed as a
 #   suffix on the very line the running press is already rewriting, so it
-#   costs no extra edit -- see RetroView.queue_note and _ack_now. The listing
-#   names the buttons and not the people any more; see QUEUE_ENTRY for what
-#   that costs.
+#   costs no extra edit -- see RetroView.queue_note and _ack_now. It names
+#   the person and then their buttons in order, so a run of presses reads as
+#   one intent: `Rob up up down down`.
 # * **the queue is intent, never work.** A pending entry is a button name and
 #   a deferred interaction; nothing touches the emulator until the runner
 #   takes the lock again for it. The one-core-at-a-time discipline is
@@ -1187,22 +1191,20 @@ class RetroView(discord.ui.View):
 
         * the session has been replaced or retired -- there is nothing left
           for a press to reach;
-        * MAX_QUEUED_PRESSES are already waiting;
-        * **this person already has one waiting.** One slot each is what
-          makes a group take turns without a scheduler, and the first click
-          is the one that stands: the message has already said it is queued.
+        * MAX_QUEUED_PRESSES are already waiting.
 
-        Never raises, and never touches the emulator: see the note above
-        MAX_QUEUED_PRESSES.
+        That is the whole list. **One person may hold every slot**, which is
+        a deliberate change: pressing a direction four times to walk four
+        tiles is the commonest thing anybody does with this controller, and
+        the per-person limit refused three of those four clicks. See the note
+        above MAX_QUEUED_PRESSES.
+
+        Never raises, and never touches the emulator: see the same note.
         """
         if self.closed or len(self.queue) >= MAX_QUEUED_PRESSES:
             return False
         user = user if user is not None else getattr(interaction, "user", None)
         user_id = getattr(user, "id", None)
-        if user_id is not None and any(
-            entry.user_id == user_id for entry in self.queue
-        ):
-            return False
         self.queue.append(
             Pending(
                 interaction=interaction,
@@ -1239,19 +1241,41 @@ class RetroView(discord.ui.View):
 
     def queued_label(self, entry: Pending) -> str:
         """
-        One waiting press, named the way the press line names a button.
+        One waiting press's button, named the way the press line names it.
 
-        The presser's name is deliberately not in it any more; see
-        QUEUE_ENTRY, which is also where putting it back would start.
+        The button and nothing else; whose it is comes from grouping in
+        :meth:`queue_note`, because one person's run of presses reads as one
+        thing rather than as several. See QUEUE_ENTRY.
         """
         if entry.field is None:
-            button = QUEUED_WAIT
-        else:
-            button = self.system.caption_for(entry.field)
-            taps = len(self.press_plan(entry.repeat)) if entry.repeat > 1 else 1
-            if taps > 1:
-                button = f"{button} x{taps}"
-        return QUEUE_ENTRY.format(button=button)
+            return QUEUED_WAIT
+        button = self.system.caption_for(entry.field)
+        taps = len(self.press_plan(entry.repeat)) if entry.repeat > 1 else 1
+        if taps > 1:
+            button = f"{button} x{taps}"
+        return button
+
+    def queued_runs(self) -> typing.List[typing.Tuple[str, typing.List[str]]]:
+        """
+        The queue as ``(who, [button, ...])`` runs, in the order it will run.
+
+        Consecutive entries by the same person are one run, so four clicks
+        from one person are ``("Rob", ["\N{UPWARDS BLACK ARROW}", ...])``
+        rather than four separate things to read. A different person starts
+        a new run; the order is never rearranged, because the order is what
+        the queue *is*.
+
+        Grouped on the presser's *id* rather than on their name, so two
+        people who happen to render the same name are still two runs.
+        """
+        runs: typing.List[typing.Tuple[str, typing.List[str]]] = []
+        last_id = object()
+        for entry in self.queue:
+            if entry.user_id is None or entry.user_id != last_id:
+                runs.append((entry.who, []))
+                last_id = entry.user_id if entry.user_id is not None else object()
+            runs[-1][1].append(self.queued_label(entry))
+        return runs
 
     def queue_note(self) -> str:
         """
@@ -1267,9 +1291,20 @@ class RetroView(discord.ui.View):
         """
         if not self.queue:
             return ""
-        return QUEUE_NOTE.format(
-            queued=", ".join(self.queued_label(entry) for entry in self.queue)
-        )
+        parts = []
+        for who, buttons in self.queued_runs():
+            # A Wait reads as a word rather than a glyph, so a run holding
+            # one needs a space to stay readable: "Rob wait ⬆️", not
+            # "Rob wait⬆️". A run of pure emoji is closed up, which is what
+            # makes four presses read as one gesture.
+            joiner = " " if any(" " in b or b.isalpha() for b in buttons) else ""
+            drawn = joiner.join(buttons)
+            parts.append(
+                QUEUE_ENTRY.format(who=who, buttons=drawn)
+                if who
+                else QUEUE_ENTRY_ANONYMOUS.format(buttons=drawn)
+            )
+        return QUEUE_NOTE.format(queued=", ".join(parts))
 
     def dropped_note(self) -> str:
         """
@@ -2252,28 +2287,17 @@ class RetroView(discord.ui.View):
             log.debug("Could not answer a hidden repeat click.", exc_info=True)
             await self._silent_ack(interaction)
 
-    def _refusal_note(self, interaction: discord.Interaction) -> str:
+    def _refusal_note(self) -> str:
         """
         Why a press could not be queued, in a sentence for whoever clicked.
 
-        The three reasons :meth:`enqueue_press` refuses are genuinely
-        different -- one is "wait your turn", one is "you are already in the
-        queue" -- and answering them identically (or, as this used to,
-        answering them with nothing) is what makes a controller feel
-        unreliable rather than busy.
+        There is only one reason left. A closed session is answered before
+        this is reached (see :meth:`_replaced_ack`), and the per-person limit
+        that used to be the other reason is gone -- one person may hold every
+        slot now, so the only way to be refused is that the queue is full.
+        Saying so beats the contentless acknowledgement this used to be,
+        which was indistinguishable from the controller ignoring the click.
         """
-        user_id = getattr(getattr(interaction, "user", None), "id", None)
-        if user_id is not None and any(
-            entry.user_id == user_id for entry in self.queue
-        ):
-            waiting = next(
-                entry for entry in self.queue if entry.user_id == user_id
-            )
-            return (
-                f"You already have a press waiting: {self.queued_label(waiting)}. "
-                "One each is what keeps a busy channel taking turns \N{EM DASH} "
-                "it will play as soon as the presses in front of it have."
-            )
         return (
             f"{MAX_QUEUED_PRESSES} presses are already waiting, so this one "
             "was not added. They play in order, a clip each \N{EM DASH} try "
@@ -2282,7 +2306,7 @@ class RetroView(discord.ui.View):
 
     async def _whisper_refusal(self, interaction: discord.Interaction) -> None:
         """Tell just the clicker why their press was not queued."""
-        note = self._refusal_note(interaction)
+        note = self._refusal_note()
         try:
             await interaction.response.send_message(note, ephemeral=True)
         except discord.HTTPException:

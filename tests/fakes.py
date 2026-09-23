@@ -1235,13 +1235,26 @@ class RetroEnv:
             whole = f"{whole} {suffix}"
         return whole
 
-    def queued(self, *entries):
-        """The ``*Queued: ...*`` suffix for these button names.
+    def queued(self, *runs):
+        """The ``*Queued: ...*`` suffix for these runs of waiting presses.
 
-        Buttons only: the listing no longer names who is waiting. See
-        QUEUE_ENTRY.
+        Each argument is one run, either ``(who, *buttons)`` or a bare
+        button string for a run by somebody with no usable name. Consecutive
+        presses by one person are a run -- ``retro.queued(("Rob", up, up))``
+        is ``*Queued: Rob ⬆️⬆️*`` -- because one person may now hold every
+        slot and four separate entries would read as four unrelated things.
+        See QUEUE_ENTRY.
         """
-        return self.viewmod.QUEUE_NOTE.format(queued=", ".join(entries))
+        parts = []
+        for run in runs:
+            if isinstance(run, str):
+                who, buttons = "", [run]
+            else:
+                who, buttons = run[0], list(run[1:])
+            joiner = " " if any(" " in b or b.isalpha() for b in buttons) else ""
+            drawn = joiner.join(buttons)
+            parts.append(f"{who} {drawn}" if who else drawn)
+        return self.viewmod.QUEUE_NOTE.format(queued=", ".join(parts))
 
     def button(self, view, custom_id):
         """The child with this custom_id, or None if the view has no such one.

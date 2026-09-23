@@ -734,25 +734,16 @@ async def test_a_press_that_lands_mid_emulation_is_queued_rather_than_dropped(re
         waiting = retro.interaction(view, message=view.message)
         await retro.control(view, "wait").callback(waiting)
 
-        # The click that was *taken down* is acknowledged with a plain defer
-        # and nothing else: no edit, and no line naming a press that has not
-        # happened yet. Its acknowledgement is the queue suffix on the
-        # running press's own line.
-        assert held.kinds() == ["response.defer"]
-        # These three clicks are all the same person, so the second and third
-        # are refused -- one slot each; see the per-user test below. A
-        # refusal is *said*, privately: answering it with the same contentless
-        # defer an accepted press gets is indistinguishable from the
-        # controller ignoring you, which is the complaint the queue exists to
-        # answer.
-        for refused in (repeat, waiting):
-            assert refused.kinds() == ["response.send_message"]
-            (_, said), = refused.log
-            assert said["ephemeral"] is True, "only the clicker is told"
-            assert "already have a press waiting" in said["content"]
-        # ...and the intent of the one that was accepted is kept.
-        assert len(view.queue) == 1, "one slot per person, and these share one"
-    assert queued_names(view) == ["B"]
+        # Every click is acknowledged with a plain defer and nothing else:
+        # no edit, and no line naming a press that has not happened yet.
+        # Their acknowledgement is the queue suffix on the running press's
+        # own line.
+        for click in (held, repeat, waiting):
+            assert click.kinds() == ["response.defer"]
+        # All three are the same person and all three are kept: one person
+        # may hold every slot. See MAX_QUEUED_PRESSES.
+        assert len(view.queue) == 3
+    assert queued_names(view) == ["B", "A x3", "wait"]
 
 
 async def test_a_full_queue_says_so_rather_than_swallowing_the_click(retro):
@@ -806,33 +797,49 @@ async def test_the_queue_is_bounded_and_says_how_deep(retro):
         assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES
 
 
-async def test_one_person_gets_one_waiting_press_however_fast_they_click(retro):
-    """Round-robin without a scheduler; see MAX_QUEUED_PRESSES.
+async def test_one_person_may_hold_every_waiting_slot(retro):
+    """Walking four tiles is four clicks in a row, and all of them count.
 
-    A second click from somebody who already has one waiting is refused and
-    the *first* stands: the message has already told them their press is
-    queued, and quietly swapping it for something else would make that
-    acknowledgement a lie for a second.
+    There used to be a one-waiting-press-per-person rule, on the theory that
+    it made a roomful of people take turns. What it did in practice was
+    refuse the second, third and fourth click of the commonest thing anybody
+    does with a d-pad, so the controller felt dead for exactly the person
+    using it most. The depth cap is what bounds the queue now; see
+    MAX_QUEUED_PRESSES.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9013, "fair")
     rob = FakeUser(uid=11, name="Rob")
-    ada = FakeUser(uid=12, name="Ada")
 
     async with view.lock:
-        assert view.enqueue_press(retro.interaction(view, user=rob), "left")
-        assert not view.enqueue_press(retro.interaction(view, user=rob), "right")
-        assert not view.enqueue_press(retro.interaction(view, user=rob), "a")
-        assert view.enqueue_press(retro.interaction(view, user=ada), "a")
-        # Rob's first choice, once, and Ada behind him: a fast clicker cannot
-        # fill the queue on their own.
-        assert queued_names(view) == [
-            "\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}",
-            "A",
-        ]
-        # Whose each one is, is still on the entry even though the listing no
-        # longer prints it; see QUEUE_ENTRY.
-        assert [entry.who for entry in view.queue] == ["Rob", "Ada"]
+        for field in ("up", "up", "down"):
+            assert view.enqueue_press(retro.interaction(view, user=rob), field)
+        # The cap still bites, and it bites on depth rather than on who.
+        assert not view.enqueue_press(retro.interaction(view, user=rob), "down")
+        assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES
+        assert [entry.who for entry in view.queue] == ["Rob", "Rob", "Rob"]
+
+
+async def test_one_person_s_run_reads_as_one_run(retro):
+    """`Rob ⬆️⬆️⬇️` rather than three unrelated-looking entries."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9015, "runs")
+    rob = FakeUser(uid=11, name="Rob")
+    ada = FakeUser(uid=12, name="Ada")
+    up = "\N{UPWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}"
+    down = "\N{DOWNWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}"
+    left = "\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}"
+
+    async with view.lock:
+        assert view.enqueue_press(retro.interaction(view, user=rob), "up")
+        assert view.enqueue_press(retro.interaction(view, user=rob), "down")
+        assert view.queue_note() == retro.queued(("Rob", up, down))
+
+        # A different person starts a new run, and the order is never
+        # rearranged: the queue order is what the queue *is*.
+        assert view.enqueue_press(retro.interaction(view, user=ada), "left")
+        assert view.queue_note() == retro.queued(("Rob", up, down), ("Ada", left))
+        assert view.queued_runs() == [("Rob", [up, down]), ("Ada", [left])]
 
 
 async def test_the_running_press_says_what_is_queued_behind_it(retro):
@@ -873,7 +880,9 @@ async def test_the_running_press_says_what_is_queued_behind_it(retro):
         view,
         "Rob pressed A.",
         suffixes=[
-            retro.queued("\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}")
+            retro.queued(
+                ("Ada", "\N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}")
+            )
         ],
     )
     # One edit for Rob's press, exactly as before the queue existed.
@@ -1128,14 +1137,14 @@ async def test_only_one_press_is_ever_inside_the_emulator(retro):
 async def test_a_queued_press_from_somebody_unnameable_still_reads(retro):
     """A plain User, or somebody who has left the guild since clicking.
 
-    The listing is button names only now (see QUEUE_ENTRY), so an entry from
-    somebody with no usable name reads exactly like everybody else's rather
-    than as " A" -- which is what it used to have to be careful about.
+    The listing names people again (see QUEUE_ENTRY), so the run belonging
+    to somebody with no usable name has to be the buttons on their own --
+    never a leading space where the name would have gone.
 
-    The name is still sanitised *at the moment of the click* and kept on the
-    entry, because it cannot be recovered afterwards: that is what putting
-    the names back in the listing would use, and what stops it having to
-    re-derive one from a member object that has since gone.
+    The name is sanitised *at the moment of the click* and kept on the entry,
+    because it cannot be recovered afterwards: re-deriving one from a member
+    object that has since gone is exactly how a listing ends up reading
+    " A".
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9022, "goneaway")
@@ -1146,7 +1155,10 @@ async def test_a_queued_press_from_somebody_unnameable_still_reads(retro):
         assert view.enqueue_press(retro.interaction(view, user=ex_member), "a")
         assert view.enqueue_press(retro.interaction(view, user=anonymous), "b")
         assert queued_names(view) == ["A", "B"]
-        assert view.queue_note() == retro.queued("A", "B")
+        # Two people, so two runs -- and the nameless one is its buttons
+        # alone rather than " B".
+        assert view.queue_note() == retro.queued(("Ex Member", "A"), "B")
+        assert not view.queue_note().startswith("*Queued:  ")
         assert [entry.who for entry in view.queue] == ["Ex Member", ""]
         # The name on the entry is a snapshot: losing the user object later
         # cannot take it back off.
@@ -3485,3 +3497,46 @@ async def test_a_press_still_posts_its_clip_if_another_channel_takes_the_core(re
 
     assert interaction.clip(), "the press lost a clip it had already emulated"
     assert interaction.kinds() == ["response.defer", "edit_original_response"]
+
+
+async def test_the_whole_line_reads_as_one_person_walking(retro):
+    """
+    The shape the line takes when somebody queues a run of directions.
+
+    Pinned as a literal, because this is the thing anybody actually looks
+    at: `**Pokemon** · Rob pressed ⬆️. *Queued: Rob ⬆️⬇️⬇️*` -- the game,
+    what just happened, and the run still to come, on one line beside the
+    picture.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9016, "Pokemon")
+    rob = FakeUser(uid=11, name="Rob")
+    up = "\N{UPWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}"
+    down = "\N{DOWNWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}"
+
+    running = retro.interaction(view, user=rob, message=view.message)
+    original = view.capture_press
+    once = []
+
+    def slow(field, repeat=1):
+        if not once:
+            once.append(True)
+            for queued in ("up", "down", "down"):
+                assert view.enqueue_press(
+                    retro.interaction(view, user=rob, message=view.message), queued
+                )
+        return original(field, repeat)
+
+    view.capture_press = slow
+    try:
+        await view._press(running, "up")
+    finally:
+        view.capture_press = original
+
+    edit = next(
+        snap for kind, snap in running.log if kind == "edit_original_response"
+    )
+    assert edit["content"] == (
+        f"**Pokemon** \N{MIDDLE DOT} Rob pressed {up}. "
+        f"*Queued: Rob {up}{down}{down}*"
+    ), edit["content"]

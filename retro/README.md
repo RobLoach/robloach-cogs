@@ -698,29 +698,35 @@ Four rules, and each of them is there for a reason:
   queued press is emulated against a game state its author has not seen yet.
   Three waiting plus the one running is about four seconds, which is the most
   that is still recognisably "I pressed that";
-* **one waiting press per person.** This is what makes a group take turns
-  without anything having to schedule them: a fast clicker cannot fill the
-  queue on their own. A second click from somebody who already has one waiting
-  is refused and the first one stands — the message has already told them
-  their press is queued, and quietly swapping it for something else would make
-  that acknowledgement a lie for a second. **A refusal is said, privately**:
-  whoever clicked is told that they already have one waiting (or that all
-  three slots are taken), which nobody else sees and which costs no edit of
-  the game's message. It used to be answered with the same contentless
-  acknowledgement an accepted press gets, so a refused click and a queued one
-  looked identical — which is the "controller feels dead" complaint the queue
-  was built to answer, reintroduced at its edge;
+* **first come, first served, and one person may hold every slot.** There
+  used to be a one-waiting-press-per-person rule, on the theory that it made
+  a group take turns. What it actually did was break the commonest way one
+  person plays: a direction is rarely pressed once, so walking four tiles is
+  four clicks in a row — and the second, third and fourth were all refused
+  because the first was still waiting. The controller went back to feeling
+  dead for exactly the person using it most. The depth cap above is what
+  bounds the queue now, and it bounds it the same way whoever is clicking:
+  three waiting is three waiting, and somebody who fills all three only ever
+  costs themselves the next three seconds. **A refusal is said, privately**:
+  whoever clicked is told the queue is full, which nobody else sees and which
+  costs no edit of the game's message. It used to be answered with the same
+  contentless acknowledgement an accepted press gets, so a refused click and
+  a queued one looked identical — which is the "controller feels dead"
+  complaint the queue was built to answer, reintroduced at its edge;
 * **every waiting press is visible.** An input nobody can see is an input that
   feels lost, which is the whole complaint. The queue is listed as a suffix on
   the very line the running press is already rewriting, so it costs **no extra
   edit** — an ephemeral "your press is queued" would be a second message per
   click (removed once already for being spam) and any further edit of this
   message would re-render the attachment and visibly rewind the clip. The
-  listing names the **buttons**, not the people: `*Queued: ⬅️, A*`. It used to
-  read `*Queued: Ada ⬅️, Sam A*`, and dropping the names is what keeps the
-  whole line readable at a glance beside the picture — at the cost that, with
-  one waiting press each, the name was how you confirmed that the `⬅️` in the
-  list was *yours* and not somebody else's identical one;
+  listing names a person and then their buttons in order, closed up, so that a
+  run reads as one intent rather than as several unrelated things:
+
+  > **Pokemon** · Rob pressed ⬆️. *Queued: Rob ⬆️⬇️⬇️*
+
+  Consecutive presses by one person are one run; somebody else starts a new
+  one (`*Queued: Rob ⬆️⬆️, Ada ⬅️*`), and the order is never rearranged,
+  because the order is what the queue is;
 * **the queue is intent, never work.** A waiting entry is a button name and a
   deferred interaction. Nothing touches the emulator until its turn comes and
   the session's lock is taken again for it, so the one-core-at-a-time rule is
