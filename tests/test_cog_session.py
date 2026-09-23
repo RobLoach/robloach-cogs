@@ -1079,11 +1079,11 @@ async def test_a_discard_says_so_once_on_the_next_line(retro):
 async def test_an_entry_queued_before_a_discard_is_not_run_after_it(retro):
     """The queue epoch, which is the gap `forget_queue()` alone cannot close.
 
-    `RetroView.run_undo` and `run_reset` discard the queue from the worker
-    thread that is emulating, so a click arriving on the event loop at that
-    exact moment can be appended on either side of the clear. An entry
-    carrying the old generation is dropped by the drain rather than emulated
-    into a state nobody aimed it at.
+    `SessionMixin.capture_undo` and `capture_reset` discard the queue from
+    the worker thread that is emulating, so a click arriving on the event
+    loop at that exact moment can be appended on either side of the clear.
+    An entry carrying the old generation is dropped by the drain rather than
+    emulated into a state nobody aimed it at.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9023, "stalequeue")
@@ -2419,19 +2419,27 @@ async def test_two_undos_step_back_two_presses(retro):
 async def test_the_history_is_bounded_by_its_depth(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9208, "deep")
-    assert retro.viewmod.UNDO_DEPTH == 8
+    assert retro.sessionmod.UNDO_DEPTH == 8
 
-    for _ in range(retro.viewmod.UNDO_DEPTH + 5):
+    for _ in range(retro.sessionmod.UNDO_DEPTH + 5):
         await view._press(retro.interaction(view, message=view.message), "a")
 
-    assert len(view.history) == retro.viewmod.UNDO_DEPTH
+    assert len(view.history) == retro.sessionmod.UNDO_DEPTH
     assert history_is_consistent(view)
 
 
 async def test_the_history_is_bounded_by_bytes_as_well_as_by_count(
     retro, monkeypatch
 ):
-    """The count alone bounds nothing: a bigger console has bigger states."""
+    """The count alone bounds nothing: a bigger console has bigger states.
+
+    Patched on ``retro.session`` and not on ``retro.RetroView``, which
+    re-exports the same number: ``SessionMixin._trim_history`` looks the cap
+    up in its own module's globals, so the re-export is a name nothing here
+    reads. Lowering that one instead lets every assertion below pass against
+    a bound that was never applied -- which is what this test did for the
+    length of one refactor.
+    """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9209, "fat")
     for _ in range(4):
@@ -2440,17 +2448,17 @@ async def test_the_history_is_bounded_by_bytes_as_well_as_by_count(
 
     # A cap that fits two and a half of these, so the count (8) is no longer
     # the bound that bites.
-    monkeypatch.setattr(retro.viewmod, "MAX_UNDO_BYTES", one * 2 + 1)
+    monkeypatch.setattr(retro.sessionmod, "MAX_UNDO_BYTES", one * 2 + 1)
     for _ in range(6):
         await view._press(retro.interaction(view, message=view.message), "a")
-    assert len(view.history) < retro.viewmod.UNDO_DEPTH
+    assert len(view.history) < retro.sessionmod.UNDO_DEPTH
     assert view.history_bytes <= one * 2 + 1
     assert history_is_consistent(view)
 
     # A single state larger than the whole cap keeps exactly one entry: an
     # Undo that cannot undo the press somebody just made is worse than the
     # memory.
-    monkeypatch.setattr(retro.viewmod, "MAX_UNDO_BYTES", 1)
+    monkeypatch.setattr(retro.sessionmod, "MAX_UNDO_BYTES", 1)
     for _ in range(3):
         await view._press(retro.interaction(view, message=view.message), "a")
     assert len(view.history) == 1
@@ -2603,7 +2611,7 @@ async def test_the_undo_history_compresses_the_states_it_keeps(retro):
 
     blob = view.history[-1]
     assert zlib.decompress(blob).startswith(b"STATE:")
-    assert retro.viewmod.UNDO_COMPRESSION_LEVEL == 1
+    assert retro.sessionmod.UNDO_COMPRESSION_LEVEL == 1
     assert view.history_bytes == len(blob)
 
 

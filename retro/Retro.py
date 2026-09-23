@@ -34,6 +34,7 @@ import io
 import logging
 import re
 import time
+import types
 import typing
 from pathlib import Path
 from urllib.parse import urlparse
@@ -77,8 +78,10 @@ from .emulator import (
     EmulatorError,
     RetroEmulator,
     clamp_clip_seconds,
+    clip_frame_count,
     describe_seconds,
     format_seconds,
+    playback_seconds,
 )
 from .migration import (
     CONFIG_IDENTIFIER,
@@ -91,6 +94,7 @@ from .RetroView import (
     DEFAULT_HOLD_MS,
     DEFAULT_TIMEOUT_MINUTES,
     MAX_HOLD_MS,
+    MAX_QUEUED_PRESSES,
     MIN_HOLD_MS,
     MIN_REPEAT_TAPS,
     REPEAT_TAPS,
@@ -127,6 +131,7 @@ from .storage import (
 from .systems import (
     CORES,
     SYSTEMS,
+    ambiguous_reason,
     core_filename,
     core_name_from_filename,
     system_for_extension,
@@ -249,6 +254,21 @@ CHANNEL_START_COOLDOWN_SECONDS = 60.0
 
 # `[p]retrosaves import`/`export` carry the other half of this; the
 # numbers live with the commands, in retro/saves.py.
+
+# How long a full press queue may take to drain before `[p]retroset
+# cliplength` says so out loud. Two settings multiply here: every edit waits
+# out the whole clip it replaces (see MAX_PACE_SECONDS in retro/timing.py),
+# so a full queue costs about MAX_QUEUED_PRESSES clips -- five seconds at the
+# one second default, twenty-five at the five second ceiling. Nothing is
+# refused at any of those; a long drain is a legitimate thing to want. But it
+# is not a thing anybody sets *on purpose* without being told, and a
+# controller that will not answer for half a minute is indistinguishable
+# from a bot that has hung.
+#
+# Ten seconds is the threshold because that is roughly where a queue stops
+# reading as "mine is coming" and starts reading as "it is broken"; the
+# default lands at half of it and says nothing.
+SLOW_DRAIN_SECONDS = 10.0
 
 # How long the paginated core option listing stays clickable.
 OPTION_MENU_TIMEOUT = 180.0
@@ -373,6 +393,12 @@ class Retro(
             CHANNEL_START_COOLDOWN_SECONDS,
             commands.BucketType.channel,
         )
+        # Channels with a Resume click already in flight. A RetiredView has
+        # its own lock, but that only guards *one* message: a channel can
+        # hold several retired messages and each has its own button, so
+        # nothing stopped two of them booting a core at the same moment. See
+        # resume_retired.
+        self._resuming: typing.Set[int] = set()
         self._idle_task: typing.Optional[asyncio.Task] = None
         self._download_task: typing.Optional[asyncio.Task] = None
 
@@ -1496,10 +1522,10 @@ class Retro(
             )
             # Taken while the lock still holds it still: an eviction in
             # another channel clears view.emulator, and the encode below runs
-            # after the lock is given back. See RetroView._encode.
+            # after the lock is given back. See SessionMixin._encode in retro/session.py.
             encoder = view.emulator
         # Out of the lock. Encoding the clip is the most expensive step of a
-        # press and touches no core (see RetroView._encode), so it happens
+        # press and touches no core (see SessionMixin._encode), so it happens
         # here: while this channel's WebP is being written, the next channel
         # is already emulating.
         clip = await asyncio.to_thread(view._encode, frames, limit, encoder)
@@ -1567,7 +1593,7 @@ class Retro(
         saved (it is only the session's bookkeeping) but the ``.state`` file
         is left holding the moment before the reset until the game saves
         again of its own accord -- the next autosave, or its next sleep. See
-        ``RetroView.run_reset`` and the command's own help.
+        ``SessionMixin.run_reset`` (retro/session.py) and the command's own help.
 
         Raises EmulatorError if the session cannot be woken or the core will
         not reset. Called by `[p]retroreboot` and nothing else: there is no
@@ -1661,9 +1687,61 @@ class Retro(
         The message being clicked is the one that is brought back to life, so
         the game reappears where it was rather than as a new post further down
         the channel.
+
+        **Two gates before any of that**, because this is the one heavyweight
+        path with no command in front of it: a button click goes through none
+        of `[p]retro`'s cooldowns, its ``max_concurrency`` or its channel
+        bucket, and resuming is not cheap -- it evicts and saves whatever is
+        live, unloads that core, loads another, restores a save state and
+        edits several messages.
+
+        The first gate is per *channel* rather than per message. A
+        :class:`RetiredView` already refuses a second click on itself while
+        the first is running, but a channel can hold several retired
+        messages, each with its own button and its own lock, so clicking two
+        of them in quick succession used to start two of these cycles at
+        once and leave them fighting over the one core slot.
+
+        The second is the same channel bucket `[p]retro` spends, so a burst
+        of Resume clicks is bounded exactly as a burst of starts is.
         """
         record = dict(retired.record)
         channel_id = int(record.get("channel_id") or retired.channel_id or 0)
+        game_name = record.get("game_name") or "that game"
+
+        if channel_id in self._resuming:
+            await self._whisper_interaction(
+                interaction,
+                f"**{game_name}** is already starting \N{HORIZONTAL ELLIPSIS} "
+                "give it a moment.",
+            )
+            return
+        delay = self._channel_start_delay(channel_id)
+        if delay:
+            await self._whisper_interaction(
+                interaction,
+                "This channel has started a lot of games in the last minute. "
+                f"Try again in {delay:.0f}s \N{EM DASH} the game already on "
+                "screen still works, and pressing its buttons is never rate "
+                "limited.",
+            )
+            return
+        self._resuming.add(channel_id)
+        try:
+            await self._resume_retired_locked(retired, interaction, record, channel_id)
+        finally:
+            self._resuming.discard(channel_id)
+
+    async def _resume_retired_locked(
+        self, retired: RetiredView, interaction, record: dict, channel_id: int
+    ) -> None:
+        """
+        The body of :meth:`resume_retired`, with the channel gate held.
+
+        Split out so the gate is released on every way out of it -- including
+        the cancellations and the failed-boot paths below, which return from
+        several places.
+        """
         game_name = record.get("game_name") or "that game"
 
         rom_path = self._rom_path(record.get("rom_filename") or "")
@@ -2230,7 +2308,7 @@ class Retro(
 
         The companion to :meth:`_write_captured`, and the split between them
         is what keeps the disk off the lock: this half is sub-millisecond
-        (see the measurements above UNDO_COMPRESSION_LEVEL), the other half
+        (see the measurements above UNDO_COMPRESSION_LEVEL in retro/session.py), the other half
         is fsync'd disk. :meth:`_write_progress` still does both at once for
         the teardown paths, which have no lock to give back.
         """
@@ -2977,15 +3055,31 @@ class Retro(
         except Exception:
             log.debug("Could not reset a Retro cooldown.", exc_info=True)
 
-    def _channel_start_delay(self, ctx: commands.Context) -> float:
+    def _channel_start_delay(self, channel_id: int) -> float:
         """
         Seconds this channel must wait before starting another game, or 0.
 
-        Checked (and charged) only where a start is about to cost a download,
-        so the channel bucket is not spent on a resume either.
+        Checked (and charged) where a start is about to cost real work: a
+        `[p]retro` that will fetch a ROM, and a Resume click, which has no
+        command in front of it and so goes through none of the decorators.
+
+        Takes a channel **id** rather than a context, and builds the shim the
+        cooldown mapping actually wants, because the two callers hold
+        different objects -- a ``Context`` and an ``Interaction`` -- and
+        discord.py's ``BucketType.channel`` reaches for ``.channel.id`` on
+        whatever it is handed. Passing an Interaction worked by duck-typing
+        or not at all depending on the object, and the ``except`` below would
+        have turned "not at all" into a rate limit that silently never
+        applied. An id is the thing the bucket is keyed on; asking for it
+        directly is what makes that impossible.
         """
         try:
-            return float(self.start_buckets.get_bucket(ctx).update_rate_limit() or 0.0)
+            keyed = types.SimpleNamespace(
+                channel=types.SimpleNamespace(id=int(channel_id))
+            )
+            return float(
+                self.start_buckets.get_bucket(keyed).update_rate_limit() or 0.0
+            )
         except Exception:
             # A rate limit that cannot be calculated must not stop the game.
             log.debug("Could not check the Retro channel cooldown.", exc_info=True)
@@ -3114,7 +3208,7 @@ class Retro(
         # Past this point a ROM really is going to be fetched and written, so
         # this is where the channel's share of the rate limit and the bot's
         # disk budget are spent.
-        delay = self._channel_start_delay(ctx)
+        delay = self._channel_start_delay(ctx.channel.id)
         if delay:
             # Only promise a game on screen when there is one. The bucket
             # trips on starts, not on sessions, so six people each trying a
@@ -3168,9 +3262,21 @@ class Retro(
         filename = self._sanitize_filename(filename)
         system = system_for_extension(Path(filename).suffix)
         if system is None:
+            suffix = Path(filename).suffix
+            # Some extensions are not merely unknown -- they are deliberately
+            # refused, and this cog knows exactly why (see
+            # AMBIGUOUS_EXTENSIONS in retro/systems.py). `.bin` is the one
+            # that matters: it is the commonest ROM extension in the wild and
+            # the reply used to be "isn't a console this bot knows", which is
+            # true, useless, and hides the fact that renaming the file to
+            # `.md` would have worked.
+            refused = ambiguous_reason(suffix)
             lines = [
-                f"`{Path(filename).suffix or filename}` isn't a console this "
-                "bot knows. Supported file types:",
+                refused
+                if refused
+                else f"`{suffix or filename}` isn't a console this bot knows.",
+                "",
+                "Supported file types:",
             ]
             lines.extend(self._supported_lines())
             for page in pagify("\n".join(lines)):
@@ -3590,12 +3696,12 @@ class Retro(
         # that is already being emulated finishes before the machine is
         # rebooted underneath it -- and so that a runner working through the
         # press queue lets go between two of them and this gets in. Rebooting
-        # discards the queue; see RetroView.run_reset.
+        # discards the queue; see SessionMixin.capture_reset in retro/session.py.
         #
         # It must not, however, wait out a clip's playing time to get that
         # lock: a press holding its edit back for pacing is told to stop
         # first, and the reboot's own clip is not paced either (see
-        # RetroView.run_reset).
+        # SessionMixin.capture_reset in retro/session.py).
         view.cancel_pacing()
         async with ctx.typing():
             try:
@@ -3885,6 +3991,47 @@ class Retro(
             )
         return " ".join(notes)
 
+    @staticmethod
+    def _describe_queue_cost(clip_seconds: float) -> str:
+        """
+        What a clip this long does to a full press queue, when it is worth it.
+
+        The companion to :meth:`_describe_press_fit`, and there for the same
+        reason: two settings constrain each other and an owner who changes
+        one of them cannot see the other's half of the answer.
+
+        The pair here is the clip length and MAX_QUEUED_PRESSES. Every edit
+        waits out the whole of the clip it replaces -- that is what stops a
+        clip being cut off partway and the game appearing to jump (see
+        MAX_PACE_SECONDS in retro/timing.py) -- so a full queue costs about
+        one whole clip per waiting press. The two numbers multiply, and the
+        product is what somebody in the channel experiences as "the buttons
+        have stopped working".
+
+        Says nothing at the ordinary lengths, which is most of the point: at
+        the one second default a full queue is five seconds and needs no
+        remark. Past SLOW_DRAIN_SECONDS it is said plainly, with the number,
+        and nothing is refused -- a long clip is a legitimate thing to want
+        and this is the one place it is cheap to mention the cost.
+
+        Worked out at DEFAULT_FPS for the same reason
+        :meth:`_describe_press_fit` is: this is about a setting rather than
+        about one session, and every console here is within half a percent
+        of it.
+        """
+        playback = playback_seconds(
+            DEFAULT_FPS, clip_frame_count(DEFAULT_FPS, clip_seconds)
+        )
+        drain = MAX_QUEUED_PRESSES * playback
+        if drain <= SLOW_DRAIN_SECONDS:
+            return ""
+        return (
+            f"At this length a full queue of {MAX_QUEUED_PRESSES} waiting "
+            f"presses takes about {drain:.0f}s to play out, because each one "
+            "waits for the clip in front of it to finish. That is a long time "
+            "for the last person who clicked to wait, so keep it in mind."
+        )
+
     @retroset.command(name="cliplength", aliases=["clip"])
     async def retroset_cliplength(self, ctx: commands.Context, seconds: float) -> None:
         """
@@ -3928,9 +4075,17 @@ class Retro(
         # "This interaction failed". Editing the message closes that window
         # instead of waiting for the next press to close it.
         await self._refresh_live_controls()
-        fit = self._describe_press_fit(seconds, await self.config.hold_ms())
+        notes = " ".join(
+            note
+            for note in (
+                self._describe_press_fit(seconds, await self.config.hold_ms()),
+                self._describe_queue_cost(seconds),
+            )
+            if note
+        )
         await ctx.send(
-            f"Clips now show {describe_seconds(seconds)} of play.{' ' + fit if fit else ''}"
+            f"Clips now show {describe_seconds(seconds)} of play."
+            f"{' ' + notes if notes else ''}"
         )
 
     @retroset.command(name="hold")

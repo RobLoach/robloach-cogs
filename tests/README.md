@@ -60,17 +60,38 @@ imports no libretro at all, with `retro/emulator.py` re-exporting every name
 so nothing downstream had to change.
 
 The controller does the same thing one level down. `retro/RetroView.py` was
-2,700 lines with about a third of them not about the view at all, and four
+2,700 lines with about a third of them not about the view at all, and five
 modules took that third: `retro/timing.py` (how long a button is held, how
 many taps fit in a clip, how long an edit waits before it may replace the one
 on screen), `retro/text.py` (every line the session writes, and the
 sanitising a display name goes through before it can be one),
 `retro/restore.py` (`Progress` and the save state -> previous state ->
-in-game save chain) and `retro/permissions.py` (`may_manage`). `RetroView`
+in-game save chain), `retro/permissions.py` (`may_manage`) and
+`retro/session.py` (booting a core, emulating a press, an undo or a reboot,
+encoding the clip, and the undo history). `RetroView`
 re-exports every name they took, so `retro.viewmod.<name>` still works in the
 tests that use it; `tests/test_view.py`'s `MOVED` table holds that promise,
-and `RetroEnv` also offers `timingmod`, `textmod`, `restoremod` and
-`permissionsmod` for a test that would rather say where the thing lives.
+and `RetroEnv` also offers `timingmod`, `textmod`, `restoremod`,
+`permissionsmod` and `sessionmod` for a test that would rather say where the
+thing lives.
+
+`retro/session.py` is the one that is not plain functions: it is
+`SessionMixin`, which `RetroView` inherits, and everything on it **blocks,
+runs in the cog's single emulator worker thread and assumes the emulator lock
+is held** (`_encode` is the deliberate exception and runs with the lock
+given back -- see that module's docstring, which is where the rule is
+written down). Two consequences for the tests:
+
+* it moved *methods*, so `MOVED_METHODS` in `test_view.py` makes the same
+  "same object, not a copy" promise for `RetroView.capture_press` and its
+  fifteen neighbours that `MOVED` makes for module-level names;
+* **patch `retro.sessionmod`, not `retro.viewmod`, for anything the mixin's
+  own code looks up.** A re-export is a second binding of the same object:
+  `SessionMixin._trim_history` reads `MAX_UNDO_BYTES` out of its own
+  module's globals, so lowering `viewmod.MAX_UNDO_BYTES` changes a name
+  nothing reads and the test passes while bounding nothing. `sessionmod`
+  exists for exactly that, and `history_is_consistent()` reads the same
+  binding the code does.
 
 Two consequences for the tests:
 

@@ -478,14 +478,28 @@ def test_no_module_level_container_is_keyed_by_user_input():
         ("retro.RetroView", "_STYLES"): "two literal Discord styles",
         ("retro.RetroView", "ACTION_NOTES"): "four literal action lines",
         ("retro.RetroView", "MARKDOWN_ESCAPES"): "one str.translate table",
+        # The same two objects, reached through their real home rather than
+        # RetroView's re-export of them; see retro/text.py.
+        ("retro.text", "ACTION_NOTES"): "four literal action lines",
+        ("retro.text", "MARKDOWN_ESCAPES"): "one str.translate table",
+        ("retro.systems", "AMBIGUOUS_REASONS"): (
+            "one entry per AMBIGUOUS_EXTENSIONS member, asserted equal to it"
+        ),
         ("retro.saves", "EXPORT_CHOICES"): "literal",
         ("retro.Retro", "DEFAULT_GLOBALS"): "the Config schema",
         ("retro.Retro", "DEFAULT_CHANNEL"): "the Config schema",
     }
+    # Every module the cog ships. The list used to stop at the original
+    # twelve, so the modules split out of RetroView and Retro since --
+    # session, text, timing, restore, permissions, bios -- could have grown
+    # an unbounded cache without this test noticing, which is the one thing
+    # it exists to prevent. A module added to retro/ belongs here.
     modules = [
         "retro.Retro", "retro.RetroView", "retro.emulator", "retro.clips",
         "retro.systems", "retro.archives", "retro.net", "retro.storage",
         "retro.cores", "retro.saves", "retro.migration", "retro.abc",
+        "retro.session", "retro.text", "retro.timing", "retro.restore",
+        "retro.permissions", "retro.bios", "retro.version",
     ]
     found = {}
     for name in modules:

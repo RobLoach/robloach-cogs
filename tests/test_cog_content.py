@@ -1517,3 +1517,174 @@ async def test_a_multi_game_zip_with_no_name_says_how_to_pick(retro):
     said = ctx.said()
     assert "2 playable ROMs" in said
     assert "retro Sonic" in said, "it should name a game that is really in there"
+
+
+# -- Two settings that multiply ------------------------------------------------
+
+
+async def test_a_long_clip_says_what_it_costs_a_full_queue(retro):
+    """
+    The clip length and the queue depth multiply, and nobody can see that.
+
+    Every edit waits out the whole clip it replaces, so a full queue costs
+    about one clip per waiting press. At the default that is five seconds
+    and unremarkable; at the ceiling it is twenty-five, which from inside
+    the channel is indistinguishable from the bot having hung. The one
+    place it is cheap to say so is the command that changes it.
+    """
+    cliplength = retro.cogmod.Retro.retroset_cliplength.callback
+    ctx = retro.context(retro.channel(9400))
+
+    await cliplength(retro.cog, ctx, 4)
+    said = str(ctx.sent[-1])
+    assert "full queue" in said, said
+    # The real number, not a vague warning -- and it is the product of the
+    # two settings rather than a hardcoded figure.
+    assert str(retro.viewmod.MAX_QUEUED_PRESSES) in said
+    assert "20s" in said, said
+
+
+async def test_the_ordinary_clip_lengths_say_nothing_about_the_queue(retro):
+    """Silence at the lengths anybody actually plays at; see SLOW_DRAIN_SECONDS."""
+    cliplength = retro.cogmod.Retro.retroset_cliplength.callback
+    ctx = retro.context(retro.channel(9401))
+
+    for seconds in (0.3, 0.5, 1.0, 1.5):
+        await cliplength(retro.cog, ctx, seconds)
+        assert "full queue" not in str(ctx.sent[-1]), seconds
+
+
+async def test_the_queue_cost_is_derived_from_both_settings(retro):
+    """It must follow the constants rather than restate them."""
+    describe = retro.cogmod.Retro._describe_queue_cost
+    assert describe(1.0) == "", "the default should be quiet"
+
+    long_note = describe(retro.emumod.MAX_CLIP_SECONDS)
+    assert long_note, "the ceiling should say something"
+    assert str(retro.viewmod.MAX_QUEUED_PRESSES) in long_note
+
+
+# -- Extensions that are refused on purpose ------------------------------------
+
+
+async def test_a_bin_rom_is_told_why_and_what_to_do(retro):
+    """
+    `.bin` is the commonest ROM extension in the wild and the worst reply.
+
+    It is refused deliberately -- the extension carries no console at all, so
+    claiming it would mean loading somebody's disc track as a Mega Drive game
+    -- but the reasoning only ever existed as a comment, so the channel got
+    "isn't a console this bot knows" and no way forward. The way forward, for
+    the case people actually hit, is to rename a Genesis ROM to `.md`.
+    """
+    await retro.install_cores()
+    channel = retro.channel(9410)
+    ctx = retro.context(channel, attachments=[FakeAttachment(ROM_BYTES, "sonic.bin")])
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game=None)
+
+    said = ctx.said()
+    assert "does not say which console" in said, said
+    assert "`.md`" in said, "it should say what to rename it to"
+    # Still lists what does work, as it always did.
+    assert "Game Boy" in said
+    assert retro.cog.sessions.get(channel.id) is None
+
+
+async def test_a_disc_image_says_it_is_a_disc_image(retro):
+    await retro.install_cores()
+    channel = retro.channel(9411)
+    ctx = retro.context(channel, attachments=[FakeAttachment(ROM_BYTES, "game.cue")])
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game=None)
+    assert "CD image" in ctx.said(), ctx.said()
+
+
+async def test_a_genuinely_unknown_extension_keeps_the_plain_reply(retro):
+    """Nothing to explain about a `.txt`, so it gets the answer it always had."""
+    await retro.install_cores()
+    channel = retro.channel(9412)
+    ctx = retro.context(channel, attachments=[FakeAttachment(ROM_BYTES, "notes.txt")])
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game=None)
+    said = ctx.said()
+    assert "isn't a console this bot knows" in said, said
+    assert "Supported file types" in said
+
+
+def test_every_refused_extension_can_explain_itself():
+    """The two tables cannot drift apart without this failing."""
+    from retro import systems
+
+    assert set(systems.AMBIGUOUS_REASONS) == set(systems.AMBIGUOUS_EXTENSIONS)
+    for extension, reason in systems.AMBIGUOUS_REASONS.items():
+        assert reason.strip(), extension
+        assert f"`.{extension}`" in reason, extension
+    # Case and a leading dot are both accepted, because callers have both.
+    assert systems.ambiguous_reason(".BIN") == systems.ambiguous_reason("bin")
+    assert systems.ambiguous_reason(".gb") is None
+
+
+# -- The Resume button has no command in front of it ---------------------------
+
+
+async def test_the_channel_bucket_is_keyed_on_the_channel_id(retro):
+    """
+    The bucket has to bite for a *click*, not just for a command.
+
+    It is keyed on a channel id now rather than on whatever object the caller
+    happens to hold. It used to be handed a Context by one caller and an
+    Interaction by the other, and the helper's `except` would have turned a
+    lookup that failed on one of them into a rate limit that silently never
+    applied at all.
+    """
+    cog = retro.cog
+    rate = retro.cogmod.CHANNEL_START_COOLDOWN_RATE
+
+    # Same channel, charged the whole bucket: the last one must be refused.
+    delays = [cog._channel_start_delay(9420) for _ in range(rate + 1)]
+    assert delays[:rate] == [0.0] * rate, delays
+    assert delays[rate] > 0.0, "the channel bucket never bit"
+
+    # A different channel has its own bucket.
+    assert cog._channel_start_delay(9421) == 0.0
+
+
+async def test_a_second_resume_in_a_channel_is_refused_while_one_is_running(retro):
+    """
+    Each retired message has its own lock, so only the cog can see the channel.
+
+    A channel can hold several retired messages, each with a Resume button.
+    Clicking two of them used to start two evict-save-boot cycles at once,
+    fighting over the one core slot.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9422, "resumable")
+    await retro.cogmod.Retro.retroend.callback(retro.cog, ctx)
+    retired = next(iter(retro.cog.retired.values()))
+
+    # Pretend a resume is already in flight for this channel.
+    retro.cog._resuming.add(channel.id)
+    try:
+        interaction = retro.interaction(view, message=view.message)
+        await retro.cog.resume_retired(retired, interaction)
+    finally:
+        retro.cog._resuming.discard(channel.id)
+
+    assert interaction.kinds() == ["response.send_message"]
+    (_, said), = interaction.log
+    assert said["ephemeral"] is True
+    assert "already starting" in said["content"], said["content"]
+    # Nothing was booted for the refused click.
+    assert retro.cog.sessions.get(channel.id) is None
+
+
+async def test_the_gate_is_released_when_a_resume_finishes(retro):
+    """A gate that is not released is a channel that can never resume again."""
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9423, "releases")
+    await retro.cogmod.Retro.retroend.callback(retro.cog, ctx)
+    retired = next(iter(retro.cog.retired.values()))
+
+    await retro.cog.resume_retired(
+        retired, retro.interaction(view, message=view.message)
+    )
+    assert channel.id not in retro.cog._resuming, "the gate was left closed"
+    assert retro.cog.sessions.get(channel.id) is not None, "it should have resumed"

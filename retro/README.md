@@ -89,7 +89,7 @@ can start it by name:
 - `[p]retroset diskbudget [megabytes]` (owner, aliased `disk`/`budget`) caps what the whole cog may use on disk, and with no argument reports what is using it. The default is 1024 MiB; `0` is no limit. **No save is ever deleted to make room** — cached ROMs are, oldest first. A download or save that fails part way through cleans its own half-written file up, and any left behind by a process that was killed outright are swept when the cog next loads, so a failed write cannot quietly eat the allowance.
 - `[p]retroset allowprivateurls [true|false]` (owner) lets ROM URLs point inside your own network. Off, and best left off: see [ROM URLs](#rom-urls).
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
-- `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 1 second; anything from 0.2 to 5 works, fractions included (`0.8` is a real answer). The ceiling was 15 and is 5: a clip that long is one nobody sits through, and it costs memory and encode time on every press to make it.
+- `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 1 second; anything from 0.2 to 5 works, fractions included (`0.8` is a real answer). The ceiling was 15 and is 5: a clip that long is one nobody sits through, and it costs memory and encode time on every press to make it. Past about 2 seconds the command also says what the length costs a *full queue* — every edit waits out the clip it replaces, so five waiting presses is five whole clips, which is 25 seconds at the ceiling.
 - `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it. The default is 160. It is a ceiling: a clip too short to show the button coming back up holds it for less.
 - `[p]retroset settings` (owner) shows the current configuration, including the build that is loaded, the system directory and any BIOS files in it.
 - `[p]retroset version` (owner) answers **“am I running the new code?”** — the declared version, the commit it was installed from, and a fingerprint of the source that was actually loaded. See [Which build is this?](#which-build-is-this).
@@ -121,7 +121,19 @@ a plain explanation rather than a stack trace.
 ## Consoles
 
 The console is chosen from the ROM's file extension. Every core is BIOS-free —
-nothing but the ROM is needed. Seven cores cover the nine consoles
+nothing but the ROM is needed.
+
+**Some extensions are refused on purpose, and now say why.** `.bin` is the
+important one: it is the commonest ROM extension in the wild and it carries no
+console information at all — an Atari cartridge, a Mega Drive ROM, a Virtual
+Boy ROM, a raw CD track and a BIOS dump are all `.bin` — so claiming it would
+mean guessing, and guessing wrong loads somebody's disc track as a Mega Drive
+game. The reply now says that, and says the thing worth doing about it: **a
+Genesis ROM renamed to `.md` starts**. `.cue`/`.iso`/`.chd` and friends explain
+that they are CD images and that these are all cartridge machines; `.fds`,
+`.bs` and `.st` explain the BIOS or base cartridge they cannot boot without.
+An extension that is merely unknown still gets the plain "not a console this
+bot knows" answer, because there is nothing to explain about a `.txt`. Seven cores cover the nine consoles
 (`genesis_plus_gx` runs three of them): about 4.5 MiB of zips from the
 buildbot, 31 MiB unpacked, which is the figure that counts against
 `[p]retroset diskbudget`.
@@ -337,6 +349,15 @@ back. It keeps working after a bot restart, because what it needs is stored
 rather than held in memory. A channel keeps one per cached game — five at the
 very most — and a button whose cached ROM has been cleaned up is forgotten
 along with it, rather than left there to apologise when somebody clicks it.
+
+**Resuming is gated, because a button click goes through no command.** It is
+the one heavyweight path with no cooldown in front of it, and it is not cheap:
+it saves and evicts whatever is live, unloads that core, loads another and
+restores a save state. So a channel may only have one resume in flight — a
+channel can hold several retired messages, each with its own button, and
+clicking two of them used to start two of those cycles at once fighting over
+the single core — and the clicks spend the same per-channel bucket `[p]retro`
+does. Both refusals answer privately, so nobody else in the channel sees them.
 
 ### What the cog forgets, and what it never does
 

@@ -660,9 +660,16 @@ def history_is_consistent(view):
     in four different test files, which is three places for it to be spelled
     out differently.
 
-    See RetroView._trim_history, UNDO_DEPTH and MAX_UNDO_BYTES.
+    See SessionMixin._trim_history, UNDO_DEPTH and MAX_UNDO_BYTES.
+
+    Read out of ``retro.session``, which is where the history and its two
+    bounds live now, and **not** out of ``retro.RetroView``'s re-export of
+    them: the re-export is a second binding of the same object, so a test that
+    lowers the cap has to lower the one ``_trim_history`` itself reads. Those
+    two bindings disagreeing is exactly how this assertion would come to be
+    checking a number nothing enforced.
     """
-    from retro.RetroView import MAX_UNDO_BYTES, UNDO_DEPTH
+    from retro.session import MAX_UNDO_BYTES, UNDO_DEPTH
 
     assert view.history_bytes == sum(len(blob) for blob in view.history)
     assert len(view.history) <= UNDO_DEPTH, len(view.history)
@@ -979,10 +986,18 @@ def zip_of(entries):
 
 # -- The environment a cog test runs in ---------------------------------------
 
-#: The modules `Retro` is assembled from: the cog module itself plus every
-#: mixin it inherits (see retro/abc.py). `RetroEnv.patch` replaces a name on
-#: all of the ones that bind it, because each of them resolves its globals in
-#: its own namespace.
+#: Every module a name `RetroEnv.patch` installs may be *looked up* in: the
+#: cog module itself, every mixin it inherits (see retro/abc.py), and
+#: retro/session.py. `RetroEnv.patch` replaces the name on all of the ones
+#: that bind it, because each of them resolves its globals in its own
+#: namespace.
+#:
+#: retro.session is the odd one out and is in deliberately. It is not part of
+#: the cog class at all -- it is the view's emulator-driving half (see
+#: retro/session.py) -- but it binds `RetroEmulator`, and it is the module
+#: that actually drives one. Patching a name on it can only ever be
+#: redundant; *not* patching a module that binds one is the silent failure
+#: this tuple exists to prevent, and it has already happened twice here.
 #:
 #: Deliberately not retro.emulator, retro.clips, retro.RetroView, retro.net,
 #: retro.systems or retro.archives: those are collaborators rather than parts
@@ -997,6 +1012,7 @@ COG_MODULES = (
     "retro.bios",
     "retro.saves",
     "retro.migration",
+    "retro.session",
 )
 
 
@@ -1023,15 +1039,24 @@ class RetroEnv:
         # the plain functions around it, which are the real ones under test.
         self.emumod = sys.modules["retro.emulator"]
         self.clipsmod = sys.modules["retro.clips"]
-        # The four modules RetroView.py was split into: when a button goes
-        # down, what the message says, what a channel has saved, and who may
-        # end somebody else's game. A test reaches a helper where it lives
-        # now; RetroView re-exports every one of them, so `viewmod.<name>`
-        # still works too and test_view.py's MOVED table holds it to that.
+        # The five modules RetroView.py was split into: when a button goes
+        # down, what the message says, what a channel has saved, who may end
+        # somebody else's game, and the worker-thread half that drives the
+        # emulator. A test reaches a helper where it lives now; RetroView
+        # re-exports every one of them, so `viewmod.<name>` still works too
+        # and test_view.py's MOVED table holds it to that.
+        #
+        # `sessionmod` is the one where the difference can bite rather than
+        # merely read better: a re-export is a second binding of the same
+        # object, so a test that *patches* UNDO_DEPTH or MAX_UNDO_BYTES has to
+        # patch the binding `SessionMixin._trim_history` reads -- this one.
+        # Patching `viewmod` instead changes a name nothing looks up and the
+        # test passes while bounding nothing.
         self.timingmod = sys.modules["retro.timing"]
         self.textmod = sys.modules["retro.text"]
         self.restoremod = sys.modules["retro.restore"]
         self.permissionsmod = sys.modules["retro.permissions"]
+        self.sessionmod = sys.modules["retro.session"]
         #: name -> the modules self.patch() replaced it on, so a test can
         #: assert that a fake is installed everywhere it has to be.
         self.patched = {}

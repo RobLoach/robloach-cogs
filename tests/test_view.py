@@ -1147,8 +1147,8 @@ def test_the_attachment_name_is_always_something_discord_accepts(name, expected)
 #
 # RetroView.py was 2,700 lines with about a third of them not about the view
 # at all: when a button goes down, what the message says, what a channel has
-# saved, and who is allowed to end somebody else's game. Four modules took
-# that third.
+# saved, who is allowed to end somebody else's game, and the worker-thread
+# half that drives the emulator. Five modules took that third.
 #
 # It was a *move*: RetroView re-exports every name that went, so
 # `retro.RetroView.press_plan` is still `retro.timing.press_plan` and no
@@ -1156,6 +1156,11 @@ def test_the_attachment_name_is_always_something_discord_accepts(name, expected)
 # is that promise, written down -- a name dropped from a re-export is a name
 # an older import site stops finding, which is a breakage no test of the new
 # module would notice.
+#
+# retro/session.py is the one that moved *methods* rather than functions (it
+# is a mixin; see the module docstring there), so it is checked twice over:
+# MOVED for the names the module exports, MOVED_METHODS for the methods
+# RetroView now inherits rather than declares.
 
 MOVED = {
     "timing": [
@@ -1177,7 +1182,37 @@ MOVED = {
         "restore_into",
     ],
     "permissions": ["may_manage"],
+    "session": [
+        "EncodedClip", "MAX_UNDO_BYTES", "SessionMixin",
+        "UNDO_COMPRESSION_LEVEL", "UNDO_DEPTH",
+    ],
 }
+
+#: The methods retro/session.py took, which `RetroView` now *inherits*. The
+#: same promise as MOVED and it has to be made separately, because these are
+#: not module-level names in either file: `viewmod.RetroView.capture_press`
+#: is what every caller and half the test suite writes, and it has to keep
+#: resolving to the one function `SessionMixin` declares rather than to a
+#: second copy somebody left behind on the view.
+MOVED_METHODS = [
+    "_boot",
+    "_capture",
+    "_encode",
+    "_init_history",
+    "_record",
+    "_schedule",
+    "_trim_history",
+    "_trim_opening",
+    "capture_press",
+    "capture_reset",
+    "capture_undo",
+    "forget_history",
+    "history_bytes",
+    "remember_state",
+    "run_press",
+    "run_reset",
+    "run_undo",
+]
 
 
 @pytest.mark.parametrize("module", sorted(MOVED))
@@ -1192,6 +1227,15 @@ def test_every_name_that_moved_is_still_reachable_from_the_view(module):
         assert getattr(viewmod, name) is getattr(home, name), name
 
 
+def view_source():
+    """retro/RetroView.py's source, parsed."""
+    import ast
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent.parent / "retro" / "RetroView.py"
+    return ast.parse(here.read_text())
+
+
 def test_nothing_that_moved_is_still_defined_in_the_view():
     """The move was a move, not a copy; see MOVED.
 
@@ -1200,11 +1244,9 @@ def test_nothing_that_moved_is_still_defined_in_the_view():
     is the duplication test_restore.py exists to stop coming back.
     """
     import ast
-    from pathlib import Path
 
-    source = (Path(__file__).resolve().parent.parent / "retro" / "RetroView.py").read_text()
     defined = set()
-    for node in ast.parse(source).body:
+    for node in view_source().body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             defined.add(node.name)
         elif isinstance(node, ast.Assign):
@@ -1215,26 +1257,114 @@ def test_nothing_that_moved_is_still_defined_in_the_view():
         assert not (defined & set(names)), sorted(defined & set(names))
 
 
+def test_every_method_that_moved_is_still_reachable_on_the_view():
+    """`view.capture_press(...)` still works, and is still one function.
+
+    The mixin half of MOVED. `RetroView` inherits these rather than declaring
+    them, so the check is identity against `SessionMixin` -- a method left
+    behind on the view would shadow the mixin's silently, and both would
+    still be callable while only one of them was being maintained.
+    """
+    from retro.session import SessionMixin
+
+    for name in MOVED_METHODS:
+        assert hasattr(SessionMixin, name), f"retro.session.{name} has gone"
+        # Identity, not merely spelling: `getattr` on a class hands back the
+        # plain function (and, for `history_bytes`, the property object), so
+        # this is the same object or it is a copy.
+        assert getattr(viewmod.RetroView, name) is getattr(SessionMixin, name), name
+    assert SessionMixin in viewmod.RetroView.__mro__
+
+
+def test_no_method_that_moved_is_still_declared_on_the_view():
+    """The same promise as test_nothing_that_moved..., one level in.
+
+    That test walks module-level definitions, so a method left behind in the
+    class body would sail straight past it -- and a shadowing copy of
+    `capture_press` is the version of this mistake that is hardest to see,
+    because everything still passes until the two drift.
+    """
+    import ast
+
+    declaration = next(
+        node
+        for node in view_source().body
+        if isinstance(node, ast.ClassDef) and node.name == "RetroView"
+    )
+    declared = {
+        node.name
+        for node in declaration.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert not (declared & set(MOVED_METHODS)), sorted(declared & set(MOVED_METHODS))
+    # ...and the mixin really is where they went, rather than RetroView
+    # having quietly stopped inheriting it.
+    assert "SessionMixin" in [ast.unparse(base) for base in declaration.bases]
+
+
+def test_the_session_mixin_only_reaches_for_state_the_view_really_has(retro):
+    """A mixin's requirements are otherwise invisible until they break.
+
+    Everything retro/session.py reads off `self` comes from one of two
+    places: the mixin itself, or the view it is mixed into. The second half
+    is a contract nobody wrote down anywhere else -- it is a `self.` two
+    files away -- and it is the contract an edit to RetroView.py can break
+    without touching retro/session.py at all. This is retro/abc.py's
+    `MixinMeta` check one level down, and the module docstring in
+    retro/session.py lists the same names in prose.
+    """
+    import re
+    from pathlib import Path
+
+    # `retro` here is the test environment, not the package: `sessionmod` is
+    # the handle RetroEnv offers for exactly this module, so the source read
+    # below is the module that is really loaded.
+    source = Path(retro.sessionmod.__file__).read_text()
+    view = viewmod.RetroView(
+        retro.cog, game_name="Test", slug="test", rom_filename="test.gb", channel_id=1
+    )
+    missing = sorted(
+        {
+            attribute
+            for attribute in re.findall(r"self\.([_a-zA-Z]\w*)", source)
+            if not hasattr(view, attribute)
+        }
+    )
+    assert not missing, f"retro/session.py reaches for {missing}, which no view has"
+    # Not vacuous: the things it reaches for across the line really are the
+    # view's own, and every one of them is named in that module's docstring.
+    for name in ("clip_frames", "forget_queue", "forget_pacing", "_last_picture"):
+        assert hasattr(view, name), name
+        assert name in retro.sessionmod.__doc__, name
+
+
 def test_the_view_still_owns_the_things_a_view_owns():
     """...and the split stopped where it should have.
 
     The custom_id prefix is baked into every message this cog has ever
-    posted, the queue and the undo history are the session's own state, and
-    the emulation drivers (capture_press and friends) are methods on the
-    session: they are the half of a press that needs the core, and they read
-    and write the view's own history, queue and pacing. They stayed.
+    posted, the press queue is the session's own state, and the clip
+    arithmetic stayed with the view rather than following the drivers out to
+    retro/session.py: `press_plan` and `repeat_taps` are read by the button
+    *layout* (see `_build_controls` and `_update_repeat_label`) and
+    `clip_playback` by the pacing gate, so they are answers the event loop
+    needs and not worker-thread work.
+
+    The drivers themselves are the other side of that line and are checked by
+    MOVED_METHODS above -- they still answer on the view, through the mixin.
     """
     for name in (
         "CUSTOM_ID_PREFIX", "DEFAULT_TIMEOUT_MINUTES", "MAX_QUEUED_PRESSES",
-        "MAX_REPLACED_NOTICES", "SAVE_STATE_EVERY_PRESSES", "UNDO_DEPTH",
-        "MAX_UNDO_BYTES", "UNDO_COMPRESSION_LEVEL", "Pending",
+        "MAX_REPLACED_NOTICES", "SAVE_STATE_EVERY_PRESSES", "Pending",
     ):
         assert hasattr(viewmod, name), name
     for name in (
-        "capture_press", "capture_undo", "capture_reset", "run_press",
-        "run_undo", "run_reset", "remember_state", "pace", "to_components",
+        "clip_frames", "clip_playback", "press_plan", "repeat_taps", "pace",
+        "posted_playback", "to_components", "_build_controls",
+        "_update_repeat_label", "upload_limit",
     ):
-        assert callable(getattr(viewmod.RetroView, name)), name
+        # Declared on the view itself rather than merely reachable through
+        # it: everything in MOVED_METHODS is reachable too.
+        assert name in vars(viewmod.RetroView), name
 
 
 async def test_a_hidden_repeat_click_on_a_replaced_game_says_where_it_went(retro):

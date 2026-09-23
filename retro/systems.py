@@ -36,6 +36,9 @@ __all__ = [
     "core_filename",
     "system_for_core",
     "system_for_extension",
+    "AMBIGUOUS_EXTENSIONS",
+    "AMBIGUOUS_REASONS",
+    "ambiguous_reason",
     "system_by_key",
     "core_name_from_filename",
     "DPAD",
@@ -460,6 +463,64 @@ class System(typing.NamedTuple):
 AMBIGUOUS_EXTENSIONS = frozenset(
     {"bin", "cue", "iso", "chd", "toc", "m3u", "ccd", "img", "fds", "bs", "st"}
 )
+
+#: Why each of those is refused, in a sentence the person who uploaded it can
+#: act on -- and, where there is one, what to do instead.
+#:
+#: The reasoning was written out at length above and then only ever existed
+#: as a comment, so somebody uploading the commonest ROM extension in the
+#: wild got "`.bin` isn't a console this bot knows" and no way to find out
+#: why. Every entry here ends in something actionable, because a refusal
+#: that cannot be acted on is just a wall.
+#:
+#: Keyed without the dot, as AMBIGUOUS_EXTENSIONS is. An extension absent
+#: from here falls back to the plain "not a console this bot knows" reply,
+#: which is the right answer for a `.txt`.
+AMBIGUOUS_REASONS: typing.Dict[str, str] = {
+    "bin": (
+        "`.bin` does not say which console a file is for \N{EM DASH} an Atari "
+        "cartridge, a Mega Drive ROM, a Virtual Boy ROM, a raw CD track and a "
+        "BIOS dump are all `.bin`. Accepting it would mean guessing, and "
+        "guessing wrong means loading a disc track as a Mega Drive game. "
+        "**If this is a Genesis or Mega Drive ROM, rename it to `.md`** and "
+        "it will start."
+    ),
+    "fds": (
+        "`.fds` is a Famicom Disk System image, which cannot boot without "
+        "Nintendo's `disksys.rom` BIOS. Every console this bot plays works "
+        "without a BIOS, so it does not claim this one."
+    ),
+    "bs": (
+        "`.bs` is a Satellaview download, which only boots inside the BS-X "
+        "base cartridge it plugged into. Without that it starts and shows "
+        "nothing, so it is refused rather than left looking broken."
+    ),
+    "st": (
+        "`.st` is a Sufami Turbo game, which only boots inside the Sufami "
+        "Turbo base cartridge. Without that it starts and shows nothing, so "
+        "it is refused rather than left looking broken."
+    ),
+}
+# The disc-image formats all fail the same way and for the same reason, so
+# they share a sentence rather than repeating four near-identical ones.
+for _disc in ("cue", "iso", "chd", "toc", "m3u", "ccd", "img"):
+    AMBIGUOUS_REASONS[_disc] = (
+        f"`.{_disc}` is a CD image. The consoles this bot plays are all "
+        "cartridge machines, and disc systems need both the disc and a "
+        "console BIOS, so none of them is supported."
+    )
+
+
+def ambiguous_reason(extension: str) -> typing.Optional[str]:
+    """
+    Why this extension is deliberately not claimed, if it is one of those.
+
+    ``extension`` may be given with or without its dot and in any case.
+    Returns None for anything that is simply unknown rather than
+    deliberately refused, which is what keeps the caller's fallback honest.
+    """
+    key = str(extension or "").lstrip(".").lower()
+    return AMBIGUOUS_REASONS.get(key)
 
 
 # Ordered roughly by how likely someone is to want them. Extensions come from

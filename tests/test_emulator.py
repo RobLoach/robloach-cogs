@@ -31,7 +31,7 @@ S = load_standalone("retro_systems_for_emulator", "systems.py")
 #: The clips module ``E`` itself imported. ``picture_hash`` and
 #: ``trim_repeated_opening`` are deliberately not on the emulator's re-export
 #: shim (see test_clips.py's SHIMMED, which is grepped rather than guessed:
-#: RetroView imports them from retro/clips.py), so they are reached here the
+#: retro/session.py imports them from retro/clips.py), so they are reached here the
 #: same way the view reaches them -- and off the very module the emulator is
 #: holding, so this cannot end up testing a second copy.
 CL = sys.modules[f"{E.__package__}.clips"]
