@@ -1065,38 +1065,34 @@ def test_a_press_is_only_ever_cut_short_by_a_clip_that_cannot_show_it():
 
 @pytest.mark.parametrize("seconds", [0.2, 0.3, 0.4, 0.5, 0.8, 1.0, 2.0, 4.0, 5.0])
 @pytest.mark.parametrize("hold_ms", [50, 160, 250, 400, 2000])
-def test_a_clip_s_preroll_can_never_swallow_one_of_the_repeat_button_s_taps(
+def test_every_tap_of_the_repeat_button_is_inside_the_clip_that_records_it(
     seconds, hold_ms
 ):
-    """The pre-roll and the repeat button, over every legal setting.
+    """The repeat button and the recording, over every legal setting.
 
-    A clip does not start photographing until the press has visibly done
-    something (see PREROLL_SECONDS in retro/clips.py), and on a screen that
-    never moves that runs to the bound. The bound therefore has to stop short
-    of the *next* tap, or a three-tap clip on a static menu would open after
-    two of the taps had already happened and the player would see fewer
-    presses than the button promised.
+    A clip photographs frames 0..frames-1 of its own window and nothing else
+    (see the seam block in retro/clips.py), so every tap the button promises
+    has to be scheduled inside that window and be up before the last picture
+    worth a whole step of playback, or the player is shown fewer presses than
+    they asked for.
 
-    ``record`` hands the frame of the second press to ``preroll_budget``; this
-    is that arithmetic over the whole settings grid.
+    This used to be a rule about the *pre-roll*, which ran the schedule out
+    unphotographed and so could have swallowed a tap. There is no pre-roll
+    any more -- the clip starts one emulated frame after the previous one
+    ended, always -- so what is left is the schedule's own arithmetic.
     """
     from retro import emulator as E
 
     frames = E.clip_frame_count(GB_FPS, seconds)
     plan = timingmod.press_plan(GB_FPS, seconds, hold_ms, timingmod.REPEAT_TAPS)
-    later = [start for start, _ in plan[1:]]
-    budget = E.preroll_budget(GB_FPS, frames, min(later) if later else None)
 
-    assert 0 <= budget <= frames
-    for start, _hold in plan[1:]:
-        # The pre-roll throws away the first `budget` frames, which are the
-        # schedule's frames 0..budget-1, so a tap on `start` survives exactly
-        # when budget <= start -- and then it lands in the clip's own first
-        # picture rather than in a frame nobody sees.
-        assert budget <= start, (budget, plan)
-    # The first press is always at frame 0 and is always in the pre-roll:
-    # holding it is the whole point, since it is what makes the picture move.
+    # The first press is always at frame 0, which is the frame the clip's
+    # opening picture is taken after: the press is landing in it.
     assert plan[0][0] == 0
+    budget = E.input_budget(GB_FPS, frames)
+    for start, hold in plan:
+        assert 0 <= start < frames, (start, frames)
+        assert start + hold <= budget <= frames - 1, (plan, budget, frames)
 
 
 def test_the_clip_is_a_webp_attachment(retro):

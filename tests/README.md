@@ -25,7 +25,7 @@ failing.
 
 | | what it covers | needs |
 | --- | --- | --- |
-| fast | console tables, button layouts, emoji, the per-console press line, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves`, `[p]retroreboot`, `[p]retroend`, the press queue and the Undo button included), the session-record lifecycle (the channel and guild listeners, and bounded growth), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `preroll_budget`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; a few tests that read a clip's frames back want Pillow) |
+| fast | console tables, button layouts, emoji, the per-console press line, zip handling, the version metadata, the `RetroCog` -> `Retro` migration, the whole cog driven against fakes (`[p]retrosaves`, `[p]retroreboot`, `[p]retroend`, the press queue and the Undo button included), the session-record lifecycle (the channel and guild listeners, and bounded growth), the shared restore chain, the clip arithmetic and the fast frame grab (`press_plan`, `input_budget`, `capture_plan`, `clip_size` and the rest of `retro/clips.py`: plain functions of a frame rate, a framebuffer or a frame size, so no core is needed), property tests | nothing (more of it runs with `discord.py` installed; a few tests that read a clip's frames back want Pillow) |
 | `-m emulator` | real libretro cores: clips at every length from 0.2s to 4s, timing (playback really does match emulated time, fractions included), clip-boundary continuity, the size each console is posted at, resetting a core, save states, battery saves, core options, BIOS directory, deliberately corrupted ROMs (`test_malformed_roms.py`), and the save export/import round trip, the Undo round trip and the `[p]retroreboot` round trip through the cog | `libretro.py`, Pillow, cores and ROMs (`test_saves_roundtrip.py` and `test_malformed_roms.py` also want `discord.py`) |
 | `-m network` | every core systems.py recommends is still on the libretro buildbot | `RETRO_TEST_NETWORK=1` and the internet |
 
@@ -281,57 +281,74 @@ about `capture_plan` at every clip length and frame rate, with no core.
 
 **A clip plays for exactly as long as it emulated**, and that rule is
 unconditional -- see `test_a_clip_plays_for_as_long_as_it_emulated`, whose
-docstring states it and says why it was nearly weakened. A clip *opens* on
-pictures where the press has not visibly landed yet (the hold is 160ms and a
-game reacts more slowly), and on a game that sits still until it is prodded
-the opening picture really was the previous clip's closing picture over again.
-Trimming those pictures out of the recording would have made playback shorter
-than the span it covers, so it was measured and rejected; what the fix turned
-out to be is a bounded **pre-roll**, which plays the press out before the
-recording starts rather than dropping anything from it.
+docstring states it and says why it was nearly weakened. It is also what rules
+out trimming a clip's leading duplicate pictures, which on a static screen
+wants to trim the whole clip and leave a 17ms flash.
 
-Four tests carry that, and between them they are the whole argument:
+**A clip starts exactly one emulated frame after the last one ended.** A
+picture is taken *after* an emulated frame, so the last picture of a clip is
+its window's final frame and the first picture of the next clip is the next
+frame of the console -- no repeat, no gap, and no way for the console to run
+ahead of what has been posted. That was broken for a while by a bounded
+**pre-roll**, which ran a clip's opening press out unphotographed until the
+picture stopped being the one the previous clip had left in the channel: it
+put 1 to 16 frames into every seam and, on the static screens this cog is
+actually played on, opened the clip on the repeated picture anyway. It is
+gone; the measurements are in the seam block in `retro/clips.py` and in
+section 3a of `test_emulator.py`.
 
-* `test_the_preroll_opens_a_clip_on_the_first_picture_the_press_changed`
-  records each responsive probe twice from one save state -- once with the
-  pre-roll switched off, which is the "before" column -- and requires the
-  opening repeat to go from at least one picture to none, with every picture
-  the capture plan asked for still photographed both times;
-* `test_a_completely_static_screen_still_produces_a_whole_clip` is the case
-  the bound protects and the case a trim would have destroyed: three screens
-  where *every* picture is unchanged, which a trim would have reduced to a
-  17ms flash. The pre-roll spends its bound, finds nothing, and records the
-  full clip -- byte-for-byte the clip it would have recorded with no pre-roll
-  at all. It `skip`s rather than fails if a ROM turns out not to be static
-  under the core build in use;
-* `test_the_hold_is_honoured_in_full_and_released_before_the_last_picture`
-  reads the input back off the frames the core really saw, by wrapping
-  `advance`, and pins that the pre-roll did not shorten, lengthen or move the
-  press;
-* `test_the_preroll_leaves_the_seam_with_no_repeat_and_no_gap` does two
-  presses in a row and requires the pre-roll's own frames to be pictures the
-  player had already seen, so that skipping them loses nothing.
+Five tests carry it, and between them they are the whole argument:
 
-`test_a_clip_with_no_input_in_it_has_no_preroll_at_all` is the other side of
-it: Wait, Undo, a boot and `[p]retroreboot` record with no schedule, so they
-photograph from their first frame as they always did. The bound itself is
-plain arithmetic and is covered with no core at all in `test_clips.py`
-(`preroll_budget`), including the rule that stops it running through one of
-the repeat button's taps -- which `test_view.py` checks across the whole
+* `test_the_seam_between_two_clips_is_exactly_one_emulated_frame` is the
+  statement itself, over every probe and both with a press and without one.
+  Two clips are recorded back to back, then the same window is rewound and
+  emulated one frame at a time with identical input, and every picture of
+  both clips has to be its reference frame -- so the first clip ends on frame
+  N and the second opens on N+1. It also counts the frames the recordings
+  emulated (by wrapping `advance`), which is the half a frozen screen cannot
+  satisfy by accident;
+* `test_the_clip_frame_rate_does_not_move_the_seam` answers the question the
+  report asked ("is there something we can do in the framerate?") at 10, 15,
+  20 and 60 fps: `capture_plan` photographs frame 0 and the final frame at
+  every cadence, so the seam does not move;
+* `test_a_moving_game_never_repeats_a_picture_across_the_seam` is the
+  pictures half, on the one probe that animates by itself;
+* `test_a_completely_static_screen_still_produces_a_whole_clip` is the cost,
+  and the case a trim would have destroyed: screens where *every* picture is
+  unchanged still get the full clip, every picture the plan asked for, and
+  durations adding up to the whole second. It presses once first, so the
+  screen is where a *second* press finds it, and `skip`s rather than fails if
+  a ROM turns out not to be static under the core build in use;
+* `test_a_games_own_reaction_latency_is_shown_rather_than_skipped` pins the
+  trade in the other direction: Libbet answers Start on its third frame, and
+  the clip now holds the unchanged picture for exactly that long instead of
+  skipping it -- no more (nothing is dragged out) and no fewer (nothing is
+  hidden).
+
+`test_the_hold_is_honoured_in_full_and_released_before_the_last_picture` reads
+the input back off the frames the core really saw and pins that the window is
+the clip and nothing else, and
+`test_a_clip_with_no_input_in_it_photographs_from_its_very_first_frame` is
+Wait, Undo, a boot and `[p]retroreboot`, which always had the one-frame seam.
+The arithmetic underneath all of it is covered with no core at all in
+`test_clips.py` (`test_the_seam_between_two_clips_is_exactly_one_emulated_frame`
+and `test_the_clip_frame_rate_cannot_move_the_seam`, over every frame rate,
+clip length and cadence), and `test_view.py` checks that every tap of the
+repeat button lands inside the clip that records it across the whole
 clip-length x hold settings grid.
 
 `roms/libbet.gb` was added to `fetch_assets.py` for this: Libbet and the
 Magic Floor (zlib) is the only ROM here with the shape the bug was reported
 against, a Game Boy screen that sits completely still until it is prodded and
 then takes a couple of frames to react. uCity animates every frame (so it is
-the control -- the pre-roll must do nothing to it) and dmg-acid2 never changes
-at all. Libbet also ignores the d-pad on that screen, which gives the
-must-not-flash case from the same ROM. One thing it is *not* used for is
-consecutive clips: pressing A there makes gambatte dupe a frame, and
-libretro.py 0.11.x raises out of its own environment callback when it sees one
-(0.6.0 does not), so the seam test uses nestest and a SNES homebrew instead.
-That is an upstream regression rather than anything to do with clips -- a
-recording with the pre-roll switched off fails in exactly the same place.
+the control -- the one probe whose clips never repeat a picture across a seam)
+and dmg-acid2 never changes at all. Libbet also ignores the d-pad on that
+screen, which gives the must-not-flash case from the same ROM, and that is how
+the seam tests drive it: pressing A there makes gambatte dupe a frame, and
+libretro.py 0.11+ raises out of its own environment callback when it sees one
+(0.6.0 does not), so consecutive clips of Libbet under A come back as "the
+core crashed while running". That is an upstream regression rather than
+anything to do with clips.
 
 ## What the cog holds on to
 

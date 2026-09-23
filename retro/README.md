@@ -539,79 +539,87 @@ press continues from. It used to stop on the last frame that happened to fall
 on the sampling cadence, three frames (about 50ms) before the end of what it
 had already emulated, so every press began with a small invisible jump.
 
-**A clip starts where the last one ended.** A press does not show up on
-screen the instant the button goes down — the hold is 160ms (ten frames) and
-a game takes a moment longer than that to react, while a clip's first picture
-is taken after a single emulated frame. On a game that animates by itself
-that first picture already looks different from the one the previous clip left
-in the channel, so the clip visibly moves on. On a game that sits still until
-it is prodded — an overworld, a menu, a text box, which is most of what this
-cog is played on — the first picture was *byte-identical* to the previous
-clip's last one, so a new clip opened by replaying a moment the player had
-already been looking at. That was reported, accurately, as "the clip seems to
-replay a bit from the previous clip".
+**A clip starts exactly one emulated frame after the last one ended.** A
+picture is taken *after* an emulated frame, so the last picture of a clip is
+its window's final frame and the first picture of the next clip is the very
+next frame of the console. Press, clip, press, clip is one unbroken run: no
+moment is shown twice and none is run past unseen, and the console can never
+get ahead of what has been posted.
 
-So a clip that opens with a press in it now runs a short **pre-roll** first:
-the button goes down and the console runs, unphotographed, until the picture
-is no longer the one the last clip finished on — and only then does the
-recording start. Measured on real cores at the default hold, opening pictures
-identical to the held one, out of the sixteen a one second clip takes:
+That rule was broken for a while by the fix for an earlier report of the same
+symptom. A press does not show up the instant the button goes down — the hold
+is 160ms and a game takes a moment longer than that to react — so on a game
+that sits still until it is prodded (an overworld, a menu, a text box, which
+is most of what this cog is played on) the clip's opening picture was
+byte-identical to the one the previous clip had left in the channel. That was
+reported as "the clip seems to replay a bit from the previous clip", and the
+answer was a bounded **pre-roll**: the button went down and the console ran,
+*unphotographed*, until the picture stopped being the held one.
 
-| Core / ROM | Button | Before | After | Pre-roll |
-| --- | --- | --- | --- | --- |
-| gambatte / µCity | ← | 0 of 16 | 0 of 16 | none |
-| genesis_plus_gx / homebrew | Start | 0 of 16 | 0 of 16 | none |
-| gambatte / Libbet | A | 1 of 16 | **0** | 2 frames |
-| fceumm / nestest (a menu) | Start | 1 of 16 | **0** | 1 frame |
-| snes9x / homebrew | A | 1 of 16 | **0** | 3 frames |
-| mgba / GBA homebrew | A | 3 of 16 | **0** | 10 frames |
-| gambatte / Libbet | ↓ (ignored) | 16 of 16 | 16 of 16 | 15 (the bound) |
-| gambatte / dmg-acid2 | A | 16 of 16 | 16 of 16 | 15 (the bound) |
+It did not fix the report, and it cost the seam to not fix it. Four
+consecutive one second clips per row, at the default hold, on a Raspberry Pi
+5 — emulated frames between one clip's last picture and the next clip's first
+("seam"), and whether that first picture is the held one again:
 
-µCity is the control: it animates every frame, so its clips never opened on a
-repeat and nothing about them changed. The worst real case is ten frames, on a
-game that reacts to the button coming *up* rather than going down — which is
-exactly the length of the hold. The clips get slightly smaller rather than
-bigger (a NES menu 1564 → 1418 bytes, the GBA homebrew 1098 → 614) because
-what came off the front was a picture the encoder was storing, and a press
-costs 0.4–1.6ms more to record.
+| Core / ROM | Button | Seam, with the pre-roll | Again? | Seam, without | Again? |
+| --- | --- | --- | --- | --- | --- |
+| gambatte / µCity | ← | 1, 1, 16 | no, no, yes | **1, 1, 1** | no, no, yes |
+| gambatte / Libbet | ↓ (ignored) | 16, 1, 16 | yes, no, yes | **1, 1, 1** | yes |
+| fceumm / nestest (a menu) | Start | 16, 16, 16 | yes | **1, 1, 1** | yes |
+| fceumm / nestest | ↓ | 2, 2, 2 | no | **1, 1, 1** | yes |
+| gambatte / dmg-acid2 | A | 16, 16, 16 | yes | **1, 1, 1** | yes |
+| any of the above | (no press) | 1, 1, 1 | — | **1, 1, 1** | — |
 
-**The pre-roll is bounded at a quarter of a second** (15 frames on a Game Boy,
-a quarter of a default clip). The last two rows above are why: on a screen
-that never changes at all — a paused game, a menu, a button the game ignores —
-there is no first difference to find, so the pre-roll runs out its bound and
-then records the clip exactly as it would have: full length, every picture,
-the whole second, and byte for byte the same file. That costs 8–18ms and a
-quarter of a second of game time, out of the 33–80ms a clip takes end to end.
+The seam was `1 + the frames the pre-roll used`, exactly, in every row. And on
+the three static rows — the ones this cog is actually played on — the pre-roll
+ran its whole 15 frame bound, found no change, opened the clip on the repeated
+picture *anyway*, and charged 251ms of game time per press for it. So the
+pre-roll is gone, and the seam is one frame everywhere.
 
-The rule that was tried before this and rejected was a *trim* of the clip's
-leading duplicate pictures, and on those rows it wants to trim everything and
-leave the single picture it is obliged to keep — a 1005ms clip played as a
-17ms flash. A bound cannot do that, because a pre-roll throws nothing away
-that the clip recorded.
+**What that trades away.** The only way to escape a repeated opening picture
+is to skip forward until the picture changes, and on a screen that never
+changes that is either a jump (what the pre-roll did) or an unbounded one
+(worse). So a game's own reaction latency is now *shown* rather than skipped:
+the clip opens on the held picture and stays there for exactly as long as the
+game really takes to answer, then moves. Measured as opening pictures that are
+the held one again, out of the sixteen a one second clip takes:
 
-The press itself is not rearranged to pay for this. The pre-roll's frames are
-emulated with the button held on exactly the frames it would have been held on
-anyway, so the console sees the same input on the same frames as it did before
-the pre-roll existed; all that changes is which frames get photographed. The
-hold is therefore honoured in full, and the guarantee that the button is up
-before the clip's last picture holds with *more* room than before rather than
-less. A clip with no input in it — **Wait**, **Undo**, a boot, `[p]retroreboot`
-— has no pre-roll at all: nothing was pressed, so there is nothing whose
-effect to wait for, and skipping frames because a paused game has not moved
-would throw away the only thing Wait does.
+| Core / ROM | Button | Before | Now |
+| --- | --- | --- | --- |
+| fceumm / nestest | ↓ | 0 of 16 | 1 of 16 (67ms) |
+| gambatte / µCity | ← | 4 of 16 | 8 of 16, once its menu stops animating |
+| gambatte / Libbet | ↓ | 11 of 16 | 16 of 16, once its screen settles |
+| fceumm / nestest | Start | 16 of 16 | 16 of 16 (unchanged) |
+| gambatte / dmg-acid2 | A | 16 of 16 | 16 of 16 (unchanged) |
+
+The encoder merges a run of identical pictures into one stored frame and adds
+their durations together, so that is a held picture rather than a stutter —
+and it is the truth about the game. In exchange, nothing is ever shown twice
+across a seam on a game that *is* moving, and the console is never a quarter
+of a second ahead of the pictures.
+
+**The frame rate is not a lever on any of this**, which is the first thing
+tried. A clip photographs its frame 0 and its final frame whatever the
+sampling cadence is, so the seam is one frame at 10, 15, 20 and 60 fps alike —
+measured against all five rows above. All the clip's frame rate changes is how
+many pictures fill the middle.
+
+A clip with no input in it — **Wait**, **Undo**, a boot, `[p]retroreboot` —
+always had the one-frame seam and is unchanged.
 
 **A clip plays for exactly as long as it emulated** — start to finish, with
 nothing dropped off either end. Not "about as long", and not "as much of it as
-had something new in it". A second of clip is a second of console. That rule
-survived the fix above intact, which is the main reason the fix is a pre-roll
-and not a trim: the pre-roll happens in *front* of the recording, so the same
-number of frames go in and the same number of frames' worth of picture
-durations come out.
+had something new in it". A second of clip is a second of console. That is
+also what rules out the other fix that was tried for the original report: a
+*trim* of the clip's leading duplicate pictures, which on a static screen
+wants to trim everything and leave the single picture it is obliged to keep —
+a 1005ms clip played as a 17ms flash.
 
 `tests/test_emulator.py` holds all of it against real cores: the timing rule,
-the table above, the static screen the bound protects, and the seam between
-two presses in a row. If a press still feels slow to land, `[p]retroset hold` is the dial
+the tables above, the static screen that must still get a whole clip, and the
+one-frame seam between two presses in a row (proved by rewinding and emulating
+the same window a frame at a time). If a press still feels slow to land,
+`[p]retroset hold` is the dial
 — a shorter hold reacts sooner, at the risk of a game not noticing the press
 at all below about 100ms.
 

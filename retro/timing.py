@@ -128,8 +128,9 @@ BOOT_SECONDS = 3
 # it had played. What that looks like is the picture lurching: the animation
 # never reaches the frame the next clip carries on from, so the game appears
 # to jump back a little on every press. The seam itself is exact (see
-# capture_plan and PREROLL_SECONDS, which between them make the last picture
-# of one clip the state the next one starts from), and the pacing below is
+# capture_plan and the seam block above it in retro/clips.py, which between
+# them make the last picture of one clip the emulated frame before the first
+# picture of the next one), and the pacing below is
 # what makes it exact *on screen* rather than only in the emulation.
 #
 # The rule: **an edit that replaces a clip waits until that clip has had its

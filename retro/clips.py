@@ -164,60 +164,90 @@ MIN_CLIP_FRAMES = 6
 # one visible picture rather than one invisible frame.
 MIN_AFTERMATH_FRAMES = 1
 
-# -- The pre-roll: where a clip starts ----------------------------------------
+# -- The seam: where one clip stops and the next one starts -------------------
 #
-# A clip's first picture is taken after a single emulated frame (see
-# capture_plan), and one frame after a button goes down almost nothing has
-# happened yet. On a game that animates by itself the first picture is already
-# different from the one the previous clip left in the channel, so the clip
-# visibly moves on. On a game that sits still until it is prodded -- an
-# overworld, a menu, a text box, which is most of what this cog is played --
-# the first picture is *byte-identical* to the previous clip's closing one, so
-# the new clip opens by re-showing a picture the player has already been
-# looking at. That is the "when I click the button, the clip seems to replay a
-# bit from the previous clip" report, and it is the whole reason this constant
-# exists.
+# A picture is taken *after* an emulated frame, never before one, so the
+# picture at index ``i`` is the game after ``i + 1`` frames and the last
+# picture of a clip is the game after all ``frames`` of them (see
+# :func:`capture_plan`, which always photographs both ends). The next clip
+# emulates one frame and photographs it. **The seam is therefore exactly one
+# emulated frame, every time, on every console**: press, clip, press, clip is
+# one unbroken run of console frames with nothing shown twice, nothing skipped,
+# and no way for the console to get ahead of what has been posted.
 #
-# So before a clip is photographed, the schedule is applied and the core is
-# run *with the press already down* until the picture is no longer the one the
-# previous clip ended on -- at most this many seconds of it. Then the clip is
-# recorded from there, at its full length. Nothing is dropped from the
-# recording: the pre-roll is emulated in front of it, so the clip still plays
-# for exactly as long as the window it photographed emulated, and every frame
-# the pre-roll ran through is a frame the player had already seen (that is the
-# stopping condition). See RetroEmulator.record_frames.
+# That is the contract, it is what ``[p]retro``'s Wait button always did, and
+# it is worth stating in one place because the thing that used to live here
+# broke it.
 #
-# Measured on a Raspberry Pi 5 against the real cores at the default 160ms
-# hold, boot + 3 seconds, one button held from frame 0 -- how many emulated
-# frames of the clip are byte-identical to the frame before the press, i.e.
-# how many the pre-roll has to run through before the clip has something new
-# to show:
+# **The pre-roll, and why it is gone.** A clip that opened with a press used to
+# run the press out *unphotographed* -- up to a quarter of a second of it --
+# until the picture stopped being the one the previous clip had left standing
+# in the channel, and only then start recording. It was written for a real
+# report ("when I click the button, the clip seems to replay a bit from the
+# previous clip"), because one frame after a button goes down a game that was
+# sitting still is still sitting still, so the opening picture was the closing
+# picture over again.
 #
-#   core / ROM                     button   identical frames   first change
-#   gambatte / uCity               down            0            frame 1
-#   genesis_plus_gx / homebrew     start           0            frame 1
-#   fceumm / nestest (a menu)      start           1            frame 2
-#   fceumm / nestest               down            1            frame 2
-#   snes9x / homebrew              a               3            frame 4
-#   mgba / GBA homebrew            a              10            frame 11
-#   gambatte / dmg-acid2           a          never changes  (bounded out)
+# It did not fix that report, and it cost the seam to not fix it. Measured on
+# this Raspberry Pi 5 against the real cores and ROMs, four consecutive one
+# second clips each, default 160ms hold, the button held from frame 0 of every
+# clip -- emulated frames between the last picture of one clip and the first
+# picture of the next ("seam"), and whether that first picture is byte
+# identical to the last one ("again?"):
 #
-# Ten frames is the worst real case, and it is exactly the hold: that game
-# reacts to the button coming *up*, not going down. 0.25s is 15 frames at
-# 59.73 fps, which clears it by half again, and is a quarter of a default
-# clip -- so on the pathological case (a frozen screen, a paused game, a
-# button the game ignores) at most a quarter of a clip's worth of emulation
-# is spent looking for a change that never comes, and the clip is then
-# recorded from where it is, at full length. That bound is the difference
-# between this and the trim that was rejected before it, which turned a one
-# second clip of a static screen into a 17ms flash.
+#                                    with the pre-roll     without it
+#   core / ROM              button    seam      again?    seam    again?
+#   gambatte / uCity         down     1,1,16    n,n,y     1,1,1   n,n,y
+#   gambatte / Libbet        down    16,1,16    y,n,y     1,1,1   y,y,y
+#   fceumm / nestest         start   16,16,16   y,y,y     1,1,1   y,y,y
+#   fceumm / nestest         down     2,2,2     n,n,n     1,1,1   y,y,y
+#   gambatte / dmg-acid2     a       16,16,16   y,y,y     1,1,1   y,y,y
+#   ...any of the above, with no press at all   1,1,1     1,1,1
 #
-# It is deliberately not tied to the configured hold (`[p]retroset hold`
-# reaches 2000ms): the cap is what keeps the worst case cheap, and a hold long
-# enough to outlast it is a hold whose release the player asked to wait for.
-# A game that only reacts after the bound runs out gets today's behaviour --
-# one re-shown picture -- which is the honest failure mode.
-PREROLL_SECONDS = 0.25
+# The seam was ``1 + the frames the pre-roll used``, exactly, in every row.
+# And wherever the screen was *static* -- a menu, an overworld, a paused game,
+# which is most of what this cog is actually played on -- the pre-roll ran its
+# whole 15 frame bound, found nothing, opened the clip on the repeated picture
+# anyway, and charged a quarter of a second of game time (251ms on a Game Boy)
+# per press for it. That
+# is the report, still, with the fix that was supposed to answer it switched
+# on: "the new clips still seem to start right before the previous clip
+# ended".
+#
+# So the pre-roll is removed rather than retuned. No bound could have saved it:
+# the only way to escape a repeated opening picture is to skip forward until
+# the picture changes, and on a screen that never changes that is either a
+# jump (what it did) or an unbounded one (worse). What is left is the honest
+# reading -- the game *has not moved*, and the clip says so.
+#
+# What that costs, measured the same way, in pictures of the sixteen a one
+# second clip photographs that are the held one again before anything moves:
+#
+#   fceumm / nestest      down     0 -> 1    (nothing -> 67ms of held picture)
+#   gambatte / uCity      down     4 -> 8    on the seam where uCity's menu
+#                                            has just stopped animating
+#   gambatte / Libbet     down    11 -> 16   on the seam where its screen has
+#                                            just settled
+#   fceumm / nestest      start   16 -> 16   unchanged, and dmg-acid2 the
+#                                            same: a screen that never moves
+#                                            was all repeat either way
+#
+# So a clip gains between nothing and a few pictures of visible latency at its
+# start, which is the latency the game really has, and the encoder folds that
+# run of identical pictures into one stored frame with their durations added
+# together (see :func:`encode_animation`) -- it is a held picture, not a
+# stutter. In exchange every clip starts one frame after the last one ended,
+# the console never runs a quarter of a second ahead of the pictures, and a
+# clip of a static screen is still a full length clip -- not the 17ms flash
+# that the *trim* of leading duplicates, tried and rejected before the
+# pre-roll, turned it into.
+#
+# **The frame rate is not a lever on any of this**, which is the first thing
+# that was tried. :func:`capture_plan` puts a picture on frame 0 and on the
+# final frame whatever the cadence is, so the seam is one frame at every
+# CLIP_FPS -- measured at 10, 15, 20 and 60 against all five rows above, and
+# the seam column is identical in all four. All CLIP_FPS changes is how many
+# pictures fill the middle.
 
 # Animated WebP, encoded losslessly, is the one format a clip is ever posted
 # in, and GIF is not worth reintroducing as an alternative: measured on a 4
@@ -591,11 +621,14 @@ def capture_plan(
     until the next picture is taken, so the durations always add up to
     ``frames`` and the clip plays for as long as it emulated.
 
-    Two frames are always photographed, and between them is why clip
-    boundaries are seamless:
+    Two frames are always photographed, whatever ``step`` is, and between them
+    they are the whole of why clip boundaries are seamless -- see the seam
+    block above, which is the one-frame rule these two halves add up to:
 
     * **frame 0**, so a press scheduled at the start of the clip is already
-      landing in the first picture the player sees;
+      landing in the first picture the player sees, and so the clip opens one
+      emulated frame after the previous clip's closing picture rather than
+      some multiple of ``step`` later;
     * **the last frame**, so the picture the clip finishes on -- and holds,
       since clips are encoded with ``loop=1`` -- is the exact state the *next*
       clip carries on from. Without it the clip stopped on the last frame that
@@ -603,6 +636,11 @@ def capture_plan(
       Boy clip) while frames 58, 59 and 60 were emulated but never shown, so
       the still picture sitting in the channel between presses was three
       frames behind the console.
+
+    Neither of them depends on ``step``, which is why the clip's frame rate
+    cannot move the seam: at any ``step`` at all, the last picture of one clip
+    is emulated frame ``frames`` of its window and the first picture of the
+    next is frame 1 of the following window.
 
     Everything in between is on the regular ``step`` cadence, so the clip's
     timing is uniform except for the tail: a 60 frame clip at ``step`` 4 is
@@ -700,55 +738,6 @@ def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     step = capture_step(fps, clip_fps)
     reserved = max(1, int(MIN_AFTERMATH_FRAMES)) - 1
     return max(1, ((frames - 1) // step - reserved) * step)
-
-
-def preroll_budget(
-    fps: float,
-    frames: int,
-    next_press: typing.Optional[int] = None,
-    seconds: float = PREROLL_SECONDS,
-) -> int:
-    """
-    The most emulated frames a clip's pre-roll may run through.
-
-    The pre-roll plays the press out without photographing it, until the
-    picture stops being the one the previous clip left in the channel; this is
-    the ceiling on how far it will look. See PREROLL_SECONDS for the
-    measurements, and :meth:`RetroEmulator.record_frames` for the mechanism.
-
-    Three things cap it, and the smallest wins:
-
-    * **PREROLL_SECONDS**, which is what bounds the pathological case -- a
-      frozen screen, where the picture never changes and the pre-roll runs to
-      the end of its rope on every press;
-    * **the clip itself**, so a 0.2 second clip cannot spend longer looking
-      for a change than it spends showing one;
-    * **``next_press``**, the frame of the schedule the *next* button goes
-      down on (the repeat button's second tap), so a pre-roll can never run
-      through a tap and leave the player a clip with fewer presses in it than
-      they asked for. Passing None means there is no second press to protect.
-      At the default settings it never binds -- the second of three taps is
-      frame 23 of a one second clip and the cap is 15 -- but a short clip with
-      a short hold brings them within a few frames of each other.
-
-    Zero is a legitimate answer and means "photograph the very first frame",
-    i.e. exactly what this did before the pre-roll existed. That is why the
-    seconds are converted here rather than through :func:`frame_count`, whose
-    floor of one frame is right for a clip length and wrong for this.
-    """
-    frames = max(1, int(frames))
-    try:
-        wanted = float(fps) * float(seconds)
-    except (TypeError, ValueError):
-        return 0
-    if not math.isfinite(wanted):
-        # A core reporting a nonsense frame rate gets no pre-roll rather than
-        # an unbounded one. See RetroEmulator.fps, which already defaults.
-        return 0
-    budget = min(round(wanted), frames)
-    if next_press is not None:
-        budget = min(budget, int(next_press))
-    return max(0, budget)
 
 
 # -- How big the posted picture is -------------------------------------------

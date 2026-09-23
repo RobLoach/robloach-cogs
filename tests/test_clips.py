@@ -222,8 +222,8 @@ def test_a_nonsense_frame_rate_does_not_divide_by_zero(fps):
     """A core that reports nothing useful gets arithmetic, not a traceback.
 
     RetroEmulator.fps already defaults such a core to DEFAULT_FPS, so this is
-    a guard for a direct caller (and for the view's own fallback while a
-    session is hibernated), in the same shape as preroll_budget's.
+    a guard for a direct caller, and for the view's own fallback while a
+    session is hibernated.
     """
     assert C.playback_seconds(fps, 60) > 0.0
     assert all(ms >= 1 for _, ms in C.clip_plan(fps, 60))
@@ -274,7 +274,6 @@ def test_a_setting_stored_above_the_new_ceiling_is_clamped_on_read():
         plan = C.capture_plan(frames, C.capture_step(fps))
         assert sum(covered for _, covered in plan) == frames
         assert 1 <= C.input_budget(fps, frames) < frames
-        assert 0 < C.preroll_budget(fps, frames) <= frames
         assert C.playback_seconds(fps, frames) == pytest.approx(
             C.MAX_CLIP_SECONDS, abs=0.05
         )
@@ -289,85 +288,110 @@ def test_the_ceiling_is_a_length_a_game_boy_can_actually_record():
     assert C.playback_seconds(FPS["gb"], frames) == 5.008
 
 
-# -- Where a clip starts: the pre-roll ----------------------------------------
+# -- The seam: where one clip stops and the next one starts -------------------
 #
-# The mechanism is in RetroEmulator.record and is proved against real cores in
-# test_emulator.py; what is here is the bound, which is plain arithmetic.
+# The rule the whole cog hangs on, stated with no core in the room: the
+# picture at plan index ``i`` is the game after ``i + 1`` emulated frames, so
+# the last picture of a clip is frame ``frames`` of its window and the first
+# picture of the next clip is frame 1 of the next window -- one frame later,
+# exactly, whatever the console's rate, whatever the clip length and whatever
+# CLIP_FPS is. RetroEmulator.record_frames is the half that has to emulate
+# that faithfully, and tests/test_emulator.py holds it to it against real
+# cores; the arithmetic is here.
+#
+# It is written out as absolute frame numbers rather than asserted on the
+# indices directly, because "index 0 of the next clip" is the thing that looks
+# obviously adjacent and is not: it was ``1 + the frames the pre-roll used``
+# frames later for as long as the pre-roll existed, and on a menu screen that
+# was sixteen. See the seam block in retro/clips.py.
+
+
+def photographed_at(fps, frames, clip_fps=C.CLIP_FPS, first=1):
+    """The absolute emulated frames a clip's pictures are taken on.
+
+    ``first`` is the window's first frame, so two calls a clip apart line the
+    second clip up behind the first exactly as ``record_frames`` does.
+    """
+    step = C.capture_step(fps, clip_fps)
+    return [first + index for index, _ in C.capture_plan(frames, step)]
 
 
 @pytest.mark.parametrize("fps", sorted(FPS.values()))
 @pytest.mark.parametrize("seconds", [0.2, 0.5, 0.8, 1.0, 4.0, 5.0])
-def test_a_preroll_is_bounded_and_never_longer_than_its_own_clip(fps, seconds):
-    """The bound is what makes the pre-roll safe on a screen that never moves.
+@pytest.mark.parametrize("clip_fps", [10, 15, 20, 60])
+def test_the_seam_between_two_clips_is_exactly_one_emulated_frame(
+    fps, seconds, clip_fps
+):
+    """No repeat and no gap, at every length, rate and cadence there is.
 
-    A trim of the clip's leading duplicate pictures was rejected because on a
-    frozen screen it wants to trim *everything* and leaves a 17ms flash. The
-    pre-roll cannot do that -- it throws away nothing the clip recorded -- but
-    it can still spend emulation looking for a change that is never coming, so
-    it is capped.
+    Two clips back to back: the first covers absolute frames 1..N and the
+    second N+1..2N. The last picture of the first has to be frame N and the
+    first picture of the second has to be frame N+1 -- adjacent, so the
+    console cannot show a moment twice and cannot run on ahead of the
+    pictures.
     """
     frames = C.clip_frame_count(fps, seconds)
-    budget = C.preroll_budget(fps, frames)
+    first = photographed_at(fps, frames, clip_fps)
+    second = photographed_at(fps, frames, clip_fps, first=frames + 1)
 
-    assert 0 < budget <= frames, (budget, frames)
-    assert budget <= C.frame_count(fps, C.PREROLL_SECONDS)
-    # A quarter of a second is the cap, so at every length a player can
-    # configure past 0.25s the pre-roll is a fraction of the clip rather than
-    # the whole of it.
-    if seconds >= 1.0:
-        assert budget <= frames // 4
+    assert first[0] == 1, "a clip opens on its window's first emulated frame"
+    assert first[-1] == frames, "a clip closes on its window's last one"
+    assert second[0] - first[-1] == 1, (first[-1], second[0])
+    # ...and the run of the two clips together is strictly increasing with no
+    # frame photographed twice, which is the same statement said the other way.
+    run = first + second
+    assert run == sorted(set(run))
+    assert run[-1] == 2 * frames
 
 
-def test_the_preroll_bound_covers_the_worst_case_that_was_measured():
-    """The numbers behind PREROLL_SECONDS, restated as an assertion.
+@pytest.mark.parametrize("fps", sorted(FPS.values()))
+def test_the_clip_frame_rate_cannot_move_the_seam(fps):
+    """"Is there something we can do in the framerate to fix it?" -- no.
 
-    The most frames any real core took to show a difference after a press was
-    ten, on a GBA homebrew that reacts to the button coming *up* rather than
-    going down -- which is exactly the default 160ms hold. See PREROLL_SECONDS
-    in retro/clips.py for the whole table. The bound has to clear that, or the
-    case it was written for is the case it misses.
+    The seam is set by which *ends* capture_plan photographs, and it
+    photographs both of them at every cadence: index 0 and index ``frames-1``
+    are in the plan whether a picture covers one emulated frame or sixty. So
+    raising CLIP_FPS buys more pictures in the middle of a clip and moves the
+    seam not at all, which is what the real cores measured too (see the seam
+    block in retro/clips.py).
     """
-    for fps in sorted(FPS.values()):
-        frames = C.clip_frame_count(fps, 1.0)
-        assert C.preroll_budget(fps, frames) >= 10, fps
-    # ...and it clears it with room, rather than sitting exactly on it.
-    assert C.frame_count(FPS["gb"], C.PREROLL_SECONDS) == 15
-    assert 0.2 <= C.PREROLL_SECONDS <= 0.5
+    frames = C.clip_frame_count(fps, 1.0)
+    seams = set()
+    counts = set()
+    for clip_fps in (1, 5, 10, 12, 15, 20, 30, 60, 120):
+        first = photographed_at(fps, frames, clip_fps)
+        second = photographed_at(fps, frames, clip_fps, first=frames + 1)
+        seams.add(second[0] - first[-1])
+        counts.add(len(first))
+
+    assert seams == {1}, seams
+    # ...and the cadence really was being varied, or the above proves nothing.
+    assert len(counts) > 1, counts
 
 
-def test_a_preroll_stops_before_the_next_press_in_the_schedule():
-    """Why preroll_budget takes a ``next_press``.
+@pytest.mark.parametrize("fps", sorted(FPS.values()))
+@pytest.mark.parametrize("seconds", [0.2, 1.0, 5.0])
+def test_a_clip_s_pictures_tile_its_whole_window_with_no_hole(fps, seconds):
+    """The other half of "no frames skipped": the durations cover the window.
 
-    The pre-roll runs the schedule out without photographing it, so left
-    unbounded on a screen that does not move it would run straight through the
-    repeat button's second tap and the clip would open after a press the
-    player asked to watch. It stops on that frame instead, which puts the tap
-    in the clip's own first picture.
+    A picture stands until the next one is taken, so the covered counts add up
+    to the whole window and nothing inside a clip is emulated without some
+    picture standing for it. Together with the seam above, that makes press,
+    clip, press, clip one unbroken run of console frames -- which is what the
+    pacing in retro/timing.py assumes when it holds an edit back.
     """
-    frames = C.clip_frame_count(FPS["gb"], 1.0)
-    cap = C.preroll_budget(FPS["gb"], frames)
+    frames = C.clip_frame_count(fps, seconds)
+    plan = C.capture_plan(frames, C.capture_step(fps))
 
-    # The default one second x3 schedule taps at frames 0, 23 and 46, so the
-    # cap bites first and the taps are never in danger.
-    assert C.preroll_budget(FPS["gb"], frames, 23) == cap == 15
-    # A short clip with a short hold brings them together, and then the tap
-    # wins.
-    assert C.preroll_budget(FPS["gb"], frames, 13) == 13
-    assert C.preroll_budget(FPS["gb"], frames, 0) == 0
-    # None means "nothing to protect", which is the ordinary single press.
-    assert C.preroll_budget(FPS["gb"], frames, None) == cap
-
-
-def test_a_preroll_can_be_turned_off_by_arithmetic_alone():
-    """Zero seconds is exactly the behaviour from before the pre-roll existed.
-
-    Not a setting -- there is no ``[p]retroset`` for this -- but it is what the
-    measurements and the before/after tests compare against, so it has to mean
-    "photograph the very first frame" rather than "one frame at least".
-    """
-    frames = C.clip_frame_count(FPS["gb"], 1.0)
-    assert C.preroll_budget(FPS["gb"], frames, seconds=0.0) == 0
-    assert C.preroll_budget(FPS["gb"], frames, 5, seconds=0.0) == 0
+    assert sum(covered for _, covered in plan) == frames
+    assert all(covered >= 1 for _, covered in plan)
+    # Every picture stands for the frames between it and the next one, so the
+    # window is tiled with no overlap and no hole.
+    edges = [index for index, _ in plan] + [frames]
+    assert edges == sorted(set(edges))
+    assert [b - a for a, b in zip(edges[:-1], edges[1:], strict=True)] == [
+        covered for _, covered in plan
+    ]
 
 
 # -- How big the posted picture is --------------------------------------------
@@ -656,7 +680,7 @@ SHIMMED = {
     "MIN_CLIP_SECONDS", "capture_plan", "capture_step", "clamp_clip_seconds",
     "clip_frame_count", "clip_plan", "describe_seconds", "encode_animation",
     "encode_clip", "fast_frame_image", "fast_frame_size", "format_seconds",
-    "frame_count", "input_budget", "playback_seconds", "preroll_budget",
+    "frame_count", "input_budget", "playback_seconds",
 }
 
 
@@ -679,7 +703,7 @@ def test_the_shim_carries_nothing_private_and_nothing_unused():
 
     # Public clips names nothing imports via the emulator are gone from
     # __all__ too, whether or not emulator.py happens to use them itself.
-    for unused in ("MIN_AFTERMATH_FRAMES", "MIN_CLIP_WIDTH", "PREROLL_SECONDS",
+    for unused in ("MIN_AFTERMATH_FRAMES", "MIN_CLIP_WIDTH",
                    "WEBP_METHOD", "WEBP_MINIMIZE_SIZE", "FAST_POINT_TABLES",
                    "clip_scale", "CLIP_FPS", "MAX_CLIP_SCALE", "CapturedClip",
                    "clip_size"):

@@ -1251,8 +1251,9 @@ async def test_a_queued_press_on_a_sleeping_session_wakes_it_first(retro):
 # A clip costs 42-92ms to make and 1005ms to watch, so presses that arrive
 # back to back -- which is every queue drain, since queued presses run with no
 # human delay between them -- each replaced the previous clip after about a
-# tenth of it had played. The seam is exact (capture_plan and the pre-roll see
-# to that) but nobody ever saw it, so the picture appeared to lurch.
+# tenth of it had played. The seam is exact (capture_plan sees to that: one
+# clip carries on exactly one emulated frame after the last picture of the
+# one before it) but nobody ever saw it, so the picture appeared to lurch.
 #
 # So the *edit* waits until the clip it is replacing has had its playing time
 # on screen. See the note above MAX_PACE_SECONDS in retro/timing.py for the

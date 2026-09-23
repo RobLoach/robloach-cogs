@@ -55,7 +55,6 @@ from .clips import (
     frame_count,
     input_budget,
     playback_seconds,
-    preroll_budget,
 )
 
 # This module's own names.
@@ -108,7 +107,6 @@ __all__ = [
     "frame_count",
     "input_budget",
     "playback_seconds",
-    "preroll_budget",
 ]
 
 log = logging.getLogger("red.robloach.retro.emulator")
@@ -415,13 +413,6 @@ class RetroEmulator:
         self._audio_drain_failed = False
         self._joypad_state_cls = None
         self.started = False
-        # How many frames the last :meth:`record` ran through before it began
-        # photographing -- see PREROLL_SECONDS. Zero for a recording with no
-        # input in it (the Wait button, a boot, an undo) and for a game that
-        # moves on the very first frame, which is to say for everything the
-        # pre-roll was not written for. Read by the tests and logged at debug;
-        # nothing in the cog branches on it.
-        self.last_preroll_frames = 0
 
     # -- Lifecycle ----------------------------------------------------------
 
@@ -1124,31 +1115,6 @@ class RetroEmulator:
             image = image.resize(tuple(size), Image.NEAREST)
         return image
 
-    def _frame_signature(self) -> typing.Optional[bytes]:
-        """
-        The current frame's pixels, for "has the picture changed?", or None.
-
-        Used once per pre-roll frame (see PREROLL_SECONDS), so it is the fast
-        grab or nothing: ArrayVideoDriver.screenshot() converts a frame a
-        pixel at a time in Python and costs ~21ms on a Game Boy, which over a
-        15 frame pre-roll would be 300ms of the ~50ms a whole clip takes. None
-        therefore means *either* "the core has not rendered anything yet" or
-        "this libretro.py/pixel format cannot be read cheaply", and the
-        caller's answer to both is the same: skip the pre-roll and photograph
-        from the first frame, exactly as this did before the pre-roll existed.
-
-        The frame is compared at the core's own resolution, before the
-        NEAREST resize. That is the stricter
-        question of the two and the cheaper one: the posted picture is never
-        *smaller* than the frame (see clip_scale), so a resize only ever
-        repeats pixels and two frames that differ cannot resize to the same
-        picture. A geometry change mid-clip shows up as a different length
-        and so reads as a change, which it is.
-        """
-        Image = _pillow()
-        image = fast_frame_image(self._video, Image)
-        return None if image is None else image.tobytes()
-
     def screenshot(self, scale: int = MAX_CLIP_SCALE) -> bytes:
         """Return the current screen as PNG bytes."""
         self._require_started()
@@ -1169,7 +1135,7 @@ class RetroEmulator:
 
         Exactly :meth:`record_frames` handed to :func:`encode_clip`, and
         nothing else -- those two carry the whole story (the press schedule
-        and the pre-roll on the first, the resize and the WebP parameters on
+        and the seam on the first, the resize and the WebP parameters on
         the second). This stays as the convenient form, but the encode is the
         most expensive CPU step of a button press and needs no core at all,
         so a caller that serializes emulator access behind a lock should call
@@ -1233,45 +1199,23 @@ class RetroEmulator:
         is only the final safety clamp, which keeps a press inside the window
         but does not promise the release will be *seen*.
 
-        **The pre-roll.** A clip that opens with a press in it does not start
-        photographing straight away. The press goes down and the core runs,
-        unphotographed, until the picture is no longer the one the previous
-        clip left standing in the channel -- for at most
-        :func:`preroll_budget` frames -- and only then are the ``frames``
-        frames of the clip recorded. See PREROLL_SECONDS for why: one frame
-        after a button goes down a game that was sitting still is still
-        sitting still, so the clip's opening picture was the previous clip's
-        closing picture all over again, and the new clip appeared to replay
-        the end of the old one before anything moved.
+        **Every frame is emulated exactly once and photographed in order.**
+        The loop advances the core by one frame and *then* takes the picture,
+        so the picture the plan calls index ``i`` is the game after ``i + 1``
+        frames, and the last one is the game after all ``frames`` of them.
+        Nothing is run past unphotographed and nothing is photographed twice,
+        which is the whole of why the next clip -- whose first picture is one
+        emulated frame later -- joins onto this one with no repeat and no gap.
+        See the seam block in retro/clips.py, which carries the per-core
+        measurements, and which is also where the pre-roll that used to sit in
+        front of this loop is written up: it skipped between 1 and 16 frames
+        at every seam and did not fix what it was written for.
 
-        Three things that follow from doing it as a pre-roll rather than as a
-        trim of the recorded pictures:
-
-        * the clip still plays for exactly as long as it emulated. ``frames``
-          frames are recorded and ``frames`` frames' worth of durations are
-          written; the pre-roll is emulated in *front* of the recording, not
-          dropped out of it;
-        * nothing the player had not already seen is skipped. The pre-roll
-          stops on the first frame that differs from where the last clip
-          finished, and that frame is the clip's own frame 0, so the seam is
-          still one unbroken run of pictures;
-        * a screen that never changes -- a menu, a paused game, a button the
-          game ignores -- costs the bound and then records normally, at full
-          length. The trim this replaced turned that case into a 17ms flash.
-
-        The hold starts *in* the pre-roll, which is why the schedule is
-        measured against the whole window rather than against the recording:
-        the press is the thing that is expected to make the picture change, so
-        pre-rolling without it would be waiting for a game to move on its own
-        while burning the frames the press needed. Emulation therefore sees
-        exactly the input it would have seen with no pre-roll at all, frame
-        for frame -- all the pre-roll changes is which frames get
-        photographed -- so a press is held for its configured length in total
-        and ``input_budget``'s promise that the button is up before the last
-        photographed frame holds with room to spare (the release moves
-        *earlier* in the recording, never later). A recording with no input
-        in it -- the Wait button, a boot, a reset, an undo -- has no pre-roll:
-        nothing was pressed, so there is nothing whose effect to wait for.
+        A clip with a press in it is therefore emulated frame for frame like
+        any other, so ``input_budget``'s promise -- that the button is up
+        before the last picture worth a whole step of playback -- is the
+        schedule's own arithmetic rather than something this loop has to
+        preserve across a shifted window.
 
         Note that this is the *only* thing that advances the emulation: the
         console is frozen between one clip and the next.
@@ -1283,11 +1227,10 @@ class RetroEmulator:
         frames = max(1, int(frames))
 
         # frame index -> buttons that go down / come up on that frame, keyed
-        # by the frame of the whole window (pre-roll included), which is what
-        # the loop below counts with. The clamp is to `frames` rather than to
-        # the window, so it stays the same last-ditch guarantee it always was:
-        # every button is up before the clip's own last frame, whatever the
-        # pre-roll does.
+        # by the clip's own frames, which is what the loop below counts with
+        # and what the caller laid the schedule out against. The clamp is the
+        # last-ditch guarantee that every button is up before the clip's last
+        # frame however the schedule was built.
         down: dict = {}
         up: dict = {}
         for button, start, hold in presses or ():
@@ -1296,20 +1239,6 @@ class RetroEmulator:
             end = max(start + 1, min(start + int(hold), frames))
             down.setdefault(start, set()).add(button)
             up.setdefault(end, set()).add(button)
-
-        # How far the pre-roll may look for the press to make a difference,
-        # and the picture it is looking for a difference from -- the one the
-        # previous clip left standing in the channel. Both are only worked out
-        # for a clip that opens with a press in it; see the docstring, and
-        # PREROLL_SECONDS for the measurements. `next_press` protects the
-        # repeat button: the pre-roll must not run through a later tap.
-        budget = 0
-        reference = None
-        if down.get(0):
-            later = [frame for frame in down if frame > 0]
-            budget = preroll_budget(core_fps, frames, min(later) if later else None)
-            if budget > 0:
-                reference = self._frame_signature()
 
         images = []
         # The size the clip posts at, taken from the first captured frame and
@@ -1339,54 +1268,31 @@ class RetroEmulator:
         # same question there as here.
         plan = dict(clip_plan(core_fps, frames, fps))
         durations: typing.List[int] = []
-        # `index` counts the clip's own frames, which is what `plan`, the
-        # durations and every docstring here are in terms of; `window` counts
-        # every frame this call emulates, pre-roll included, which is what the
-        # press schedule is in terms of. They differ by exactly the number of
-        # frames the pre-roll used, and that is zero for most clips.
-        preroll = 0
-        index = 0
-        window = 0
-        self.last_preroll_frames = 0
+        # `index` counts the clip's own frames and is the only counter there
+        # is: the schedule, the plan, the durations and every docstring here
+        # are all in terms of it. There used to be a second one, `window`,
+        # counting the frames the pre-roll ran in front of the recording --
+        # and the gap between the two was exactly the gap the seam should not
+        # have had. See the seam block in retro/clips.py.
         try:
-            while index < frames:
-                if window in up:
-                    held -= up[window]
-                if window in down:
-                    held |= down[window]
+            for index in range(frames):
+                if index in up:
+                    held -= up[index]
+                if index in down:
+                    held |= down[index]
                 self._pressed = frozenset(held)
                 self.advance(1)
-                window += 1
-                if reference is not None:
-                    if preroll < budget and self._frame_signature() == reference:
-                        # Still the picture the last clip finished on, so the
-                        # player has seen this one: run it out rather than
-                        # opening the clip on it.
-                        preroll += 1
-                        continue
-                    # Either the picture moved on -- in which case this frame
-                    # is what the clip should open on -- or the bound ran out.
-                    reference = None
                 duration = plan.get(index)
                 if duration is not None:
                     if size is None:
                         size = self.output_size(scale=scale)
                     images.append(self._native_frame_image())
                     durations.append(duration)
-                index += 1
         finally:
             self._pressed = frozenset()
-            self.last_preroll_frames = preroll
 
         if not images:
             raise EmulatorError("No video frames were captured.")
-        if preroll:
-            log.debug(
-                "The clip's pre-roll ran %d of a possible %d frames before the "
-                "picture changed.",
-                preroll,
-                budget,
-            )
         return CapturedClip(images, durations, size)
 
 

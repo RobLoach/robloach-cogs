@@ -11,6 +11,7 @@ is 1 and why the ``emu`` fixture below keeps exactly one alive at a time.
 These tests must not be run in parallel with each other.
 """
 
+import contextlib
 import hashlib
 import io
 import logging
@@ -85,7 +86,7 @@ def press(emulator, button, hold_frames=12, release_frames=40):
     """Hold a button, release it, run on -- and photograph nothing.
 
     ``record()`` is the only way the cog drives a core, and it always
-    records (and may pre-roll); a couple of the tests below want the plain
+    photographs what it emulates; a couple of the tests below want the plain
     version instead.
     """
     emulator._pressed = frozenset({emulator._check_button(button)})
@@ -603,19 +604,20 @@ def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
     has not visibly landed yet (the button is held for 160ms and a game reacts
     more slowly still), which reads as the clip showing a moment from before
     the press -- and on a game that sits still until it is prodded, the
-    opening picture really was the previous clip's closing picture over again.
+    opening picture really is the previous clip's closing picture over again.
     Trimming those opening pictures out of the recording was measured and
     rejected, because on a frozen screen the rule wants to trim the whole clip
-    and leaves a 17ms flash.
+    and leaves a 17ms flash. A bounded pre-roll -- playing the press out
+    unphotographed in front of the recording -- was then tried and is also
+    gone, for a different reason: it put up to sixteen emulated frames into
+    the seam between one clip and the next. See section 3a below.
 
-    What the fix turned out to be is a *pre-roll*, which is why this rule is
-    still unqualified: the press is played out before the recording starts
-    (see PREROLL_SECONDS and :meth:`RetroEmulator.record`), so the clip begins
-    on the first picture the press changed without anything being dropped from
-    what it recorded. ``frames`` frames go in and ``frames`` frames' worth of
-    durations come out, at every length, pre-roll or no pre-roll. See
-    :func:`test_the_preroll_opens_a_clip_on_the_first_picture_the_press_changed`
-    and retro/README.md for the same statement in prose.
+    So the rule stays unqualified and the opening duplicates stay in the clip:
+    ``frames`` frames go in and ``frames`` frames' worth of durations come
+    out, at every length. The encoder merges a run of identical pictures into
+    one stored frame and adds their durations together, so what the player
+    sees is a held picture for as long as the game really took, which costs
+    the rule nothing. See retro/README.md for the same statement in prose.
     """
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
@@ -690,7 +692,7 @@ def test_a_static_screen_collapses_to_a_still_that_is_still_a_clip(
     assert frame_hashes(data, image) == [frame_hashes(data, image)[0]]
 
 
-def photographed(emulator, frames, presses=(), budget=None, monkeypatch=None):
+def photographed(emulator, frames, presses=(), clip_fps=E.CLIP_FPS):
     """Record a clip and report the pictures it actually *took*.
 
     ``record`` is driven for real -- no second copy of its loop here -- and
@@ -708,12 +710,8 @@ def photographed(emulator, frames, presses=(), budget=None, monkeypatch=None):
     equal posted -- as long as everything compared against them (see
     held_picture) is hashed at native size too.
 
-    ``budget`` of 0 turns the pre-roll off, which is the "before" column of
-    every table below; None leaves it as it ships. Returns
-    ``(clip bytes, one hash per picture, frames the pre-roll used)``.
+    Returns ``(clip bytes, one hash per picture)``.
     """
-    if budget is not None:
-        monkeypatch.setattr(E, "preroll_budget", lambda *a, **k: budget)
     shots = []
     original = type(emulator)._native_frame_image
 
@@ -724,10 +722,10 @@ def photographed(emulator, frames, presses=(), budget=None, monkeypatch=None):
 
     type(emulator)._native_frame_image = spy
     try:
-        payload = emulator.record(frames, presses=list(presses))
+        payload = emulator.record(frames, presses=list(presses), fps=clip_fps)
     finally:
         type(emulator)._native_frame_image = original
-    return payload, shots, emulator.last_preroll_frames
+    return payload, shots
 
 
 def held_picture(emulator):
@@ -749,7 +747,16 @@ def opening_repeats(shots, held):
     return count
 
 
-def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gambatte, ucity):
+def test_a_clip_of_a_moving_game_opens_on_a_picture_nobody_has_seen(
+    emu, image, gambatte, ucity
+):
+    """uCity animates every frame, so one frame is enough to move the picture.
+
+    The control for the whole seam section below: on a game that is never
+    still, the clip's opening picture -- taken one emulated frame after the
+    previous clip's closing one -- is already new, and so is the one after it.
+    A game that *is* still is a different matter and is covered further down.
+    """
     emulator = emu(gambatte, ucity)
     emulator.advance(emulator.frames_for_seconds(3))
     frames = emulator.clip_frames(E.CLIP_SECONDS)
@@ -763,216 +770,90 @@ def test_a_clip_never_opens_on_the_picture_from_before_the_press(emu, image, gam
     assert hashes[0] != hashes[1], "the first two frames are duplicates"
 
 
-# -- 3a. The pre-roll: where a clip starts ------------------------------------
+# -- 3a. The seam: where one clip stops and the next one starts ---------------
 #
-# A clip's first picture is taken after a single emulated frame, and one frame
-# after a button goes down a game that was sitting still is still sitting
-# still -- so the clip used to open by re-showing the picture the previous clip
-# had left in the channel, which is how the bug was reported ("the clip seems
-# to replay a bit from the previous clip"). The answer is a bounded pre-roll:
-# the press is applied and the core runs, unphotographed, until the picture is
-# no longer the one the last clip finished on. See PREROLL_SECONDS in
-# retro/clips.py, and preroll_budget in tests/test_clips.py for the bound with
-# no core at all.
+# A picture is taken *after* an emulated frame, so the last picture of a clip
+# is its window's last frame and the first picture of the next clip is the
+# very next one. That one-frame seam is the whole contract: press, clip,
+# press, clip is an unbroken run of console frames with nothing shown twice
+# and nothing run past unseen.
 #
-# The measurements, on the real cores at the default 160ms hold, one second
-# clips (opening pictures identical to the held one, before -> after, out of
-# the sixteen a one second clip photographs; and the frames the pre-roll used):
+# It was not always kept. A clip that opened with a press used to run a
+# bounded **pre-roll** first -- the press down, the core running,
+# unphotographed, until the picture stopped being the one the previous clip
+# had left in the channel -- which put between 1 and 16 emulated frames into
+# the seam. Measured here on a Raspberry Pi 5, four consecutive one second
+# clips per row, the default 160ms hold, the button held from frame 0 of each:
 #
-#   core / ROM                    button   identical    pre-roll   bytes
-#   gambatte / uCity              down     0 -> 0        0         3962 -> 3962
-#   gambatte / Libbet             a        1 -> 0        2         4098 -> 3834
-#   fceumm / nestest (a menu)     start    1 -> 0        1         1876 -> 1888
-#   fceumm / nestest              down     1 -> 0        1         1564 -> 1418
-#   snes9x / homebrew             a        1 -> 0        3         7198 -> 5398
-#   mgba / GBA homebrew           a        3 -> 0       10         1098 ->  614
-#   gambatte / Libbet             down    16 -> 16      15 (bound)  264 ->  264
-#   gambatte / dmg-acid2          a       16 -> 16      15 (bound)  608 ->  608
-#   snes9x / homebrew (a title)   start   16 -> 16      15 (bound) 1350 -> 1350
+#                                    with the pre-roll     without it
+#   core / ROM              button    seam      again?    seam    again?
+#   gambatte / uCity         down     1,1,16    n,n,y     1,1,1   n,n,y
+#   gambatte / Libbet        down    16,1,16    y,n,y     1,1,1   y,y,y
+#   fceumm / nestest         start   16,16,16   y,y,y     1,1,1   y,y,y
+#   fceumm / nestest         down     2,2,2     n,n,n     1,1,1   y,y,y
+#   gambatte / dmg-acid2     a       16,16,16   y,y,y     1,1,1   y,y,y
+#   ...any of the above, with no press at all   1,1,1     1,1,1
 #
-# Identical to the frame on libretro.py 0.6.0 and 0.11.x alike. uCity is the
-# control: it animates every frame, so its first picture was never a repeat
-# and the pre-roll does nothing at all to it. The last three rows are the case
-# a trim would have destroyed -- every picture identical -- and they still
-# come back as full length clips, byte for byte the clip they were before.
+# ("seam" is emulated frames between one clip's last picture and the next
+# clip's first; "again?" is whether that first picture is byte-identical to
+# the last one.) The seam was ``1 + the frames the pre-roll used``, exactly,
+# in every row -- and on the three static rows, which are what this cog is
+# played on, the pre-roll ran its whole 15 frame bound, opened the clip on the
+# repeated picture anyway and charged 251ms of game time a press for it. So it
+# is gone; see the seam block in retro/clips.py for the reasoning and for the
+# trade that replaces it (a game's own reaction latency is now shown as a held
+# opening picture rather than skipped over).
 #
-# The cost is the pre-roll's own frames: nothing measurable on a game that
-# reacts (0.4-1.6ms), and 8-18ms plus a quarter of a second of game time on
-# the rows that run the whole bound, out of the 33-80ms a clip takes end to
-# end. That is the price of the bound, and the reason the bound is small.
+# What the tests below pin, against real cores:
+#
+# * the seam is exactly one emulated frame, with a press and without one;
+# * a game that is moving never repeats a picture across it;
+# * a game that is *not* moving repeats it and still gets a full length clip,
+#   which is the case a lead-in trim would have turned into a 17ms flash;
+# * the clip's own frame rate cannot move any of this.
 
-#: A responsive probe: (core, ROM, button, seconds of boot).
+#: Probes for the seam, one per shape of game: (core, ROM, button, boot
+#: seconds, whether the game moves by itself).
 #:
-#: Libbet is the one with the reported shape and the reason it was added to
-#: tests/fetch_assets.py: a Game Boy screen that sits completely still until
-#: it is prodded, like an overworld or a menu, which is what this cog is
-#: actually played on. uCity animates constantly and dmg-acid2 never moves, so
-#: neither of them is that case. See LIBBET_BOOT_SECONDS in conftest.py.
-RESPONSIVE = {
-    "libbet": ("gambatte", "libbet.gb", "a", LIBBET_BOOT_SECONDS),
-    "nestest": ("fceumm", "nestest.nes", "start", 3),
-    "nestest-down": ("fceumm", "nestest.nes", "down", 3),
-    "snes": ("snes9x", "snes_rotzoom.sfc", "a", 3),
-    "gba": ("mgba", "measure_gba.gba", "a", 3),
+#: Libbet is the reported shape and the reason it is in tests/fetch_assets.py:
+#: a Game Boy screen that sits completely still until it is prodded, like an
+#: overworld or a menu. uCity animates constantly and dmg-acid2 never moves at
+#: all, so between them the three cover both ends. See LIBBET_BOOT_SECONDS in
+#: conftest.py.
+#:
+#: Libbet is driven with `down`, which it ignores, rather than with `a`:
+#: pressing A on its title screen makes gambatte *dupe* a frame (video_refresh
+#: with a NULL framebuffer, meaning "draw the last one again") and
+#: libretro.py 0.11+ raises a TypeError out of its own environment callback
+#: when it sees one, so the recording comes back as "the core crashed while
+#: running". libretro.py 0.6.0 handles the same frame fine, so that is an
+#: upstream regression and nothing to do with the seam.
+SEAM_PROBES = {
+    "ucity": ("gambatte", "ucity.gbc", "down", 3, True),
+    "libbet": ("gambatte", "libbet.gb", "down", LIBBET_BOOT_SECONDS, False),
+    "nestest": ("fceumm", "nestest.nes", "start", 3, False),
+    "nestest-down": ("fceumm", "nestest.nes", "down", 3, False),
+    "dmg-acid2": ("gambatte", "dmg-acid2.gb", "a", 3, False),
+    # Not in test-assets/ on the machine this was measured on, so they skip
+    # here; they are the two consoles whose reaction to a press is slowest
+    # (3 and 10 frames, which is what the pre-roll's bound was sized from) and
+    # so the two most likely to expose a seam that is off by a frame.
+    "snes": ("snes9x", "snes_rotzoom.sfc", "a", 3, False),
+    "snes-title": ("snes9x", "snes_rotzoom.sfc", "start", 3, False),
+    "gba": ("mgba", "measure_gba.gba", "a", 3, False),
 }
 
 
-@pytest.mark.parametrize("probe", sorted(RESPONSIVE))
-def test_the_preroll_opens_a_clip_on_the_first_picture_the_press_changed(
-    assets, emu, probe, monkeypatch
-):
-    """The bug, and the fix, on every game here that answers a press.
+@contextlib.contextmanager
+def frames_emulated(emulator):
+    """Collect what was held on each emulated frame, for the block's duration.
 
-    Recorded twice from one save state: with the pre-roll off, which is what
-    this did before, and with it on. The "before" clip has to open on the
-    picture the previous clip left standing -- that is the complaint -- and
-    the "after" clip must not.
+    ``record`` is the only thing that advances a session, so the length of
+    the list this yields is exactly the window a recording ran through --
+    which is "the console does not get ahead of the pictures" stated in a way
+    that a frozen screen cannot satisfy by accident, since it counts frames
+    rather than comparing pictures.
     """
-    core, rom_name, button, boot = RESPONSIVE[probe]
-    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
-    emulator.advance(emulator.frames_for_seconds(boot))
-    frames = emulator.clip_frames(E.CLIP_SECONDS)
-    presses = [(button, 0, frames_for_ms(emulator, 160))]
-    captured = len(E.capture_plan(frames, capture_step(emulator)))
-    state = emulator.save_state()
-
-    emulator.load_state(state)
-    held = held_picture(emulator)
-    before, before_shots, no_preroll = photographed(
-        emulator, frames, presses, budget=0, monkeypatch=monkeypatch
-    )
-    monkeypatch.undo()
-
-    emulator.load_state(state)
-    assert held_picture(emulator) == held, "the two recordings did not start level"
-    after, after_shots, preroll = photographed(emulator, frames, presses)
-
-    budget = E.preroll_budget(emulator.fps, frames)
-    if opening_repeats(before_shots, held) == 0:
-        pytest.skip(
-            f"{core}/{rom_name} does not re-show its opening picture after a "
-            f"press of {button} under this build, so there is nothing for the "
-            "pre-roll to skip (which is the uCity case, and fine)"
-        )
-    if preroll >= budget:
-        pytest.skip(
-            f"{core}/{rom_name} takes longer than the {budget} frame bound to "
-            f"react to {button} under this build; the bounded case is covered "
-            "by the static tests below"
-        )
-
-    # The whole point: the clip no longer opens on a picture the player has
-    # already been looking at.
-    assert no_preroll == 0
-    assert opening_repeats(after_shots, held) == 0, (
-        f"{probe}: the clip still opens on the picture the last one held"
-    )
-    assert after_shots[0] != held and before_shots[0] == held
-    assert 0 < preroll <= budget
-
-    # And it is a pre-roll, not a trim: every picture the plan asked for is
-    # still photographed, both times, so the clip is the same length as ever.
-    assert len(before_shots) == len(after_shots) == captured
-    assert len(before) > 0 and len(after) > 0
-
-
-@pytest.mark.parametrize(
-    "probe",
-    ["dmg-acid2", "libbet-ignored", "snes-title"],
-)
-def test_a_completely_static_screen_still_produces_a_whole_clip(
-    assets, emu, probe, monkeypatch
-):
-    """The case a lead-in trim would have destroyed, and the pre-roll's bound.
-
-    Three shapes of "nothing happens": a ROM that draws one picture and holds
-    it for ever (dmg-acid2), a game sitting on a static screen with a button
-    it ignores pressed (Libbet and the d-pad -- the paused-game case, and the
-    likeliest of the three in real play), and a static title screen on another
-    console.
-
-    On all three *every* captured picture is the pre-press one, so a rule that
-    trimmed opening duplicates would trim the entire clip and be left with the
-    single picture it is obliged to keep: a one second clip played as a 17ms
-    flash. The pre-roll cannot do that. It spends its bound looking for a
-    change, does not find one, and then records the clip exactly as it would
-    have -- full length, every picture the plan asked for, durations adding up
-    to the whole second it emulated.
-    """
-    core, rom_name, button, boot = {
-        "dmg-acid2": ("gambatte", "dmg-acid2.gb", "a", 3),
-        "libbet-ignored": ("gambatte", "libbet.gb", "down", LIBBET_BOOT_SECONDS),
-        "snes-title": ("snes9x", "snes_rotzoom.sfc", "start", 3),
-    }[probe]
-    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
-    emulator.advance(emulator.frames_for_seconds(boot))
-    frames = emulator.clip_frames(E.CLIP_SECONDS)
-    presses = [(button, 0, frames_for_ms(emulator, 160))]
-    plan = E.capture_plan(frames, capture_step(emulator))
-    budget = E.preroll_budget(emulator.fps, frames)
-
-    state = emulator.save_state()
-    emulator.load_state(state)
-    held = held_picture(emulator)
-    payload, shots, preroll = photographed(emulator, frames, presses)
-
-    if opening_repeats(shots, held) != len(shots):
-        pytest.skip(
-            f"{core}/{rom_name} is not static under this build "
-            f"({opening_repeats(shots, held)} of {len(shots)} pictures "
-            "unchanged); the all-static case needs a screen that really does "
-            "hold one frame"
-        )
-
-    # The pre-roll looked as far as it is allowed to and gave up, which is
-    # exactly what the bound is for.
-    assert preroll == budget > 0
-    # ...and then recorded the whole clip anyway. Not a flash: every picture
-    # the plan asked for was taken, and the durations handed to the encoder
-    # still add up to the second that was emulated. (The encoder is free to
-    # merge them into one stored frame, and does -- see
-    # test_a_static_screen_collapses_to_a_still_that_is_still_a_clip.)
-    assert len(shots) == len(plan) >= 2
-    durations = [max(1, round(1000 * covered / emulator.fps)) for _, covered in plan]
-    emulated = 1000 * frames / emulator.fps
-    assert abs(sum(durations) - emulated) / emulated < 0.01
-    # ...and it is still a clip, not an error.
-    assert len(payload) > 0
-
-    # Turning the pre-roll off changes nothing here except the quarter of a
-    # second of emulation it spent looking, which is the honest cost of the
-    # bound and the reason the bound is a quarter of a second.
-    monkeypatch.setattr(E, "preroll_budget", lambda *a, **k: 0)
-    emulator.load_state(state)
-    plain, plain_shots, none_used = photographed(emulator, frames, presses)
-    assert none_used == 0
-    assert len(plain_shots) == len(shots)
-    assert plain == payload, "the pre-roll changed a clip of a frozen screen"
-
-
-def test_the_hold_is_honoured_in_full_and_released_before_the_last_picture(
-    assets, emu, libbet
-):
-    """The press schedule, read off the frames the core really saw.
-
-    The pre-roll is in front of the recording, not instead of part of it, so
-    the sequence of (input, frame) pairs the core sees is identical to what it
-    saw before the pre-roll existed: the button goes down before the first
-    emulated frame and comes up ``hold`` frames later, wherever the
-    photographs happen to start. That is why the hold does not have to be
-    lengthened to pay for the pre-roll, and why ``input_budget``'s promise --
-    the button is up before the clip's last picture -- holds with *more* room
-    than before rather than less.
-
-    Libbet is the probe because it is the one that actually pre-rolls: on a
-    game that moves immediately there is nothing to distinguish.
-    """
-    emulator = emu(assets.need_core("gambatte"), libbet)
-    emulator.advance(emulator.frames_for_seconds(LIBBET_BOOT_SECONDS))
-    frames = emulator.clip_frames(E.CLIP_SECONDS)
-    hold = frames_for_ms(emulator, 160)
-    budget = input_budget(emulator, frames)
-
     timeline = []
     original = type(emulator).advance
 
@@ -983,160 +864,321 @@ def test_the_hold_is_honoured_in_full_and_released_before_the_last_picture(
 
     type(emulator).advance = spy
     try:
-        emulator.record(frames, presses=[("a", 0, hold)])
+        yield timeline
     finally:
         type(emulator).advance = original
-    preroll = emulator.last_preroll_frames
-
-    assert preroll > 0, "Libbet used to re-show its opening picture; recheck the probe"
-    # The whole window is the pre-roll plus the clip, and the button is down
-    # for exactly the configured hold, from the very first frame.
-    assert len(timeline) == preroll + frames
-    down = [index for index, pressed in enumerate(timeline) if "a" in pressed]
-    assert down == list(range(hold)), (down[:4], down[-4:], hold)
-    # Released before the last frame of the clip that is worth a whole
-    # picture -- which is what input_budget promises -- and by a wider margin
-    # than it promises, because the pre-roll moved the clip later and the
-    # press did not move with it.
-    assert max(down) < preroll + budget <= preroll + frames - 1
-    assert max(down) < budget, "the promise held before the pre-roll too"
-    assert not timeline[-1], "the clip's last frame is emulated with nothing held"
 
 
-def test_a_clip_with_no_input_in_it_has_no_preroll_at_all(assets, emu, libbet):
-    """Wait, Undo, a boot and a reset: nothing was pressed, nothing to wait for.
+def frame_by_frame(emulator, schedule, button, total):
+    """Emulate ``total`` frames one at a time and hash every one.
 
-    The pre-roll exists because a press takes a moment to show up. With no
-    press there is nothing whose effect to wait for, and skipping frames
-    because a *paused* game has not moved would be throwing away the only
-    thing the Wait button does -- so a recording with no schedule in it starts
-    photographing on its first frame, exactly as it always did.
-
-    Libbet on its static screen is the probe that would notice: it is the one
-    ROM here where an unconditional pre-roll would run the whole bound.
+    ``schedule`` is the set of frame numbers the button is held on, so the
+    core sees exactly the input the recordings gave it and the pictures are
+    comparable. Native hashes, like ``photographed``'s.
     """
-    emulator = emu(assets.need_core("gambatte"), libbet)
-    emulator.advance(emulator.frames_for_seconds(LIBBET_BOOT_SECONDS))
-    frames = emulator.clip_frames(E.CLIP_SECONDS)
-
-    state = emulator.save_state()
-    emulator.load_state(state)
-    held = held_picture(emulator)
-    waited, shots, preroll = photographed(emulator, frames)
-
-    assert preroll == 0, "a clip with no press in it pre-rolled"
-    assert emulator.last_preroll_frames == 0
-    # The screen is frozen, so the Wait clip is the held picture for its whole
-    # length -- which is the truth about a paused game and what Wait is for.
-    assert opening_repeats(shots, held) == len(shots)
-    assert len(shots) == len(E.capture_plan(frames, capture_step(emulator)))
-    assert len(waited) > 0
-
-    # A reset's boot clip goes through the same path (RetroView.run_reset
-    # records with no schedule), so it cannot pre-roll either.
-    emulator.reset()
-    emulator.advance(emulator.frames_for_seconds(1))
-    emulator.record(frames)
-    assert emulator.last_preroll_frames == 0
-
-
-#: A probe that pre-rolls on two presses in a row, for the seam test:
-#: (core, ROM, button, seconds of boot).
-#:
-#: Deliberately not Libbet, which is otherwise the best probe here: pressing A
-#: on its title screen makes gambatte *dupe* a frame (video_refresh with a
-#: NULL framebuffer, meaning "draw the last one again"), and libretro.py
-#: 0.11.x raises a TypeError out of its own environment callback when it sees
-#: one -- so the second clip comes back as "the core crashed while running".
-#: libretro.py 0.6.0 handles the same frame fine, so this is an upstream
-#: regression rather than anything to do with the pre-roll: a recording with
-#: the pre-roll switched off crashes in exactly the same place. The two probes
-#: below never dupe, and pre-roll by the same number of frames on every clip
-#: on both libretro.py versions.
-SEAM_CASES = {
-    "nes": ("fceumm", "nestest.nes", "down", 3),
-    "snes": ("snes9x", "snes_rotzoom.sfc", "a", 3),
-}
-
-
-@pytest.mark.parametrize("probe", sorted(SEAM_CASES))
-def test_the_preroll_leaves_the_seam_with_no_repeat_and_no_gap(
-    assets, emu, image, probe
-):
-    """Two presses in a row, with nothing re-shown and nothing lost.
-
-    The companion to
-    :func:`test_one_clip_carries_on_from_the_last_with_no_frames_lost`, which
-    proves the same thing for clips with no input in them. Here both clips
-    have a press in them and both pre-roll, so this is the statement the
-    author asked for: the next clip starts where the previous one ended.
-
-    "No gap" is a claim about state, not about pictures: the pre-roll's frames
-    are emulated, in order, with the press applied -- nothing is skipped over
-    -- and every one of them is a frame whose picture was the one already
-    sitting in the channel, which is the pre-roll's own stopping condition. So
-    the run of pictures a player sees is unbroken, and the frame the second
-    clip opens on is the first one that had anything new in it.
-    """
-    core, rom_name, button, boot = SEAM_CASES[probe]
-    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
-    emulator.advance(emulator.frames_for_seconds(boot))
-    frames = emulator.clip_frames(E.CLIP_SECONDS)
-    hold = frames_for_ms(emulator, 160)
-    presses = [(button, 0, hold)]
-    size = emulator.output_size()
-    state = emulator.save_state()
-
-    emulator.load_state(state)
-    first, first_shots, first_pre = photographed(emulator, frames, presses)
-    second, second_shots, second_pre = photographed(emulator, frames, presses)
-    if not first_pre or not second_pre:
-        pytest.skip(
-            f"{core}/{rom_name} reacts to {button} on the very first frame "
-            f"under this build (pre-roll {first_pre} then {second_pre}), so "
-            "there is no pre-roll at this seam to prove anything about"
-        )
-
-    # Rewind and emulate the same window one frame at a time, holding the
-    # button on exactly the frames the two recordings held it on, for a
-    # reference picture per absolute frame.
-    emulator.load_state(state)
     reference = []
-    total = first_pre + frames + second_pre + frames
-    schedule = set(range(hold)) | {
-        first_pre + frames + index for index in range(hold)
-    }
     try:
         for index in range(total):
             emulator._pressed = (
                 frozenset({button}) if index in schedule else frozenset()
             )
             emulator.advance(1)
-            # Native, because photographed()'s shots are; see its docstring.
             reference.append(
                 hashlib.sha1(emulator._native_frame_image().tobytes()).hexdigest()[:10]
             )
     finally:
         emulator._pressed = frozenset()
+    return reference
 
-    # The first clip finishes on its own last emulated frame...
-    assert first_shots[-1] == reference[first_pre + frames - 1]
-    # ...the second clip's pre-roll frames are all that picture again, which
-    # is why skipping them loses nothing...
-    start = first_pre + frames
-    assert all(
-        reference[start + offset] == first_shots[-1] for offset in range(second_pre)
-    ), "the pre-roll skipped a frame the player had not already seen"
-    # ...and the second clip opens on the very next frame after those, which
-    # is the first one with something new on it.
-    assert second_shots[0] == reference[start + second_pre]
-    assert second_shots[0] != first_shots[-1], "the seam repeats a picture"
-    # Neither clip lost a picture to any of this.
+
+@pytest.mark.parametrize("probe", sorted(SEAM_PROBES))
+@pytest.mark.parametrize("pressed", [True, False], ids=["press", "wait"])
+def test_the_seam_between_two_clips_is_exactly_one_emulated_frame(
+    assets, emu, probe, pressed
+):
+    """The report, answered: "new clips start a frame after the previous one".
+
+    Two clips back to back, then the same window rewound and emulated one
+    frame at a time with exactly the same input, for a reference picture per
+    absolute frame. The first clip has to finish on reference frame N and the
+    second has to open on reference frame N+1 -- adjacent, neither repeated
+    nor skipped -- whether the clips have a press in them or not, and whether
+    the game is animating or sitting still.
+    """
+    core, rom_name, button, boot, _moves = SEAM_PROBES[probe]
+    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
+    emulator.advance(emulator.frames_for_seconds(boot))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    hold = frames_for_ms(emulator, 160)
+    presses = [(button, 0, hold)] if pressed else []
     captured = len(E.capture_plan(frames, capture_step(emulator)))
+    state = emulator.save_state()
+
+    emulator.load_state(state)
+    with frames_emulated(emulator) as timeline:
+        first, first_shots = photographed(emulator, frames, presses)
+        second, second_shots = photographed(emulator, frames, presses)
+
+    # Two clips, two windows, and not one frame more: whatever the pictures
+    # turn out to say, the console cannot have run on past them. This is the
+    # half a frozen screen would otherwise satisfy by accident, because every
+    # one of its pictures matches every other.
+    assert len(timeline) == 2 * frames, (len(timeline), frames)
+
+    # The same two windows again, a frame at a time. Both clips are emulated
+    # for exactly `frames` frames -- there is no pre-roll to account for any
+    # more -- so the press schedule is frames 0..hold-1 of each of them.
+    emulator.load_state(state)
+    schedule = (
+        set(range(hold)) | {frames + index for index in range(hold)}
+        if pressed
+        else set()
+    )
+    reference = frame_by_frame(emulator, schedule, button, 2 * frames)
+
+    assert first_shots[-1] == reference[frames - 1], (
+        "the first clip does not finish on its own last emulated frame"
+    )
+    assert second_shots[0] == reference[frames], (
+        "the second clip does not open on the very next emulated frame"
+    )
+    # ...and it opens on that frame rather than merely matching it by
+    # accident on a screen where several frames look alike: the whole of both
+    # clips is the reference run, in order, with nothing missing.
+    plan = [index for index, _ in E.capture_plan(frames, capture_step(emulator))]
+    assert first_shots == [reference[index] for index in plan]
+    assert second_shots == [reference[frames + index] for index in plan]
+    # Neither clip lost a picture to any of this, and both are still clips.
     assert len(first_shots) == len(second_shots) == captured
-    # ...and both are still clips Pillow will open.
-    for payload in (first, second):
-        assert image.open(io.BytesIO(payload)).size == size
+    assert len(first) > 0 and len(second) > 0
+
+
+@pytest.mark.parametrize("clip_fps", [10, 15, 20, 60])
+def test_the_clip_frame_rate_does_not_move_the_seam(emu, gambatte, ucity, clip_fps):
+    """"Is there something we can do in the framerate to fix it?" -- no.
+
+    capture_plan photographs frame 0 and the final frame at every cadence, so
+    the seam is one emulated frame at 10, 15, 20 and 60 fps alike; all
+    CLIP_FPS changes is how many pictures fill the middle of a clip. uCity is
+    the probe because it moves every frame, so an off-by-one at either end
+    would show up as a picture that does not match its reference.
+    """
+    emulator = emu(gambatte, ucity)
+    emulator.advance(emulator.frames_for_seconds(3))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    step = E.capture_step(emulator.fps, clip_fps)
+    state = emulator.save_state()
+
+    emulator.load_state(state)
+    _first, first_shots = photographed(emulator, frames, clip_fps=clip_fps)
+    _second, second_shots = photographed(emulator, frames, clip_fps=clip_fps)
+
+    emulator.load_state(state)
+    reference = frame_by_frame(emulator, set(), "a", frames + 1)
+
+    assert first_shots[-1] == reference[frames - 1]
+    assert second_shots[0] == reference[frames]
+    # The cadence really did change, or the above says nothing about it.
+    assert len(first_shots) == len(E.capture_plan(frames, step))
+    assert reference[frames - 1] != reference[frames], "nothing moved at all"
+
+
+@pytest.mark.parametrize(
+    "probe", [name for name, row in sorted(SEAM_PROBES.items()) if row[4]]
+)
+def test_a_moving_game_never_repeats_a_picture_across_the_seam(assets, emu, probe):
+    """The half of the report that is about pictures rather than frames.
+
+    On a game that is actually moving, "one emulated frame later" and "a
+    picture nobody has seen" are the same thing, so the clip cannot open by
+    re-showing what the player is already looking at. (On a game that is *not*
+    moving they are not the same thing, and the next test is that case.)
+    """
+    core, rom_name, button, boot, _moves = SEAM_PROBES[probe]
+    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
+    emulator.advance(emulator.frames_for_seconds(boot))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    presses = [(button, 0, frames_for_ms(emulator, 160))]
+
+    _first, first_shots = photographed(emulator, frames, presses)
+    _second, second_shots = photographed(emulator, frames, presses)
+
+    assert second_shots[0] != first_shots[-1], "the seam repeats a picture"
+    # ...and the clip goes on moving rather than the seam happening to differ
+    # once: the second clip is not one picture over and over.
+    assert len(set(second_shots)) > 1, "the game stopped moving; recheck the probe"
+
+
+@pytest.mark.parametrize(
+    "probe", ["dmg-acid2", "libbet", "nestest", "snes-title"],
+)
+def test_a_completely_static_screen_still_produces_a_whole_clip(assets, emu, probe):
+    """The trade the seam is bought with, and the flash it must not become.
+
+    Three shapes of "nothing happens": a ROM that draws one picture and holds
+    it for ever (dmg-acid2), a game sitting on a static screen with a button
+    it ignores pressed (Libbet and the d-pad -- the paused-game case, and the
+    likeliest of them in real play), a menu that has already answered the
+    button it is being given (nestest and Start), and a static title screen on
+    another console.
+
+    On all of them *every* captured picture is the pre-press one. That is the
+    honest reading -- the game has not moved -- and it is what the seam costs:
+    the pre-roll used to skip forward looking for a change, which on these
+    rows it never found, so it spent a quarter of a second of game time and
+    opened the clip on the repeated picture regardless.
+
+    What must not happen is the other failure: a rule that trimmed the opening
+    duplicates would trim the entire clip and leave the single picture it is
+    obliged to keep, i.e. a one second clip played as a 17ms flash. So this
+    pins the full length -- every picture the plan asked for, durations adding
+    up to the whole second that was emulated.
+    """
+    core, rom_name, button, boot, _moves = SEAM_PROBES[probe]
+    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
+    emulator.advance(emulator.frames_for_seconds(boot))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    presses = [(button, 0, frames_for_ms(emulator, 160))]
+    plan = E.capture_plan(frames, capture_step(emulator))
+
+    # One press first, so the screen is where a *second* press finds it. That
+    # is the shape of the complaint -- the player is already on the menu, or
+    # the cursor is already where Start put it -- and it is the difference
+    # between nestest answering the button and nestest ignoring it.
+    emulator.record(frames, presses=presses)
+    held = held_picture(emulator)
+    payload, shots = photographed(emulator, frames, presses)
+
+    if opening_repeats(shots, held) != len(shots):
+        pytest.skip(
+            f"{core}/{rom_name} is not static under this build "
+            f"({opening_repeats(shots, held)} of {len(shots)} pictures "
+            "unchanged); the all-static case needs a screen that really does "
+            "hold one frame"
+        )
+
+    # Not a flash: every picture the plan asked for was taken, and the
+    # durations handed to the encoder still add up to the second that was
+    # emulated. (The encoder is free to merge them into one stored frame, and
+    # does -- see test_a_static_screen_collapses_to_a_still_that_is_still_a_clip.)
+    assert len(shots) == len(plan) >= 2
+    durations = [max(1, round(1000 * covered / emulator.fps)) for _, covered in plan]
+    emulated = 1000 * frames / emulator.fps
+    assert abs(sum(durations) - emulated) / emulated < 0.01
+    assert sum(durations) == round(1000 * E.playback_seconds(emulator.fps, frames))
+    # ...and it is still a clip, not an error.
+    assert len(payload) > 0
+
+
+def test_a_games_own_reaction_latency_is_shown_rather_than_skipped(
+    assets, emu, libbet
+):
+    """What replaced the pre-roll, stated as the thing a player will see.
+
+    Libbet's title screen answers Start on its third frame. With the pre-roll
+    the clip skipped the two frames before that and opened on the change; now
+    it opens one frame after the previous clip ended, holds the unchanged
+    picture for exactly as long as the game really takes, and then moves.
+
+    That is a run of identical opening pictures, which the encoder merges into
+    one stored frame with their durations added together, so it is a held
+    picture and not a stutter -- and, crucially, the console is not a quarter
+    of a second ahead of what has been posted.
+    """
+    emulator = emu(assets.need_core("gambatte"), libbet)
+    emulator.advance(emulator.frames_for_seconds(LIBBET_BOOT_SECONDS))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    step = capture_step(emulator)
+    hold = frames_for_ms(emulator, 160)
+    presses = [("start", 0, hold)]
+
+    held = held_picture(emulator)
+    state = emulator.save_state()
+    emulator.load_state(state)
+    payload, shots = photographed(emulator, frames, presses)
+
+    # How long the game really takes, read off the core rather than assumed.
+    emulator.load_state(state)
+    reference = frame_by_frame(emulator, set(range(hold)), "start", frames)
+    latency = opening_repeats(reference, held)
+    if not 0 < latency < frames:
+        pytest.skip(
+            f"Libbet answers Start after {latency} of {frames} frames under "
+            "this build, which is not the delayed-reaction shape this pins"
+        )
+
+    # The clip opens on the held picture for exactly that many frames' worth
+    # of pictures -- no more (nothing is dragged out) and no fewer (nothing is
+    # skipped to hide it).
+    assert opening_repeats(shots, held) == len(
+        [index for index, _ in E.capture_plan(frames, step) if index < latency]
+    )
+    # And the clip moves on afterwards rather than being a still, so the
+    # latency really is being shown and then left behind.
+    assert shots[-1] != held
+    assert len(shots) == len(E.capture_plan(frames, step))
+    assert len(payload) > 0
+
+
+def test_the_hold_is_honoured_in_full_and_released_before_the_last_picture(
+    assets, emu, libbet
+):
+    """The press schedule, read off the frames the core really saw.
+
+    The button goes down before the clip's first emulated frame and comes up
+    ``hold`` frames later, and ``input_budget`` promises that is before the
+    last picture worth a whole step of playback -- so the clip's closing
+    pictures show what the press *did* rather than the game still under it.
+
+    This used to have to account for a pre-roll shifting the recording later
+    while the press stayed put. Now the clip's frames and the window's frames
+    are the same frames, which is what makes the promise the schedule's own
+    arithmetic rather than something the recording loop has to preserve.
+    """
+    emulator = emu(assets.need_core("gambatte"), libbet)
+    emulator.advance(emulator.frames_for_seconds(LIBBET_BOOT_SECONDS))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    hold = frames_for_ms(emulator, 160)
+    budget = input_budget(emulator, frames)
+
+    with frames_emulated(emulator) as timeline:
+        emulator.record(frames, presses=[("a", 0, hold)])
+
+    # The window is the clip and nothing else: no frame is emulated that the
+    # clip does not account for.
+    assert len(timeline) == frames
+    down = [index for index, pressed in enumerate(timeline) if "a" in pressed]
+    assert down == list(range(hold)), (down[:4], down[-4:], hold)
+    assert max(down) < budget <= frames - 1
+    assert not timeline[-1], "the clip's last frame is emulated with nothing held"
+
+
+def test_a_clip_with_no_input_in_it_photographs_from_its_very_first_frame(
+    assets, emu, libbet
+):
+    """Wait, Undo, a boot and a reset: the same seam as everything else.
+
+    A recording with no schedule in it has never done anything but photograph
+    from its first frame, and that was already the one-frame seam -- it is the
+    clips *with* a press that used to differ. Libbet on its static screen is
+    the probe that would notice a stray skip: it is the one ROM here where
+    something waiting for the picture to change would run for ever.
+    """
+    emulator = emu(assets.need_core("gambatte"), libbet)
+    emulator.advance(emulator.frames_for_seconds(LIBBET_BOOT_SECONDS))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+
+    held = held_picture(emulator)
+    with frames_emulated(emulator) as timeline:
+        waited, shots = photographed(emulator, frames)
+
+    assert len(timeline) == frames, "a clip with no press in it ran extra frames"
+    assert not any(timeline), "a clip with no press in it held a button"
+    # The screen is frozen, so the Wait clip is the held picture for its whole
+    # length -- which is the truth about a paused game and what Wait is for.
+    assert opening_repeats(shots, held) == len(shots)
+    assert len(shots) == len(E.capture_plan(frames, capture_step(emulator)))
+    assert len(waited) > 0
 
 
 def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, image, gambatte, ucity):

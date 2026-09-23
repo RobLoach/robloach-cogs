@@ -124,14 +124,14 @@ def dmg_acid2(assets):
     return assets.need_rom("dmg-acid2.gb")
 
 
-#: Seconds of boot that put Libbet on the screen the clip pre-roll was
-#: written for. Measured on gambatte under libretro.py 0.6.0 and 0.11.x
-#: alike: from 3.5s to 5s the picture is frozen for 131 frames (2.2 seconds)
-#: with no input and with any button but A or Start, and A or Start changes it
-#: on the *third* frame. So one ROM covers both halves of the pre-roll -- a
-#: static screen that answers a press after a delay, which is the shape the
-#: pre-roll exists for, and a static screen that ignores the press
-#: altogether, which is the shape that must still produce a full-length clip.
+#: Seconds of boot that put Libbet on the screen the clip seam tests want.
+#: Measured on gambatte under libretro.py 0.6.0, 0.11.x and 0.12 alike: from
+#: 3.5s to 5s the picture is frozen for 131 frames (2.2 seconds) with no input
+#: and with any button but A or Start, and A or Start changes it on the
+#: *third* frame. So one ROM covers both shapes the seam has to be right for
+#: -- a static screen that answers a press after a delay, whose latency the
+#: clip now shows rather than skipping, and a static screen that ignores the
+#: press altogether, which must still produce a full-length clip.
 LIBBET_BOOT_SECONDS = 4
 
 
@@ -139,11 +139,11 @@ LIBBET_BOOT_SECONDS = 4
 def libbet(assets):
     """Libbet and the Magic Floor: a zlib-licensed Game Boy homebrew.
 
-    The only ROM here with the shape the pre-roll was reported against (see
-    PREROLL_SECONDS in retro/clips.py): a screen that sits completely still
-    until a button is pressed, and then takes a couple of frames to react.
-    uCity animates every frame and dmg-acid2 never changes at all, so neither
-    of them is that case.
+    The only ROM here with the shape the seam reports were about (see the
+    seam block in retro/clips.py): a screen that sits completely still until a
+    button is pressed, and then takes a couple of frames to react. uCity
+    animates every frame and dmg-acid2 never changes at all, so neither of
+    them is that case.
     """
     return assets.need_rom("libbet.gb")
 

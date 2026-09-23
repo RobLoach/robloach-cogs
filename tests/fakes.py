@@ -108,11 +108,6 @@ class FakeEmulator:
         self.loaded_sram = None
         #: How many times this instance has been power-cycled; see reset().
         self.resets = 0
-        #: Always zero here. The real emulator runs a bounded pre-roll before
-        #: a clip that opens with a press in it (see PREROLL_SECONDS in
-        #: retro/clips.py) and records how many frames it used; nothing in the
-        #: cog reads it, so this fake only has to have the attribute.
-        self.last_preroll_frames = 0
         FakeEmulator.instances.append(self)
 
     @classmethod
