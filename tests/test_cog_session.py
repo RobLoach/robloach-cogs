@@ -39,21 +39,21 @@ async def test_the_clip_and_hold_defaults_reach_a_new_install(retro):
 
 
 async def test_an_already_configured_value_survives_a_new_default(retro):
-    await retro.cog.config.clip_seconds.set(9)
+    await retro.cog.config.clip_seconds.set(4)
     await retro.cog.config.hold_ms.set(420)
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(8050, "defaults")
-    assert view.clip_seconds == 9
+    assert view.clip_seconds == 4
     assert view.hold_ms == 420
 
 
 async def test_an_integer_clip_length_in_config_still_loads_as_a_float(retro):
     """Nobody who set `[p]retroset cliplength 4` before it was a float."""
-    await retro.cog.config.clip_seconds.set(7)  # an int, as it was written
+    await retro.cog.config.clip_seconds.set(4)  # an int, as it was written
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(8049, "legacy")
-    assert view.clip_seconds == 7.0 and isinstance(view.clip_seconds, float)
-    assert view.clip_frames(view.emulator) == view.emulator.frames_for_seconds(7)
+    assert view.clip_seconds == 4.0 and isinstance(view.clip_seconds, float)
+    assert view.clip_frames(view.emulator) == view.emulator.frames_for_seconds(4)
 
 
 async def test_a_nonsense_clip_length_in_config_cannot_make_an_empty_clip(retro):
@@ -93,7 +93,7 @@ async def test_retroset_cliplength_reports_and_clamps(retro):
     await cliplength(retro.cog, ctx, 0)
     assert await retro.cog.config.clip_seconds() == retro.emumod.MIN_CLIP_SECONDS == 0.2
     await cliplength(retro.cog, ctx, 9999)
-    assert await retro.cog.config.clip_seconds() == retro.emumod.MAX_CLIP_SECONDS == 15.0
+    assert await retro.cog.config.clip_seconds() == retro.emumod.MAX_CLIP_SECONDS == 5.0
 
 
 async def test_retroset_cliplength_says_what_a_short_clip_does_to_a_press(retro):
@@ -122,23 +122,29 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
 
     Both ways round, which is the whole point of the button being hidden
     rather than greyed out: at 0.2s only one tap fits, so the x3 button goes
-    away entirely, and at 4s it comes back -- in its proper place in the row,
-    between Wait and Undo, rather than tacked on the end.
+    off the message entirely, and at 4s it comes back -- in its proper place
+    in the row, between Wait and Undo, rather than tacked on the end.
+
+    Off the *message*: the button object stays in the view either way, so a
+    click on a message Discord has not re-rendered still reaches a callback
+    that answers it. See RetroView.to_components.
     """
     await retro.install_cores("gambatte")
     view, ctx, _ = await retro.posted_game(8054, "relength")
     cliplength = retro.cogmod.Retro.retroset_cliplength.callback
     assert retro.control(view, "repeat").label == "A x3"
     assert not retro.control(view, "repeat").disabled
+    assert retro.drawn(view, "repeat")["label"] == "A x3"
 
     await cliplength(retro.cog, ctx, 0.2)
     assert view.clip_seconds == 0.2
     # The next press redraws the controls, and the repeat button -- which can
-    # now do no more than the console's own A button -- is gone.
+    # now do no more than the console's own A button -- is gone from them.
     vanishing = retro.interaction(view, message=view.message)
     await view._press(vanishing, "a")
     assert view.repeat_taps == 1
-    assert retro.control(view, "repeat") is None
+    assert retro.drawn(view, "repeat") is None
+    assert retro.control(view, "repeat").hidden, "hidden, not removed"
     # ...and that press says where it went, once. A control that silently
     # disappears reads as removed just as surely as a greyed-out one does,
     # which is exactly how the greyed-out version was reported. It rides on
@@ -153,20 +159,16 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
     assert view.clip_frames(view.emulator) == 12
     # Wait and Undo have not moved, because the row still reserves space for
     # all three controls whether or not the third is drawn.
-    assert [c.label for c in view.children if c.row == 2] == [
-        "Start", "Select", "Wait", "Undo"
-    ]
+    assert retro.drawn_row(view) == ["Start", "Select", "Wait", "Undo"]
 
     coming_back = retro.interaction(view, message=view.message)
     await cliplength(retro.cog, ctx, 4)
     await view._press(coming_back, "a")
-    back = retro.control(view, "repeat")
-    assert back is not None and back.label == "A x3" and not back.disabled
+    back = retro.drawn(view, "repeat")
+    assert back is not None and back["label"] == "A x3" and not back["disabled"]
     # Coming back says nothing: the button is right there saying what it does.
     assert "hidden" not in coming_back.log[-1][1]["content"]
-    assert [c.label for c in view.children if c.row == 2] == [
-        "Start", "Select", "Wait", "A x3", "Undo"
-    ]
+    assert retro.drawn_row(view) == ["Start", "Select", "Wait", "A x3", "Undo"]
 
 
 async def test_can_stop_is_kept_for_retrosleep_reboot_and_end(retro):
@@ -610,7 +612,7 @@ async def test_nothing_is_edited_while_the_press_is_being_emulated(retro):
     view, _, _ = await retro.posted_game(9005, "midpress")
     interaction = retro.interaction(view, message=view.message)
 
-    original = view.run_press
+    original = view.capture_press
     seen = []
 
     def watched(field, repeat=1):
@@ -618,11 +620,11 @@ async def test_nothing_is_edited_while_the_press_is_being_emulated(retro):
         seen.append(list(interaction.kinds()))
         return original(field, repeat)
 
-    view.run_press = watched
+    view.capture_press = watched
     try:
         await view._press(interaction, "a")
     finally:
-        view.run_press = original
+        view.capture_press = original
 
     assert seen == [["response.defer"]], seen
     assert not any(
@@ -643,7 +645,7 @@ async def test_a_press_no_longer_greys_the_controls_out(retro):
     view, _, _ = await retro.posted_game(9006, "nogrey")
     interaction = retro.interaction(view, message=view.message)
 
-    original = view.run_press
+    original = view.capture_press
     disabled_midway = []
 
     def watched(field, repeat=1):
@@ -652,11 +654,11 @@ async def test_a_press_no_longer_greys_the_controls_out(retro):
         )
         return original(field, repeat)
 
-    view.run_press = watched
+    view.capture_press = watched
     try:
         await view._press(interaction, "a")
     finally:
-        view.run_press = original
+        view.capture_press = original
 
     assert disabled_midway == [[]], disabled_midway
     assert not any(c.disabled for c in retro.pressable(view))
@@ -732,15 +734,59 @@ async def test_a_press_that_lands_mid_emulation_is_queued_rather_than_dropped(re
         waiting = retro.interaction(view, message=view.message)
         await retro.control(view, "wait").callback(waiting)
 
-        # Each click is acknowledged with a plain defer and nothing else: no
-        # edit, and no line naming a press that has not happened yet.
+        # The click that was *taken down* is acknowledged with a plain defer
+        # and nothing else: no edit, and no line naming a press that has not
+        # happened yet. Its acknowledgement is the queue suffix on the
+        # running press's own line.
         assert held.kinds() == ["response.defer"]
-        assert repeat.kinds() == ["response.defer"]
-        assert waiting.kinds() == ["response.defer"]
-        # ...but the intent is kept. Three different people, because one
-        # person only ever gets one slot; see the per-user test below.
+        # These three clicks are all the same person, so the second and third
+        # are refused -- one slot each; see the per-user test below. A
+        # refusal is *said*, privately: answering it with the same contentless
+        # defer an accepted press gets is indistinguishable from the
+        # controller ignoring you, which is the complaint the queue exists to
+        # answer.
+        for refused in (repeat, waiting):
+            assert refused.kinds() == ["response.send_message"]
+            (_, said), = refused.log
+            assert said["ephemeral"] is True, "only the clicker is told"
+            assert "already have a press waiting" in said["content"]
+        # ...and the intent of the one that was accepted is kept.
         assert len(view.queue) == 1, "one slot per person, and these share one"
     assert queued_names(view) == ["B"]
+
+
+async def test_a_full_queue_says_so_rather_than_swallowing_the_click(retro):
+    """
+    The other refusal, and the reason both are worth a sentence.
+
+    A press that cannot be queued is a press that will never happen, and the
+    two reasons it can be refused are genuinely different things to be told:
+    "wait your turn" and "you are already in the queue". Both used to be
+    answered with a defer that changes nothing on screen -- i.e. with
+    nothing.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9011, "full")
+    async with view.lock:
+        # Fill every slot with somebody different, so the refusal below is
+        # about the queue being full rather than about one person's slot.
+        for index in range(retro.viewmod.MAX_QUEUED_PRESSES):
+            clicker = FakeUser(uid=600 + index, name=f"P{index}")
+            await view._press(
+                retro.interaction(view, user=clicker, message=view.message), "a"
+            )
+        assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES
+
+        latecomer = retro.interaction(
+            view, user=FakeUser(uid=699, name="Late"), message=view.message
+        )
+        await view._press(latecomer, "b")
+
+    assert latecomer.kinds() == ["response.send_message"]
+    (_, said), = latecomer.log
+    assert said["ephemeral"] is True
+    assert str(retro.viewmod.MAX_QUEUED_PRESSES) in said["content"]
+    assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES, "and nothing jumped in"
 
 
 async def test_the_queue_is_bounded_and_says_how_deep(retro):
@@ -804,7 +850,7 @@ async def test_the_running_press_says_what_is_queued_behind_it(retro):
     rob = retro.interaction(
         view, user=FakeUser(uid=11, name="Rob"), message=view.message
     )
-    original = view.run_press
+    original = view.capture_press
     waiting = []
 
     def slow(field, repeat=1):
@@ -816,11 +862,11 @@ async def test_the_running_press_says_what_is_queued_behind_it(retro):
             assert view.enqueue_press(interaction, "left")
         return original(field, repeat)
 
-    view.run_press = slow
+    view.capture_press = slow
     try:
         await view._press(rob, "a")
     finally:
-        view.run_press = original
+        view.capture_press = original
 
     robs_edit = next(snap for kind, snap in rob.log if kind == "edit_original_response")
     assert robs_edit["content"] == retro.line(
@@ -849,7 +895,7 @@ async def test_two_simultaneous_presses_both_happen_one_edit_each(retro):
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9011, "race")
-    original = view.run_press
+    original = view.capture_press
     original_enqueue = view.enqueue_press
     # The first press's worker thread is held until the second click has
     # actually been taken down, which is what makes this a race rather than
@@ -866,7 +912,7 @@ async def test_two_simultaneous_presses_both_happen_one_edit_each(retro):
         queued.set()
         return accepted
 
-    view.run_press = slow
+    view.capture_press = slow
     view.enqueue_press = enqueue
     first = retro.interaction(
         view, user=FakeUser(uid=21, name="Rob"), message=view.message
@@ -877,7 +923,7 @@ async def test_two_simultaneous_presses_both_happen_one_edit_each(retro):
     try:
         await asyncio.gather(view._press(first, "a"), view._press(second, "b"))
     finally:
-        view.run_press = original
+        view.capture_press = original
         view.enqueue_press = original_enqueue
 
     # One defer and one edit each: "one press, one visible change" holds for
@@ -902,7 +948,7 @@ async def test_a_queued_press_runs_against_the_state_it_was_queued_behind(retro)
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9015, "ordered")
     emulator = view.emulator
-    original = view.run_press
+    original = view.capture_press
     seen = []
     queued = []
 
@@ -918,11 +964,11 @@ async def test_a_queued_press_runs_against_the_state_it_was_queued_behind(retro)
                 assert view.enqueue_press(interaction, button)
         return original(field, repeat)
 
-    view.run_press = watched
+    view.capture_press = watched
     try:
         await view._press(retro.interaction(view, message=view.message), "a")
     finally:
-        view.run_press = original
+        view.capture_press = original
 
     # In the order they were clicked, each one starting from a strictly later
     # machine state than the press before it.
@@ -1045,7 +1091,7 @@ async def test_only_one_press_is_ever_inside_the_emulator(retro):
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9021, "onlyone")
-    original = view.run_press
+    original = view.capture_press
     inside = 0
     overlap = 0
     queued = []
@@ -1068,11 +1114,11 @@ async def test_only_one_press_is_ever_inside_the_emulator(retro):
         finally:
             inside -= 1
 
-    view.run_press = watched
+    view.capture_press = watched
     try:
         await view._press(retro.interaction(view, message=view.message), "a")
     finally:
-        view.run_press = original
+        view.capture_press = original
 
     assert overlap == 1, overlap
     assert queued, "the queue was exercised at all"
@@ -1115,9 +1161,46 @@ async def test_a_press_on_a_retired_message_is_neither_run_nor_queued(retro):
 
     stale = retro.interaction(view, message=view.message)
     await view._press(stale, "a")
-    assert stale.kinds() == ["response.defer"]
+    # Nothing is run and nothing is queued -- but the click is answered.
+    # These buttons are dead and the game is not: it was saved, and it is
+    # either further down the channel or behind this message's own Resume
+    # button. A controller that says nothing at all is how "the bot stopped
+    # working" gets reported.
+    assert stale.kinds() == ["response.send_message"]
+    (_, said), = stale.log
+    assert said["ephemeral"] is True, "only the person who clicked is told"
+    assert "retiredpress" in said["content"]
     assert not view.queue, "a retired session has nothing for a press to reach"
     assert not view.enqueue_press(retro.interaction(view), "a")
+
+
+async def test_a_replaced_controller_explains_itself_once_per_person(retro):
+    """
+    Once each, not once per click.
+
+    Somebody who has not noticed the channel moved on will tap several
+    buttons before concluding the bot is broken, and a whisper per tap is
+    the spam an ephemeral acknowledgement was removed for being.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9020, "toldonce")
+    view.retire()
+
+    rob = FakeUser(uid=71, name="Rob")
+    first = retro.interaction(view, user=rob, message=view.message)
+    await view._press(first, "a")
+    assert first.kinds() == ["response.send_message"]
+
+    second = retro.interaction(view, user=rob, message=view.message)
+    await view._press(second, "b")
+    assert second.kinds() == ["response.defer"], "told once, then left alone"
+
+    # Somebody else gets their own explanation: they have not been told.
+    ada = retro.interaction(
+        view, user=FakeUser(uid=72, name="Ada"), message=view.message
+    )
+    await view._press(ada, "a")
+    assert ada.kinds() == ["response.send_message"]
 
 
 async def test_a_queued_press_on_a_sleeping_session_wakes_it_first(retro):
@@ -1130,7 +1213,7 @@ async def test_a_queued_press_on_a_sleeping_session_wakes_it_first(retro):
     ada = retro.interaction(
         view, user=FakeUser(uid=41, name="Ada"), message=view.message
     )
-    original = view.run_press
+    original = view.capture_press
     once = []
 
     def slow(field, repeat=1):
@@ -1139,11 +1222,11 @@ async def test_a_queued_press_on_a_sleeping_session_wakes_it_first(retro):
             assert view.enqueue_press(ada, "b")
         return original(field, repeat)
 
-    view.run_press = slow
+    view.capture_press = slow
     try:
         await view._press(retro.interaction(view, message=view.message), "a")
     finally:
-        view.run_press = original
+        view.capture_press = original
 
     # The waking press says it woke up; the queued one behind it is an
     # ordinary press on a session that is now awake.
@@ -1160,7 +1243,7 @@ async def test_a_queued_press_on_a_sleeping_session_wakes_it_first(retro):
 # to that) but nobody ever saw it, so the picture appeared to lurch.
 #
 # So the *edit* waits until the clip it is replacing has had its playing time
-# on screen. See the note above MAX_PACE_SECONDS in retro/RetroView.py for the
+# on screen. See the note above MAX_PACE_SECONDS in retro/timing.py for the
 # rule, the cap and the numbers behind them.
 #
 # The gate spends its time in exactly one place -- the module-level
@@ -1196,7 +1279,7 @@ async def fill_the_queue(retro, view, waiting):
         retro.interaction(view, user=person, message=view.message)
         for person in people
     ]
-    original = view.run_press
+    original = view.capture_press
     once = []
 
     def slow(field, repeat=1):
@@ -1207,11 +1290,11 @@ async def fill_the_queue(retro, view, waiting):
         return original(field, repeat)
 
     running = retro.interaction(view, message=view.message)
-    view.run_press = slow
+    view.capture_press = slow
     try:
         await view._press(running, "b")
     finally:
-        view.run_press = original
+        view.capture_press = original
     return running, queued
 
 
@@ -1473,8 +1556,10 @@ async def test_an_undo_that_lands_during_pacing_is_dropped_rather_than_waiting(r
     """Undo is not queueable, and pacing does not make it so.
 
     A click that arrives while a press is running -- which now includes the
-    moment it is holding its edit back -- is acknowledged and dropped, as it
-    always was. It does not wait, and it does not edit.
+    moment it is holding its edit back -- is answered and dropped, as it
+    always was. It does not wait, and it does not edit the message: the
+    answer is one private line telling the clicker to try again when the
+    next clip lands, which costs an interaction response and nothing else.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9211, "undoduring")
@@ -1491,7 +1576,9 @@ async def test_an_undo_that_lands_during_pacing_is_dropped_rather_than_waiting(r
     retro.pace_wait(wait)
     await view._press(retro.interaction(view, message=view.message), "b")
 
-    assert clicked["kinds"] == ["response.defer"], clicked
+    # One interaction response and no edit of the message: the pacing wait
+    # was not extended and the clip on screen was not replaced.
+    assert clicked["kinds"] == ["response.send_message"], clicked
 
 
 async def test_an_undo_s_own_clip_is_never_paced(retro):
@@ -1646,7 +1733,7 @@ async def test_a_failed_press_explains_itself_rather_than_naming_a_button(retro)
     def boom(field, repeat=1):
         raise retro.emumod.EmulatorError("the core fell over")
 
-    view.run_press = boom
+    view.capture_press = boom
     interaction = retro.interaction(view, message=view.message)
     await view._press(interaction, "a")
     snap = interaction.log[-1][1]
@@ -1916,19 +2003,19 @@ async def test_nothing_is_edited_while_the_undo_is_being_emulated(retro):
     view, _, _ = await retro.posted_game(9202, "midundo")
     await view._press(retro.interaction(view, message=view.message), "a")
 
-    original = view.run_undo
+    original = view.capture_undo
     seen = []
 
     def watched():
         seen.append(list(interaction.kinds()))
         return original()
 
-    view.run_undo = watched
+    view.capture_undo = watched
     interaction = retro.interaction(view, message=view.message)
     try:
         await retro.control(view, "undo").callback(interaction)
     finally:
-        view.run_undo = original
+        view.capture_undo = original
     assert seen == [["response.defer"]], seen
 
 
@@ -2166,13 +2253,25 @@ async def test_a_state_the_core_will_not_take_back_is_reported_once(retro):
     assert not retro.control(view, "undo").disabled, "still clickable"
 
 
-async def test_an_undo_while_the_session_is_busy_only_defers(retro):
+async def test_an_undo_while_the_session_is_busy_says_to_try_again(retro):
+    """
+    Undo is never queued, so a click that cannot run has to say so.
+
+    Queueing it would mean undoing a press its author never saw -- see
+    RetroView._undo -- so the click is refused. It used to be refused with a
+    bare defer, i.e. with nothing: clicking Undo and watching the message
+    carry on as though you had not is exactly the "did that register?"
+    failure the press queue was built to answer.
+    """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9213, "busyundo")
     await view._press(retro.interaction(view, message=view.message), "a")
     async with view.lock:
         interaction = await undo(retro, view)
-    assert interaction.kinds() == ["response.defer"]
+    assert interaction.kinds() == ["response.send_message"]
+    (_, said), = interaction.log
+    assert said["ephemeral"] is True, "only the person who clicked is told"
+    assert "Undo" in said["content"]
     assert view.history, "and the history was not touched"
 
 
@@ -2241,6 +2340,33 @@ async def test_the_idle_task_saves_and_frees_a_sleeping_session(retro):
     assert not any(c.disabled for c in retro.pressable(view))
     assert all(c.disabled for c in view.children if isinstance(c, retro.viewmod._SpacerButton))
     assert retro.cog.config.channels[channel.id]["session"]["slug"] == view.slug
+
+
+async def test_the_idle_timeout_is_read_from_config_and_never_carried(retro):
+    """`[p]retroset timeout` applies to the games already running.
+
+    A session used to be handed the timeout at construction, and handed it
+    again by from_record on every restart, and nothing ever read either copy:
+    the sweep asks Config for the current value on every pass. That is the
+    whole reason the setting takes effect immediately -- so the copy is gone,
+    and this is what it would have had to disagree with.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9031, "timeoutless")
+    assert not hasattr(view, "timeout_minutes")
+    # ...including a session rebuilt from a record after a restart, which is
+    # the other place it was threaded through.
+    rebuilt = retro.viewmod.RetroView.from_record(retro.cog, view.to_record())
+    assert not hasattr(rebuilt, "timeout_minutes")
+
+    view.last_active = time.time() - 11 * 60
+    await retro.cog.config.session_timeout_minutes.set(30)
+    await retro.cog._hibernate_idle()
+    assert view.live, "eleven minutes idle is not thirty minutes idle"
+
+    await retro.cog.config.session_timeout_minutes.set(5)
+    await retro.cog._hibernate_idle()
+    assert not view.live, "and the new value reached a session already playing"
 
 
 async def test_a_press_resumes_a_sleeping_session_and_says_so_once(retro):
@@ -2443,7 +2569,11 @@ async def test_a_different_game_replaces_the_session_and_retires_the_old_one(ret
 
     stale = retro.interaction(old, message=old.message)
     await old._press(stale, "a")
-    assert stale.kinds() == ["response.defer"], "a click on the replaced message is a no-op"
+    # A no-op as far as the game is concerned: nothing is emulated, nothing
+    # is queued, and no core is loaded for it. The clicker is told where the
+    # game went, privately, which is the one thing that changed.
+    assert stale.kinds() == ["response.send_message"]
+    assert not old.queue and old.emulator is None
     assert sum(1 for v in retro.cog.sessions.values() if v.live) <= retro.cogmod.MAX_LIVE_EMULATORS
 
 
@@ -2958,11 +3088,14 @@ async def test_retroend_makes_the_controls_inert_and_drops_the_queue(retro):
     await end_command(retro)(retro.cog, ctx)
 
     assert view.closed and not view.queue
-    # A click on the old controls does nothing at all now, which is the whole
-    # difference from `[p]retrosleep`.
+    # A click on the old controls moves nothing, which is the whole
+    # difference from `[p]retrosleep`. It is *answered* -- privately, with
+    # where the game went -- rather than met with silence, but nothing is
+    # emulated and nothing is taken down.
     stale = retro.interaction(view, message=view.message)
     await view._press(stale, "a")
-    assert stale.kinds() == ["response.defer"]
+    assert stale.kinds() == ["response.send_message"]
+    assert not view.queue
     assert view.emulator is None
 
 
@@ -3004,3 +3137,351 @@ def test_retrosleep_and_retroend_say_what_each_other_is_for(retro):
     assert "retire its controls" in end
     assert "[p]retrosleep" in end
     assert "Nothing is deleted" in end
+
+
+# -- A queue nobody drains ----------------------------------------------------
+#
+# An entry is only ever taken down while something holds `view.lock`, and for
+# a long time only one thing that holds it -- an ordinary press -- ever
+# drained it afterwards. An undo, a `[p]retroreboot` and a `[p]retrosleep` all
+# take the same lock. Each of them throws the queue away as it starts, which
+# covers the presses aimed at the game they are about to move; none of them
+# used to deal with a click landing *after* that and before the lock was given
+# back, and that entry is the dangerous one. It survives with the current
+# epoch and nothing is coming to run it, so `RetroView.busy` is true for ever:
+# every later click is queued behind an entry nothing will take, and the
+# controller answers nothing at all until the session hibernates.
+#
+# All three arrange exactly that: the click lands from inside the operation,
+# after it has discarded the queue, which is the one moment that used to
+# strand an entry. There is a fourth test for the backstop.
+
+
+def click_lands_during(view, interaction, field="a"):
+    """
+    Queue a press from inside an operation that is holding ``view.lock``.
+
+    This is precisely what :meth:`RetroView._press` does when it finds the
+    session busy, and doing it here rather than through ``_press`` is what
+    puts the click *after* the operation's own ``forget_queue`` -- the window
+    that used to strand it.
+    """
+    assert view.enqueue_press(interaction, field), "the click was not taken down"
+
+
+async def test_a_press_queued_during_an_undo_is_run_rather_than_stranded(retro):
+    """An undo drains what arrived while it held the lock."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9310, "undodrain")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert view.history, "nothing to undo, so this would prove nothing"
+
+    late = retro.interaction(
+        view, user=FakeUser(uid=781, name="Latecomer"), message=view.message
+    )
+    original = view.capture_undo
+
+    def undo_then_click(*args, **kwargs):
+        clip = original(*args, **kwargs)
+        # The undo has discarded the queue by now, so this entry is one it
+        # cannot have thrown away: a click that landed a moment too late.
+        click_lands_during(view, late, "b")
+        return clip
+
+    view.capture_undo = undo_then_click
+    await undo(retro, view)
+
+    assert not view.queue, "the queued press was left with nobody to run it"
+    assert not view.busy, "which is a controller that answers nothing at all"
+    # It really ran, and made its own single edit through its own deferred
+    # interaction -- exactly as a press queued behind a press does.
+    assert late.kinds() == ["response.defer", "edit_original_response"]
+
+
+async def test_a_press_queued_during_a_reboot_is_dropped_not_stranded(retro):
+    """
+    Rebooting drops the queue by design -- but it has to drop *all* of it.
+
+    Draining would be wrong here: those presses were aimed at a game
+    mid-play and this is the title screen. Leaving them is worse than
+    either, so they go, and the line the reboot writes says how many.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9311, "rebootdrain")
+
+    late = retro.interaction(
+        view, user=FakeUser(uid=782, name="Latecomer"), message=view.message
+    )
+    original = view.capture_reset
+
+    def reset_then_click(*args, **kwargs):
+        clip = original(*args, **kwargs)
+        click_lands_during(view, late, "b")
+        return clip
+
+    view.capture_reset = reset_then_click
+    await reset_command(retro)(retro.cog, ctx)
+
+    assert not view.queue, "an entry nothing will ever run"
+    assert not view.busy
+    # Dropped rather than emulated: the entry never became a press, so this
+    # interaction was never edited. (It carries no defer either, because the
+    # click was taken down by hand here rather than through `_press`, which
+    # is what acknowledges one.)
+    assert "edit_original_response" not in late.kinds()
+    # And the drop is announced rather than silent -- a press that simply
+    # vanishes is the whole complaint the queue exists to answer. It rides
+    # out on the reboot's own line, which is why the counter reads zero by
+    # now: `dropped_note` clears it as it is shown.
+    assert "dropped" in view.message.edits[-1]["content"]
+    assert view.queue_dropped == 0, "said once, not on every later line"
+
+
+async def test_a_press_queued_during_a_sleep_is_dropped_not_woken(retro):
+    """
+    Sleeping drops it too, and must not drain: draining would wake the game.
+
+    `[p]retrosleep` promises the queued presses go and the game stays asleep
+    until somebody presses something. Running the stragglers would undo both
+    halves of that in one go.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9312, "sleepdrain")
+
+    late = retro.interaction(
+        view, user=FakeUser(uid=783, name="Latecomer"), message=view.message
+    )
+    original = retro.cog.hibernate
+
+    async def hibernate_then_click(*args, **kwargs):
+        await original(*args, **kwargs)
+        click_lands_during(view, late, "b")
+
+    retro.cog.hibernate = hibernate_then_click
+    try:
+        await sleep_command(retro)(retro.cog, ctx)
+    finally:
+        retro.cog.hibernate = original
+
+    assert not view.queue and not view.busy
+    assert not view.live, "a drained press would have woken it straight back up"
+    assert "edit_original_response" not in late.kinds(), "it was emulated after all"
+
+
+async def test_a_stranded_queue_is_drained_by_the_next_press(retro):
+    """
+    The backstop, so this class of bug cannot brick a controller again.
+
+    A queue with no runner is not supposed to exist at all. If one does --
+    some future path taking the lock and walking away from what arrived --
+    the next click starts a runner rather than joining the line behind it
+    for ever.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9313, "stranded")
+
+    stranded = retro.interaction(
+        view, user=FakeUser(uid=784, name="Stuck"), message=view.message
+    )
+    assert view.enqueue_press(stranded, "left")
+    assert view.busy and not view.running, "a queue with nobody working through it"
+
+    nudger = retro.interaction(
+        view, user=FakeUser(uid=785, name="Nudger"), message=view.message
+    )
+    await view._press(nudger, "a")
+
+    assert not view.queue, "the stranded entry is still waiting"
+    assert not view.busy
+    assert stranded.kinds() == ["response.defer", "edit_original_response"]
+
+
+# -- What the one core is held across -----------------------------------------
+#
+# `emulator_lock` serializes every core operation in every channel, so
+# anything slow done while holding it is latency charged to channels that had
+# nothing to do with it. Two things used to be done under it that are not core
+# work at all: talking to Discord (the first message of a game, and the edit
+# that tells an evicted channel it went to sleep) and writing the autosave to
+# disk. A Discord rate limit on one channel's message therefore froze
+# gameplay bot-wide, and every third press paid for a couple of hundred
+# kilobytes of fsync'd disk before its own clip could go out.
+
+
+async def test_the_first_message_of_a_game_is_sent_with_the_core_free(retro):
+    """Booting holds the lock; posting does not."""
+    await retro.install_cores("gambatte")
+    channel = retro.channel(9320)
+    ctx = retro.context(channel)
+    seen = {}
+
+    original = retro.viewmod.RetroView.post
+
+    async def watched_post(self, ctx, clip):
+        seen["locked"] = retro.cog.emulator_lock.locked()
+        return await original(self, ctx, clip)
+
+    retro.viewmod.RetroView.post = watched_post
+    try:
+        await retro.start_game(ctx, "postfree")
+    finally:
+        retro.viewmod.RetroView.post = original
+
+    assert seen["locked"] is False, "the one core was held while Discord answered"
+    assert retro.cog.sessions[channel.id].live, "and the game really started"
+
+
+async def test_the_autosave_is_captured_under_the_lock_and_written_outside(retro):
+    """
+    Reading the state out of a core is sub-millisecond; writing it is disk.
+
+    So the read happens where it has to -- on the emulator thread, under the
+    lock, right after the press -- and the write happens once the lock is
+    back. A press that had to wait for somebody else's fsync is a press
+    somebody is sitting watching.
+    """
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9321, "autosave")
+    every = retro.viewmod.SAVE_STATE_EVERY_PRESSES
+    seen = []
+
+    original = retro.cog._write_captured
+
+    async def watched_write(*args, **kwargs):
+        seen.append(retro.cog.emulator_lock.locked())
+        return await original(*args, **kwargs)
+
+    retro.cog._write_captured = watched_write
+    try:
+        for _ in range(every):
+            await view._press(retro.interaction(view, message=view.message), "a")
+    finally:
+        retro.cog._write_captured = original
+
+    assert seen, "no autosave happened, so this proves nothing"
+    assert not any(seen), "the save state was written with the one core held"
+    assert retro.cog._state_path(channel.id, view.slug).is_file()
+
+
+async def test_an_evicted_channel_is_told_with_the_core_free(retro):
+    """
+    The edit that says "your game went to sleep" is not core work either.
+
+    It used to be awaited inside `_hibernate_locked`, i.e. under the lock,
+    once per evicted session -- so one channel starting a game held the core
+    while Discord thought about another channel's message.
+    """
+    await retro.install_cores("gambatte")
+    first, _, _ = await retro.posted_game(9322, "evictedone")
+    assert first.live
+
+    seen = {}
+    original = retro.viewmod.RetroView.refresh
+
+    async def watched_refresh(self, note=None):
+        if self is first:
+            seen["locked"] = retro.cog.emulator_lock.locked()
+        return await original(self, note)
+
+    retro.viewmod.RetroView.refresh = watched_refresh
+    try:
+        second, _, _ = await retro.posted_game(9323, "evictedtwo")
+    finally:
+        retro.viewmod.RetroView.refresh = original
+
+    assert not first.live and second.live, "the core changed hands"
+    assert seen.get("locked") is False, "the eviction notice was sent under the lock"
+    # And it was still actually said, on the evicted game's own message.
+    assert "asleep" in first.message.edits[-1]["content"].lower() or (
+        "sleep" in first.message.edits[-1]["content"].lower()
+    )
+
+
+async def test_a_session_that_lost_its_channel_is_not_popped_by_the_loser(retro):
+    """
+    Teardown removes a channel's session only if it is still its own.
+
+    `_retire` and a failed start both await, and a Resume click landing
+    during one installs a *live* session in the same channel. An
+    unconditional pop then removes that live session from the only
+    dictionary `_evict_locked` looks at -- leaving a loaded core nothing can
+    reach, which with MAX_LIVE_EMULATORS at 1 is the cog dead until restart.
+    """
+    await retro.install_cores("gambatte")
+    old, _, channel = await retro.posted_game(9324, "oldgame")
+    newer, _, _ = await retro.posted_game(9325, "newergame")
+    # Pretend the newer session took this channel over while `old` was being
+    # retired: same channel, different view.
+    retro.cog.sessions[channel.id] = newer
+
+    assert retro.cog._forget_session_view(channel.id, old) is False
+    assert retro.cog.sessions[channel.id] is newer, "the live session was evicted"
+
+    # ...and it does remove the entry when it really is the one named.
+    assert retro.cog._forget_session_view(channel.id, newer) is True
+    assert channel.id not in retro.cog.sessions
+
+
+async def test_the_clip_is_encoded_with_the_core_free(retro):
+    """
+    Encoding costs more than emulating, and needs no core.
+
+    A clip is captured under `emulator_lock` -- that part really is the core
+    -- and turned into WebP after it, so the next channel's press starts
+    while this channel's picture is still being written. Doing both under
+    the lock made the single core the bottleneck for the one step that never
+    needed it.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9330, "encodefree")
+    seen = {}
+
+    original = view._encode
+
+    def watched_encode(captured, limit=None, emulator=None):
+        seen["locked"] = retro.cog.emulator_lock.locked()
+        return original(captured, limit, emulator)
+
+    view._encode = watched_encode
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "a")
+
+    assert "locked" in seen, "nothing was encoded, so this proves nothing"
+    assert seen["locked"] is False, "the one core was held while WebP was written"
+    # And the press still posted a real clip.
+    assert interaction.clip(), "the press posted no picture"
+
+
+async def test_a_press_still_posts_its_clip_if_another_channel_takes_the_core(retro):
+    """
+    Encoding happens after the lock, so eviction must not cost the clip.
+
+    The frames are already captured and encoding touches no core -- but the
+    session's `emulator` is cleared the moment another channel evicts it,
+    which can happen the instant the lock is given back. Reading the encoder
+    off the view at that point would fail a press whose picture was sitting
+    right there, finished.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9350, "evictedmidpress")
+    other, _, _ = await retro.posted_game(9351, "thief")
+    # `other` holds the core now, so this session is asleep; wake it so the
+    # press below is an ordinary one.
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert view.live
+
+    original = view._encode
+
+    def encode_after_eviction(captured, limit=None, emulator=None):
+        # Exactly what an eviction in another channel does, at the worst
+        # possible moment: the lock is free, the frames are captured, and
+        # the clip has not been encoded yet.
+        view.emulator = None
+        return original(captured, limit, emulator)
+
+    view._encode = encode_after_eviction
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "b")
+
+    assert interaction.clip(), "the press lost a clip it had already emulated"
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]

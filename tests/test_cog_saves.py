@@ -156,6 +156,33 @@ async def test_a_save_whose_rom_was_pruned_is_still_listed(retro):
     assert "ROM pruned" in said, "the save outlives the ROM and is still managed"
 
 
+async def test_the_listing_gathers_its_files_off_the_event_loop(retro):
+    """The stats and globs behind a listing must not stall every press.
+
+    ``_saved_games`` runs on `[p]retrosaves`, and everything filesystem-shaped
+    in it -- five glob passes plus a stat per file -- used to run directly on
+    the event loop, where a big states directory froze every session in every
+    channel for the length of a directory listing.
+    """
+    import threading
+
+    cog = retro.cog
+    cog._state_path(9206, "threaded").write_bytes(b"STATE:1")
+    main = threading.get_ident()
+    seen = {}
+    real = cog._stored_slugs
+
+    def spy(channel_id):
+        seen["thread"] = threading.get_ident()
+        return real(channel_id)
+
+    cog._stored_slugs = spy
+    entries = await cog._saved_games(9206)
+
+    assert [entry.slug for entry in entries] == ["threaded"]
+    assert seen["thread"] != main, "the directory walk ran on the event loop"
+
+
 async def test_a_long_listing_is_paginated(retro):
     cog = retro.cog
     for index in range(40):
@@ -282,6 +309,9 @@ async def test_export_sends_the_battery_save_byte_for_byte(battery):
     assert set(uploaded) == {"ucity.srm"}, "the state is not sent unless asked for"
     assert uploaded["ucity.srm"] == marker
     assert "in-game save" in ctx.said()
+    # Streamed from the file on disk, not copied through memory first: the
+    # attachment's stream is the open file itself (a BytesIO has no name).
+    assert getattr(ctx.uploads[0].fp, "name", None)
 
 
 async def test_export_both_sends_the_state_as_well_with_a_warning(battery):
@@ -338,6 +368,44 @@ async def test_exporting_a_game_with_nothing_saved_says_so(retro):
     await command(retro, "retrosaves_export")(retro.cog, asking, game="unsaved")
     assert "nothing saved yet" in asking.said()
     assert not asking.uploaded()
+
+
+async def test_export_falls_back_to_the_state_when_there_is_no_in_game_save(retro):
+    """A bare `export <game>` on a state-only game used to dead-end.
+
+    A cartridge with no battery -- most homebrew, everything that saved by
+    password -- never writes a `.srm` at all, so the default half simply does
+    not exist for it. The old reply said there was no in-game save and never
+    mentioned the save state sitting right next to it, which left the one
+    file the channel actually had unreachable without knowing the `export
+    state <slug>` spelling.
+    """
+    cog = retro.cog
+    cog._state_path(9227, "stateonly").write_bytes(b"STATE:1" * 64)
+    ctx = retro.context(retro.channel(9227))
+
+    await command(retro, "retrosaves_export")(cog, ctx, game="stateonly")
+
+    assert set(ctx.uploaded()) == {"stateonly.state"}
+    said = ctx.said()
+    assert "has no in-game save" in said, "and it says why it sent the other half"
+    assert "only loads on the same build" in said, "with the usual caveat"
+
+
+async def test_naming_the_in_game_save_is_answered_about_that_half_alone(retro):
+    # Only the *default* falls through. Somebody who typed a half meant that
+    # half and is told the truth about it -- and pointed at the other one
+    # rather than left at the dead end.
+    cog = retro.cog
+    cog._state_path(9228, "stateonly").write_bytes(b"STATE:1" * 64)
+    ctx = retro.context(retro.channel(9228))
+
+    await command(retro, "retrosaves_export")(cog, ctx, game="save stateonly")
+
+    assert not ctx.uploaded(), "an explicit half is never swapped for the other"
+    said = ctx.said()
+    assert "no in-game save" in said
+    assert "retrosaves export state stateonly" in said
 
 
 async def test_anyone_in_the_channel_may_export(battery):
@@ -601,6 +669,76 @@ async def test_deleting_a_live_games_save_really_starts_it_over(battery):
     assert view.emulator.save_sram() == b"\xff" * SRAM_BYTES, "an erased cartridge"
 
 
+async def test_a_delete_that_only_half_worked_says_which_half(battery, monkeypatch):
+    """A partial delete is the one shape nothing else here produces.
+
+    The four files go one at a time, so a data folder that turns read-only
+    part way through leaves a game with no save state and an intact in-game
+    save -- a state neither the confirmation nor the old reply described.
+    Giving up on the first failure and saying "the save files could not be
+    deleted" sent somebody off to start a game they had been told was
+    untouched, and got them the middle of it instead of the beginning.
+    """
+    from pathlib import Path
+
+    view, _, channel = await playing(battery, 9255, "ucity")
+    cog = battery.cog
+    marker = marker_bytes(SRAM_BYTES)
+    view.emulator.load_sram(marker)
+    await cog._write_state(view)
+    real_unlink = Path.unlink
+
+    def the_in_game_save_will_not_go(self, missing_ok=False):
+        if self.name.endswith(".srm"):
+            raise PermissionError(13, "read-only file system")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", the_in_game_save_will_not_go)
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
+
+    await command(battery, "retrosaves_delete")(cog, ctx, game="ucity")
+
+    assert not cog._state_path(9255, "ucity").is_file(), "what could go, went"
+    assert cog._sram_path(9255, "ucity").read_bytes() == marker
+    # The reply itself, not the whole transcript: the confirmation that came
+    # before it promises the very beginning, and the point of this test is
+    # that the *answer* stops promising it.
+    said = str(ctx.sent[-1])
+    assert "Only part" in said
+    assert "Gone: its save state" in said
+    assert "Still there: its in-game save" in said
+    # And the sentence that matters most: where the game really comes back
+    # from now, read off the files as they are rather than as they were meant
+    # to be.
+    assert "title screen, with the in-game save in place" in said
+    assert "very beginning" not in said, "it would not, and saying so was the bug"
+
+
+async def test_a_delete_that_removed_nothing_claims_nothing(retro, monkeypatch):
+    from pathlib import Path
+
+    cog = retro.cog
+    cog._state_path(9257, "stuck").write_bytes(b"STATE:1")
+    cog._sram_path(9257, "stuck").write_bytes(b"\x01" * 512)
+
+    def nothing_goes(self, missing_ok=False):
+        raise PermissionError(13, "read-only file system")
+
+    monkeypatch.setattr(Path, "unlink", nothing_goes)
+    FakeConfirm.reset(answer=True)
+    ctx = retro.context(retro.channel(9257), author=FakeUser(uid=1))
+
+    await command(retro, "retrosaves_delete")(cog, ctx, game="stuck")
+
+    said = ctx.said()
+    assert "None of" in said and "could be deleted" in said
+    assert "Still there: its save state and its in-game save" in said
+    assert "Wiped" not in said and "Gone:" not in said
+    assert cog._state_path(9257, "stuck").is_file()
+    assert cog._sram_path(9257, "stuck").is_file()
+
+
 async def test_deleting_a_game_with_nothing_saved_does_not_even_ask(battery):
     view, _, channel = await playing(battery, 9254, "ucity")
     FakeConfirm.reset(answer=True)
@@ -609,6 +747,44 @@ async def test_deleting_a_game_with_nothing_saved_does_not_even_ask(battery):
     await command(battery, "retrosaves_delete")(battery.cog, ctx, game="ucity")
     assert FakeConfirm.asked == 0
     assert "nothing saved" in ctx.said()
+
+
+# -- Rollback: swap with the previous generation --------------------------------
+
+
+async def test_rollback_is_a_swap_and_its_own_undo(retro):
+    """Rolling back twice puts everything exactly as it was.
+
+    The command promises a swap, not a delete: what is rolled back from lands
+    in the backup slot, so a rollback that turned out to be a mistake is
+    undone by running it again. And a completed swap leaves no ``.rollback``
+    parking file behind for the sweeper to find.
+    """
+    cog = retro.cog
+    state = cog._state_path(9256, "swapper")
+    sram = cog._sram_path(9256, "swapper")
+    state.write_bytes(b"STATE:2")
+    cog._backup_path(state).write_bytes(b"STATE:1")
+    sram.write_bytes(b"\x02" * 512)
+    cog._backup_path(sram).write_bytes(b"\x01" * 512)
+    owner = FakeUser(uid=1)
+
+    ctx = retro.context(retro.channel(9256), author=owner)
+    await command(retro, "retrosaves_rollback")(cog, ctx, game="swapper")
+
+    assert state.read_bytes() == b"STATE:1"
+    assert cog._backup_path(state).read_bytes() == b"STATE:2"
+    assert sram.read_bytes() == b"\x01" * 512
+    assert cog._backup_path(sram).read_bytes() == b"\x02" * 512
+    said = ctx.said()
+    assert "rolled back" in said and "again puts it back" in said
+
+    again = retro.context(retro.channel(9256), author=owner)
+    await command(retro, "retrosaves_rollback")(cog, again, game="swapper")
+
+    assert state.read_bytes() == b"STATE:2"
+    assert sram.read_bytes() == b"\x02" * 512
+    assert not list(cog._data_dir("states").glob("*.rollback"))
 
 
 # -- Importing ----------------------------------------------------------------
@@ -720,6 +896,144 @@ async def test_a_battery_save_is_installed_and_takes_the_old_state_with_it(batte
     assert cog._sram_path(9266, "ucity").read_bytes() == incoming
     assert not cog._state_path(9266, "ucity").is_file()
     assert "old save state was removed with it" in ctx.said()
+
+
+async def test_the_import_question_never_promises_a_rollback_it_cannot_do(battery):
+    # Two fates, and the question keeps them straight: the overwritten
+    # in-game save is rotated into the backup slot (rollback recovers it),
+    # while the save state a battery-only import removes is deleted outright,
+    # both generations of it -- so the only honest advice is to export first.
+    view, _, channel = await playing(battery, 9273, "ucity")
+    cog = battery.cog
+    view.emulator.load_sram(marker_bytes(SRAM_BYTES))
+    await cog._write_state(view)
+    FakeConfirm.reset(answer=False)
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[FakeAttachment(marker_bytes(SRAM_BYTES, seed=3), "ucity.srm")],
+    )
+
+    await command(battery, "retrosaves_import")(cog, ctx, game="ucity")
+
+    assert FakeConfirm.asked == 1
+    said = ctx.said()
+    assert "kept as the previous generation" in said, "the in-game save's fate"
+    assert "outright" in said, "the save state's fate is a deletion"
+    assert "cannot be rolled back" in said
+    assert "export both ucity" in said, "the copy worth taking includes the state"
+
+
+async def test_a_full_import_keeps_what_it_overwrites_one_generation_deep(battery):
+    """The promise the confirmation makes, held to: rollback undoes an import.
+
+    Both halves of a full import are written with the backup rotation, so
+    what was there lands in the backup slots and one `[p]retrosaves rollback`
+    puts the pre-import save back exactly.
+    """
+    view, _, channel = await playing(battery, 9274, "ucity")
+    cog = battery.cog
+    old_sram = marker_bytes(SRAM_BYTES)
+    view.emulator.load_sram(old_sram)
+    # Asleep first, so the files on disk are settled and the import's own
+    # pause rewrites nothing.
+    await cog.hibernate(view, None)
+    state_path = cog._state_path(9274, "ucity")
+    sram_path = cog._sram_path(9274, "ucity")
+    old_state = state_path.read_bytes()
+
+    new_state = b"STATE:777".ljust(64, b"\0")
+    new_sram = marker_bytes(SRAM_BYTES, seed=9)
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[
+            FakeAttachment(new_sram, "ucity.srm"),
+            FakeAttachment(new_state, "ucity.state"),
+        ],
+    )
+    await command(battery, "retrosaves_import")(cog, ctx, game="ucity")
+
+    assert state_path.read_bytes() == new_state
+    assert sram_path.read_bytes() == new_sram
+    assert cog._backup_path(state_path).read_bytes() == old_state
+    assert cog._backup_path(sram_path).read_bytes() == old_sram
+
+    roll = battery.context(channel, author=FakeUser(uid=view.starter_id))
+    await command(battery, "retrosaves_rollback")(cog, roll, game="ucity")
+    assert state_path.read_bytes() == old_state
+    assert sram_path.read_bytes() == old_sram
+
+
+async def test_a_press_during_the_import_check_cannot_undo_the_import(battery):
+    """The TOCTOU the import used to have, made deterministic.
+
+    _pause_for_saves puts the game to sleep, but the core-boot validation
+    between it and the write takes whole seconds, and the session's controls
+    stay live the entire time: a press in that window wakes the game from the
+    old files, and its next automatic save would silently write those old
+    files back over the import. _mutate_saves closes it by re-hibernating
+    under the view's own lock and writing before letting it go.
+    """
+    view, _, channel = await playing(battery, 9275, "ucity")
+    cog = battery.cog
+    old = marker_bytes(SRAM_BYTES)
+    view.emulator.load_sram(old)
+    for _ in range(4):
+        await cog.run_press(view, "a")
+    assert cog._sram_path(9275, "ucity").read_bytes() == old
+
+    real_check = cog._check_import
+
+    async def check_and_then_a_press_lands(entry, state, sram, prefix=""):
+        problem = await real_check(entry, state, sram, prefix)
+        # The moment the race lives in: the check is done, the write has not
+        # happened, and a player presses a button.
+        await cog.run_press(view, "a")
+        assert view.live, "the press really did wake the game mid-command"
+        return problem
+
+    cog._check_import = check_and_then_a_press_lands
+    incoming = marker_bytes(SRAM_BYTES, seed=99)
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[FakeAttachment(incoming, "ucity.srm")],
+    )
+
+    await command(battery, "retrosaves_import")(cog, ctx, game="ucity")
+
+    assert not view.live, "the rewoken session was put back to sleep for the write"
+    assert cog._sram_path(9275, "ucity").read_bytes() == incoming
+
+    # Playing on wakes from the imported save rather than writing the old
+    # one back over it.
+    for _ in range(4):
+        await cog.run_press(view, "a")
+    assert view.emulator.save_sram() == incoming
+    assert cog._sram_path(9275, "ucity").read_bytes() == incoming
+
+
+async def test_mutate_saves_touches_the_files_only_while_nothing_is_live(battery):
+    """The helper's contract, asserted directly: mutate runs with the game asleep."""
+    view, _, channel = await playing(battery, 9276, "ucity")
+    cog = battery.cog
+    assert view.live
+    entries = await cog._saved_games(channel.id)
+    entry = next(e for e in entries if e.slug == "ucity")
+    seen = {}
+
+    def mutate():
+        seen["live"] = view.live
+        return "changed"
+
+    ctx = battery.context(channel)
+    paused, result = await cog._mutate_saves(ctx, entry, "being tested", mutate)
+
+    assert (paused, result) == (True, "changed")
+    assert seen["live"] is False, "the files were changed under a core that could autosave"
 
 
 async def test_importing_over_an_existing_save_asks_first(battery):
@@ -835,6 +1149,63 @@ async def test_a_state_cannot_be_imported_for_a_game_whose_rom_is_gone(retro):
     assert "[p]" not in said, said
 
 
+async def test_an_import_that_could_not_be_checked_admits_it(retro):
+    """An unvalidated in-game save is accepted, and now says it was.
+
+    With the ROM pruned there is no cartridge to boot, so the size check that
+    every other import gets cannot run. The file is still stored -- it costs
+    nothing and is very likely right -- but a `.sav` that turns out to be the
+    wrong size is passed over at the next boot without a word, which from the
+    channel's side looks exactly like an import that worked and a game that
+    lost it. The reply is the only moment anybody can be told.
+    """
+    cog = retro.cog
+    cog._sram_path(9277, "pruned").write_bytes(b"\x01" * 1024)
+    incoming = marker_bytes(2048, seed=4)
+    ctx = retro.context(
+        retro.channel(9277),
+        author=FakeUser(uid=1),
+        attachments=[FakeAttachment(incoming, "pruned.srm")],
+    )
+    FakeConfirm.reset(answer=True)
+
+    await command(retro, "retrosaves_import")(cog, ctx, game="pruned")
+
+    assert cog._sram_path(9277, "pruned").read_bytes() == incoming, "it still goes in"
+    said = ctx.said()
+    assert "not** checked" in said
+    assert "cleaned up" in said, "and why it could not be"
+    assert "will ignore it" in said, "and what that means later"
+    assert f"`{ctx.clean_prefix}retro <name or url>`" in said, "and the way out"
+    assert "[p]" not in said, said
+
+
+async def test_an_unchecked_import_still_says_what_became_of_the_save_state(retro):
+    # The same path deletes *both* generations of the save state, exactly as
+    # the confirmation warns, so the success message accounts for both of
+    # them rather than for the live one alone.
+    cog = retro.cog
+    state = cog._state_path(9278, "pruned")
+    state.write_bytes(b"STATE:2" * 8)
+    cog._backup_path(state).write_bytes(b"STATE:1" * 8)
+    cog._sram_path(9278, "pruned").write_bytes(b"\x01" * 1024)
+    ctx = retro.context(
+        retro.channel(9278),
+        author=FakeUser(uid=1),
+        attachments=[FakeAttachment(marker_bytes(1024, seed=2), "pruned.srm")],
+    )
+    FakeConfirm.reset(answer=True)
+
+    await command(retro, "retrosaves_import")(cog, ctx, game="pruned")
+
+    assert not state.is_file()
+    assert not cog._backup_path(state).is_file()
+    assert (
+        "old save state and the previous generation of it were removed"
+        in ctx.said()
+    )
+
+
 async def test_a_stranger_may_not_import_over_someone_elses_save(battery):
     view, _, channel = await playing(battery, 9272, "ucity")
     ctx = battery.context(
@@ -846,6 +1217,132 @@ async def test_a_stranger_may_not_import_over_someone_elses_save(battery):
     await command(battery, "retrosaves_import")(battery.cog, ctx, game="ucity")
     assert "Only the person who started" in ctx.said()
     assert not battery.cog._sram_path(9272, "ucity").is_file()
+
+
+# -- What the cooldown is charged for -----------------------------------------
+#
+# `import` and `export` are limited to four a minute each because one moves a
+# file and the other boots a core. Red charges that before the callback runs,
+# which is before every mistake somebody makes on the way to a working
+# command -- so the cog hands the slot back on each path that gives up before
+# an attachment has been downloaded or a file has been read off disk.
+# Otherwise fixing your own typo is what locks you out for a minute.
+
+
+def charged(ctx):
+    """Give a context a command to refund, and watch for the refund.
+
+    These tests call the command callbacks directly, so Red's real cooldown
+    never runs and there is nothing to spend. What is asserted is the only
+    half the cog controls: whether it asks for the slot back. See
+    ``SavesMixin._refund_cooldown``.
+    """
+    import types
+
+    refunds = []
+    ctx.command = types.SimpleNamespace(reset_cooldown=refunds.append)
+    return refunds
+
+
+@pytest.mark.parametrize(
+    "name, game, attachments",
+    [
+        pytest.param("retrosaves_import", "ucity", (), id="nothing-attached"),
+        pytest.param(
+            "retrosaves_import",
+            "ucity",
+            (("holiday.jpg", b"\x00" * 64),),
+            id="not-a-save-file",
+        ),
+        pytest.param(
+            "retrosaves_import",
+            "ucity",
+            (("ucity.srm", 4 * 1024 * 1024),),
+            id="over-the-size-ceiling",
+        ),
+        pytest.param(
+            "retrosaves_import",
+            "ucity",
+            (("one.srm", 8192), ("two.sav", 8192)),
+            id="two-of-the-same-kind",
+        ),
+        pytest.param(
+            "retrosaves_import",
+            "nothinglikeit",
+            (("ucity.srm", 8192),),
+            id="import-for-a-game-that-is-not-there",
+        ),
+        pytest.param(
+            "retrosaves_export", "nothinglikeit", (), id="export-of-an-unknown-game"
+        ),
+        pytest.param(
+            "retrosaves_export", "ucity", (), id="export-with-nothing-saved-yet"
+        ),
+    ],
+)
+async def test_giving_up_before_reading_anything_hands_the_cooldown_back(
+    battery, name, game, attachments
+):
+    view, _, channel = await playing(battery, 9290, "ucity")
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[FakeAttachment(data, filename) for filename, data in attachments],
+    )
+    refunds = charged(ctx)
+
+    await command(battery, name)(battery.cog, ctx, game=game)
+
+    assert refunds == [ctx], ctx.said()
+
+
+async def test_a_refused_import_hands_the_cooldown_back_too(battery):
+    # Nothing was downloaded, and the person who tried cannot fix it by
+    # waiting either. The same call `[p]retro` makes on every path that does
+    # not fetch a ROM.
+    view, _, channel = await playing(battery, 9291, "ucity")
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=4242, name="Passerby"),
+        attachments=[FakeAttachment(marker_bytes(SRAM_BYTES), "ucity.srm")],
+    )
+    refunds = charged(ctx)
+
+    await command(battery, "retrosaves_import")(battery.cog, ctx, game="ucity")
+
+    assert "Only the person who started" in ctx.said()
+    assert refunds == [ctx]
+
+
+async def test_an_attachment_that_really_was_downloaded_keeps_the_cooldown(battery):
+    # The other side of the line: these bytes came off Discord, so the
+    # invocation cost what the limit exists to ration.
+    view, _, channel = await playing(battery, 9292, "ucity")
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[FakeAttachment(b"", "ucity.srm")],
+    )
+    refunds = charged(ctx)
+
+    await command(battery, "retrosaves_import")(battery.cog, ctx, game="ucity")
+
+    assert "is empty" in ctx.said()
+    assert refunds == []
+
+
+async def test_an_export_that_uploaded_something_keeps_the_cooldown(battery):
+    view, _, channel = await playing(battery, 9293, "ucity")
+    cog = battery.cog
+    view.emulator.load_sram(marker_bytes(SRAM_BYTES))
+    await cog._write_state(view)
+    ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
+    refunds = charged(ctx)
+
+    await command(battery, "retrosaves_export")(cog, ctx, game="ucity")
+
+    assert ctx.uploaded()
+    assert refunds == []
 
 
 # -- The group's own front door -----------------------------------------------

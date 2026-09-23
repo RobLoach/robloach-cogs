@@ -12,6 +12,7 @@ Nothing here touches the network: DNS is answered by a fake resolver and the
 HTTP session is injected.
 """
 
+import asyncio
 import contextlib
 
 import pytest
@@ -20,7 +21,7 @@ from .loader import load_standalone
 
 # retro/net.py needs aiohttp (Red ships it, a bare checkout may not), so the
 # whole module stands down rather than failing collection.
-pytest.importorskip("aiohttp", reason="the URL guard needs aiohttp")
+aiohttp = pytest.importorskip("aiohttp", reason="the URL guard needs aiohttp")
 
 net = load_standalone("retro_net_standalone", "net.py")
 
@@ -112,6 +113,11 @@ def test_a_literal_private_address_is_refused_without_a_lookup(url):
 
 
 # -- The fetch, with DNS and HTTP faked ---------------------------------------
+#
+# The FakeSession's get() takes no timeout argument on purpose: the guard must
+# only hand one down when the caller actually gave it a budget, so a fetch
+# without a timeout exercises that path by construction. The budget tests
+# further down use their own session that does accept (and record) one.
 
 
 class FakeResolver:
@@ -226,6 +232,85 @@ async def test_a_redirect_loop_gives_up():
         await fetch("https://example.com/rom.gb", hops, max_redirects=3)
 
 
+# -- The timeout budget --------------------------------------------------------
+#
+# The redirect bound above caps how many hops a chain gets; these cap how much
+# *time* it gets. A ClientTimeout on the session restarts per request, so
+# without a shared budget each hop of a slow chain would get the full timeout
+# again -- six full budgets, about twelve minutes for a ROM fetch. The guard
+# must instead fix a deadline once and give every hop only what remains.
+
+
+def budgeted_session_factory(hops, per_hop_delay=0.0):
+    """Like session_factory_for, but get() accepts and records a timeout."""
+    asked = []
+    given_timeouts = []
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.connector = kwargs.get("connector")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            connector = getattr(self, "connector", None)
+            if connector is not None:
+                await connector.close()
+            return False
+
+        async def get(self, url, allow_redirects=False, timeout=None):
+            asked.append(url)
+            given_timeouts.append(timeout)
+            if per_hop_delay:
+                # A slow hop. asyncio.sleep() never sleeps *less* than asked,
+                # which is what lets the assertions below use exact bounds.
+                await asyncio.sleep(per_hop_delay)
+            return hops[len(asked) - 1]
+
+    return FakeSession, asked, given_timeouts
+
+
+async def test_each_redirect_hop_gets_only_what_remains_of_the_budget():
+    hops = [
+        FakeResponse(302, "https://cdn.example.com/rom.gb"),
+        FakeResponse(302, "https://cdn2.example.com/rom.gb"),
+        FakeResponse(),
+    ]
+    factory, asked, given = budgeted_session_factory(hops, per_hop_delay=0.02)
+    async with net.guarded_get(
+        "https://example.com/rom.gb",
+        timeout=aiohttp.ClientTimeout(total=30),
+        session_factory=factory,
+        resolver=FakeResolver({}),
+    ) as response:
+        assert await response.read() == b"rom"
+    assert len(asked) == 3
+    totals = [t.total for t in given]
+    # Every hop is held to the one budget, and each hop after the first gets
+    # strictly less of it: at least the 0.02 s the previous hop dawdled.
+    assert all(total is not None and total <= 30 for total in totals)
+    assert totals[1] <= totals[0] - 0.02
+    assert totals[2] <= totals[1] - 0.02
+
+
+async def test_a_slow_redirect_chain_cannot_restart_the_clock_at_every_hop():
+    """The attack: a chain of redirects that each dawdle just under the limit."""
+    hops = [FakeResponse(302, f"https://h{i}.example.com/rom.gb") for i in range(6)]
+    factory, asked, _ = budgeted_session_factory(hops, per_hop_delay=0.1)
+    with pytest.raises(asyncio.TimeoutError):
+        async with net.guarded_get(
+            "https://example.com/rom.gb",
+            timeout=aiohttp.ClientTimeout(total=0.15),
+            session_factory=factory,
+            resolver=FakeResolver({}),
+        ):
+            pass
+    # 0.15 s buys at most two 0.1 s hops; a per-hop budget would have paid
+    # for the whole chain and failed on the redirect bound instead.
+    assert 1 <= len(asked) <= 2
+
+
 async def test_a_hostname_that_resolves_into_a_private_address_is_refused():
     """DNS is the other way in: the URL looks fine, the answer does not."""
     guard = net.GuardedResolver(inner=FakeResolver({"rom.example": "10.1.2.3"}))
@@ -305,7 +390,5 @@ def test_the_response_is_released_even_when_the_caller_raises():
             ):
                 raise RuntimeError("the caller blew up mid-download")
         return response
-
-    import asyncio
 
     assert asyncio.run(run()).released

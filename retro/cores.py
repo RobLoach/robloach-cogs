@@ -60,6 +60,15 @@ OPTION_RESET = "reset"
 # cores offer sixty-odd palettes on a single setting.
 MAX_LISTED_VALUES = 8
 
+# How long the cores directory must have been quiet before a scan of it is
+# safe to cache. Filesystems round mtimes -- FAT to two whole seconds -- so a
+# file dropped in just after a scan can leave the directory's mtime looking
+# unchanged, and a listing cached in that window could hide the file for as
+# long as the directory stays untouched. A listing taken while the mtime is
+# still within this window of "now" is therefore used once and never cached,
+# so the very next lookup rescans. See _scan_cores_dir.
+CORES_MTIME_SETTLE_SECONDS = 2
+
 
 class CoresMixin(MixinMeta):
     """Installing cores, and reading and writing their options."""
@@ -82,7 +91,7 @@ class CoresMixin(MixinMeta):
         await self.config.core_path.set("")
         log.info("Migrated the old Libretro core setting to the %s core.", name)
 
-    # Cores are found, not configured. The managed cores directory is scanned
+    # Cores are found, not configured. The managed cores directory is checked
     # on every lookup, so a core that is simply *there* -- downloaded by
     # `[p]retroset download`, fetched automatically on load, or dropped in by
     # hand while the bot was off -- is playable without anybody having to
@@ -95,13 +104,60 @@ class CoresMixin(MixinMeta):
     # still written by the downloader, so an owner can see where a core came
     # from, but nothing depends on it being there.
 
+    # The last full listing of the cores directory, keyed by the directory
+    # mtime it was taken under. A class attribute rather than an __init__
+    # assignment because the mixin has no __init__ of its own; the first
+    # write creates the instance attribute, so two cogs in one process (the
+    # tests build several) never share a cache.
+    _cores_scan_cache: typing.Optional[
+        typing.Tuple[int, typing.Dict[str, Path]]
+    ] = None
+
+    def _invalidate_cores_scan(self) -> None:
+        """Forget the cached cores listing; the next lookup rescans."""
+        self._cores_scan_cache = None
+
+    # A directory's mtime moves whenever an entry is added, removed or
+    # renamed, so a single stat() of the directory itself says whether the
+    # last listing is still the truth. That keeps the promise above --
+    # detected, not registered: a hand-dropped core still shows up on the
+    # very next lookup -- while game starts and coreoptions commands stop
+    # paying for a full listing, with a stat per entry, on the event loop
+    # every single time. On a networked data directory that walk is what
+    # used to stall every session.
+    #
+    # The one thing an mtime cannot promise is a change inside its own
+    # rounding tick (see CORES_MTIME_SETTLE_SECONDS), so a fresh listing is
+    # only cached once the directory has been quiet for longer than the
+    # tick. And the one writer inside this cog, _download_core, does not
+    # lean on any of this: it drops the cache by hand after every write. A
+    # directory whose mtime sits in the future (a networked filesystem with
+    # a skewed clock) never looks quiet, which costs the cache but never
+    # the correctness -- every lookup just rescans, as it always did.
+
     def _scan_cores_dir(self) -> typing.Dict[str, Path]:
         """Every core this cog knows sitting in the managed cores directory."""
-        found: typing.Dict[str, Path] = {}
         try:
-            entries = sorted(self._cores_dir().iterdir())
+            directory = self._cores_dir()
+            # stat() before iterdir(): a file that lands in between is then
+            # listed under the pre-change mtime, and the next lookup notices
+            # the newer mtime and rescans. The other order would cache a
+            # listing the file is missing from under the post-change mtime,
+            # and that would stick.
+            mtime_ns = directory.stat().st_mtime_ns
         except OSError:
             log.warning("Could not read the Retro cores directory.", exc_info=True)
+            self._cores_scan_cache = None
+            return {}
+        cached = self._cores_scan_cache
+        if cached is not None and cached[0] == mtime_ns:
+            return dict(cached[1])
+        found: typing.Dict[str, Path] = {}
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            log.warning("Could not read the Retro cores directory.", exc_info=True)
+            self._cores_scan_cache = None
             return found
         for path in entries:
             name = core_name_from_filename(path.name)
@@ -113,6 +169,10 @@ class CoresMixin(MixinMeta):
             except OSError:
                 continue
             found[name] = path
+        if time.time_ns() - mtime_ns > CORES_MTIME_SETTLE_SECONDS * 1_000_000_000:
+            self._cores_scan_cache = (mtime_ns, dict(found))
+        else:
+            self._cores_scan_cache = None
         return found
 
     async def _installed_cores(self) -> typing.Dict[str, Path]:
@@ -152,7 +212,12 @@ class CoresMixin(MixinMeta):
         # Not recorded, recorded wrongly, or recorded at a path that has since
         # gone: look where the cog puts them. The exact filename first, since
         # that is what both download paths write, then a scan for a core built
-        # for another platform's suffix.
+        # for another platform's suffix. The filename probe is a live stat on
+        # purpose, not a lookup in the cached scan: the scan only ever returns
+        # names in CORES, and this method is also called with names that are
+        # not (a core an old save record remembers, say), whose file only this
+        # probe can find. One stat is the same price as the scan cache's own
+        # mtime check, so there is nothing to save by folding it in.
         candidate = self._cores_dir() / core_filename(core)
         try:
             if candidate.is_file():
@@ -310,6 +375,11 @@ class CoresMixin(MixinMeta):
             await asyncio.to_thread(self._write_atomic, core_path, data)
         except OSError as error:
             return False, 0, f"could not be saved: {error}"
+        # The write bumped the cores directory's mtime, which the scan cache
+        # watches -- but mtimes are rounded on some filesystems, and the one
+        # write this cog makes itself does not get to gamble on granularity:
+        # drop the cache outright and let the next lookup rescan.
+        self._invalidate_cores_scan()
 
         try:
             async with self.config.cores() as cores:
@@ -413,8 +483,14 @@ class CoresMixin(MixinMeta):
     #     FCEUmm declares nothing until a ROM is in, and then declares 44. So
     #     an empty answer means "not known yet", never "this core has none".
     #   * Loading a core to ask it is subject to the same one-at-a-time rule
-    #     as playing a game, so the probe takes the cog's emulator lock and
-    #     hibernates whatever is running first.
+    #     as playing a game, so the ROM-less probe only runs when nothing is
+    #     playing anywhere. It used to make room the way starting a game does
+    #     -- save and hibernate every live session in every channel -- which
+    #     meant an owner listing gambatte's settings silently cost a stranger
+    #     in another channel a wake-up delay on their next button press.
+    #     Reading a list is not worth interrupting playing for, so the probe
+    #     steps aside instead and the command says what it did not do. See
+    #     _probe_definitions.
     #   * Everything found is cached in Config, and the cache is extended
     #     every time a session starts, so the list stays instant and FCEUmm's
     #     44 options become listable after the first NES game anyone plays.
@@ -475,6 +551,18 @@ class CoresMixin(MixinMeta):
                 return view.emulator
         return None
 
+    def _any_session_live(self) -> bool:
+        """
+        Whether any channel at all has an emulator loaded right now.
+
+        Any core, not just one: the one-at-a-time rule is about the process,
+        not about the core name, so a NES game is exactly as much in the way
+        of loading gambatte as a Game Boy game would be. A session that has
+        hibernated is still in ``sessions`` and still answers its buttons,
+        but it holds no core and so is not in the way of anything.
+        """
+        return any(view.live for view in self.sessions.values())
+
     async def _learn_options(self, core: str, emulator: RetroEmulator) -> None:
         """
         Note down what a just-started core says about itself.
@@ -495,27 +583,52 @@ class CoresMixin(MixinMeta):
         """
         Load the core on its own, with no game, and ask what it offers.
 
-        Respects the one-core-at-a-time rule exactly as starting a game does:
-        the emulator lock is held, and anything already running is saved and
-        hibernated first. The probe itself is blocking C code, so it runs in a
-        worker thread. Returns {} (having logged) if the core cannot be asked.
+        Answers ``{}`` without loading anything while *any* channel has a game
+        live. A libretro core has process-global state, so there is only one
+        slot, and this used to take it the way starting a game does: call
+        ``_evict_locked()`` with no exclusion, saving and hibernating every
+        live session in every channel. That made ``[p]retroset coreoptions
+        <core>`` -- a read -- the most disruptive command in the cog: someone
+        mid-game in another guild got no message, no warning and a second or
+        two of wake-up on their next press, all so an owner could see a list.
+        Reading is not worth that, so the probe now yields. The caller turns
+        the empty answer into advice; see :meth:`_coreoptions`.
+
+        The check is made under the emulator lock and not before it, so it is
+        the binding one: a game that starts while a caller was deciding stops
+        the probe rather than being evicted by it. The probe itself is
+        blocking C code, so it runs in a worker thread. Also returns ``{}``
+        (having logged) if the core cannot be asked.
         """
         core_path = await self._core_path(core)
         if core_path is None:
             return {}
         seeded = await self._core_options(core)
+        definitions: typing.Dict[str, dict] = {}
         async with self.emulator_lock:
-            # A libretro core has process-global state, so nothing else may be
-            # loaded while this one is. _evict_locked() with no exclusion
-            # hibernates every live session, saving each one first.
-            await self._evict_locked()
-            try:
-                return await asyncio.to_thread(probe_core_options, core_path, seeded)
-            except EmulatorError as error:
-                log.warning("Could not probe the %s core for options: %s", core, error)
-            except Exception:
-                log.exception("Probing the %s core for options failed.", core)
-        return {}
+            if self._any_session_live():
+                log.debug(
+                    "Not loading the %s core to read its options: a game is "
+                    "running and only one core can be loaded at a time.",
+                    core,
+                )
+            else:
+                try:
+                    definitions = await self.run_in_emulator_thread(
+                        probe_core_options, core_path, seeded
+                    )
+                except EmulatorError as error:
+                    log.warning(
+                        "Could not probe the %s core for options: %s", core, error
+                    )
+                except Exception:
+                    log.exception("Probing the %s core for options failed.", core)
+        # This path no longer puts anybody to sleep, so it queues no edits of
+        # its own -- but everything that lets the emulator lock go flushes
+        # what was put off while it was held, and an exception to that rule is
+        # how an edit ends up sitting unsent. See Retro._flush_refreshes.
+        await self._flush_refreshes()
+        return definitions
 
     async def _definitions_for(
         self, core: str, probe: bool = True
@@ -525,7 +638,10 @@ class CoresMixin(MixinMeta):
 
         Tried in order: the session that is running that core right now (the
         richest answer, since a loaded ROM is what makes some cores declare
-        anything at all), then the Config cache, then a ROM-less probe.
+        anything at all), then the Config cache, then a ROM-less probe. The
+        first two are free; only the third loads a core, and it declines to
+        while anything is playing, so ``({}, "")`` is a perfectly ordinary
+        answer for a busy bot. See :meth:`_probe_definitions`.
         """
         async with self.emulator_lock:
             live = self._live_emulator_for(core)
@@ -612,20 +728,37 @@ class CoresMixin(MixinMeta):
         docstring. A default would be a `[p]` waiting for the next caller to
         forget.
 
-        Returns ``(key, error)``; exactly one of the two is set. Cores name
-        their options inconsistently -- FCEUmm uses ``fceumm_region`` but
-        mednafen_ngp uses ``ngp_language``, not ``mednafen_ngp_language`` --
-        so rather than guessing a prefix this tries the exact key, then
-        ``<core>_<key>``, then a unique suffix match among the keys the core
-        actually declared. An ambiguous suffix is reported rather than picked.
+        Returns ``(key, error)``, and exactly one of the two is always set --
+        every path out of here either names a real key or says in words why
+        it could not. That is a promise and not merely a tendency: this used
+        to answer ``(None, None)`` when ``definitions`` was empty, on the
+        theory that the caller would decide what to do about it, and the
+        result was a branch in :meth:`_coreoptions` that handled an
+        unresolvable key with a sentence of its own and could never actually
+        run. A caller that is handed no key is handed a reason for it.
+
+        Cores name their options inconsistently -- FCEUmm uses
+        ``fceumm_region`` but mednafen_ngp uses ``ngp_language``, not
+        ``mednafen_ngp_language`` -- so rather than guessing a prefix this
+        tries the exact key, then ``<core>_<key>``, then a unique suffix
+        match among the keys the core actually declared. An ambiguous suffix
+        is reported rather than picked.
         """
         wanted = str(text).strip().strip("`").lower()
         if not wanted:
             return None, "No option name was given."
         if not definitions:
-            # Nothing to match against; the caller decides whether to allow
-            # an unvalidated key through.
-            return None, None
+            # Nothing to match against, and guessing a prefix from the core
+            # name would be wrong often enough to matter (mednafen_ngp again).
+            # The command never gets here -- it answers "this core has not
+            # told us what options it has" long before -- but saying so is
+            # still the only honest thing to return.
+            return None, (
+                f"Nothing is known about the `{core}` core's options yet, so "
+                f"`{text}` cannot be checked against them. Start a game on "
+                f"this core once, then run `{prefix}retroset coreoptions "
+                f"{core}`."
+            )
 
         lookup = {key.lower(): key for key in definitions}
         for candidate in (wanted, f"{core.lower()}_{wanted}"):
@@ -863,7 +996,9 @@ class CoresMixin(MixinMeta):
             emulator = self._live_emulator_for(core)
             if emulator is None:
                 return " It takes effect the next time a game starts on this core."
-            changed = await asyncio.to_thread(emulator.set_option, key, value)
+            changed = await self.run_in_emulator_thread(
+                emulator.set_option, key, value
+            )
         if not changed:
             return (
                 " The game running on this core could not be told about it, so "
@@ -906,8 +1041,18 @@ class CoresMixin(MixinMeta):
             return
 
         installed = await self._core_path(core) is not None
+        # Whether anybody is mid-game decides two things at once: whether the
+        # ROM-less probe is even offered, and what to say if nothing is known
+        # without it. This read is advisory -- _probe_definitions makes the
+        # binding one under the emulator lock -- and racing it either way is
+        # harmless. A game that ends in between costs one skipped probe and a
+        # second run of the command; a game that starts in between is refused
+        # by the probe rather than evicted by it.
+        playing = self._any_session_live()
         async with ctx.typing():
-            definitions, source = await self._definitions_for(core, probe=installed)
+            definitions, source = await self._definitions_for(
+                core, probe=installed and not playing
+            )
 
         if not definitions:
             system = system_for_core(core)
@@ -918,6 +1063,27 @@ class CoresMixin(MixinMeta):
                 if system is not None
                 else "Start a game on it once and its options become listable."
             )
+            if playing:
+                # The old behaviour here was to load the core anyway, which
+                # meant saving and hibernating whoever was playing. Saying
+                # "not known" and stopping would be no better: an owner told
+                # only that would type the same command again. So name both
+                # ways forward instead -- one of them is free and the other
+                # costs a wait rather than somebody else's game.
+                start_it = (
+                    f"start a {system.name} game (`{ctx.clean_prefix}retro "
+                    "<rom>`) on it"
+                    if system is not None
+                    else "start a game on it"
+                )
+                hint = (
+                    "A game is running right now, and only one emulator core "
+                    "can be loaded at a time \N{EM DASH} so this core was not "
+                    "loaded to ask it, because that would have saved the "
+                    f"running game and put it to sleep. Either {start_it}, "
+                    "which is what teaches this cog a core's options, or run "
+                    "this again once nothing is playing."
+                )
             if not installed:
                 hint = (
                     f"It is not installed; run `{ctx.clean_prefix}retroset "
@@ -948,9 +1114,13 @@ class CoresMixin(MixinMeta):
         if error is not None:
             await self._safe_send(ctx, error)
             return
-        if resolved is None:
-            await self._safe_send(ctx, f"`{key}` is not an option of the `{core}` core.")
-            return
+        # And that is the whole of the failure handling: _resolve_option_key
+        # returns a key or a reason and never neither, so `resolved` is a real
+        # key from here down. There used to be a third branch here saying
+        # "`x` is not an option of the `y` core", and nothing could reach it:
+        # the only way to get no key and no reason was an empty
+        # `definitions`, and `if not definitions:` above has already returned
+        # in that case.
 
         if value is None:
             await self._coreoptions_show(ctx, core, resolved, definitions[resolved])

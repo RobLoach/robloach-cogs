@@ -7,7 +7,9 @@ trusted. Needs discord.py; the tables themselves are covered, with no
 dependencies at all, in test_systems.py.
 """
 
+import asyncio
 import re
+import types
 
 import pytest
 
@@ -15,6 +17,8 @@ discord = pytest.importorskip("discord", reason="the view tests need discord.py"
 
 from retro import RetroView as viewmod  # noqa: E402
 from retro import systems as S  # noqa: E402
+from retro import text as textmod  # noqa: E402
+from retro import timing as timingmod  # noqa: E402
 
 SYSTEM_KEYS = [system.key for system in S.SYSTEMS]
 
@@ -158,11 +162,12 @@ def test_the_controls_share_the_last_row(view):
 #: side of the repeat button are the same at all of them.
 #:
 #: The whole point of the table: removing Replay took the control cluster back
-#: to three wide, which fits beside every console's bottom row -- so all eight
+#: to three wide, which fits beside every console's bottom row -- so all nine
 #: consoles' controls share that row again, the widest layouts are back to
 #: four of Discord's five action rows, and every console is one component and
-#: (on six of the eight) one row smaller than it was. Anything that changes
-#: this has changed what every player sees.
+#: (on six of the nine -- the ones whose bottom row is two wide) one row
+#: smaller than it was. Anything that changes this has changed what every
+#: player sees.
 LAYOUTS = {
     "gb": (12, 3, ["Start", "Select", "Wait", "A x3", "Undo"]),
     "gba": (14, 3, ["Start", "Select", "Wait", "A x3", "Undo"]),
@@ -171,6 +176,10 @@ LAYOUTS = {
     "genesis": (18, 4, ["Mode", "Start", "Wait", "B x3", "Undo"]),
     "pce": (18, 4, ["Select", "Run", "Wait", "I x3", "Undo"]),
     "sms": (11, 3, ["Pause", "Wait", "1 x3", "Undo"]),
+    # The Game Gear's pad is the Master System's, but the button beside its
+    # screen is START -- Pause is a button on the SMS console deck, which a
+    # handheld does not have.
+    "gg": (11, 3, ["Start", "Wait", "1 x3", "Undo"]),
     "ngp": (11, 3, ["Option", "Wait", "A x3", "Undo"]),
 }
 
@@ -228,6 +237,14 @@ def test_the_repeat_button_taps_this_console_s_confirm_button(view, system):
 # removed from the cog. Now it is simply not there, and it comes back on the
 # next press at a longer clip.
 #
+# "Not there" is on the wire only. The button stays a child of the view at
+# every clip length, because that is what discord.py builds its routing table
+# from: a message Discord has not re-rendered still shows the button, and a
+# click on a custom_id no view has is dropped without ever being
+# acknowledged, which is what puts "This interaction failed" in front of the
+# player. So the assertions below are about `to_components()` -- the payload
+# -- and the object is asserted to still be there and to know it is hidden.
+#
 # The table is every clip length that changes the answer, against every
 # console, because this is what every player's controller looks like. The
 # boundaries (measured at DEFAULT_FPS with the default 160ms hold) are 0.48s
@@ -246,7 +263,7 @@ REPEAT_BY_LENGTH = [
     (0.8, 3, True, "x3"),
     (1.0, 3, True, "x3"),    # the default
     (4.0, 3, True, "x3"),
-    (15.0, 3, True, "x3"),   # the settings ceiling
+    (5.0, 3, True, "x3"),    # the settings ceiling
 ]
 
 
@@ -270,14 +287,15 @@ def test_the_repeat_button_is_drawn_only_when_it_can_do_something(
     )
     assert view.repeat_taps == taps, (system.key, seconds)
     assert (view.repeat_taps >= viewmod.MIN_REPEAT_TAPS) is drawn
-    assert (button is not None) is drawn, (system.key, seconds)
-    if button is None:
-        # Nothing dead is left behind, on the objects or on the wire.
-        ids = {c.custom_id for c in view.children}
-        assert f"{viewmod.CUSTOM_ID_PREFIX}:repeat" not in ids
-    else:
+    # The object is there at every clip length, so a click on a stale copy of
+    # the button has somewhere to land; only the payload changes.
+    assert button is not None, (system.key, seconds)
+    assert button.hidden is not drawn, (system.key, seconds)
+    assert f"{viewmod.CUSTOM_ID_PREFIX}:repeat" in {c.custom_id for c in view.children}
+    assert button.label.endswith(f" x{taps}"), button.label
+    assert not button.disabled, "hidden or not, it is never a greyed-out button"
+    if drawn:
         assert button.label.endswith(f" {suffix}"), button.label
-        assert not button.disabled, "a drawn repeat button is always live"
 
     # Whatever the clip length, the layout is still one Discord will take,
     # and Wait and Undo have not moved: the row reserves space for all three
@@ -287,7 +305,11 @@ def test_the_repeat_button_is_drawn_only_when_it_can_do_something(
     assert len(payload) == expected_rows, (system.key, seconds)
     assert all(len(row["components"]) <= S.MAX_BUTTONS_PER_ROW for row in payload)
     assert len(view.children) <= S.MAX_COMPONENTS
-    assert len(view.children) == expected_components - (0 if drawn else 1)
+    assert len(view.children) == expected_components
+    on_the_wire = sum(len(row["components"]) for row in payload)
+    assert on_the_wire == expected_components - (0 if drawn else 1)
+    wire_ids = {b["custom_id"] for row in payload for b in row["components"]}
+    assert (f"{viewmod.CUSTOM_ID_PREFIX}:repeat" in wire_ids) is drawn
     confirm = system.label_for(system.confirm)
     wanted = []
     for label in full_row:
@@ -307,9 +329,10 @@ def test_the_repeat_button_is_drawn_only_when_it_can_do_something(
 def test_changing_the_clip_length_adds_and_removes_the_button_in_place(view, system):
     """Both directions, and the button lands back in its proper place.
 
-    A Discord action row is ordered by insertion, so adding the button back
-    by itself would put it after Undo and read "Wait Undo A x3". The row is
-    rebuilt instead; see RetroView._update_repeat_label.
+    A Discord action row is ordered by insertion, so a button that really
+    left the row and came back would land after Undo and read "Wait Undo
+    A x3". It never leaves it: only the payload changes, so its seat between
+    Wait and Undo is kept for it. See RetroView._update_repeat_label.
     """
     confirm = system.label_for(system.confirm)
     full = [b.get("label") for b in view.to_components()[-1]["components"]]
@@ -390,6 +413,15 @@ PRESS_LINES = {
         "b": "Pressed 1.", "a": "Pressed 2.",
         "start": "Pressed Pause.",
     },
+    # Same two buttons as the Master System above, and the same core -- but
+    # its own console, so `start` is its own Start rather than the SMS's
+    # console-deck Pause.
+    "gg": {
+        "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
+        "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
+        "b": "Pressed 1.", "a": "Pressed 2.",
+        "start": "Pressed Start.",
+    },
     "pce": {
         "up": "Pressed ⬆️.", "down": "Pressed ⬇️.",
         "left": "Pressed ⬅️.", "right": "Pressed ➡️.",
@@ -464,7 +496,8 @@ def test_wait_and_the_repeat_button_say_what_they_do(view, system):
     view.clip_seconds = 0.2
     view._update_repeat_label()
     assert view.repeat_taps == 1
-    assert view._repeat_button() is None
+    assert view._repeat_button().hidden, "hidden from the payload..."
+    assert view._repeat_button() in view.children, "...but still routable"
     assert view.press_note(system.confirm, viewmod.REPEAT_TAPS) == f"Pressed {confirm}."
 
 
@@ -492,6 +525,11 @@ def test_the_press_line_matches_the_tone_of_the_other_notes():
 # line can never notify anybody, is checked against real edits in
 # test_cog_session.py; what is checked here is the half of it that is a
 # property of the string: no mention syntax is ever emitted.
+#
+# The names themselves live in retro/text.py now -- every line this cog
+# writes and the sanitising that goes into one -- so that is what this
+# section calls. RetroView re-exports all of it, which
+# test_every_name_that_moved_is_still_reachable_from_the_view holds.
 
 
 class Named:
@@ -517,11 +555,11 @@ ACTION_LINES = {
 @pytest.mark.parametrize("action", sorted(ACTION_LINES))
 def test_every_action_reads_in_one_voice(action):
     named, plain = ACTION_LINES[action]
-    assert viewmod.action_note(action, Named(display_name="Rob"), "A") == named
+    assert textmod.action_note(action, Named(display_name="Rob"), "A") == named
     # Nobody to name: the impersonal form of the very same sentence, never an
     # empty line and never a stray leading space.
-    assert viewmod.action_note(action, None, "A") == plain
-    assert set(ACTION_LINES) == set(viewmod.ACTION_NOTES), "an action was added"
+    assert textmod.action_note(action, None, "A") == plain
+    assert set(ACTION_LINES) == set(textmod.ACTION_NOTES), "an action was added"
     for line in (named, plain):
         assert line[0].isupper() and line.endswith("."), line
         assert "  " not in line and line == line.strip(), repr(line)
@@ -529,7 +567,7 @@ def test_every_action_reads_in_one_voice(action):
 
 def test_the_four_actions_are_the_four_the_view_can_perform():
     """One table, so the lines a session can show cannot drift apart."""
-    for named, plain in viewmod.ACTION_NOTES.values():
+    for named, plain in textmod.ACTION_NOTES.values():
         assert "{who}" in named and "{who}" not in plain
         # The verb is lower case in the named form ("Rob pressed A.") and
         # capitalised in the impersonal one ("Pressed A."), which is the only
@@ -587,18 +625,18 @@ SANITISED = {
 
 @pytest.mark.parametrize("raw", sorted(SANITISED))
 def test_a_display_name_is_made_safe_before_it_goes_on_the_line(raw):
-    assert viewmod.presser_name(Named(display_name=raw)) == SANITISED[raw]
+    assert textmod.presser_name(Named(display_name=raw)) == SANITISED[raw]
 
 
 def test_a_very_long_display_name_cannot_own_the_line():
-    long = viewmod.presser_name(Named(display_name="R" * 200))
-    assert len(long) == viewmod.MAX_PRESSER_NAME
+    long = textmod.presser_name(Named(display_name="R" * 200))
+    assert len(long) == textmod.MAX_PRESSER_NAME
     assert long.endswith("\N{HORIZONTAL ELLIPSIS}")
     # 32 is Discord's own ceiling for a nickname, so a real name is never
     # cut; the whole line stays short either way.
-    assert viewmod.MAX_PRESSER_NAME == 32
-    line = viewmod.action_note("undo", Named(display_name="R" * 200))
-    assert len(line) <= viewmod.MAX_PRESSER_NAME + 30, line
+    assert textmod.MAX_PRESSER_NAME == 32
+    line = textmod.action_note("undo", Named(display_name="R" * 200))
+    assert len(line) <= textmod.MAX_PRESSER_NAME + 30, line
 
 
 #: Names crafted to notify somebody, or to break the line, or both.
@@ -655,23 +693,23 @@ def test_anybody_the_cog_can_be_handed_is_named_or_gracefully_not():
     """
     # A Member: display_name is the nickname, and is preferred.
     member = Named(display_name="Robbo", global_name="Rob Loach", name="robloach")
-    assert viewmod.presser_name(member) == "Robbo"
+    assert textmod.presser_name(member) == "Robbo"
     # A User with no nickname anywhere: discord.py's User.display_name
     # already falls back to global_name, but an object that only carries one
     # of the two is still named.
-    assert viewmod.presser_name(Named(global_name="Rob Loach")) == "Rob Loach"
-    assert viewmod.presser_name(Named(name="robloach")) == "robloach"
+    assert textmod.presser_name(Named(global_name="Rob Loach")) == "Rob Loach"
+    assert textmod.presser_name(Named(name="robloach")) == "robloach"
     # Somebody who has left the guild: discord.py still hands over a Member
     # or User object, with no guild_permissions on the User case -- which is
     # not something naming them depends on.
     left = Named(display_name="Gone", id=7)
     assert not hasattr(left, "guild_permissions")
-    assert viewmod.presser_name(left) == "Gone"
+    assert textmod.presser_name(left) == "Gone"
     # Nothing nameable at all, in every shape it can arrive in.
     for nobody in (None, Named(), Named(display_name=""), Named(display_name=None),
                    Named(display_name="\u200b"), object()):
-        assert viewmod.presser_name(nobody) == ""
-        assert viewmod.action_note("press", nobody, "A") == "Pressed A."
+        assert textmod.presser_name(nobody) == ""
+        assert textmod.action_note("press", nobody, "A") == "Pressed A."
 
 
 def test_a_named_press_uses_the_console_s_own_button_name(view, system):
@@ -749,6 +787,77 @@ def test_a_click_on_a_removed_button_is_dropped_silently():
     store.dispatch_view(2, f"{viewmod.CUSTOM_ID_PREFIX}:stop", FakeInteraction())
 
 
+def test_a_hidden_repeat_button_is_still_registered_for_routing(retro, system):
+    """The half of hiding that a removal could never have.
+
+    discord.py builds its routing table by walking a view's *children*
+    (ViewStore.add_view) and builds the message from ``to_components()``, so
+    a button that is a child and not in the payload is reachable and
+    invisible at the same time -- which is exactly what a stale message
+    needs. A button that had been taken out of the view would resolve to a
+    custom_id nothing is registered for, and ViewStore.dispatch_view returns
+    without acknowledging the interaction at all: three seconds later the
+    player is shown Discord's "This interaction failed".
+    """
+    view = viewmod.RetroView(
+        retro.cog,
+        game_name="Test",
+        slug="test",
+        rom_filename=f"test.{system.extensions[0]}",
+        channel_id=1,
+        system=system,
+        clip_seconds=0.2,
+        message_id=4343,
+    )
+    assert view.repeat_taps == 1 and view._repeat_button().hidden
+
+    store = discord.ui.view.ViewStore(None)
+    store.add_view(view, 4343)
+    key = (2, f"{viewmod.CUSTOM_ID_PREFIX}:repeat")
+    assert key in store._views.get(4343, {}), sorted(store._views.get(4343, {}))
+    # ...and it is not on the wire, so nobody is shown a dead "A x1".
+    drawn = {b["custom_id"] for row in view.to_components() for b in row["components"]}
+    assert f"{viewmod.CUSTOM_ID_PREFIX}:repeat" not in drawn
+    # Registering the view again after it has been hidden must not unregister
+    # it: discord.py pops the custom_ids a view has *stopped* carrying
+    # (ViewStore.add_view's snapshot diff), which is precisely what taking
+    # the item out of the view would have done on the next message edit.
+    store.add_view(view, 4343)
+    assert key in store._views.get(4343, {})
+    assert view.is_persistent()
+
+
+async def test_a_click_on_a_hidden_repeat_button_is_answered_privately(retro, system):
+    """A stale click costs one ephemeral line and no edit of the message.
+
+    Not an edit, because any edit re-renders the message and rewinds the clip
+    that is playing on it for everybody in the channel (see
+    RetroView._ack_now), and not a press either: pressing the confirm button
+    on somebody's behalf is doing something they did not ask for.
+    """
+    view = viewmod.RetroView(
+        retro.cog,
+        game_name="Test",
+        slug="test",
+        rom_filename=f"test.{system.extensions[0]}",
+        channel_id=1,
+        system=system,
+        clip_seconds=0.2,
+    )
+    interaction = retro.interaction(view)
+    await view._repeat_button().callback(interaction)
+
+    assert interaction.kinds() == ["response.send_message"]
+    said = interaction.log[-1][1]
+    assert said["ephemeral"] is True
+    confirm = system.label_for(system.confirm)
+    assert f"**{confirm}**" in said["content"], said["content"]
+    assert "cliplength" in said["content"]
+    # No count is claimed: the button on their screen says x2 or x3 depending
+    # on when that message was last drawn, and the view cannot know which.
+    assert f"{confirm} x" not in said["content"], said["content"]
+
+
 def test_a_real_button_still_routes_to_its_view(retro):
     view = viewmod.RetroView(
         retro.cog,
@@ -776,7 +885,7 @@ def test_the_hold_and_clip_defaults():
     # One second, not four: a turn is press -> watch -> press, and three of
     # those four seconds were the game sitting still after the press.
     assert CLIP_SECONDS == 1.0
-    assert (MIN_CLIP_SECONDS, MAX_CLIP_SECONDS) == (0.2, 15.0)
+    assert (MIN_CLIP_SECONDS, MAX_CLIP_SECONDS) == (0.2, 5.0)
     assert isinstance(CLIP_SECONDS, float), "the clip length is fractional now"
     assert viewmod.DEFAULT_HOLD_MS == 160
     assert (viewmod.MIN_HOLD_MS, viewmod.MAX_HOLD_MS) == (50, 2000)
@@ -791,7 +900,7 @@ def test_a_clip_length_is_clamped_and_may_be_fractional():
     assert clamp_clip_seconds(4) == 4.0 and isinstance(clamp_clip_seconds(4), float)
     assert clamp_clip_seconds(0) == 0.2, "no clip of no frames"
     assert clamp_clip_seconds(-5) == 0.2
-    assert clamp_clip_seconds(9999) == 15.0
+    assert clamp_clip_seconds(9999) == 5.0
     # Hundredths, so the number can be printed straight back out.
     assert clamp_clip_seconds(0.8004) == 0.8
     # Nonsense in Config must not take a session down with it.
@@ -825,7 +934,9 @@ def test_the_default_hold_is_under_a_game_boy_walk_cycle():
 #
 # Gambatte's real frame rate, so this is the arithmetic that runs in
 # production rather than a tidy 60. No core is needed: press_plan and friends
-# are plain functions of a frame rate.
+# are plain functions of a frame rate -- which is exactly why they live in
+# retro/timing.py rather than on the view, and why this section asks that
+# module directly.
 
 GB_FPS = 59.727
 
@@ -884,15 +995,15 @@ def test_a_clip_is_never_fewer_frames_than_an_animation_needs():
 def test_three_taps_are_squeezed_then_dropped_to_fit_the_clip(seconds, expected):
     from retro import emulator as E
 
-    plan = viewmod.press_plan(GB_FPS, seconds, viewmod.DEFAULT_HOLD_MS, viewmod.REPEAT_TAPS)
+    plan = timingmod.press_plan(GB_FPS, seconds, timingmod.DEFAULT_HOLD_MS, timingmod.REPEAT_TAPS)
     assert plan == expected
     budget = E.input_budget(GB_FPS, E.clip_frame_count(GB_FPS, seconds))
     assert max(start + hold for start, hold in plan) <= budget
     gaps = [b[0] - (a[0] + a[1]) for a, b in zip(plan, plan[1:], strict=False)]
-    assert all(gap >= E.frame_count(GB_FPS, viewmod.MIN_REPEAT_GAP_MS / 1000) for gap in gaps)
+    assert all(gap >= E.frame_count(GB_FPS, timingmod.MIN_REPEAT_GAP_MS / 1000) for gap in gaps)
 
 
-@pytest.mark.parametrize("seconds", [0.2, 0.25, 0.4, 0.5, 0.8, 1.0, 2.0, 4.0, 15.0])
+@pytest.mark.parametrize("seconds", [0.2, 0.25, 0.4, 0.5, 0.8, 1.0, 2.0, 4.0, 5.0])
 @pytest.mark.parametrize("hold_ms", [50, 160, 250, 400, 2000])
 @pytest.mark.parametrize("taps", [1, 3])
 def test_no_schedule_ever_runs_past_the_end_of_its_clip(seconds, hold_ms, taps):
@@ -901,7 +1012,7 @@ def test_no_schedule_ever_runs_past_the_end_of_its_clip(seconds, hold_ms, taps):
 
     frames = E.clip_frame_count(GB_FPS, seconds)
     budget = E.input_budget(GB_FPS, frames)
-    plan = viewmod.press_plan(GB_FPS, seconds, hold_ms, taps)
+    plan = timingmod.press_plan(GB_FPS, seconds, hold_ms, taps)
 
     assert 1 <= len(plan) <= taps
     assert plan[0][0] == 0, "the first press is down before the first frame"
@@ -926,19 +1037,19 @@ def test_the_tap_count_can_depend_on_the_core_so_the_label_is_rewritten():
     lengths = [tenths / 100 for tenths in range(20, 1501)]
     for fps in (59.727, 60.0988):
         for seconds in lengths:
-            fallback = viewmod.press_plan(E.DEFAULT_FPS, seconds, 160, viewmod.REPEAT_TAPS)
-            real = viewmod.press_plan(fps, seconds, 160, viewmod.REPEAT_TAPS)
+            fallback = timingmod.press_plan(E.DEFAULT_FPS, seconds, 160, timingmod.REPEAT_TAPS)
+            real = timingmod.press_plan(fps, seconds, 160, timingmod.REPEAT_TAPS)
             assert len(fallback) == len(real), (fps, seconds)
 
     pal = [s for s in lengths
-           if len(viewmod.press_plan(E.DEFAULT_FPS, s, 160, viewmod.REPEAT_TAPS))
-           != len(viewmod.press_plan(50.0, s, 160, viewmod.REPEAT_TAPS))]
+           if len(timingmod.press_plan(E.DEFAULT_FPS, s, 160, timingmod.REPEAT_TAPS))
+           != len(timingmod.press_plan(50.0, s, 160, timingmod.REPEAT_TAPS))]
     assert pal, "a PAL core used to disagree; if it no longer can, say so here"
     # A 50 fps core fits *more* taps around 0.45s, because a 160ms hold is
     # eight of its frames rather than ten and leaves proportionally more of
     # the clip free. Either way the fallback is a guess and the core is not.
-    assert len(viewmod.press_plan(50.0, pal[0], 160, viewmod.REPEAT_TAPS)) == 2
-    assert len(viewmod.press_plan(E.DEFAULT_FPS, pal[0], 160, viewmod.REPEAT_TAPS)) == 1
+    assert len(timingmod.press_plan(50.0, pal[0], 160, timingmod.REPEAT_TAPS)) == 2
+    assert len(timingmod.press_plan(E.DEFAULT_FPS, pal[0], 160, timingmod.REPEAT_TAPS)) == 1
 
 
 def test_a_press_is_only_ever_cut_short_by_a_clip_that_cannot_show_it():
@@ -946,13 +1057,13 @@ def test_a_press_is_only_ever_cut_short_by_a_clip_that_cannot_show_it():
 
     wanted = E.frame_count(GB_FPS, 0.4)
     # A four second clip honours a 400ms hold to the frame...
-    assert viewmod.press_plan(GB_FPS, 4.0, 400, 1) == [(0, wanted)]
+    assert timingmod.press_plan(GB_FPS, 4.0, 400, 1) == [(0, wanted)]
     # ...and a fifth of a second holds for the eight frames it can show.
-    assert viewmod.press_plan(GB_FPS, 0.2, 400, 1) == [(0, 8)]
+    assert timingmod.press_plan(GB_FPS, 0.2, 400, 1) == [(0, 8)]
     assert 8 < wanted
 
 
-@pytest.mark.parametrize("seconds", [0.2, 0.3, 0.4, 0.5, 0.8, 1.0, 2.0, 4.0, 15.0])
+@pytest.mark.parametrize("seconds", [0.2, 0.3, 0.4, 0.5, 0.8, 1.0, 2.0, 4.0, 5.0])
 @pytest.mark.parametrize("hold_ms", [50, 160, 250, 400, 2000])
 def test_a_clip_s_preroll_can_never_swallow_one_of_the_repeat_button_s_taps(
     seconds, hold_ms
@@ -972,7 +1083,7 @@ def test_a_clip_s_preroll_can_never_swallow_one_of_the_repeat_button_s_taps(
     from retro import emulator as E
 
     frames = E.clip_frame_count(GB_FPS, seconds)
-    plan = viewmod.press_plan(GB_FPS, seconds, hold_ms, viewmod.REPEAT_TAPS)
+    plan = timingmod.press_plan(GB_FPS, seconds, hold_ms, timingmod.REPEAT_TAPS)
     later = [start for start, _ in plan[1:]]
     budget = E.preroll_budget(GB_FPS, frames, min(later) if later else None)
 
@@ -1001,3 +1112,161 @@ def test_the_clip_is_a_webp_attachment(retro):
 )
 def test_the_attachment_name_is_always_something_discord_accepts(name, expected):
     assert viewmod.RetroView._screen_filename(name) == expected
+
+
+# -- What moved out of the view, and what still answers to its old name -------
+#
+# RetroView.py was 2,700 lines with about a third of them not about the view
+# at all: when a button goes down, what the message says, what a channel has
+# saved, and who is allowed to end somebody else's game. Four modules took
+# that third.
+#
+# It was a *move*: RetroView re-exports every name that went, so
+# `retro.RetroView.press_plan` is still `retro.timing.press_plan` and no
+# import site outside the package had to be touched for it. The table below
+# is that promise, written down -- a name dropped from a re-export is a name
+# an older import site stops finding, which is a breakage no test of the new
+# module would notice.
+
+MOVED = {
+    "timing": [
+        "BOOT_SECONDS", "DEFAULT_HOLD_MS", "MAX_HOLD_MS", "MAX_PACE_SECONDS",
+        "MIN_HOLD_MS", "MIN_PACE_SECONDS", "MIN_REPEAT_GAP_MS",
+        "MIN_REPEAT_TAPS", "REPEAT_GAP_MS", "REPEAT_TAPS", "pace_wait",
+        "press_plan",
+    ],
+    "text": [
+        "ACTION_NOTES", "ASLEEP_MARK", "DROPPED_NOTE", "HEADER",
+        "HEADER_SEPARATOR", "INVISIBLE_CATEGORIES", "LEADING_ORDINAL",
+        "MARKDOWN_ESCAPES", "MAX_GAME_NAME", "MAX_PRESSER_NAME", "NO_PINGS",
+        "QUEUED_WAIT", "QUEUE_ENTRY", "QUEUE_NOTE", "REPEAT_GONE_NOTE",
+        "REPEAT_STALE_NOTE", "RESUMED_NOTE", "action_note", "escape_label",
+        "presser_name",
+    ],
+    "restore": [
+        "BackupSource", "Progress", "backup_offered", "read_backup",
+        "restore_into",
+    ],
+    "permissions": ["may_manage"],
+}
+
+
+@pytest.mark.parametrize("module", sorted(MOVED))
+def test_every_name_that_moved_is_still_reachable_from_the_view(module):
+    import importlib
+
+    home = importlib.import_module(f"retro.{module}")
+    for name in MOVED[module]:
+        assert hasattr(home, name), f"retro.{module}.{name} has gone"
+        # The same object, not merely a name of the same spelling: a copy
+        # would drift, and a test that patches one would not reach the other.
+        assert getattr(viewmod, name) is getattr(home, name), name
+
+
+def test_nothing_that_moved_is_still_defined_in_the_view():
+    """The move was a move, not a copy; see MOVED.
+
+    Two definitions of `presser_name` -- one imported, one left behind -- is
+    how the restore chain came to have two copies in the first place, which
+    is the duplication test_restore.py exists to stop coming back.
+    """
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent / "retro" / "RetroView.py").read_text()
+    defined = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            defined.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            defined.add(node.target.id)
+    for names in MOVED.values():
+        assert not (defined & set(names)), sorted(defined & set(names))
+
+
+def test_the_view_still_owns_the_things_a_view_owns():
+    """...and the split stopped where it should have.
+
+    The custom_id prefix is baked into every message this cog has ever
+    posted, the queue and the undo history are the session's own state, and
+    the emulation drivers (capture_press and friends) are methods on the
+    session: they are the half of a press that needs the core, and they read
+    and write the view's own history, queue and pacing. They stayed.
+    """
+    for name in (
+        "CUSTOM_ID_PREFIX", "DEFAULT_TIMEOUT_MINUTES", "MAX_QUEUED_PRESSES",
+        "MAX_REPLACED_NOTICES", "SAVE_STATE_EVERY_PRESSES", "UNDO_DEPTH",
+        "MAX_UNDO_BYTES", "UNDO_COMPRESSION_LEVEL", "Pending",
+    ):
+        assert hasattr(viewmod, name), name
+    for name in (
+        "capture_press", "capture_undo", "capture_reset", "run_press",
+        "run_undo", "run_reset", "remember_state", "pace", "to_components",
+    ):
+        assert callable(getattr(viewmod.RetroView, name)), name
+
+
+async def test_a_hidden_repeat_click_on_a_replaced_game_says_where_it_went(retro):
+    """Two true things, and the useful one wins.
+
+    A retired controller's buttons do nothing at all, which is a bigger fact
+    about that message than which of them it still draws -- and the reply
+    says where the game went. See RetroView._replaced_ack.
+    """
+    view = viewmod.RetroView(
+        retro.cog,
+        game_name="Test",
+        slug="test",
+        rom_filename="test.gb",
+        channel_id=1,
+        clip_seconds=0.2,
+    )
+    view.retire()
+    interaction = retro.interaction(view)
+    await view._repeat_button().callback(interaction)
+
+    assert interaction.kinds() == ["response.send_message"]
+    said = interaction.log[-1][1]["content"]
+    assert "has been replaced" in said, said
+    assert "cliplength" not in said, said
+
+
+async def test_a_stale_click_really_reaches_the_view_through_discord_s_own_store(
+    retro, system
+):
+    """The end of the chain, walked rather than assumed.
+
+    Everything else here asserts a piece: the item is registered, the payload
+    leaves it out, the callback answers. This one hands a click to the real
+    ``ViewStore.dispatch_view`` -- the function that *drops* a click whose
+    custom_id no view has, which is what leaves the player looking at "This
+    interaction failed" -- and watches it come out the other end at a button
+    Discord is no longer being sent.
+    """
+    view = viewmod.RetroView(
+        retro.cog,
+        game_name="Test",
+        slug="test",
+        rom_filename=f"test.{system.extensions[0]}",
+        channel_id=1,
+        system=system,
+        clip_seconds=0.2,
+        message_id=4747,
+    )
+    store = discord.ui.view.ViewStore(None)
+    store.add_view(view, 4747)
+
+    interaction = retro.interaction(view, message=types.SimpleNamespace(id=4747))
+    # discord.py reads this off the interaction before it calls the callback.
+    interaction.data = {"custom_id": f"{viewmod.CUSTOM_ID_PREFIX}:repeat", "component_type": 2}
+    store.dispatch_view(2, f"{viewmod.CUSTOM_ID_PREFIX}:repeat", interaction)
+    # dispatch_view schedules a task rather than awaiting one.
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if interaction.log:
+            break
+
+    assert interaction.kinds() == ["response.send_message"], interaction.log
+    assert "hidden while clips are this short" in interaction.log[-1][1]["content"]

@@ -6,6 +6,7 @@ with nothing playable in them at all.
 """
 
 import io
+import tracemalloc
 import zipfile
 from pathlib import Path
 
@@ -32,8 +33,8 @@ def zipped(entries, **kwargs):
     return buf.getvalue()
 
 
-def extract(data, max_size=MAX, what="ROM"):
-    return A.extract(data, accept=is_rom, max_size=max_size, what=what)
+def extract(data, max_size=MAX, what="ROM", **kwargs):
+    return A.extract(data, accept=is_rom, max_size=max_size, what=what, **kwargs)
 
 
 # -- Spotting an archive ------------------------------------------------------
@@ -94,6 +95,110 @@ def test_macos_junk_is_ignored_and_not_even_listed():
     assert found.name == "game.gb"
     assert "__MACOSX/._game.gb" not in found.members
     assert ".DS_Store" not in found.members
+
+
+def test_junk_is_spotted_through_backslashes_nesting_and_dot_folders():
+    # All three sort before game.gb, so any one of them slipping past the
+    # junk filter would become the ROM the user's game boots from.
+    found = extract(
+        zipped(
+            [
+                ("__MACOSX\\alpha.gb", b"x" * 99),  # Windows-repacked
+                ("a/__MacOSX/beta.gb", b"y" * 99),  # nested, mixed case
+                ("a/.hidden/gamma.gb", b"z" * 99),  # dot *folder*
+                ("game.gb", ROM),
+            ]
+        )
+    )
+    assert found.name == "game.gb"
+    assert found.members == ("game.gb",)
+
+
+# -- Asking for a member by name ----------------------------------------------
+#
+# A zip of a dozen ROMs used to mean "upload the one you want on its own".
+# `prefer` is the caller saying which one, matched on the basename alone,
+# case-insensitively, with or without the extension -- what a person types
+# after reading the bot's own listing back.
+
+
+def test_prefer_picks_a_member_that_is_not_the_alphabetical_first():
+    found = extract(zipped([("alpha.gb", ROM + b"a"), ("zeta.nes", ROM + b"z")]), prefer="zeta.nes")
+    assert found.name == "zeta.nes"
+    assert found.data.endswith(b"z")
+    assert found.preferred
+    # The report of what else was in there is unchanged by the preference.
+    assert found.candidates == ("alpha.gb", "zeta.nes")
+
+
+@pytest.mark.parametrize("prefer", ["zeta.nes", "ZETA.NES", "Zeta.Nes", "zeta", "ZETA"])
+def test_prefer_ignores_case_and_the_extension(prefer):
+    found = extract(zipped([("alpha.gb", ROM + b"a"), ("zeta.nes", ROM + b"z")]), prefer=prefer)
+    assert found.name == "zeta.nes"
+
+
+def test_prefer_matches_a_member_inside_a_folder_by_its_basename():
+    data = zipped([("aaa.gb", ROM + b"a"), ("pack/v1.0/roms/Deep.GBC", ROM + b"d")])
+    found = extract(data, prefer="deep.gbc")
+    assert found.name == "pack/v1.0/roms/Deep.GBC"
+    assert found.data.endswith(b"d")
+
+
+def test_prefer_ignores_any_folder_the_user_typed_in_front_of_the_name():
+    # Pasting a path back out of the bot's own listing has to work, and only
+    # the last component of it is ever compared.
+    data = zipped([("aaa.gb", ROM + b"a"), ("roms/game.gb", ROM + b"g")])
+    assert extract(data, prefer="roms/game.gb").name == "roms/game.gb"
+    assert extract(data, prefer="somewhere\\else\\game.gb").name == "roms/game.gb"
+
+
+def test_an_exact_name_beats_one_that_only_matches_without_its_extension():
+    # `game.gb.bak` sorts first and its stem is `game.gb`, so a single-pass
+    # match would hand back the backup instead of the ROM that was named.
+    data = zipped([("backup/game.gb.bak", ROM + b"b"), ("game.gb", ROM + b"g")])
+    found = extract(data, prefer="game.gb")
+    assert found.name == "game.gb"
+    assert found.data.endswith(b"g")
+
+
+def test_a_name_that_matches_nothing_falls_back_to_the_first_alphabetically():
+    # Better a ROM and a note than an error: the caller still gets every
+    # candidate to tell the user what it did instead.
+    found = extract(zipped([("alpha.gb", ROM), ("zeta.nes", ROM)]), prefer="missing.gb")
+    assert found.name == "alpha.gb"
+    assert not found.preferred
+    assert found.candidates == ("alpha.gb", "zeta.nes")
+
+
+@pytest.mark.parametrize("prefer", [None, "", "   "])
+def test_no_preference_at_all_is_the_old_behaviour(prefer):
+    found = extract(zipped([("alpha.gb", ROM), ("zeta.nes", ROM)]), prefer=prefer)
+    assert found.name == "alpha.gb"
+    assert not found.preferred
+
+
+def test_prefer_cannot_reach_past_accept_to_a_file_the_bot_cannot_use():
+    # Naming the readme does not make the readme a ROM; the preference only
+    # ever picks between members `accept` already said yes to.
+    found = extract(zipped([("readme.txt", b"hi" * 50), ("game.gb", ROM)]), prefer="readme.txt")
+    assert found.name == "game.gb"
+    assert not found.preferred
+
+
+def test_prefer_cannot_reach_into_the_junk_either():
+    found = extract(
+        zipped([("__MACOSX/._game.gb", b"x" * 99), ("game.gb", ROM)]),
+        prefer="._game.gb",
+    )
+    assert found.name == "game.gb"
+    assert not found.preferred
+
+
+def test_two_members_share_a_basename_and_the_sorted_first_wins():
+    data = zipped([("b/game.gb", ROM + b"b"), ("a/game.gb", ROM + b"a")])
+    found = extract(data, prefer="game.gb")
+    assert found.name == "a/game.gb"
+    assert found.preferred
 
 
 # -- Nothing usable inside ----------------------------------------------------
@@ -243,13 +348,18 @@ def test_extract_all_drops_archive_junk():
         [
             ("real.bin", b"x" * 8),
             ("__MACOSX/._real.bin", b"junk"),
+            ("__MACOSX\\real.bin", b"junk"),
+            ("sub/__MACOSX/real.bin", b"junk"),
             (".DS_Store", b"junk"),
             ("folder/.hidden", b"junk"),
+            ("folder/.hidden/deep.bin", b"junk"),
         ]
     )
     found = A.extract_all(data, **ALL_LIMITS)
     assert [f.path for f in found.files] == ["real.bin"]
-    # Junk is dropped rather than reported: nobody meant to install it.
+    # Junk is dropped rather than reported: nobody meant to install it. The
+    # backslashed and nested __MACOSX members matter here -- an unsafe *name*
+    # would be skipped and counted, junk must not be.
     assert found.skipped == ()
 
 
@@ -267,6 +377,17 @@ def test_extract_all_drops_archive_junk():
         "weird;name.bin",
         "name\nwith\nnewlines.bin",
         "x" * 80,
+        # DOS device aliases: NT resolves these before touching the directory,
+        # on the stem alone, so the extension is no disguise.
+        "CON",
+        "aux.rom",
+        "COM1.bin",
+        "dc/nul.bin",
+        # A trailing dot or space is stripped by Windows on write, storing the
+        # file under a name that was never validated.
+        "trailing.",
+        "trailing ",
+        "dotted./inside.bin",
     ],
 )
 def test_extract_all_refuses_an_unsafe_member(member):
@@ -289,6 +410,30 @@ def test_extract_all_refuses_an_unsafe_member(member):
         ("a\x00b.bin", None),
         (".hidden", None),
         ("a/b/c/d/e.bin", None),
+        # DOS device names, however cased or dressed up with an extension.
+        ("CON", None),
+        ("prn", None),
+        ("aux.rom", None),
+        ("NUL.bin.rom", None),
+        ("COM1.bin", None),
+        ("com0.bin", None),
+        ("lpt9", None),
+        ("con .rom", None),  # NT ignores the trailing space in the stem too
+        ("dc/AUX.bin", None),
+        # ...but only the exact stem is a device: these are honest names.
+        ("console.bin", "console.bin"),
+        ("communist.rom", "communist.rom"),
+        ("lpt10.bin", "lpt10.bin"),
+        ("aux2.bin", "aux2.bin"),
+        # A trailing dot or space would be stripped by Windows on write.
+        ("foo.", None),
+        ("foo ", None),
+        ("dir./a.bin", None),
+        # Single- and two-character components still pass.
+        ("a", "a"),
+        ("ab", "ab"),
+        ("x" * 64, "x" * 64),
+        ("x" * 65, None),
     ],
 )
 def test_safe_member_path(name, expected):
@@ -371,6 +516,38 @@ def test_extract_all_skips_a_single_member_over_the_per_file_cap():
     assert found.skipped == ("big.bin",)
 
 
+def test_extract_all_skips_a_case_insensitive_duplicate():
+    # Both names are individually safe, but on the case-insensitive disks of
+    # Windows/macOS hosts the second write would clobber the first. Sorted
+    # order means the uppercase one is always the survivor.
+    data = zipped([("BIOS.bin", b"first"), ("bios.bin", b"second")])
+    found = A.extract_all(data, **ALL_LIMITS)
+    assert [f.path for f in found.files] == ["BIOS.bin"]
+    assert found.files[0].data == b"first"
+    assert len(found.skipped) == 1
+    assert found.skipped[0].startswith("bios.bin ")
+    assert "case" in found.skipped[0]
+
+
+def test_extract_all_spots_a_case_collision_in_a_folder_name():
+    data = zipped(
+        [("DC/boot.bin", b"upper"), ("dc/boot.bin", b"lower"), ("dc/extra.bin", b"ok")]
+    )
+    found = A.extract_all(data, **ALL_LIMITS)
+    assert [f.path for f in found.files] == ["DC/boot.bin", "dc/extra.bin"]
+    assert len(found.skipped) == 1
+    assert found.skipped[0].startswith("dc/boot.bin ")
+
+
+def test_a_case_variant_of_a_member_that_was_not_taken_is_still_taken():
+    # Only *accepted* members claim a name: the empty BIOS.bin is skipped for
+    # being empty, so bios.bin collides with nothing and is kept.
+    data = zipped([("BIOS.bin", b""), ("bios.bin", b"real")])
+    found = A.extract_all(data, **ALL_LIMITS)
+    assert [f.path for f in found.files] == ["bios.bin"]
+    assert found.skipped == ("BIOS.bin",)
+
+
 def test_extract_all_skips_an_empty_member():
     data = zipped([("empty.bin", b""), ("real.bin", b"x" * 8)])
     found = A.extract_all(data, **ALL_LIMITS)
@@ -401,3 +578,153 @@ def test_extract_all_raises_on_an_empty_archive():
 def test_extract_all_raises_on_something_that_is_not_a_zip():
     with pytest.raises(A.ArchiveError):
         A.extract_all(b"this is not a zip at all", **ALL_LIMITS)
+
+
+def test_the_password_sentence_counts_the_files_it_is_asking_for():
+    # One sentence, one plural knob: `extract` is after a single file and
+    # `extract_all` after a set, and both ask the uploader to unzip it.
+    data = bytearray(zipped([("secret.gb", ROM)]))
+    data[data.find(b"PK\x03\x04") + 6] |= 0x01
+    data[data.find(b"PK\x01\x02") + 8] |= 0x01
+    with pytest.raises(A.ArchiveError) as one:
+        extract(bytes(data))
+    with pytest.raises(A.ArchiveError) as many:
+        A.extract_all(bytes(data), **ALL_LIMITS)
+    assert str(one.value).endswith("Unzip it yourself and upload the file inside.")
+    assert str(many.value).endswith("Unzip it yourself and upload the files inside.")
+
+
+# -- Unpacking without holding the whole archive ------------------------------
+#
+# `extract_each` is the same walk as `extract_all` -- same caps, same skips,
+# same order -- handing each file over as it is decompressed so that a
+# hundred-megabyte firmware pack never sits in memory in one piece.
+
+
+def collected(data, **limits):
+    """Run `extract_each` into a list, the way `extract_all` does."""
+    files = []
+    report = A.extract_each(data, sink=files.append, **(limits or ALL_LIMITS))
+    return files, report
+
+
+def test_extract_each_hands_over_every_file_in_sorted_order():
+    data = zipped([("b.bin", b"bb"), ("a.bin", b"aa"), ("dc/boot.bin", b"cc")])
+    files, report = collected(data)
+    assert [f.path for f in files] == ["a.bin", "b.bin", "dc/boot.bin"]
+    assert [f.data for f in files] == [b"aa", b"bb", b"cc"]
+    assert report.paths == ("a.bin", "b.bin", "dc/boot.bin")
+    assert report.members == ("a.bin", "b.bin", "dc/boot.bin")
+    assert report.skipped == ()
+    assert report.total_size == 6
+
+
+def test_the_report_keeps_no_payloads_of_its_own():
+    # The point of the exercise: what comes back is names and numbers, so a
+    # caller that wrote each file out is not still holding all of them.
+    _, report = collected(zipped([("a.bin", b"x" * 8), ("b.bin", b"y" * 8)]))
+    assert not hasattr(report, "files")
+    assert all(isinstance(path, str) for path in report.paths)
+
+
+def test_extract_each_sees_one_file_at_a_time():
+    # Each call arrives with the bytes of exactly one member -- nothing is
+    # batched up and handed over at the end.
+    seen = []
+
+    def sink(extracted):
+        seen.append((len(seen), extracted.path, len(extracted.data)))
+
+    A.extract_each(
+        zipped([("a.bin", b"x" * 8), ("b.bin", b"y" * 16), ("c.bin", b"z" * 32)]),
+        sink=sink,
+        **ALL_LIMITS,
+    )
+    assert seen == [(0, "a.bin", 8), (1, "b.bin", 16), (2, "c.bin", 32)]
+
+
+def test_extract_each_matches_extract_all_on_an_awkward_archive():
+    # One archive with every skip rule in it at once, unpacked both ways: the
+    # convenient shape must be exactly the streaming one, collected.
+    data = zipped(
+        [
+            ("BIOS.bin", b"first"),
+            ("bios.bin", b"second"),  # case collision
+            ("../escape.bin", b"x" * 8),  # unsafe name
+            ("empty.bin", b""),  # empty
+            ("__MACOSX/._junk.bin", b"junk"),  # dropped, never reported
+            ("dc/boot.bin", b"z" * 8),
+        ]
+    )
+    files, report = collected(data)
+    found = A.extract_all(data, **ALL_LIMITS)
+    assert found.files == tuple(files)
+    assert found.skipped == report.skipped
+    assert found.members == report.members
+    assert found.total_size == report.total_size
+    assert report.paths == tuple(f.path for f in found.files)
+
+
+def test_extract_each_peaks_far_below_extract_all(tmp_path):
+    # The whole point of item 15, measured: eight megabytes of firmware, one
+    # megabyte at a time. The sink here writes and forgets, as the cog's does.
+    data = zipped([(f"f{i}.bin", bytes(1024 * 1024)) for i in range(8)])
+    limits = dict(max_total_size=MAX, max_file_size=2 * 1024 * 1024, max_files=10)
+
+    tracemalloc.start()
+    A.extract_each(data, sink=lambda f: (tmp_path / f.path).write_bytes(f.data), **limits)
+    streamed = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+    tracemalloc.start()
+    held = A.extract_all(data, **limits)
+    assert held.total_size == 8 * 1024 * 1024
+    at_once = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+    assert streamed < at_once / 2, (streamed, at_once)
+
+
+def test_a_sink_that_fails_stops_the_unpack_then_and_there():
+    # A full disk should not be answered by decompressing the rest of the
+    # archive anyway. Whatever the sink managed before the failure stands.
+    seen = []
+
+    def sink(extracted):
+        if len(seen) == 1:
+            raise OSError("no space left on device")
+        seen.append(extracted.path)
+
+    with pytest.raises(OSError, match="no space left"):
+        A.extract_each(
+            zipped([("a.bin", b"x" * 8), ("b.bin", b"y" * 8), ("c.bin", b"z" * 8)]),
+            sink=sink,
+            **ALL_LIMITS,
+        )
+    assert seen == ["a.bin"]
+
+
+def test_extract_each_keeps_every_cap():
+    big = zipped([("big.bin", b"x" * 4096), ("small.bin", b"y" * 8)])
+    files, report = collected(big, max_total_size=MAX, max_file_size=1024, max_files=10)
+    assert [f.path for f in files] == ["small.bin"]
+    assert report.skipped == ("big.bin",)
+
+    with pytest.raises(A.ArchiveError, match="more than the 1"):
+        collected(big, max_total_size=MAX, max_file_size=MAX, max_files=1)
+    with pytest.raises(A.ArchiveError, match="unpacks to"):
+        collected(big, max_total_size=64, max_file_size=MAX, max_files=10)
+
+
+def test_extract_each_refuses_an_archive_with_nothing_usable_without_calling_the_sink():
+    def sink(extracted):
+        raise AssertionError(f"nothing should have been handed over: {extracted.path}")
+
+    with pytest.raises(A.NoSupportedMember, match="no BIOS file this bot can use"):
+        A.extract_each(
+            zipped([("../nope.bin", b"x" * 8)]), sink=sink, what="BIOS file", **ALL_LIMITS
+        )
+    with pytest.raises(A.NoSupportedMember, match="no files in it"):
+        A.extract_each(zipped([]), sink=sink, **ALL_LIMITS)
+    with pytest.raises(A.ArchiveError):
+        A.extract_each(b"this is not a zip at all", sink=sink, **ALL_LIMITS)

@@ -143,10 +143,20 @@ async def test_cog_unload_captures_the_battery_before_freeing_the_core(retro, ba
     assert srm.read_bytes() == marker
 
 
-async def test_pruning_a_game_takes_its_battery_save_with_it(retro):
+async def test_pruning_a_game_never_takes_its_saves_with_it(retro):
+    """The count cap prunes ROMs; a save is never deleted to make room.
+
+    A ROM re-downloads and a save does not come back, which is the rule the
+    disk budget's pruner has always followed and the messaging everywhere
+    promises. The count-based pruner used to take all four save files of a
+    game that fell off the end, quietly destroying the one thing the player
+    could not get back -- starting the game again by name re-downloads the
+    ROM and picks these saves straight back up.
+    """
     channel_id = 9810
     cog = retro.cog
-    for index in range(retro.cogmod.MAX_CACHED_GAMES_PER_CHANNEL + 3):
+    count = retro.cogmod.MAX_CACHED_GAMES_PER_CHANNEL + 3
+    for index in range(count):
         rom = cog._roms_dir() / f"{channel_id}-pruned{index}.gb"
         rom.write_bytes(b"r")
         cog._state_path(channel_id, f"pruned{index}").write_bytes(b"s")
@@ -156,9 +166,9 @@ async def test_pruning_a_game_takes_its_battery_save_with_it(retro):
         # a second of wall clock bought nothing a mtime cannot state.
         os.utime(rom, (1_700_000_000 + index, 1_700_000_000 + index))
 
-    cog._prune_cached_games(channel_id, "pruned0")
+    deleted = cog._prune_cached_games(channel_id, "pruned0")
 
-    leftover = list(cog._data_dir("states").glob(f"{channel_id}-pruned*.srm"))
-    assert len(leftover) < retro.cogmod.MAX_CACHED_GAMES_PER_CHANNEL + 3
-    orphans = [p for p in leftover if not (cog._roms_dir() / f"{p.stem}.gb").is_file()]
-    assert not orphans, "no battery save outlives its ROM"
+    assert deleted, "the cap really pruned some ROMs"
+    for index in range(count):
+        assert cog._state_path(channel_id, f"pruned{index}").is_file(), index
+        assert cog._sram_path(channel_id, f"pruned{index}").is_file(), index

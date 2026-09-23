@@ -89,32 +89,128 @@ async def test_an_unknown_core_is_reported(retro, options):
 # -- Reading the options off a core -------------------------------------------
 
 
-async def test_the_probe_puts_a_running_game_to_sleep_first(retro, options, monkeypatch):
-    # Only one core may be loaded at a time, so reading gambatte's options
-    # while a NES game is running means the NES game has to come down first.
-    channel = retro.channel(9702)
+async def test_the_probe_reads_the_core_when_nobody_is_playing(retro, options, monkeypatch):
+    # The uninterrupted case, which is the only one that loads a core: no
+    # session anywhere, so the ROM-less probe is free to take the one slot.
+    probed = []
+
+    def fake_probe(core_path, opts=None):
+        probed.append((Path(core_path).name, dict(opts or {})))
+        return dict(GAMBATTE_DEFS) if "gambatte" in Path(core_path).name else {}
+
+    retro.patch("probe_core_options", fake_probe, monkeypatch)
+
+    ctx = retro.context(retro.channel(9740))
+    await options(retro.cog, ctx, core="gambatte")
+    assert probed and probed[0][0].startswith("gambatte")
+    assert "the core itself" in ctx.said()
+    assert len(await retro.cog._cached_definitions("gambatte")) >= len(GAMBATTE_DEFS)
+
+
+async def test_listing_a_core_never_puts_a_running_game_to_sleep(retro, options, monkeypatch):
+    """Reading a list must not cost somebody else their game.
+
+    This used to call ``_evict_locked()`` to take the one core slot, which
+    saved and hibernated every live session in every channel -- so an owner
+    typing `[p]retroset coreoptions gambatte` silently bought a stranger
+    mid-game a wake-up delay on their next press, and nothing said so.
+    """
+    channel = retro.channel(9741)
     playing = await retro.start_game(
         retro.context(channel), "probegame", data=NES_BYTES, filename="probegame.nes"
     )
     assert playing.live and playing.core == "fceumm"
 
     probed = []
+    retro.patch(
+        "probe_core_options",
+        lambda path, opts=None: probed.append(path) or dict(GAMBATTE_DEFS),
+        monkeypatch,
+    )
 
-    def fake_probe(core_path, opts=None):
-        probed.append((Path(core_path).name, dict(opts or {})))
-        assert not any(v.live for v in retro.cog.sessions.values()), (
-            "the probe ran with another core still loaded"
-        )
-        return dict(GAMBATTE_DEFS) if "gambatte" in Path(core_path).name else {}
-
-    retro.patch("probe_core_options", fake_probe, monkeypatch)
-
-    ctx = retro.context(channel)
+    ctx = retro.context(retro.channel(9742))
     await options(retro.cog, ctx, core="gambatte")
-    assert probed and probed[0][0].startswith("gambatte")
-    assert not playing.live
-    assert retro.cog._state_path(channel.id, playing.slug).is_file()
-    assert len(await retro.cog._cached_definitions("gambatte")) >= len(GAMBATTE_DEFS)
+
+    assert not probed, "the core was loaded anyway"
+    assert playing.live, "somebody else's game was put to sleep to read a list"
+    said = ctx.said()
+    # ...and the owner is told why the answer is empty, plus both ways out.
+    assert "only one emulator core can be loaded at a time" in said
+    assert "put it to sleep" in said
+    assert "start a Game Boy game" in said, "the way that teaches us the options"
+    assert "once nothing is playing" in said, "and the way that reads them directly"
+
+
+async def test_a_sleeping_session_is_not_in_the_probe_s_way(retro, options, monkeypatch):
+    # A hibernated session still exists and still answers its buttons, but it
+    # holds no core -- so it is no reason to refuse to load one.
+    channel = retro.channel(9743)
+    view = await retro.start_game(
+        retro.context(channel), "napping", data=NES_BYTES, filename="napping.nes"
+    )
+    await retro.cog.hibernate(view, None)
+    assert not view.live and channel.id in retro.cog.sessions
+
+    probed = []
+    retro.patch(
+        "probe_core_options",
+        lambda path, opts=None: probed.append(path) or dict(GAMBATTE_DEFS),
+        monkeypatch,
+    )
+    ctx = retro.context(retro.channel(9744))
+    await options(retro.cog, ctx, core="gambatte")
+    assert probed, "a sleeping session blocked the probe"
+    assert "the core itself" in ctx.said()
+
+
+async def test_what_is_already_known_still_answers_while_a_game_is_running(
+    retro, options, monkeypatch
+):
+    # Skipping the probe costs nothing when the cog has been taught already:
+    # the cache answers, and the listing is the same listing.
+    await retro.cog._remember_definitions("gambatte", GAMBATTE_DEFS)
+    probed = []
+    retro.patch(
+        "probe_core_options",
+        lambda path, opts=None: probed.append(path) or {},
+        monkeypatch,
+    )
+    playing = await retro.start_game(
+        retro.context(retro.channel(9745)), "nesgame", data=NES_BYTES, filename="nesgame.nes"
+    )
+    assert playing.live
+
+    ctx = retro.context(retro.channel(9746))
+    await options(retro.cog, ctx, core="gambatte")
+    said = ctx.said()
+    assert not probed and playing.live
+    assert "**gb_colorization**" in said
+    assert "the last time this core ran" in said
+
+
+async def test_a_game_that_starts_mid_command_is_refused_not_evicted(retro, monkeypatch):
+    """The binding check is the one under the emulator lock.
+
+    `_coreoptions` reads "is anybody playing?" before it takes the lock, so a
+    game that starts in the gap would slip past it. The probe itself checks
+    again while holding the lock, which is what makes "this never evicts
+    anybody" true rather than merely likely.
+    """
+    await retro.install_cores("gambatte", "fceumm")
+    probed = []
+    retro.patch(
+        "probe_core_options",
+        lambda path, opts=None: probed.append(path) or dict(GAMBATTE_DEFS),
+        monkeypatch,
+    )
+    playing = await retro.start_game(
+        retro.context(retro.channel(9747)), "nesgame", data=NES_BYTES, filename="nesgame.nes"
+    )
+    assert playing.live
+
+    # Called directly, as the racing caller would have called it.
+    assert await retro.cog._probe_definitions("gambatte") == {}
+    assert not probed and playing.live
 
 
 async def test_the_listing_shows_keys_values_defaults_and_provenance(retro, options, monkeypatch):
@@ -224,9 +320,39 @@ def test_an_unknown_key_is_reported(retro):
 
 def test_a_core_prefix_is_never_assumed_when_nothing_is_known(retro):
     # mednafen_ngp names its own option `ngp_language`, so guessing a prefix
-    # from the core name would be wrong.
+    # from the core name would be wrong. Nothing known means no key -- and,
+    # since this used to answer (None, None), a reason to go with it.
     key, error = retro.cog._resolve_option_key("mednafen_ngp", {}, "language", "!")
-    assert key is None and error is None
+    assert key is None
+    assert error and "Nothing is known" in error
+    assert "mednafen_ngp_language" not in error, "it did not guess a key"
+    assert "!retroset coreoptions" in error, "the prefix it was handed"
+
+
+@pytest.mark.parametrize(
+    "definitions, typed",
+    [
+        (GAMBATTE_DEFS, "gambatte_gb_colorization"),  # resolves
+        (GAMBATTE_DEFS, "nonsense"),                  # no such option
+        (GAMBATTE_DEFS, "   "),                       # nothing typed
+        ({}, "gb_colorization"),                      # nothing to match against
+        (
+            {**GAMBATTE_DEFS, "gambatte_gbc_colorization": {"values": [["off", "Off"]]}},
+            "colorization",                           # ambiguous
+        ),
+    ],
+)
+def test_resolving_a_key_returns_a_key_or_a_reason_and_never_neither(
+    retro, definitions, typed
+):
+    """The contract every caller leans on.
+
+    `_coreoptions` sends the error and then uses the key, with no third
+    branch for "neither" -- there used to be one and it could not run. That
+    is only safe while this is true of every path out of the function.
+    """
+    key, error = retro.cog._resolve_option_key("gambatte", definitions, typed, "!")
+    assert (key is None) != (error is None), (typed, key, error)
 
 
 def test_effective_values_fall_back_exactly_as_libretro_does(retro):
@@ -344,6 +470,28 @@ async def test_setting_an_unverifiable_option_is_allowed_but_flagged(retro, opti
     assert "quietly use its default" in said
 
 
+async def test_setting_an_option_still_works_while_a_game_is_running(retro, options, monkeypatch):
+    # Skipping the probe only withholds the *listing*. Storing an override
+    # loads nothing, so it goes through unvalidated exactly as it does on an
+    # idle bot -- and still without touching the game that is playing.
+    probed = []
+    retro.patch(
+        "probe_core_options",
+        lambda path, opts=None: probed.append(path) or {},
+        monkeypatch,
+    )
+    playing = await retro.start_game(
+        retro.context(retro.channel(9748)), "nesgame", data=NES_BYTES, filename="nesgame.nes"
+    )
+    assert playing.live
+
+    ctx = retro.context(retro.channel(9749))
+    await options(retro.cog, ctx, core="gambatte", key="gambatte_gb_colorization", value="GBC")
+    assert not probed and playing.live
+    assert (await retro.cog._core_options("gambatte")).get("gambatte_gb_colorization") == "GBC"
+    assert "could not be checked" in ctx.said()
+
+
 async def test_starting_a_game_is_what_teaches_us_a_core_like_fceumm(retro, options):
     FakeEmulator.definitions_by_core = {"fceumm": FCEUMM_DEFS}
     channel = retro.channel(9722)
@@ -393,13 +541,22 @@ async def test_retroset_version_says_what_is_actually_loaded(retro):
     assert not any(isinstance(entry, dict) and "embed" in entry for entry in ctx.sent)
 
 
-async def test_retroset_version_mentions_the_commit_in_a_git_checkout(retro):
+async def test_retroset_version_names_the_checkout_in_a_git_checkout(retro):
+    """The branch HEAD is on, or a detached HEAD's commit id.
+
+    Only one of the two is ever known: version.py reads HEAD and nothing
+    else, so a branch is reported by name rather than resolved to a commit.
+    """
     version = retro.cogmod.version
-    if version.COMMIT is None:
+    if version.BRANCH is None and version.COMMIT is None:
         pytest.skip("this copy of the cog is not in a git checkout")
     ctx = retro.context(retro.channel(9731))
     await retro.cogmod.Retro.retroset_version.callback(retro.cog, ctx)
-    assert version.COMMIT[:12] in ctx.said()
+    said = ctx.said()
+    if version.BRANCH:
+        assert version.BRANCH in said
+    else:
+        assert version.COMMIT[:12] in said
 
 
 async def test_the_settings_embed_leads_with_the_build(retro):

@@ -9,7 +9,6 @@ per user; the paths all come from retro/storage.py.
 """
 
 import asyncio
-import io
 import logging
 import typing
 from pathlib import Path
@@ -22,7 +21,7 @@ from redbot.core.utils.views import ConfirmView
 from .abc import MixinMeta
 from .emulator import MAX_SRAM_SIZE, EmulatorError, RetroEmulator
 from .RetroView import RetroView, may_manage
-from .storage import BACKUP_SUFFIX, MAX_CACHED_GAMES_PER_CHANNEL
+from .storage import BACKUP_SUFFIX, MAX_CACHED_GAMES_PER_CHANNEL, ROLLBACK_SUFFIX
 from .systems import system_by_key, system_for_extension
 
 log = logging.getLogger("red.robloach.retro")
@@ -63,6 +62,17 @@ DEFAULT_UPLOAD_LIMIT = 8 * 1024 * 1024
 
 # How long `[p]retrosaves delete` waits for someone to press Yes.
 CONFIRM_TIMEOUT = 60.0
+
+# What a delete removes, in the order `StorageMixin._save_paths` hands the
+# four paths back, and what to call each one in a sentence. Named per file
+# rather than per half, because the reply has to be able to say that three of
+# them went and the fourth did not; see _delete_saves.
+DELETE_LABELS = (
+    "its save state",
+    "the previous save state",
+    "its in-game save",
+    "the previous in-game save",
+)
 
 # The words `[p]retrosaves export` accepts in front of a game name to say what
 # to send. Anything else is part of the name, so a game really called "state"
@@ -174,6 +184,26 @@ class SaveInfo(typing.NamedTuple):
         if self.has_sram_backup:
             return "backup-sram"
         return "fresh"
+
+
+class DeleteOutcome(typing.NamedTuple):
+    """
+    What one `[p]retrosaves delete` managed, file by file.
+
+    A delete that goes perfectly needs none of this -- ``freed`` would do. It
+    exists for the delete that goes half way: four files are removed one at a
+    time and the third of them can fail on a read-only data folder, leaving a
+    game with no save state and an intact in-game save. That is a state
+    nothing else in this cog ever produces on purpose, so the reply has to be
+    able to describe it, which means the removal has to report it.
+    """
+
+    #: Bytes that really stopped existing.
+    freed: int
+    #: DELETE_LABELS for the files that were there and are now gone.
+    removed: typing.List[str]
+    #: DELETE_LABELS for the files that were there and still are.
+    failed: typing.List[str]
 
 
 class SavesMixin(MixinMeta):
@@ -289,6 +319,14 @@ class SavesMixin(MixinMeta):
         the files on disk supply the rest. A game whose ROM has been pruned
         and whose Resume button has been forgotten still appears, under its
         slug, because its save is still there and still worth managing.
+
+        The files are the slow part -- several directory globs and a ``stat``
+        per file -- so the whole gather runs in one worker thread rather than
+        on the event loop, where a big states directory used to stall every
+        press in every channel for the length of a directory listing each
+        time somebody typed `[p]retrosaves`. Only reads happen in the
+        thread, and only of things that are safe to read from one: the
+        filesystem, and plain attributes of the session.
         """
         channel_id = int(channel_id)
         session = self.sessions.get(channel_id)
@@ -315,14 +353,18 @@ class SavesMixin(MixinMeta):
                 "core": record.get("core") or "",
                 "starter_id": record.get("starter_id"),
             }
-        entries = [
-            self._save_info(channel_id, slug, meta.get(slug) or {}, session)
-            for slug in sorted(set(meta) | self._stored_slugs(channel_id))
-        ]
-        # The game being played first, then by when it was last saved, so the
-        # top of the list is what somebody is most likely asking about.
-        entries.sort(key=lambda e: (not e.current, -e.last_written, e.slug))
-        return entries
+        def gather() -> typing.List[SaveInfo]:
+            entries = [
+                self._save_info(channel_id, slug, meta.get(slug) or {}, session)
+                for slug in sorted(set(meta) | self._stored_slugs(channel_id))
+            ]
+            # The game being played first, then by when it was last saved, so
+            # the top of the list is what somebody is most likely asking
+            # about.
+            entries.sort(key=lambda e: (not e.current, -e.last_written, e.slug))
+            return entries
+
+        return await asyncio.to_thread(gather)
 
     def _save_info(
         self,
@@ -493,24 +535,43 @@ class SavesMixin(MixinMeta):
         view.forget_history()
         if not view.live:
             return False
-        reason = (
-            f"Saved and put to sleep while {doing}. Press a button to pick "
-            "the game back up."
-        )
         # And, exactly as `[p]retrosleep` does, before reaching for that
         # lock: a press sitting out the clip on screen holds it, and no save
         # command should wait on a cosmetic delay. See
         # RetroView.cancel_pacing.
         view.cancel_pacing()
+        # The view's own lock, exactly as `[p]retrosleep` takes it, so a
+        # press that is already being emulated finishes before the core is
+        # taken away from it.
+        async with view.lock:
+            return await self._hibernate_for_saves(view, entry, doing)
+
+    async def _hibernate_for_saves(
+        self, view: RetroView, entry: SaveInfo, doing: str
+    ) -> bool:
+        """
+        Save a live session and free its core. Hold ``view.lock`` to call.
+
+        The working half of :meth:`_pause_for_saves`, split out so
+        :meth:`_mutate_saves` can run it again *while already holding the
+        lock* just before it touches the files. Checks ``live`` itself,
+        because by the time the lock has been acquired the answer may have
+        changed either way: the press that held it may have been the one
+        that woke the game up. Returns whether anything was put to sleep.
+        """
+        view.forget_history()
+        if not view.live:
+            return False
+        reason = (
+            f"Saved and put to sleep while {doing}. Press a button to pick "
+            "the game back up."
+        )
         try:
-            # The view's own lock, exactly as `[p]retrosleep` takes it, so a
-            # press that is already being emulated finishes before the core is
-            # taken away from it.
-            async with view.lock:
-                await self.hibernate(view, reason)
+            await self.hibernate(view, reason)
         except Exception:
-            # And the same belt and braces, from the same helper: everything
-            # below assumes the files on disk are the only copy.
+            # And the same belt and braces as `[p]retrosleep`, from the same
+            # helper: everything after this assumes the files on disk are the
+            # only copy.
             log.exception(
                 "Could not hibernate %s cleanly before changing its saves.",
                 entry.slug,
@@ -523,6 +584,51 @@ class SavesMixin(MixinMeta):
             view.channel_id,
         )
         return True
+
+    async def _mutate_saves(
+        self,
+        ctx: commands.Context,
+        entry: SaveInfo,
+        doing: str,
+        mutate: typing.Callable[[], typing.Any],
+    ) -> typing.Tuple[bool, typing.Any]:
+        """
+        Change one game's save files while no live core can undo the change.
+
+        :meth:`_pause_for_saves` alone is not quite enough, because pausing
+        and writing are separate awaits and the session's controls stay live
+        in between: any button press in that gap wakes the game *from the
+        old files*, and the woken core's next automatic save then writes
+        those old files straight back over whatever the command changed --
+        silently, which is the worst way for a delete, a rollback or an
+        import to fail. `[p]retrosaves import` has the widest gap (a
+        multi-second core boot validates the incoming save between its pause
+        and its write), but every command that touches the files has one.
+
+        So the files are only ever touched from in here: pause first, then
+        take the view's own lock -- the same lock every button press holds
+        for the whole of its press -- hibernate again if a press slipped in
+        and woke the game, and run ``mutate`` (blocking, so it goes to a
+        worker thread) before letting the lock go. Nothing can boot from, or
+        save over, the files while it runs. Returns ``(anything was put to
+        sleep, whatever mutate returned)``; whatever mutate raises passes
+        through.
+        """
+        paused = await self._pause_for_saves(ctx, entry, doing)
+        view = self.sessions.get(int(getattr(ctx.channel, "id", 0)))
+        if view is None or view.slug != entry.slug:
+            # Nothing to race with. A session for this game *appearing*
+            # mid-thread means somebody started it fresh, and a fresh start
+            # boots from whatever files this leaves behind, which is the
+            # order every command already promises.
+            return paused, await asyncio.to_thread(mutate)
+        # Same as _pause_for_saves: never wait out a cosmetic delay for the
+        # lock.
+        view.cancel_pacing()
+        async with view.lock:
+            if await self._hibernate_for_saves(view, entry, doing):
+                paused = True
+            return paused, await asyncio.to_thread(mutate)
 
     async def _confirm(self, ctx: commands.Context, question: str) -> bool:
         """
@@ -540,6 +646,45 @@ class SavesMixin(MixinMeta):
         view.message = message
         await view.wait()
         return bool(view.result)
+
+    @staticmethod
+    def _refund_cooldown(ctx: commands.Context) -> None:
+        """
+        Hand this invocation's cooldown back: it cost nothing.
+
+        `[p]retrosaves import` and `[p]retrosaves export` are limited to
+        SAVE_COOLDOWN_RATE a minute because each one moves a file and an
+        import boots a core on top of that. Red charges that the moment the
+        command is invoked, which is before every mistake somebody makes on
+        the way to a working one: a forgotten attachment, a `.zip` where a
+        `.srm` should be, a file over the size ceiling, a name that matched
+        two games. Every one of those is a correction away from working, and
+        charging for the correction is exactly how somebody trying to fix
+        their own typo locks themselves out for a minute in the middle of a
+        conversation. So each path that gives up *before* an attachment has
+        been downloaded or a file has been read off disk hands the slot back,
+        and the limit goes on protecting the only things that cost anything.
+
+        `Retro._forgive_cooldown` does the identical thing for `[p]retro`,
+        and this is deliberately a twin of it rather than a call to it:
+        retro/abc.py's MixinMeta is the whole contract of what a mixin may
+        reach for on the assembled cog and `_forgive_cooldown` is not in it,
+        so calling it would be reaching for something nobody wrote down (a
+        test holds the contract to that -- see tests/test_mixins.py). Two
+        guarded lines are not worth widening the contract for.
+
+        Guarded because none of it is guaranteed: a command with no cooldown,
+        or a context assembled by something other than Red, must not turn a
+        polite refusal into a traceback.
+        """
+        command = getattr(ctx, "command", None)
+        reset = getattr(command, "reset_cooldown", None)
+        if reset is None:
+            return
+        try:
+            reset(ctx)
+        except Exception:
+            log.debug("Could not hand back a Retro save cooldown.", exc_info=True)
 
     def _upload_limit(self, ctx: commands.Context) -> int:
         """How large an attachment this server will accept."""
@@ -836,13 +981,19 @@ class SavesMixin(MixinMeta):
 
         Only when something is left after it, so a game actually called
         "state" is still exportable by name.
+
+        Nothing typed comes back as ``"default"`` rather than as ``"sram"``.
+        The two are not the same thing: what a bare `[p]retrosaves export
+        <game>` should send depends on which halves the game actually has,
+        while somebody who typed a half meant that half. Resolved against the
+        game in :meth:`retrosaves_export`.
         """
         text = str(game).strip()
         head, _, rest = text.partition(" ")
         choice = EXPORT_CHOICES.get(head.strip().strip("`").lower())
         if choice is not None and rest.strip():
             return choice, rest.strip()
-        return "sram", text
+        return "default", text
 
     @commands.bot_has_permissions(attach_files=True)
     # An export uploads a file per invocation; four a minute is far more than
@@ -860,9 +1011,11 @@ class SavesMixin(MixinMeta):
 
         By default this sends the in-game save, the `.srm` file RetroArch
         and most emulators read, so a player can carry their progress
-        somewhere else. Put `state` or `both` in front of the
-        name to send the save state as well — that one only works on the exact
-        emulator core that wrote it, and it is much larger.
+        somewhere else — or, for a game that has no in-game save because its
+        cartridge has no battery, the save state instead. Put `save`, `state`
+        or `both` in front of the name to ask for one of them by name; a save
+        state only works on the exact emulator core that wrote it, and it is
+        much larger.
 
         Anyone in the channel can export; nothing is changed by doing it.
 
@@ -877,8 +1030,13 @@ class SavesMixin(MixinMeta):
         what, name = self._split_export(game)
         entry = await self._resolve_save(ctx, name)
         if entry is None:
+            # Nothing was sent and nothing was read: an unknown or ambiguous
+            # name is a typo away from a working command. See
+            # _refund_cooldown.
+            self._refund_cooldown(ctx)
             return
         if not entry.has_save:
+            self._refund_cooldown(ctx)
             await self._safe_send(
                 ctx,
                 f"**{entry.game_name}** has nothing saved yet, so there is "
@@ -886,6 +1044,23 @@ class SavesMixin(MixinMeta):
                 "save itself.",
             )
             return
+
+        # What a bare `export <game>` means, decided against the game rather
+        # than in the parser. The in-game save is the preference, because it
+        # is the copy that travels between emulators -- but a cartridge with
+        # no battery never has one, and those are common enough (most
+        # homebrew, every game that saved by password) that a default which
+        # could only ever name a file that cannot exist turned "export my
+        # game" into a dead end: the reply said there was no in-game save and
+        # said nothing at all about the save state sitting next to it. So the
+        # default falls through to the state when that is the only half there
+        # is, and the reply says why it did.
+        #
+        # Only the default falls through. `export save <game>` is somebody
+        # naming a half, and it is still answered about that half.
+        fell_back = what == "default" and not entry.has_sram and entry.has_state
+        if what == "default":
+            what = "state" if fell_back else "sram"
 
         limit = self._upload_limit(ctx)
         wanted: typing.List[typing.Tuple[str, Path, str, typing.Optional[int]]] = []
@@ -923,15 +1098,34 @@ class SavesMixin(MixinMeta):
                 )
                 continue
             try:
-                data = await asyncio.to_thread(path.read_bytes)
+                # The path, not the payload: given a path, discord.File opens
+                # the file and streams it into the upload (closing it when the
+                # send is done), so a multi-megabyte save state is never
+                # copied through memory just to be attached. Opening it is
+                # also the readability check -- the size above came from the
+                # same directory listing the command started from.
+                files.append(discord.File(path, filename=filename))
             except OSError as error:
                 log.warning("Could not read %s to export it.", path, exc_info=True)
                 notes.append(f"The {label} could not be read: {error}")
                 continue
-            files.append(discord.File(io.BytesIO(data), filename=filename))
             sent.append(f"the {label} (`{filename}`, {self._humanize_bytes(size)})")
 
         if not files:
+            # Nothing was uploaded and no file was opened, so this invocation
+            # cost the bot nothing worth rationing.
+            self._refund_cooldown(ctx)
+            if what == "sram" and entry.has_state:
+                # Reachable only from an explicit `export save <game>` now
+                # that the default falls through, and worth saying even
+                # there: the answer "there is no in-game save" is true and
+                # useless on its own when the game's whole progress is
+                # sitting in a save state.
+                notes.append(
+                    "It does have a save state \N{EM DASH} "
+                    f"`{ctx.clean_prefix}retrosaves export state {entry.slug}` "
+                    "sends that one."
+                )
             await self._safe_send(
                 ctx,
                 f"Nothing could be exported for **{entry.game_name}**. "
@@ -939,6 +1133,13 @@ class SavesMixin(MixinMeta):
             )
             return
         lines = [f"**{entry.game_name}**: {humanize_list(sent)}."]
+        if fell_back:
+            lines.append(
+                f"**{entry.game_name}** has no in-game save \N{EM DASH} its "
+                "cartridge may have no battery to keep one in, or nobody has "
+                "saved from inside the game yet \N{EM DASH} so its save state "
+                "is what was sent."
+            )
         if any(upload.filename.endswith(".state") for upload in files):
             lines.append(
                 "A save state only loads on the same build of the same "
@@ -1001,16 +1202,22 @@ class SavesMixin(MixinMeta):
             )
             return
 
-        # Before the file is touched, never after: a running core would write
-        # its own save state back over this on the very next press.
-        paused = await self._pause_for_saves(ctx, entry, "its save state was reset")
-        try:
+        def drop_state_files() -> None:
             # The previous generation goes with it. Leaving it would be a
             # command that appears to do nothing: the restore chain would fall
             # straight through to the backup and the game would come back at
             # almost exactly the moment that was just dropped.
             for path in self._save_paths(ctx.channel.id, entry.slug)[:2]:
-                await asyncio.to_thread(path.unlink, True)
+                path.unlink(missing_ok=True)
+
+        try:
+            # Deleted with the session paused and its lock held, never under
+            # a running core: a live core holds its own copy of the state and
+            # would write it back over this on the very next press. See
+            # _mutate_saves.
+            paused, _ = await self._mutate_saves(
+                ctx, entry, "its save state was reset", drop_state_files
+            )
         except OSError as error:
             log.warning("Could not delete a Retro save state.", exc_info=True)
             await self._safe_send(ctx, f"The save state could not be deleted: {error}")
@@ -1100,11 +1307,15 @@ class SavesMixin(MixinMeta):
             return
 
         # Same rule as everything else in this group: the live core holds the
-        # authoritative copy and would write it straight back over this.
-        paused = await self._pause_for_saves(ctx, entry, "its save was rolled back")
+        # authoritative copy and would write it straight back over this, so
+        # the swap runs via _mutate_saves, with the session asleep and its
+        # lock held so no press can wake it mid-swap.
         try:
-            swapped = await asyncio.to_thread(
-                self._rollback_saves, ctx.channel.id, entry.slug
+            paused, swapped = await self._mutate_saves(
+                ctx,
+                entry,
+                "its save was rolled back",
+                lambda: self._rollback_saves(ctx.channel.id, entry.slug),
             )
         except OSError as error:
             log.warning("Could not roll a Retro save back.", exc_info=True)
@@ -1150,11 +1361,21 @@ class SavesMixin(MixinMeta):
         promotion, so the command is its own undo: the file being rolled back
         from lands in the backup slot instead of being deleted.
 
-        Done through a third name so that neither file is ever lost if the
-        process dies between the two renames -- the worst case leaves a
-        ``.bak`` and a ``.rollback`` and no live file, and the restore chain
-        then falls through to the battery save rather than to nothing. Each
-        rename is atomic on its own.
+        Done through a third name (ROLLBACK_SUFFIX) so that neither file is
+        ever lost if the process dies mid-swap, and so that every crash point
+        is put right at the next cog load by ``_sweep_partial_writes``. Each
+        rename is atomic on its own, so a crash can only land between them,
+        and each gap is recoverable from the shape it leaves (the full
+        reasoning is on :meth:`StorageMixin._recover_rollback`):
+
+        * between (1) live -> spare and (2) backup -> live, the live slot is
+          empty and the spare holds the newest save; the sweep puts it back.
+        * between (2) and (3) spare -> backup, the backup slot is empty and
+          the spare holds what used to be live; the sweep finishes the swap.
+
+        Until that sweep runs, the worst a boot sees is one missing slot,
+        which the restore chain answers by falling through to whatever it
+        still has -- never a lost generation.
         """
         swapped: typing.List[str] = []
         state, state_backup, sram, sram_backup = self._save_paths(channel_id, slug)
@@ -1164,7 +1385,7 @@ class SavesMixin(MixinMeta):
         ):
             if not backup.is_file():
                 continue
-            spare = live.with_name(live.name + ".rollback")
+            spare = live.with_name(live.name + ROLLBACK_SUFFIX)
             try:
                 if live.is_file():
                     live.replace(spare)
@@ -1220,22 +1441,20 @@ class SavesMixin(MixinMeta):
             )
             return
 
-        # Sized here, where the sizes are still current. What is finally
-        # deleted is measured again at the time, because putting a live
-        # session to sleep below rewrites both files first.
+        # Sized here, where the sizes are still current, and only for the
+        # question. What is finally deleted is measured again at the time and
+        # named from that, because putting a live session to sleep below
+        # rewrites both files first -- and because a file that could not be
+        # removed must not be listed among the ones that were.
         pieces = []
-        named = []
         if entry.has_state:
             pieces.append(f"its save state ({self._humanize_bytes(entry.state_size)})")
-            named.append("its save state")
         if entry.has_sram:
             pieces.append(
                 f"its in-game save ({self._humanize_bytes(entry.sram_size)})"
             )
-            named.append("its in-game save")
         if entry.has_backup:
             pieces.append("the previous generation of both")
-            named.append("the previous generation")
         question = (
             f"Delete {humanize_list(pieces)} for **{entry.game_name}**?\n"
             "The game will start from the very beginning next time, and none "
@@ -1255,26 +1474,44 @@ class SavesMixin(MixinMeta):
             )
             return
 
-        paused = await self._pause_for_saves(ctx, entry, "its save data was deleted")
-        removed = await asyncio.to_thread(
-            self._delete_saves, ctx.channel.id, entry.slug
+        # Via _mutate_saves, so a press arriving while the confirmation sat
+        # on screen cannot have woken a core that would write everything
+        # straight back; see the helper.
+        paused, outcome = await self._mutate_saves(
+            ctx,
+            entry,
+            "its save data was deleted",
+            lambda: self._delete_saves(ctx.channel.id, entry.slug),
         )
-        if removed is None:
-            await self._safe_send(
-                ctx,
-                "The save files could not be deleted; the bot's data folder "
-                "may be read-only. The details are in the bot's log.",
-            )
-            return
         log.info(
-            "Deleted the save data for %s in channel %s at %s's request.",
+            "Deleted %s for %s in channel %s at %s's request.%s",
+            humanize_list(outcome.removed) or "nothing",
             entry.slug,
             ctx.channel.id,
             getattr(ctx.author, "id", "?"),
+            f" {humanize_list(outcome.failed)} could not be removed."
+            if outcome.failed
+            else "",
         )
+        if outcome.failed:
+            await self._report_partial_delete(ctx, entry, outcome, paused)
+            return
+        if not outcome.removed:
+            # Everything was gone before the delete ran: a second delete of
+            # the same game, or a prune between the listing and the
+            # confirmation. Claiming to have wiped four files that were not
+            # there would be the same kind of lie as the partial case.
+            await self._safe_send(
+                ctx,
+                f"**{entry.game_name}** had nothing left to delete by the "
+                "time the confirmation came back, so nothing was removed. It "
+                "will start from the very beginning next time.",
+            )
+            return
         lines = [
             f"Wiped **{entry.game_name}**'s save data: "
-            f"{humanize_list(named)}, {self._humanize_bytes(removed)} in all. "
+            f"{humanize_list(outcome.removed)}, "
+            f"{self._humanize_bytes(outcome.freed)} in all. "
             "It will start from the very beginning next time."
         ]
         if entry.rom is not None:
@@ -1290,27 +1527,108 @@ class SavesMixin(MixinMeta):
             )
         await self._safe_send(ctx, " ".join(lines))
 
-    def _delete_saves(
-        self, channel_id: int, slug: str
-    ) -> typing.Optional[int]:
+    async def _report_partial_delete(
+        self,
+        ctx: commands.Context,
+        entry: SaveInfo,
+        outcome: DeleteOutcome,
+        paused: bool,
+    ) -> None:
         """
-        Remove every save file for one game. Blocking; None if it failed.
+        Say which of a game's save files went and which are still there.
+
+        The rare half of `[p]retrosaves delete`, and the only half that can
+        leave a game in a shape nobody asked for: the save state deleted and
+        the in-game save surviving is neither "wiped" nor "unchanged", and
+        the old reply -- "The save files could not be deleted" after three of
+        the four already had been -- sent somebody off to start a game they
+        had been told was untouched and find it halfway through.
+
+        So the two lists are read out, and then the same sentence
+        `[p]retrosaves info` would give is read off the files as they are
+        *now* rather than guessed at, because what survived decides where the
+        game comes back from.
+        """
+        lines = [
+            (
+                f"Only part of **{entry.game_name}**'s save data could be "
+                f"deleted. Gone: {humanize_list(outcome.removed)}, "
+                f"{self._humanize_bytes(outcome.freed)} in all."
+            )
+            if outcome.removed
+            else f"None of **{entry.game_name}**'s save data could be deleted."
+        ]
+        lines.append(
+            f"Still there: {humanize_list(outcome.failed)} \N{EM DASH} the "
+            "bot's data folder may be read-only, and the details are in the "
+            "bot's log."
+        )
+        left = next(
+            (
+                fresh
+                for fresh in await self._saved_games(ctx.channel.id)
+                if fresh.slug == entry.slug
+            ),
+            None,
+        )
+        if left is not None:
+            lines.append(
+                "Started now, it would come back " + self._restore_sentence(left)
+            )
+        lines.append(
+            f"Running `{ctx.clean_prefix}retrosaves delete {entry.slug}` again "
+            "is safe once that is sorted out \N{EM DASH} it only removes what "
+            "is left."
+        )
+        if paused:
+            lines.append(
+                "The game was saved and put to sleep for the delete; press a "
+                "button on it to pick it back up from whatever survived."
+            )
+        await self._safe_send(ctx, " ".join(lines))
+
+    def _delete_saves(self, channel_id: int, slug: str) -> DeleteOutcome:
+        """
+        Remove every save file for one game. Blocking; never raises.
 
         All four of them: both halves and the previous generation of each.
         "Wipe this game's progress" has to mean it, and a rollback that
         resurrected what somebody had just deleted would be worse than not
         having a rollback at all.
+
+        Every path is tried even after one of them has failed, and what
+        failed comes back instead of a bare "it did not work". Giving up on
+        the first OSError left the four files in a shape nobody was ever told
+        about -- two deleted, two not -- under a message that said none of
+        them had been; carrying on at least makes the answer describable, and
+        deleting as much as can be deleted is what was asked for anyway.
+
+        ``failed`` names the files that are *still there*, which is the only
+        thing worth telling somebody. A file that was already gone and whose
+        unlink failed anyway (an unwritable directory says the same thing
+        about a name that is not in it) is logged and left out: "the in-game
+        save survived" about a save that never existed is its own lie.
         """
-        removed = 0
-        for path in self._save_paths(channel_id, slug):
+        freed = 0
+        removed: typing.List[str] = []
+        failed: typing.List[str] = []
+        paths = self._save_paths(channel_id, slug)
+        # strict: DELETE_LABELS is _save_paths' tuple spelled out in words, so
+        # a fifth save file added to one and not the other should stop the
+        # delete rather than silently leave the new file behind.
+        for path, label in zip(paths, DELETE_LABELS, strict=True):
+            facts = self._file_facts(path)
             try:
-                facts = self._file_facts(path)
                 path.unlink(missing_ok=True)
             except OSError:
                 log.warning("Could not delete the Retro save %s", path, exc_info=True)
-                return None
-            removed += facts[0] if facts else 0
-        return removed
+                if facts is not None:
+                    failed.append(label)
+                continue
+            if facts is not None:
+                removed.append(label)
+                freed += facts[0]
+        return DeleteOutcome(freed, removed, failed)
 
     # An import downloads two attachments and boots a real core to check them
     # against the cartridge, which is the most expensive thing in this group.
@@ -1350,38 +1668,76 @@ class SavesMixin(MixinMeta):
         """
         entry = await self._resolve_save(ctx, game)
         if entry is None:
+            # No attachment has been downloaded yet, so neither of these cost
+            # anything worth rationing and both are a retry away from
+            # working. See _refund_cooldown.
+            self._refund_cooldown(ctx)
             return
         if not await self._may_manage_saves(ctx, entry):
+            self._refund_cooldown(ctx)
             await self._refuse_management(ctx, entry, "import a save for it")
             return
 
+        # _read_import hands the cooldown back itself on the paths that give
+        # up before downloading anything, and keeps it charged on the ones
+        # that have already pulled the bytes.
         incoming = await self._read_import(ctx, entry)
         if incoming is None:
             return
         state, sram = incoming
 
+        # Two fates for what is already there, and the question must not mix
+        # them up. A file that is *overwritten* is rotated into the backup
+        # slot first (see _write_import), so `rollback` really can bring it
+        # back. The save state a battery-save-only import removes is
+        # *deleted*, both generations of it, and cannot -- so promising the
+        # rollback there would be promising something the command cannot do.
         replacing = []
         if sram is not None and entry.has_sram:
             replacing.append(
                 f"its in-game save ({self._humanize_bytes(entry.sram_size)})"
             )
-        if entry.has_state:
-            # Even a battery-save-only import takes the state with it; see
-            # below and the note in the docstring.
+        if state is not None and entry.has_state:
             replacing.append(
                 f"its save state ({self._humanize_bytes(entry.state_size)})"
             )
-        if replacing:
-            question = (
-                f"Importing this will overwrite {humanize_list(replacing)} for "
-                f"**{entry.game_name}**. What is there now is kept as the "
-                f"previous generation, so `{ctx.clean_prefix}retrosaves "
-                f"rollback {entry.slug}` can swap back to it \N{EM DASH} but "
-                "only until the next automatic save rotates it out, so "
-                f"`{ctx.clean_prefix}retrosaves export {entry.slug}` is the "
-                "way to keep a copy. Go ahead?"
+        deleting_state = state is None and (
+            entry.has_state or entry.has_state_backup
+        )
+        if replacing or deleting_state:
+            sentences = []
+            if replacing:
+                sentences.append(
+                    f"Importing this will overwrite {humanize_list(replacing)} "
+                    f"for **{entry.game_name}**. What is there now is kept as "
+                    f"the previous generation, so `{ctx.clean_prefix}retrosaves "
+                    f"rollback {entry.slug}` can swap back to it \N{EM DASH} "
+                    "but only until the next automatic save rotates it out."
+                )
+            if deleting_state:
+                sized = (
+                    f" ({self._humanize_bytes(entry.state_size)})"
+                    if entry.has_state
+                    else ""
+                )
+                sentences.append(
+                    (
+                        "It will also delete its"
+                        if replacing
+                        else f"Importing this will delete **{entry.game_name}**'s"
+                    )
+                    + f" save state{sized} outright, the previous generation "
+                    "of it included \N{EM DASH} a save state is the whole "
+                    "machine and either copy would be restored over the top "
+                    "of the in-game save you are bringing in. A deleted save "
+                    "state cannot be rolled back."
+                )
+            keep = "both " if deleting_state and entry.has_state else ""
+            sentences.append(
+                f"`{ctx.clean_prefix}retrosaves export {keep}{entry.slug}` "
+                "first is the way to keep a copy. Go ahead?"
             )
-            if not await self._confirm(ctx, question):
+            if not await self._confirm(ctx, " ".join(sentences)):
                 await self._safe_send(
                     ctx, f"Left **{entry.game_name}**'s save alone."
                 )
@@ -1390,6 +1746,12 @@ class SavesMixin(MixinMeta):
         # Sleep first, so nothing that is written below can be overwritten by
         # a core that is still holding the old save in memory.
         paused = await self._pause_for_saves(ctx, entry, "a save was imported")
+        # Asked here as well as inside the check, because the answer is worth
+        # something on the way *out*: an in-game save that could not be tried
+        # on the cartridge is accepted anyway (see _check_import) and the only
+        # sign it did not fit is the game quietly ignoring it days later.
+        # Whoever imported it deserves to be told which of the two happened.
+        blocker = await self._import_check_blocker(entry)
         problem = await self._check_import(entry, state, sram, ctx.clean_prefix)
         if problem is not None:
             lines = [problem, "Nothing was changed."]
@@ -1402,9 +1764,20 @@ class SavesMixin(MixinMeta):
             return
 
         try:
-            written = await asyncio.to_thread(
-                self._write_import, ctx.channel.id, entry.slug, state, sram
+            # Via _mutate_saves rather than straight to a thread: the check
+            # above took whole seconds of core boot, and any button press
+            # during it woke the session from the old files. Written under a
+            # core that came back like that, the import would be silently
+            # overwritten by its very next automatic save -- so the session
+            # is put back to sleep, under its own lock, and stays there until
+            # the imported files are on disk.
+            paused_again, written = await self._mutate_saves(
+                ctx,
+                entry,
+                "a save was imported",
+                lambda: self._write_import(ctx.channel.id, entry.slug, state, sram),
             )
+            paused = paused or paused_again
         except OSError as error:
             log.warning("Could not write an imported Retro save.", exc_info=True)
             await self._safe_send(
@@ -1422,11 +1795,23 @@ class SavesMixin(MixinMeta):
         )
 
         lines = [f"Imported {humanize_list(written)} for **{entry.game_name}**."]
-        if state is None and entry.has_state:
+        if state is None and (entry.has_state or entry.has_state_backup):
+            # Both generations go (see _write_import), so both are accounted
+            # for here -- the confirmation was made precise about which files
+            # survive an import and a success message that mentioned only the
+            # live one would quietly take that back. A game whose newer state
+            # had already been thrown out for being unloadable has only the
+            # older one to lose, and it loses it just the same.
+            if entry.has_state and entry.has_state_backup:
+                gone = "The old save state and the previous generation of it were"
+            elif entry.has_state:
+                gone = "The old save state was"
+            else:
+                gone = "The previous save state, the only one left, was"
             lines.append(
-                "The old save state was removed with it: a save state is the "
-                "whole machine and would have been restored over the top of "
-                "the in-game save you just brought in."
+                f"{gone} removed with it: a save state is the whole machine "
+                "and would have been restored over the top of the in-game "
+                "save you just brought in."
             )
         if state is not None:
             lines.append(
@@ -1438,6 +1823,8 @@ class SavesMixin(MixinMeta):
                 "The game will start from the title screen with the imported "
                 "save in place \N{EM DASH} load it from the game's own menu."
             )
+        if sram is not None and blocker is not None:
+            lines.append(self._unchecked_import_note(entry, blocker, ctx.clean_prefix))
         if paused:
             lines.append(
                 "The game was running, so it was saved and put to sleep first "
@@ -1459,9 +1846,17 @@ class SavesMixin(MixinMeta):
         there is an attachment at all, that its extension says what it is,
         that there is at most one of each, that it is not empty, and that it
         is inside the size ceilings. Returns None (having said why) if not.
+
+        The cooldown is handed back on every refusal above the download loop
+        and kept on every refusal below it, which is the line drawn in
+        :meth:`_refund_cooldown`: an attachment Discord reported as 4 MiB was
+        never fetched, so the retry that renames the file should not have to
+        wait a minute, while bytes that really were pulled were really paid
+        for.
         """
         attachments = list(getattr(ctx.message, "attachments", ()) or ())
         if not attachments:
+            self._refund_cooldown(ctx)
             await self._safe_send(
                 ctx,
                 "Attach the save file to your message: an in-game save "
@@ -1472,6 +1867,7 @@ class SavesMixin(MixinMeta):
             )
             return None
         if len(attachments) > 2:
+            self._refund_cooldown(ctx)
             await self._safe_send(
                 ctx,
                 "Attach at most two files: one in-game save and one save "
@@ -1488,6 +1884,7 @@ class SavesMixin(MixinMeta):
             elif suffix in STATE_EXTENSIONS:
                 kind = "state"
             else:
+                self._refund_cooldown(ctx)
                 await self._safe_send(
                     ctx,
                     f"`{name or 'that file'}` is not a save this cog knows. A "
@@ -1497,6 +1894,7 @@ class SavesMixin(MixinMeta):
                 )
                 return None
             if kind in found:
+                self._refund_cooldown(ctx)
                 await self._safe_send(
                     ctx,
                     f"Two {'in-game saves' if kind == 'sram' else 'save states'} "
@@ -1510,6 +1908,7 @@ class SavesMixin(MixinMeta):
             )
             size = int(getattr(attachment, "size", 0) or 0)
             if size > limit:
+                self._refund_cooldown(ctx)
                 await self._safe_send(
                     ctx,
                     f"`{name}` is {self._humanize_bytes(size)}, past the "
@@ -1544,6 +1943,70 @@ class SavesMixin(MixinMeta):
             data[kind] = bytes(payload)
         return data.get("state"), data.get("sram")
 
+    async def _import_check_blocker(self, entry: SaveInfo) -> typing.Optional[str]:
+        """
+        Why an incoming save cannot be tried on the real core, or None.
+
+        ``"rom"`` when the cached ROM has been pruned and ``"core"`` when the
+        emulator the game needs is not installed. Either way there is nothing
+        to boot, so there is nothing to offer the file to.
+
+        One answer, two callers with opposite uses for it:
+        :meth:`_check_import` turns it into a refusal for a save state, which
+        is worthless unless a core has actually loaded it, and
+        ``retrosaves_import`` turns it into the caveat on an accepted in-game
+        save, which is merely unproven. They worked it out separately once,
+        which is one edit away from a command that checks nothing and says
+        nothing about it.
+        """
+        if entry.rom is None or not entry.rom.is_file():
+            return "rom"
+        if not entry.core or await self._core_path(entry.core) is None:
+            return "core"
+        return None
+
+    def _unchecked_import_note(
+        self, entry: SaveInfo, blocker: str, prefix: str
+    ) -> str:
+        """
+        Own up to an in-game save that went in without being checked.
+
+        An in-game save is the cartridge's own battery memory and is accepted
+        unvalidated (see :meth:`_check_import`) because storing one costs
+        nothing. Being *ignored* later does cost something, though: a `.sav`
+        that is the wrong size for this cartridge is passed over at the next
+        boot without a word, and from the channel's side that looks exactly
+        like an import that worked and a game that lost it. The only moment
+        anybody can be told is now, so this is appended to the success
+        message rather than left to be discovered.
+        """
+        if blocker == "rom":
+            why = (
+                f"the cached ROM for **{entry.game_name}** has been cleaned "
+                "up, so there was no cartridge to try it against"
+            )
+            fix = (
+                f" Start the game once with `{prefix}retro <name or url>` and "
+                "import it again if that happens, and it will be checked "
+                "properly."
+            )
+        else:
+            why = (
+                f"the emulator **{entry.game_name}** needs "
+                f"(`{entry.core or 'unknown'}`) is not installed, so there "
+                "was nothing to try it against"
+            )
+            fix = (
+                " Ask the bot owner to install it, then import again to have "
+                "it checked properly."
+            )
+        return (
+            f"It was **not** checked first: {why}. If it turns out to be the "
+            "wrong size for this game's save memory, the game will ignore it "
+            "when it starts and carry on as though it had never been "
+            f"imported.{fix}"
+        )
+
     async def _check_import(
         self,
         entry: SaveInfo,
@@ -1571,8 +2034,23 @@ class SavesMixin(MixinMeta):
         """
         if state is None and sram is None:
             return None
-        if entry.rom is None or not entry.rom.is_file():
-            if state is not None:
+        blocker = await self._import_check_blocker(entry)
+        # Looked up again rather than carried out of the blocker, and the gap
+        # between the two closed here: a core that was uninstalled in between
+        # is the "core" blocker by another route, never a None handed to an
+        # emulator.
+        core_path = None if blocker is not None else await self._core_path(entry.core)
+        if blocker is None and core_path is None:
+            blocker = "core"
+        if blocker is not None:
+            if state is None:
+                # A battery save is the cartridge's own format and is checked
+                # against the region size at boot, so storing one unvalidated
+                # costs nothing worse than it being ignored later -- and the
+                # reply says exactly that rather than leaving it to be found
+                # out on the next start. See _unchecked_import_note.
+                return None
+            if blocker == "rom":
                 return (
                     f"The cached ROM for **{entry.game_name}** has been "
                     "cleaned up, so a save state cannot be checked against it "
@@ -1581,19 +2059,11 @@ class SavesMixin(MixinMeta):
                     f"`{prefix}retro <name or url>` and import the state "
                     "after that."
                 )
-            # A battery save is the cartridge's own format and is checked
-            # against the region size at boot, so storing one unvalidated
-            # costs nothing worse than it being ignored later.
-            return None
-        core_path = await self._core_path(entry.core) if entry.core else None
-        if core_path is None:
-            if state is not None:
-                return (
-                    f"The emulator core **{entry.game_name}** needs "
-                    f"(`{entry.core or 'unknown'}`) is not installed, so a "
-                    "save state cannot be checked against it."
-                )
-            return None
+            return (
+                f"The emulator core **{entry.game_name}** needs "
+                f"(`{entry.core or 'unknown'}`) is not installed, so a "
+                "save state cannot be checked against it."
+            )
 
         emulator = RetroEmulator(
             core_path,
@@ -1606,20 +2076,24 @@ class SavesMixin(MixinMeta):
             # put to sleep, exactly as starting a game would do.
             await self._evict_locked()
             try:
-                return await asyncio.to_thread(
+                outcome = await self.run_in_emulator_thread(
                     self._try_import, emulator, entry, state, sram
                 )
             except EmulatorError as error:
                 log.warning("Could not check an imported save: %s", error)
-                return (
+                outcome = (
                     f"**{entry.game_name}** could not be started to check the "
                     f"save against it: {error}"
                 )
             finally:
                 try:
-                    await asyncio.to_thread(emulator.stop)
+                    await self.run_in_emulator_thread(emulator.stop)
                 except Exception:
                     log.exception("Could not stop the import-check emulator.")
+        # Whatever this check put to sleep is told so now, with the lock given
+        # back rather than while it is held; see Retro._flush_refreshes.
+        await self._flush_refreshes()
+        return outcome
 
     def _try_import(
         self,
@@ -1672,11 +2146,18 @@ class SavesMixin(MixinMeta):
         """
         Put validated saves in place. Blocking. Returns what it wrote.
 
+        Everything *overwritten* is rotated into its backup slot first, so
+        `[p]retrosaves rollback` genuinely brings it back.
+
         A battery save imported on its own takes the existing save state with
-        it. A state is the whole machine and is restored *before* SRAM is even
-        looked at (see :func:`RetroView.restore_into`), so leaving the old one
-        there would restore the game over the top of the save that was just
-        brought in -- the import would look as though it had done nothing.
+        it -- deleted, not rotated. A state is the whole machine and is
+        restored *before* SRAM is even looked at (see
+        :func:`RetroView.restore_into`), so leaving the old one anywhere the
+        restore chain looks would restore the game over the top of the save
+        that was just brought in; the import would look as though it had done
+        nothing. That makes the old state the one thing an import destroys
+        for good, and the confirmation in ``retrosaves_import`` says exactly
+        that instead of promising a rollback it cannot deliver.
         """
         state_path, state_backup, sram_path, _ = self._save_paths(channel_id, slug)
         written: typing.List[str] = []
@@ -1692,7 +2173,11 @@ class SavesMixin(MixinMeta):
         elif sram is not None:
             # Both generations of the state go, for the reason in the
             # docstring: either of them would be restored over the top of the
-            # battery save that was just imported.
+            # battery save that was just imported. Deleted, not parked in the
+            # backup slot -- the restore chain boots from a lone
+            # ``.state.bak`` exactly as happily as from a live state, so
+            # "keeping" the old state there would make this import a silent
+            # no-op on the next boot.
             state_path.unlink(missing_ok=True)
             state_backup.unlink(missing_ok=True)
         return written

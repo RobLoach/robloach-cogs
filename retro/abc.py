@@ -69,10 +69,22 @@ class MixinMeta(ABC):
     #: leave a core loaded. Also retro/saves.py.
     _force_hibernate: typing.Callable[..., typing.Awaitable[None]]
     #: Put every *other* live session to sleep, so loading a core here cannot
-    #: make two. Called before a core is loaded for a probe or an option
-    #: change (retro/cores.py) and before a save is inspected with a real
-    #: core (retro/saves.py).
+    #: make two. Called before a save is inspected with a real core
+    #: (retro/saves.py), which is the only caller left outside this class:
+    #: reading a core's options used to evict every session in every channel
+    #: to do it, and now answers from what is already known instead.
     _evict_locked: typing.Callable[..., typing.Awaitable[typing.List[typing.Any]]]
+    #: Run one blocking call into a libretro core, on the single thread every
+    #: core call is made from. Used wherever a mixin drives a core -- probing
+    #: a core's options and setting one (retro/cores.py), checking an
+    #: uploaded save against the real core (retro/saves.py). Never
+    #: ``asyncio.to_thread``: see Retro.run_in_emulator_thread for what a
+    #: core does when the thread under it changes.
+    run_in_emulator_thread: typing.Callable[..., typing.Awaitable[typing.Any]]
+    #: Make the message edits that were put off while the emulator lock was
+    #: held. Called by anything that takes that lock and lets it go again --
+    #: _evict_locked records an edit per session it puts to sleep.
+    _flush_refreshes: typing.Callable[..., typing.Awaitable[None]]
     #: Reply to a command without letting a missing permission raise.
     _safe_send: typing.Callable[..., typing.Awaitable[typing.Any]]
     #: Reply with something long enough to need paging.

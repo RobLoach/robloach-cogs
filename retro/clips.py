@@ -81,8 +81,71 @@ CLIP_FPS = 15
 # controller a few times a second can miss a press entirely. Halve it again
 # and the clip is two pictures and the hold is four frames, i.e. a press that
 # may not register at all and a "clip" nobody can read.
+#
+# The ceiling is 5s, and used to be 15 with nothing behind it. Three costs
+# grow with the clip -- encode time, the uncompressed working set and the
+# turn itself -- and all three are linear in it, so this constant is the only
+# thing bounding any of them.
+#
+# Encode first. Measured on a Raspberry Pi 5 against the real cores, best of
+# three, one press end to end (emulate, then encode; the encode is the half
+# that runs with the emulator lock released, see encode_clip):
+#
+#                        pics   emulate   encode    total   native RAM
+#   gambatte / uCity, which animates every frame (320x288 posted)
+#     1s                   16     48ms     24ms      72ms     1.1 MiB
+#     4s                   61    105ms     54ms     160ms     4.0 MiB
+#     5s                   76    131ms     64ms     195ms     5.0 MiB
+#     15s                 225    366ms    205ms     571ms    14.8 MiB
+#   fceumm / nestest with a direction held (293x224 posted)
+#     1s                   16     48ms      8ms      57ms     2.6 MiB
+#     4s                   61    192ms     24ms     216ms    10.0 MiB
+#     5s                   76    243ms     28ms     272ms    12.5 MiB
+#     15s                 226    802ms     83ms     885ms    37.1 MiB
+#
+# Encode time is linear in pictures past the first clip (which carries a
+# fixed few milliseconds of setup): 0.84-0.91ms a picture on the Game Boy and
+# 0.37-0.39ms on the NES at every length from 4s up.
+#
+# Those are the two cheapest consoles here, and they are not what the ceiling
+# is for. The expensive case is a Super Nintendo in hi-res, which posts at
+# 597x448 (see MIN_CLIP_WIDTH) and which the WEBP_METHOD table above measures
+# at 342ms of encode for a one second clip and 1,863ms for a four second one
+# at the settings this ships with. At the same per-picture rate 15 seconds is
+# 225 pictures and roughly 7 seconds of encode, for one button press, on the
+# thread every channel's emulation shares. 5 seconds is 76 pictures and
+# roughly 2.3 -- still the slowest thing this cog does, but bounded, and only
+# reachable by someone who asked for it.
+#
+# Second, the working set. A recording holds every picture as an
+# uncompressed native-size Pillow image until the encode has finished (see
+# CapturedClip.images), so the peak is pictures x frame bytes. 512x448 RGB is
+# 688 KiB a picture, which is the "native RAM" column above taken to the
+# console that has the biggest frames:
+#
+#                    1s         5s        15s
+#   SNES hi-res    10.5 MiB   49.9 MiB   147.7 MiB
+#   Game Boy        1.1 MiB    5.0 MiB    14.8 MiB
+#
+# 148 MiB of images for one press is not a thing a bot sharing a host should
+# be askable for from a chat box.
+#
+# Third, the turn, which is the same argument that made CLIP_SECONDS one
+# second rather than four -- a press is a round trip, and the clip is the
+# part the player spends watching. At 15 seconds the watching is fifteen
+# times the default and almost all of it is a game that has finished
+# reacting. The pacing gate does not even deliver that footage reliably: it
+# holds an edit for playback_seconds but caps one wait at MAX_PACE_SECONDS
+# (1.25s, see retro/RetroView.py), so anything longer than that is replaced
+# before it has played out whenever somebody is queued behind it.
+#
+# 5 seconds still covers the thing the long end was wanted for -- letting a
+# cutscene or a long text box play out without pressing anything -- at five
+# times the default. :func:`clamp_clip_seconds` is on every path that reads
+# the setting, so an installation configured at 15 before this changed is
+# clamped down on read rather than needing a migration.
 MIN_CLIP_SECONDS = 0.2
-MAX_CLIP_SECONDS = 15.0
+MAX_CLIP_SECONDS = 5.0
 
 # The fewest emulated frames a clip may be, whatever it was asked for. At
 # CLIP_FPS against a 60 fps core one picture is four frames, so six frames is
@@ -122,7 +185,7 @@ MIN_AFTERMATH_FRAMES = 1
 # recording: the pre-roll is emulated in front of it, so the clip still plays
 # for exactly as long as the window it photographed emulated, and every frame
 # the pre-roll ran through is a frame the player had already seen (that is the
-# stopping condition). See RetroEmulator.record.
+# stopping condition). See RetroEmulator.record_frames.
 #
 # Measured on a Raspberry Pi 5 against the real cores at the default 160ms
 # hold, boot + 3 seconds, one button held from frame 0 -- how many emulated
@@ -523,7 +586,7 @@ def capture_plan(
 
     Returns ``[(frame index, emulated frames that picture stands for), ...]``,
     oldest first, where the index is the 0-based frame of the recording --
-    exactly what ``RetroEmulator.record`` counts with. The picture taken on
+    exactly what ``RetroEmulator.record_frames`` counts with. The picture taken on
     index ``i`` shows the game after ``i + 1`` emulated frames, and stands
     until the next picture is taken, so the durations always add up to
     ``frames`` and the clip plays for as long as it emulated.
@@ -570,7 +633,7 @@ def clip_plan(
     :func:`capture_plan` in milliseconds: which frames, shown for how long.
 
     ``[(frame index, that picture's duration in ms), ...]``, oldest first --
-    exactly the durations ``RetroEmulator.record`` hands the encoder, and
+    exactly the durations ``RetroEmulator.record_frames`` captures with, and
     therefore exactly what ends up in the clip's ANMF chunks. A picture
     stands for ``covered`` emulated frames and is shown for as long as those
     frames took to emulate, which is what makes the clip play for as long as
@@ -651,7 +714,7 @@ def preroll_budget(
     The pre-roll plays the press out without photographing it, until the
     picture stops being the one the previous clip left in the channel; this is
     the ceiling on how far it will look. See PREROLL_SECONDS for the
-    measurements, and :meth:`RetroEmulator.record` for the mechanism.
+    measurements, and :meth:`RetroEmulator.record_frames` for the mechanism.
 
     Three things cap it, and the smallest wins:
 
@@ -834,6 +897,14 @@ def clamp_clip_seconds(value: typing.Any) -> float:
     and a hand-edited settings file can hold anything at all. Rounding to
     hundredths keeps the number something that can be printed back without
     trailing noise, and 10ms is well under one frame of any console here.
+
+    Clamping on *read* rather than on write is what makes lowering
+    MAX_CLIP_SECONDS safe. An installation that set 15 while the ceiling was
+    15 still has 15 in Config; the next session to read it gets 5, nothing
+    raises, and the stored number is corrected the next time anybody runs
+    `[p]retroset cliplength` (which clamps through here too). The same is
+    true of a value below MIN_CLIP_SECONDS and of a value that is not a
+    number at all.
     """
     try:
         seconds = float(value)
@@ -879,15 +950,20 @@ def _pillow():
     return Image
 
 
-def encode_animation(images, duration_ms) -> bytes:
+def encode_animation(
+    images, duration_ms, *, lossless: bool = True, quality: int = 100
+) -> bytes:
     """
     Turn a list of same-sized Pillow images into one animated WebP.
 
     ``duration_ms`` is either a list with one entry per frame or a single
-    duration for all of them. The only caller in the cog passes a list, because
+    duration for all of them. The cog itself only ever passes a list, because
     :func:`capture_plan` gives the closing picture a shorter nominal duration
-    than the rest; the scalar form is kept because Pillow accepts it and it
-    costs a branch.
+    than the rest -- but the scalar form is not dead: ``tests/fakes.py``
+    builds its stand-in clips with ``encode_animation(images, FAKE_FRAME_MS)``
+    and every fast test that reads a clip back depends on it. It is also the
+    honest shape for "all the same length", which is what a caller with no
+    capture plan in hand has.
     """
     buffer = io.BytesIO()
     if isinstance(duration_ms, (list, tuple)):
@@ -906,13 +982,156 @@ def encode_animation(images, duration_ms) -> bytes:
             # state the next press carries on from; loop=0 would mean
             # "forever" and fill a busy channel with flickering.
             loop=1,
-            lossless=True,
+            # Lossless, at quality 100, is what every ordinary clip is: these
+            # are flat-shaded console frames with hard edges, which is
+            # exactly what lossless WebP is good at, and a lossy pass on
+            # sprite art shows its mistakes. The knobs exist for one case --
+            # a clip too big for the server to accept, where a visibly
+            # softer picture beats no picture at all. See shrink_clip.
+            lossless=lossless,
             # See WEBP_METHOD and WEBP_MINIMIZE_SIZE, which carry the
             # measurements these three numbers were chosen from.
-            quality=100,
+            quality=quality,
             method=WEBP_METHOD,
             minimize_size=WEBP_MINIMIZE_SIZE,
         )
     except Exception as exc:
         raise EmulatorError(f"The clip could not be encoded: {exc}") from exc
     return buffer.getvalue()
+
+
+class CapturedClip(typing.NamedTuple):
+    """A recorded-but-not-yet-encoded clip: what ``record_frames`` hands over.
+
+    Everything :func:`encode_clip` needs and nothing that touches a core,
+    which is the point of splitting the two: capturing frames needs the
+    emulator (and therefore whatever lock serializes access to it), encoding
+    them does not, so a caller can capture under the lock, release it, and
+    encode -- the most expensive CPU step of a button press -- while the next
+    press is already emulating.
+    """
+
+    #: The captured pictures as Pillow images, oldest first, each at the
+    #: core's own resolution rather than the posted size. That is what makes
+    #: holding a clip's worth of them cheap: the posted picture is up to
+    #: MAX_CLIP_SCALE times the frame in each direction (a Game Boy's 160x144
+    #: posts at 320x288), so output-sized frames cost scale-squared the
+    #: memory of native ones for no information at all -- the enlargement
+    #: only ever repeats pixels.
+    images: typing.List
+    #: Milliseconds each picture is shown for, one entry per image; see
+    #: :func:`clip_plan`, whose durations these are.
+    durations: typing.List[int]
+    #: The ``(width, height)`` the clip is posted at (see :func:`clip_size`),
+    #: decided from the first captured frame and pinned there, so a core that
+    #: changes resolution mid-clip (libretro's SET_GEOMETRY; the SNES does)
+    #: cannot change the answer part-way through.
+    size: typing.Tuple[int, int]
+
+
+def encode_clip(
+    captured: CapturedClip, *, lossless: bool = True, quality: int = 100
+) -> bytes:
+    """Turn a :class:`CapturedClip` into the WebP bytes the cog posts.
+
+    The other half of ``RetroEmulator.record``, and deliberately a plain
+    function of the captured data rather than a method: it needs no core, so
+    a caller serializing emulator access can run it with the lock released.
+
+    Each picture is enlarged from the core's resolution to ``captured.size``
+    with NEAREST here -- the same single resize the recording used to do per
+    frame at capture time, so the bytes that come out are identical -- and
+    only once per *run* of identical pictures: libwebp already merges
+    identical consecutive frames (which is why a static screen costs a
+    handful of bytes, see :func:`encode_animation`), so resizing every copy
+    of a picture the encoder was about to fold away was pure waste. Spotting
+    a run costs one ``tobytes()`` per native-sized frame, which is far
+    cheaper than the resize it skips.
+
+    A picture whose size is not ``captured.size`` -- every frame of a 1x
+    console, and any frame from a mid-clip geometry change -- goes straight
+    from its own resolution to the posted one in that single step, never
+    through a chain, so no frame handed to the encoder can disagree with its
+    siblings about the size.
+    """
+    images, durations, size = captured
+    Image = _pillow()
+    size = tuple(size)
+    posted = []
+    last_key = None
+    last_resized = None
+    for image in images:
+        if image.size != size:
+            key = (image.size, image.tobytes())
+            if key != last_key:
+                last_key = key
+                last_resized = image.resize(size, Image.NEAREST)
+            image = last_resized
+        posted.append(image)
+    return encode_animation(posted, durations, lossless=lossless, quality=quality)
+
+
+#: What to try, in order, when a lossless clip is bigger than the server will
+#: accept. Each step is (lossless, quality, scale-of-the-posted-size).
+#:
+#: The order is "give up the least first". Lossy at 80 is the cheapest thing
+#: that helps and is still perfectly readable on console art; 60 is visibly
+#: soft but legible; halving the picture is the last resort, because a
+#: smaller screen costs everybody in the channel something a slightly mushier
+#: one does not.
+#:
+#: The alternative -- what this cog did before -- was to post it, let Discord
+#: refuse it, and tell the player to ask the owner to lower `cliplength`.
+#: That spends the whole round trip (emulate, encode, upload) before
+#: failing, the press is gone, and the person told to change a setting is
+#: usually not the person who can.
+CLIP_SHRINK_STEPS = (
+    (False, 80, 1.0),
+    (False, 60, 1.0),
+    (False, 60, 0.5),
+)
+
+
+def shrink_clip(
+    captured: CapturedClip, limit: int, current: typing.Optional[bytes] = None
+) -> bytes:
+    """
+    Re-encode a clip until it fits ``limit`` bytes, or give up gracefully.
+
+    Only ever reached when the ordinary lossless encode came out too big for
+    the server it is going to (Discord's per-guild attachment limit, which
+    boosting raises). Tries CLIP_SHRINK_STEPS in order and returns the first
+    result that fits.
+
+    ``current`` is what the caller already has -- the lossless encode that
+    was too big -- and passing it is what makes this safe, because **lossy
+    is not reliably smaller here**. These are flat-shaded console frames with
+    large areas of one colour and hard edges: lossless WebP is extremely good
+    at exactly that, and a lossy pass can come out *many times larger* by
+    spending bits on the edges it is trying to approximate. (Measured on a
+    synthetic 320x288 pattern: 1.1 KB lossless against 188 KB at quality 80.)
+    So every attempt is compared against what the caller already had, and
+    nothing bigger is ever handed back.
+
+    If nothing fits, the **smallest** candidate is returned rather than an
+    error: the caller still has to hand Discord something, a clip that is
+    merely probably-too-big is worth the attempt, and the existing 40005
+    handling is the backstop underneath it. Never raises anything an
+    ordinary encode would not.
+    """
+    smallest = current
+    if current is not None and len(current) <= limit:
+        return current
+    for lossless, quality, scale in CLIP_SHRINK_STEPS:
+        if scale != 1.0:
+            width, height = captured.size
+            resized = (max(1, int(width * scale)), max(1, int(height * scale)))
+            attempt = captured._replace(size=resized)
+        else:
+            attempt = captured
+        encoded = encode_clip(attempt, lossless=lossless, quality=quality)
+        if len(encoded) <= limit:
+            return encoded
+        if smallest is None or len(encoded) < len(smallest):
+            smallest = encoded
+    return smallest

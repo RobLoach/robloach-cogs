@@ -262,10 +262,13 @@ async def test_a_resumed_game_draws_its_repeat_button_from_the_real_core(
 
     back = retro.cog.sessions[retired.channel.id]
     assert back.repeat_taps == 1
-    assert retro.control(back, "repeat") is None
+    assert retro.drawn(back, "repeat") is None
+    # Hidden from the payload rather than taken out of the view, so a click
+    # on the copy still sitting on some older message in this channel lands
+    # on a callback that answers it; see RetroView.to_components.
+    assert retro.control(back, "repeat").hidden
     # The row the controls sit on still has Wait and Undo, in that order.
-    row = max(c.row for c in back.children)
-    assert [c.label for c in back.children if c.row == row][-2:] == ["Wait", "Undo"]
+    assert retro.drawn_row(back)[-2:] == ["Wait", "Undo"]
     # ...and the message the resume posted was drawn from that same view, so
     # what went out has no x3 button on it either.
     labels = interaction.log[-1][1]["labels"]

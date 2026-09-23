@@ -3,17 +3,22 @@ Standalone retro console emulator built on libretro.py.
 
 This module has no Red-DiscordBot or discord.py imports so it can be imported
 and tested with nothing but libretro.py and Pillow. All methods are
-synchronous and not thread-safe; async callers should run them in a single
-worker thread (e.g. asyncio.to_thread) and serialize access with a lock.
+synchronous and not thread-safe; async callers should give each live core one
+dedicated worker thread -- a ``ThreadPoolExecutor(max_workers=1)`` driven
+through ``loop.run_in_executor`` -- and serialize access with a lock. Not
+``asyncio.to_thread``: that dispatches to a shared pool, so successive calls
+against the same core can land on different threads, and a core that keeps
+thread-local state misbehaves the moment they do.
 
 Supports both the SessionBuilder API of libretro.py <= 0.6.x (the newest
 release available on Python 3.11, which Red-DiscordBot requires) and the
 Session constructor API of libretro.py >= 0.7.
 
 The clip arithmetic, the animation encoder and the fast frame grab live next
-door in retro/clips.py, which needs no libretro at all; every one of their
-names is re-exported here, so importing them from this module still works
-and still gets the same objects.
+door in retro/clips.py, which needs no libretro at all. The names of theirs
+that the rest of the cog imports from *here* are re-exported below, so the
+split cost nothing at the call sites; anything else in clips.py is imported
+from clips.py, which is where it lives.
 """
 
 import io
@@ -23,35 +28,27 @@ import typing
 from pathlib import Path
 
 from .clips import (
-    _SLOW_GRAB_LOGGED,
     CLIP_EXTENSION,
     CLIP_FPS,
     CLIP_SECONDS,
-    FAST_POINT_TABLES,
     FAST_RAW_MODES,
     FAST_ROTATIONS,
     MAX_CLIP_SCALE,
     MAX_CLIP_SECONDS,
-    MIN_AFTERMATH_FRAMES,
     MIN_CLIP_FRAMES,
     MIN_CLIP_SECONDS,
-    MIN_CLIP_WIDTH,
-    PREROLL_SECONDS,
-    WEBP_METHOD,
-    WEBP_MINIMIZE_SIZE,
+    CapturedClip,
     EmulatorError,
-    _channel_expansion_table,
-    _note_slow_frame_grab,
     _pillow,
     capture_plan,
     capture_step,
     clamp_clip_seconds,
     clip_frame_count,
     clip_plan,
-    clip_scale,
     clip_size,
     describe_seconds,
     encode_animation,
+    encode_clip,
     fast_frame_image,
     fast_frame_size,
     format_seconds,
@@ -61,54 +58,57 @@ from .clips import (
     preroll_budget,
 )
 
+# This module's own names.
 __all__ = [
     "RetroEmulator",
-    "EmulatorError",
     "BUTTONS",
     "MIN_ROM_SIZE",
     "DEFAULT_FPS",
-    "CLIP_SECONDS",
-    "CLIP_FPS",
-    "MIN_CLIP_SECONDS",
-    "MAX_CLIP_SECONDS",
-    "MIN_CLIP_FRAMES",
-    "MIN_AFTERMATH_FRAMES",
-    "MIN_CLIP_WIDTH",
-    "PREROLL_SECONDS",
-    "MAX_CLIP_SCALE",
-    "CLIP_EXTENSION",
     "MAX_SRAM_SIZE",
     "RETRO_MEMORY_SAVE_RAM",
+    "describe_definitions",
+    "probe_core_options",
+    # ...and the re-export shim. These live in retro/clips.py; they are
+    # listed here because something else in this cog imports them from
+    # ``retro.emulator``, which is what made splitting clips.py out cost
+    # nothing at the call sites.
+    #
+    # It is exactly that list and no more. The shim used to carry every name
+    # clips.py defines, private ones included (`_pillow`, `_SLOW_GRAB_LOGGED`,
+    # `_channel_expansion_table`, `_note_slow_frame_grab`) -- which is a
+    # promise nobody is owed. A Red cog is installed as a whole and imported
+    # by name from Red's cog manager; nothing outside this repository can
+    # import `retro.emulator` at all, let alone depend on a leading
+    # underscore in it. So the ones nothing here uses are gone, and the
+    # place to import a clips name that is not below is retro/clips.py.
+    #
+    # A few clips names are still *imported* above without being re-exported,
+    # because this module's own code uses them: CLIP_FPS and MAX_CLIP_SCALE
+    # are method defaults, CapturedClip and clip_size are what record_frames
+    # builds, and _pillow is what the frame grabs import Pillow with.
+    "CLIP_EXTENSION",
+    "CLIP_SECONDS",
+    "EmulatorError",
+    "FAST_RAW_MODES",
+    "FAST_ROTATIONS",
+    "MAX_CLIP_SECONDS",
+    "MIN_CLIP_FRAMES",
+    "MIN_CLIP_SECONDS",
     "capture_plan",
     "capture_step",
     "clamp_clip_seconds",
     "clip_frame_count",
     "clip_plan",
-    "clip_scale",
-    "clip_size",
-    "describe_definitions",
     "describe_seconds",
     "encode_animation",
+    "encode_clip",
+    "fast_frame_image",
+    "fast_frame_size",
     "format_seconds",
     "frame_count",
     "input_budget",
     "playback_seconds",
     "preroll_budget",
-    "probe_core_options",
-    # Split out into retro/clips.py and re-exported here, which is the only
-    # reason that split cost nothing downstream. Anything importing these
-    # from retro.emulator still gets the same objects.
-    "fast_frame_image",
-    "fast_frame_size",
-    "FAST_POINT_TABLES",
-    "FAST_RAW_MODES",
-    "FAST_ROTATIONS",
-    "WEBP_METHOD",
-    "WEBP_MINIMIZE_SIZE",
-    "_channel_expansion_table",
-    "_note_slow_frame_grab",
-    "_pillow",
-    "_SLOW_GRAB_LOGGED",
 ]
 
 log = logging.getLogger("red.robloach.retro.emulator")
@@ -373,6 +373,10 @@ class RetroEmulator:
         emulator.press("start", hold_frames=12, release_frames=40)
         png_bytes = emulator.screenshot()
         clip_bytes = emulator.record(presses=[("a", 0, 12)])
+        # ...or in two halves, so the encode -- which needs no core -- can
+        # run outside whatever lock serializes access to this object:
+        captured = emulator.record_frames(presses=[("a", 0, 12)])
+        clip_bytes = encode_clip(captured)
         state = emulator.save_state()
         sram = emulator.save_sram()   # None if the cart has no battery
         emulator.stop()
@@ -1022,15 +1026,12 @@ class RetroEmulator:
         return 0 if memory is None else len(memory)
 
     # -- Video --------------------------------------------------------------
-
-    @staticmethod
-    def _pillow():
-        """Import Pillow, turning a missing dependency into an EmulatorError."""
-        try:
-            from PIL import Image
-        except Exception as exc:  # ImportError or a broken install
-            raise EmulatorError(f"Pillow could not be loaded: {exc}") from exc
-        return Image
+    #
+    # Pillow is imported through :func:`clips._pillow`, which is where the
+    # lazy import and its "Pillow could not be loaded" EmulatorError live.
+    # There used to be a byte-for-byte copy of it here as a staticmethod, on
+    # a module that already imports the original -- two definitions of the
+    # same four lines, either of which could be fixed without the other.
 
     def _screenshot(self):
         """
@@ -1077,30 +1078,46 @@ class RetroEmulator:
         frame_width, frame_height = self._frame_size()
         return clip_size(frame_width, frame_height, self.aspect_ratio, scale)
 
-    def _frame_image(self, size=None, *, scale: int = MAX_CLIP_SCALE):
+    def _native_frame_image(self):
         """
-        Grab the current screen as a Pillow image.
+        Grab the current screen as a Pillow image, at the core's own size.
 
         The core's native pixel format (RGB565/XRGB8888/RGB1555) is decoded
         straight out of the video driver's framebuffer by Pillow -- see
         :func:`fast_frame_image` -- and only if that is not possible does
         ArrayVideoDriver.screenshot() convert it a pixel at a time. Both
-        produce the same bytes. The image is then resized with
-        nearest-neighbor so it stays crisp pixel art rather than a blurry
-        upscale.
+        produce the same bytes.
 
-        ``size`` pins the output to an exact size. :meth:`record` uses it so
-        that a core which changes resolution part-way through a clip (the SNES
-        does, and libretro calls that SET_GEOMETRY) cannot produce frames of
-        two different sizes, which no animation format allows.
+        No resize happens here, which is what a recording wants: captured
+        frames are kept at the core's resolution and each distinct picture is
+        enlarged exactly once, at encode time (see :func:`encode_clip`),
+        instead of every frame being enlarged before the encoder merges the
+        identical ones anyway.
         """
-        Image = self._pillow()
+        Image = _pillow()
         image = fast_frame_image(self._video, Image)
         if image is None:
             shot = self._screenshot()
             image = Image.frombuffer(
                 "RGBA", (shot.width, shot.height), bytes(shot.data), "raw", "RGBA", 0, 1
             ).convert("RGB")
+        return image
+
+    def _frame_image(self, size=None, *, scale: int = MAX_CLIP_SCALE):
+        """
+        Grab the current screen at the size it would be posted at.
+
+        :meth:`_native_frame_image` plus the NEAREST resize -- nearest so the
+        picture stays crisp pixel art rather than a blurry upscale. ``size``
+        pins the output to an exact size instead of asking
+        :meth:`output_size`. Recordings used to pass it for the
+        mid-clip-geometry-change case; they now keep native frames and leave
+        the resize to :func:`encode_clip`, so what is left on this method is
+        the single-picture traffic: :meth:`screenshot`, and the tests that
+        compare a clip's pictures against the screen.
+        """
+        Image = _pillow()
+        image = self._native_frame_image()
         if size is None:
             size = self.output_size(scale=scale)
         if tuple(size) != image.size:
@@ -1128,7 +1145,7 @@ class RetroEmulator:
         picture. A geometry change mid-clip shows up as a different length
         and so reads as a change, which it is.
         """
-        Image = self._pillow()
+        Image = _pillow()
         image = fast_frame_image(self._video, Image)
         return None if image is None else image.tobytes()
 
@@ -1149,6 +1166,49 @@ class RetroEmulator:
     ) -> bytes:
         """
         Run the core for ``frames`` frames and return the clip as image bytes.
+
+        Exactly :meth:`record_frames` handed to :func:`encode_clip`, and
+        nothing else -- those two carry the whole story (the press schedule
+        and the pre-roll on the first, the resize and the WebP parameters on
+        the second). This stays as the convenient form, but the encode is the
+        most expensive CPU step of a button press and needs no core at all,
+        so a caller that serializes emulator access behind a lock should call
+        the halves itself and hold the lock only for the capture.
+        """
+        return encode_clip(
+            self.record_frames(frames, scale=scale, fps=fps, presses=presses)
+        )
+
+    @staticmethod
+    def encode_captured(captured) -> bytes:
+        """
+        Encode what :meth:`record_frames` captured. Touches no core.
+
+        :func:`encode_clip` reached through the emulator, so a caller that
+        has one in hand does not have to import the clips module to finish a
+        recording it started -- and, more to the point, so that a *stand-in*
+        emulator can answer the same two calls. It is a staticmethod because
+        it genuinely needs nothing from ``self``: that is what makes it safe
+        to run with the emulator lock released, and on any thread.
+        """
+        return encode_clip(captured)
+
+    def record_frames(
+        self,
+        frames: "int | None" = None,
+        *,
+        scale: int = MAX_CLIP_SCALE,
+        fps: int = CLIP_FPS,
+        presses: "typing.Iterable | None" = None,
+    ) -> CapturedClip:
+        """
+        Run the core for ``frames`` frames and capture the clip's pictures.
+
+        Everything :meth:`record` does short of the encode: the returned
+        :class:`CapturedClip` is a plain value -- native-size Pillow images,
+        their durations, and the size the clip posts at -- that
+        :func:`encode_clip` turns into the final bytes without touching the
+        emulator again.
 
         ``presses`` is a sequence of ``(button, start_frame, hold_frames)``
         triples, scheduled against the frames *of this window*, so the clip
@@ -1252,11 +1312,17 @@ class RetroEmulator:
                 reference = self._frame_signature()
 
         images = []
-        # Taken from the first captured frame, then held for the rest of the
-        # clip: a core that changes resolution part-way through must not
-        # produce frames of two different sizes. It cannot be worked out
+        # The size the clip posts at, taken from the first captured frame and
+        # then held for the rest of the clip: a core that changes resolution
+        # part-way through must not produce frames of two different sizes,
+        # and pinning the answer here is what keeps that true once
+        # encode_clip resizes everything to it. It cannot be worked out
         # before the loop, because a core that has just been loaded has not
-        # rendered anything yet.
+        # rendered anything yet. Only the *size* is decided here: the
+        # pictures themselves stay at the core's own resolution, so a clip's
+        # worth of them costs native memory rather than scale-squared times
+        # it, and the NEAREST enlargement is paid once per distinct picture
+        # at encode time instead of once per frame now.
         size = None
         held: set = set()
         # One duration per captured picture rather than one for the clip, so
@@ -1305,7 +1371,7 @@ class RetroEmulator:
                 if duration is not None:
                     if size is None:
                         size = self.output_size(scale=scale)
-                    images.append(self._frame_image(size))
+                    images.append(self._native_frame_image())
                     durations.append(duration)
                 index += 1
         finally:
@@ -1321,7 +1387,7 @@ class RetroEmulator:
                 preroll,
                 budget,
             )
-        return encode_animation(images, durations)
+        return CapturedClip(images, durations, size)
 
 
 def _make_log_driver():

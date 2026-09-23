@@ -593,7 +593,12 @@ async def test_a_cancelled_start_still_frees_the_core(retro, monkeypatch):
 
     channel = retro.channel(9800)
     ctx = retro.context(channel)
-    monkeypatch.setattr(retro.viewmod.RetroView, "start", boot_then_cancel)
+    # `boot`, not `start`: the cog runs the two halves of starting a game on
+    # opposite sides of the emulator lock (the core comes up under it, the
+    # message goes out after it), and the half that leaves a core loaded is
+    # this one. Patching `start` proved nothing here once the cog stopped
+    # calling it.
+    monkeypatch.setattr(retro.viewmod.RetroView, "boot", boot_then_cancel)
     with pytest.raises(asyncio.CancelledError):
         await retro.start_game(ctx, "cancelme")
 
@@ -670,8 +675,10 @@ async def test_a_rom_the_core_will_not_digest_leaves_nothing_behind(retro, when)
     with real cores and genuinely corrupted cartridges: here the fake is
     simply made to fail the way a core does, at the two points it can --
     refusing the content (``start``) and falling over while the first clip is
-    being recorded (``record``). Both land in ``_start_session``'s
-    EmulatorError branch and ``_abandon_session``.
+    being recorded (``record_frames`` -- the capture half, which is the half
+    that runs the core; encoding the frames afterwards touches nothing).
+    Both land in ``_start_session``'s EmulatorError branch and
+    ``_abandon_session``.
     """
     await retro.install_cores("gambatte")
     fake = retro.fakes["RetroEmulator"]
@@ -687,7 +694,7 @@ async def test_a_rom_the_core_will_not_digest_leaves_nothing_behind(retro, when)
 
     method, replacement = {
         "load": ("start", refuse_the_rom),
-        "run": ("record", die_mid_run),
+        "run": ("record_frames", die_mid_run),
     }[when]
     original = getattr(fake, method)
     setattr(fake, method, replacement)
@@ -1634,6 +1641,115 @@ async def test_cog_load_sweeps_the_orphans_itself(retro):
     assert not orphan.exists(), "cog_load did not sweep the data directory"
 
 
+# -- Interrupted rollbacks -----------------------------------------------------
+#
+# `[p]retrosaves rollback` swaps a save with its previous generation through
+# three renames, parking the live file at ``<name>.rollback`` in between. A
+# crash can only land between two atomic renames, and each gap identifies
+# itself by which ordinary slot is empty -- so the sweep can always put the
+# stranded file back instead of leaving (or deleting) what may be the only
+# copy of the channel's newest save. See StorageMixin._recover_rollback.
+
+
+def test_a_rollback_stranded_before_the_swap_is_put_back(retro):
+    """Crash after rename (1): the live slot is empty, the spare is newest."""
+    cog = retro.cog
+    live = cog._state_path(9986, "stranded")
+    backup = cog._backup_path(live)
+    backup.write_bytes(b"STATE:1")
+    spare = live.with_name(live.name + ".rollback")
+    spare.write_bytes(b"STATE:2")
+
+    cog._sweep_partial_writes()
+
+    assert live.read_bytes() == b"STATE:2", "the newest save went back to its slot"
+    assert backup.read_bytes() == b"STATE:1", "the previous generation was untouched"
+    assert not spare.exists()
+
+
+def test_a_rollback_stranded_mid_swap_is_finished(retro):
+    """Crash after rename (2): the backup slot is empty, the spare was live."""
+    cog = retro.cog
+    live = cog._state_path(9987, "stranded")
+    live.write_bytes(b"STATE:1")  # the old backup, already promoted
+    spare = live.with_name(live.name + ".rollback")
+    spare.write_bytes(b"STATE:2")
+
+    cog._sweep_partial_writes()
+
+    assert live.read_bytes() == b"STATE:1"
+    assert cog._backup_path(live).read_bytes() == b"STATE:2", "the swap was finished"
+    assert not spare.exists()
+
+
+def test_a_rollback_orphaned_next_to_a_full_set_is_reclaimed(retro):
+    """Both slots occupied: no crash point of the swap leaves this shape.
+
+    The spare is a leftover that was then played past -- both generations it
+    could have belonged to have been written since -- so it is the one case
+    where deletion is safe, and the bytes count as reclaimed.
+    """
+    cog = retro.cog
+    live = cog._state_path(9988, "orphaned")
+    live.write_bytes(b"STATE:3")
+    cog._backup_path(live).write_bytes(b"STATE:2")
+    spare = live.with_name(live.name + ".rollback")
+    spare.write_bytes(b"x" * 1024)
+
+    freed = cog._sweep_partial_writes()
+
+    assert not spare.exists()
+    assert freed == 1024
+    assert live.read_bytes() == b"STATE:3"
+    assert cog._backup_path(live).read_bytes() == b"STATE:2"
+
+
+# -- The data directories are made once, and a write never trusts that ---------
+
+
+def test_the_data_directories_are_made_once_not_per_call(retro, monkeypatch):
+    """_data_dir sits under every path helper, on every press's autosave.
+
+    It used to mkdir() on every call, a pair of syscalls per path for a
+    directory that exists for the life of the install; the names created are
+    remembered on the instance instead, so the common case is a pure join.
+    """
+    from pathlib import Path
+
+    cog = retro.cog
+    cog._data_dir("states")
+    made = []
+    real = Path.mkdir
+
+    def counting(self, *args, **kwargs):
+        made.append(self)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", counting)
+    for _ in range(5):
+        cog._data_dir("states")
+
+    assert made == [], "a hot path paid mkdir syscalls for a directory it had made"
+
+
+def test_a_deleted_data_directory_cannot_break_a_save_write(retro):
+    """The memo can lie, and a lying memo must never cost a save.
+
+    A test (or somebody tidying the disk) can delete a directory the
+    instance remembers creating, so _write_atomic re-makes the parent itself
+    -- one extra syscall on the write path, none on the reads.
+    """
+    import shutil
+
+    states = retro.cog._data_dir("states")
+    target = retro.cog._state_path(9989, "survivor")
+    shutil.rmtree(states)
+
+    retro.cog._write_atomic(target, b"STATE:1".ljust(64, b"\0"), True)
+
+    assert target.read_bytes().rstrip(b"\0") == b"STATE:1"
+
+
 def test_a_save_state_is_flushed_to_the_platter_before_it_is_renamed(retro, monkeypatch):
     """The saves are the one thing here that exists nowhere else.
 
@@ -1659,3 +1775,226 @@ def test_a_save_state_is_flushed_to_the_platter_before_it_is_renamed(retro, monk
     synced.clear()
     retro.cog._write_atomic(retro.cog._roms_dir() / "9985-durable.gbc", b"x" * 4096)
     assert synced == [], "a re-downloadable ROM paid for an fsync"
+
+
+# -- The disk budget counts once, not on every download ------------------------
+#
+# The budget is checked before every incoming ROM and every BIOS install, and
+# it used to answer the question by walking the entire data directory and
+# stat()ing every file in it. That is O(everything the bot has ever stored) --
+# five cached ROMs and four save files per channel, plus the cores -- paid on
+# the path a player is waiting on. So the total is kept running instead, and
+# these are the three things that has to be true of it: it is really used, it
+# is really corrected when something changes the directory behind its back,
+# and it has not blurred the line the budget draws.
+#
+# The direction of error is the whole design (see "Measuring without walking"
+# in retro/storage.py): a remembered total that is too *high* may cost an
+# extra walk and must never refuse a download, while one that is too *low* may
+# let the directory sit briefly over the budget. Both halves are asserted
+# below.
+
+
+def counted_walks(cog, monkeypatch):
+    """Record every full walk of the data directory ``cog`` makes."""
+    walks = []
+    real = cog._data_usage
+
+    def counting():
+        walks.append(True)
+        return real()
+
+    # On the instance, because that is what `self._data_usage()` finds -- and
+    # it is reached through _measure_usage in a worker thread, so a patch on
+    # the class would be no closer to the call.
+    monkeypatch.setattr(cog, "_data_usage", counting)
+    return walks
+
+
+async def test_the_budget_check_does_not_rewalk_the_directory_every_time(
+    retro, monkeypatch
+):
+    """The point of the exercise: a game start costs no recursive walk."""
+    cog = retro.cog
+    await cog.config.disk_budget_mb.set(1024)
+    cog._write_atomic(cog._roms_dir() / "9990-first.gbc", b"x" * 4096)
+    # The first check is allowed to measure -- nothing has yet.
+    assert (await cog._make_room(4096))[0]
+
+    walks = counted_walks(cog, monkeypatch)
+    for index in range(10):
+        cog._write_atomic(cog._roms_dir() / f"9990-game{index}.gbc", b"x" * 4096)
+        room, note = await cog._make_room(4096)
+        assert room and not note, note
+
+    assert walks == [], (
+        "the disk budget walked the whole data directory for a download that "
+        "was nowhere near the limit"
+    )
+
+
+async def test_the_running_total_follows_every_write_and_delete_here(retro):
+    """Every path in storage.py that moves bytes keeps the total honest."""
+    cog = retro.cog
+    base = cog._data_usage()["total"]
+    assert cog._usage_cached_total == base, "a walk did not seed the total"
+
+    # A plain write, then an overwrite: the second one replaces the first
+    # rather than adding to it.
+    rom = cog._roms_dir() / "9991-counted.gbc"
+    cog._write_atomic(rom, b"x" * 8192)
+    assert cog._usage_cached_total == base + 8192
+    cog._write_atomic(rom, b"x" * 2048)
+    assert cog._usage_cached_total == base + 2048
+
+    # A save write rotates rather than replaces, so the directory holds both
+    # generations and the total has to say so.
+    state = cog._state_path(9991, "counted")
+    cog._write_atomic(state, b"S" * 64, True)
+    cog._write_atomic(state, b"T" * 128, True)
+    assert cog._usage_cached_total == base + 2048 + 128 + 64
+    # ...and a third write drops the oldest generation off the end.
+    cog._write_atomic(state, b"U" * 256, True)
+    assert cog._usage_cached_total == base + 2048 + 256 + 128
+
+    cog._discard(state)
+    assert cog._usage_cached_total == base + 2048 + 128
+    # Whatever the arithmetic above said, the disk is the referee.
+    assert cog._usage_cached_total == cog._data_usage()["total"]
+
+
+async def test_the_running_total_follows_the_pruners_too(retro):
+    """The budget's own pruner deletes ROMs; the total has to notice."""
+    cog = retro.cog
+    await cog.config.disk_budget_mb.set(1)
+    for index in range(4):
+        cog._write_atomic(cog._roms_dir() / f"9992-old{index}.gbc", b"x" * (200 * 1024))
+    assert cog._data_usage()["total"] == 800 * 1024
+
+    # 800 KiB of prunable ROMs against a 1 MiB budget: this only fits once
+    # some of them have gone.
+    room, note = await cog._make_room(700 * 1024)
+
+    assert room, note
+    assert "Freed" in note, note
+    assert cog._usage_cached_total == cog._data_usage()["total"], (
+        "the pruner deleted ROMs the running total still thinks are there"
+    )
+
+    # And the per-channel cache pruner, which deletes on a different path.
+    for index in range(retro.storagemod.MAX_CACHED_GAMES_PER_CHANNEL + 2):
+        cog._write_atomic(cog._roms_dir() / f"9993-cached{index}.gbc", b"y" * 1024)
+    deleted = cog._prune_cached_games(9993, "cached0")
+    assert deleted, "nothing was pruned, so nothing is proved"
+    assert cog._usage_cached_total == cog._data_usage()["total"]
+
+
+async def test_a_file_that_appeared_by_hand_cannot_hide_behind_the_total(retro):
+    """The owner drops a core in with `scp`, and the budget still holds.
+
+    Nothing outside this cog tells it what it put on the disk, so the
+    remembered total is an undercount until something measures. The rule that
+    catches it: a decision this close to the limit is never taken on a
+    remembered number.
+    """
+    cog = retro.cog
+    await cog.config.disk_budget_mb.set(1)
+    assert (await cog._make_room(1024))[0]  # seeds the total: an empty folder
+
+    (cog._system_dir() / "dropped-in.bin").write_bytes(b"x" * (900 * 1024))
+    stale = cog._usage_cached_total
+    assert stale + 800 * 1024 <= 1024 * 1024, (
+        "the remembered total already says no, so this proves nothing"
+    )
+
+    room, note = await cog._make_room(800 * 1024)
+
+    assert not room, "the budget was decided on a number 900 KiB out of date"
+    assert "run out of room" in note, note
+    assert cog._usage_cached_total == 900 * 1024
+
+
+async def test_a_stale_total_can_never_refuse_a_download(retro):
+    """The error the design refuses to make, in the other direction.
+
+    Deletions made outside storage.py -- `[p]retrosaves delete`, `[p]retroset
+    bios remove`, an owner with `rm` -- leave the total too high. That may
+    cost a walk; it may never cost somebody their game.
+    """
+    cog = retro.cog
+    await cog.config.disk_budget_mb.set(1)
+    filler = cog._system_dir() / "filler.bin"
+    cog._write_atomic(filler, b"x" * (900 * 1024))
+    assert cog._data_usage()["total"] == 900 * 1024
+
+    # Straight off the disk, the way every path outside storage.py does it.
+    filler.unlink()
+    assert cog._usage_cached_total == 900 * 1024, "the test did not go behind its back"
+
+    room, note = await cog._make_room(800 * 1024)
+
+    assert room, f"a download was refused because of a file that is gone: {note}"
+    assert cog._usage_cached_total == 0
+
+
+async def test_the_total_is_thrown_away_once_it_is_old(retro):
+    """Drift deep inside the budget is bounded by time, not left forever."""
+    cog = retro.cog
+    await cog.config.disk_budget_mb.set(1024)
+    assert (await cog._make_room(4096))[0]
+    base = cog._usage_cached_total
+
+    (cog._system_dir() / "by-hand.bin").write_bytes(b"x" * 4096)
+    # Comfortably inside the budget, so nothing measures and the total is
+    # allowed to be wrong about a file it was never told about.
+    assert (await cog._make_room(4096))[0]
+    assert cog._usage_cached_total == base
+
+    # Age it past the interval and the very next check measures for real.
+    cog._usage_cached_at -= retro.storagemod.USAGE_CACHE_SECONDS
+    assert (await cog._make_room(4096))[0]
+
+    assert cog._usage_cached_total == base + 4096
+
+
+async def test_the_budget_is_still_exact_at_the_boundary(retro):
+    """A cache must not blur the line it exists to defend.
+
+    The filler goes in the system directory, which the budget's pruner may
+    never touch, so this is the refusal branch and not the prune-and-retry
+    one.
+    """
+    cog = retro.cog
+    await cog.config.disk_budget_mb.set(1)
+    budget = 1024 * 1024
+    used = cog._data_usage()["total"]
+    (cog._system_dir() / "filler.bin").write_bytes(b"x" * (budget - used - 4096))
+    assert cog._data_usage()["total"] == budget - 4096
+
+    room, note = await cog._make_room(4096)
+    assert room, f"a download that fits to the byte was refused: {note}"
+
+    room, note = await cog._make_room(4097)
+    assert not room, "one byte over the budget was allowed through"
+    assert "run out of room" in note, note
+
+
+async def test_the_load_sweep_leaves_a_measured_total_behind(retro):
+    """The one walk the cog makes anyway is the one the total starts from.
+
+    A bot that was off while somebody tidied the disk (or migrated the data
+    directory into place) must not come back up believing whatever it
+    believed when it stopped.
+    """
+    cog, _bot = retro.make_cog()
+    assert cog._usage_cached_total is None, "a fresh cog has measured nothing"
+    (cog._roms_dir() / "9994-was-here.gbc").write_bytes(b"x" * 2048)
+    orphan = cog._roms_dir() / "9994-killed.gbc.tmp"
+    orphan.write_bytes(b"x" * 1024)
+
+    freed = cog._sweep_partial_writes()
+
+    assert freed == 1024
+    # The orphan it just deleted is not in the total, and the file it knows
+    # nothing about is.
+    assert cog._usage_cached_total == 2048

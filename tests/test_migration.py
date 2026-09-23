@@ -260,6 +260,8 @@ async def test_every_setting_and_session_comes_across(retro, pre_rename):
 
 
 async def test_the_live_session_survives_the_whole_load(retro, pre_rename):
+    from retro.emulator import clamp_clip_seconds
+
     cog, bot, _ = pre_rename
     channel = retro.channel(8000, bot=bot)
     await cog._migrate_legacy_namespace()
@@ -268,13 +270,148 @@ async def test_the_live_session_survives_the_whole_load(retro, pre_rename):
     view = cog.sessions.get(channel.id)
     assert view is not None
     assert view.game_name == "ucity" and view.slug == "ucity"
-    assert view.clip_seconds == 7 and view.hold_ms == 250
+    # The old install's seven-second clip, through the clamp a restored
+    # session puts every stored length through -- the copy hands the value
+    # over unchanged (the setting itself is asserted above), and what the
+    # session runs at is whatever today's ceiling allows. Written this way
+    # so moving that ceiling is not a failure in the *migration* tests.
+    assert view.clip_seconds == clamp_clip_seconds(7)
+    assert view.hold_ms == 250
     # The ROM and its save state moved with it, so the session can wake up.
     assert cog._rom_path(view.rom_filename).is_file()
     assert cog._state_path(8000, "ucity").is_file()
     await view._press(retro.interaction(view, message=None), "a")
     assert view.live
     assert view.emulator.loaded_from == 1234, "it woke from its own save state"
+
+
+async def test_the_settings_are_copied_one_scope_at_a_time(retro, monkeypatch):
+    """One Config write per scope, not one per setting.
+
+    Red's default (JSON) driver serialises the *whole* settings file on
+    every set(), so copying key by key cost one whole-file write per global
+    and per channel key. On a bot with hundreds of channels that is hundreds
+    of serialise-the-world writes, inside cog_load, before the cog answers
+    anything.
+    """
+    from . import fakes
+
+    legacy_dir = furnish(retro.legacy_data)
+    store = retro.legacy_store()
+    furnish_legacy_config(store, legacy_dir)
+    session = store.channels[8000]["session"]
+    for channel_id in range(8001, 8021):
+        store.channels[channel_id] = {
+            "session": dict(session, channel_id=channel_id),
+            "retired": {},
+        }
+    cog, _ = retro.make_cog(fresh_config=True)
+
+    writes = []
+    for cls in (fakes.FakeValue, fakes.FakeScope, fakes.FakeConfig):
+        original = cls.set
+
+        async def counted(self, value, _original=original, _kind=cls.__name__):
+            writes.append(_kind)
+            await _original(self, value)
+
+        monkeypatch.setattr(cls, "set", counted)
+
+    copied = await cog._migrate_config()
+
+    # 7 globals, one channel with a session and twenty with a session and a
+    # retired table: 48 settings, which the old copy paid 48 writes for.
+    assert copied == 7 + 1 + 20 * 2
+    # The globals in one write, then one per channel. Nothing else.
+    assert len(writes) == 1 + 21, writes
+    assert "FakeValue" not in writes, "a single-key write is a whole-file write"
+    # ...and everything really did come across.
+    assert await cog.config.games() == {"ucity": "https://example.com/ucity.gbc"}
+    channels = await cog.config.all_channels()
+    assert len(channels) == 21
+    assert channels[8020]["session"]["game_name"] == "ucity"
+
+
+async def test_a_scope_config_will_not_take_whole_is_copied_key_by_key(retro, caplog):
+    """A refused batch costs the batch, not the settings in it.
+
+    The copy is one write per scope now, so the failure it has to survive is
+    a scope that will not go in one piece -- a driver that objects to one
+    value in it, say. It falls back to the old key-at-a-time write, so
+    everything Config will accept still lands.
+    """
+
+    class WholeScopeRefused:
+        """A Config handle that only accepts one key at a time."""
+
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        async def set(self, value):
+            raise RuntimeError("this driver will not take a whole group")
+
+        def __getattr__(self, name):
+            return getattr(self._wrapped, name)
+
+    legacy_dir = furnish(retro.legacy_data)
+    furnish_legacy_config(retro.legacy_store(), legacy_dir)
+    cog, _ = retro.make_cog(fresh_config=True)
+    real = cog.config
+    cog.config = WholeScopeRefused(real)
+
+    copied = await cog._migrate_config()
+
+    assert copied == 7 + 1, "every global one at a time, and the one channel"
+    assert await real.games() == {"ucity": "https://example.com/ucity.gbc"}
+    assert await real.clip_seconds() == 7
+    assert "one at a time" in caplog.text
+    # The channels are reached through channel_from_id(), which is delegated
+    # to the real handle, so they were unaffected by the refusal above.
+    assert (await real.all_channels())[8000]["session"]["game_name"] == "ucity"
+
+
+async def test_one_impossible_channel_does_not_cost_the_others(retro, caplog):
+    """Per-channel granularity: the loop keeps going.
+
+    One channel Config cannot write, and one key that is not a channel id at
+    all (which no version of this cog wrote, but the old namespace is
+    somebody else's data and may hold anything).
+    """
+
+    class Unwritable:
+        def __init__(self, reason):
+            self.reason = reason
+
+        async def set(self, value):
+            raise RuntimeError(self.reason)
+
+        def __getattr__(self, name):
+            raise RuntimeError(self.reason)
+
+    legacy_dir = furnish(retro.legacy_data)
+    store = retro.legacy_store()
+    furnish_legacy_config(store, legacy_dir)
+    session = store.channels[8000]["session"]
+    store.channels[8001] = {"session": dict(session, channel_id=8001)}
+    store.channels["not-a-channel-id"] = {"session": dict(session)}
+    cog, _ = retro.make_cog(fresh_config=True)
+
+    real = cog.config.channel_from_id
+
+    def refuse_8000(channel_id):
+        if int(channel_id) == 8000:
+            return Unwritable("this channel cannot be written")
+        return real(channel_id)
+
+    cog.config.channel_from_id = refuse_8000
+
+    copied = await cog._migrate_config()
+
+    assert copied == 7 + 1, "the globals and the one channel that could be written"
+    channels = await cog.config.all_channels()
+    assert sorted(channels) == [8001], channels
+    assert "not-a-channel-id" in caplog.text
+    assert "this channel cannot be written" in caplog.text
 
 
 async def test_a_setting_this_version_no_longer_has_is_left_behind(retro):
@@ -360,6 +497,28 @@ def test_red_really_does_offer_both_escape_hatches():
 
     assert "cog_name" in inspect.signature(Config.get_conf).parameters
     assert "raw_name" in inspect.signature(cog_data_path).parameters
+
+
+@pytest.mark.redbot
+def test_red_really_does_write_a_whole_scope_in_one_call():
+    """What the batched copy rests on; see MigrationMixin._copy_settings.
+
+    A channel scope is a ``Group``, and a Group is a ``Value``, so
+    ``group.set({...})`` writes the lot. The globals are the same group Red
+    hands out for attribute access on the Config itself, which is what the
+    key-at-a-time copy always used -- so ``config.set({...})`` is that
+    group's set(). If Config ever grows a ``set`` of its own, this stops
+    being true and the globals half of the copy has to find the global group
+    another way.
+    """
+    import inspect
+
+    from redbot.core.config import Config, Group, Value
+
+    assert issubclass(Group, Value)
+    assert inspect.iscoroutinefunction(Group.set)
+    assert "set" not in vars(Config), sorted(vars(Config))
+    assert callable(getattr(Config, "__getattr__", None))
 
 
 @pytest.mark.redbot
