@@ -459,7 +459,15 @@ def test_frames_are_counted_from_the_core_s_own_frame_rate(emu, gambatte, ucity)
     assert frames_for_ms(emulator, 160) < 16
 
 
-@pytest.mark.parametrize("seconds", [0.2, 0.5, 0.8, 1.0, 4.0])
+# The two ends of what `[p]retroset cliplength` accepts are in this list on
+# purpose: 0.2 is MIN_CLIP_SECONDS and 5.0 is MAX_CLIP_SECONDS, which came
+# down from an unmeasured 15 (see the tables above MAX_CLIP_SECONDS in
+# retro/clips.py). A ceiling nothing records at is a ceiling nobody has
+# checked, and 5 seconds of Game Boy is 299 frames and 76 pictures.
+CLIP_LENGTHS = [0.2, 0.5, 0.8, 1.0, 4.0, 5.0]
+
+
+@pytest.mark.parametrize("seconds", CLIP_LENGTHS)
 def test_a_fractional_clip_length_is_a_real_number_of_frames(
     emu, gambatte, ucity, seconds
 ):
@@ -581,7 +589,7 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
 # -- 3. Clip timing: what the player actually sees ----------------------------
 
 
-@pytest.mark.parametrize("seconds", [0.2, 0.5, 0.8, 1.0, 4.0])
+@pytest.mark.parametrize("seconds", CLIP_LENGTHS)
 def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
     """Playback time tracks emulated time at every clip length, whole or not.
 

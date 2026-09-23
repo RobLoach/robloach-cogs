@@ -330,6 +330,20 @@ class FakeScope:
         self.store = store
         self.defaults = defaults or {}
 
+    async def set(self, value):
+        """Write the whole scope at once, as Red's ``Group.set()`` does.
+
+        Red replaces the group's stored value outright (and refuses anything
+        that is not a dict), which is what lets the migration copy a channel
+        across in one write instead of one per key -- the JSON driver
+        rewrites the entire settings file on every set(). Done in place so a
+        test holding a reference to the store still sees it.
+        """
+        if not isinstance(value, dict):
+            raise ValueError("You may only set the value of a group to be a dict.")
+        self.store.clear()
+        self.store.update(value)
+
     async def clear(self):
         """Throw the whole scope away, as Red's ``Group.clear()`` does.
 
@@ -379,6 +393,21 @@ class FakeConfig:
         if isinstance(default, dict):
             default = dict(default)
         return FakeValue(self.globals, name, default)
+
+    async def set(self, value):
+        """Write every global at once.
+
+        Red's Config delegates attribute access to its *global* group, so
+        ``config.set`` really is that group's ``set`` and writes the whole
+        global scope in one call -- which is how the migration copies the
+        old namespace's settings without one whole-file write per setting.
+        Registered defaults are not part of the stored value, here or in
+        Red: they are merged in on read by :meth:`all`.
+        """
+        if not isinstance(value, dict):
+            raise ValueError("You may only set the value of a group to be a dict.")
+        self.globals.clear()
+        self.globals.update(value)
 
     async def all(self):
         """Registered defaults with whatever has been stored on top, as Red does."""
@@ -573,7 +602,7 @@ def playable(viewmod, view):
 #: reads as broken.
 #:
 #: * the **x3** button, on a clip too short to fit two taps. Answered by not
-#:   drawing the button at all (see MIN_REPEAT_TAPS in retro/RetroView.py),
+#:   drawing the button at all (see MIN_REPEAT_TAPS in retro/timing.py),
 #:   with a one-line notice when it goes;
 #: * **Undo**, whenever the history was empty -- which is every session's
 #:   state after a bot restart, since the history is memory only. It is
@@ -691,7 +720,7 @@ def mentions_suppressed(allowed):
 
     False for a missing one, because Discord then falls back to the client's
     default -- which allows user mentions. The press line carries a display
-    name, so "we did not say" is not good enough; see ``RetroView.NO_PINGS``.
+    name, so "we did not say" is not good enough; see ``retro.text.NO_PINGS``.
     """
     if allowed is None:
         return False
@@ -710,7 +739,18 @@ def snapshot(viewmod, kwargs, view):
         "clip": clip_bytes(files),
         "all_disabled": all(getattr(c, "disabled", False) for c in pressable(viewmod, view)),
         "any_disabled": any(getattr(c, "disabled", False) for c in pressable(viewmod, view)),
-        "labels": [getattr(c, "label", None) or getattr(c, "custom_id", None) for c in view.children],
+        # What the message really carries, i.e. the payload discord.py would
+        # send rather than the view's children. The two are deliberately not
+        # the same thing: the repeat button stays a child at every clip
+        # length so that clicks on a stale copy of it still route somewhere
+        # that answers, and is left out of the payload when it has nothing to
+        # do (see RetroView.to_components). A test asking "what does this
+        # message look like" means the payload.
+        "labels": [
+            button.get("label") or button.get("custom_id")
+            for row in view.to_components()
+            for button in row["components"]
+        ],
         "content": kwargs.get("content"),
         # The content names whoever clicked, so every edit that carries one
         # has to carry an allowed_mentions that can never notify anybody.
@@ -959,6 +999,7 @@ COG_MODULES = (
     "retro.Retro",
     "retro.storage",
     "retro.cores",
+    "retro.bios",
     "retro.saves",
     "retro.migration",
 )
@@ -979,6 +1020,7 @@ class RetroEnv:
         # rather than against one of these by hand; see COG_MODULES.
         self.storagemod = sys.modules["retro.storage"]
         self.coresmod = sys.modules["retro.cores"]
+        self.biosmod = sys.modules["retro.bios"]
         self.savesmod = sys.modules["retro.saves"]
         self.migrationmod = sys.modules["retro.migration"]
         # The emulator module itself, for the clip arithmetic and its bounds.
@@ -986,6 +1028,15 @@ class RetroEnv:
         # the plain functions around it, which are the real ones under test.
         self.emumod = sys.modules["retro.emulator"]
         self.clipsmod = sys.modules["retro.clips"]
+        # The four modules RetroView.py was split into: when a button goes
+        # down, what the message says, what a channel has saved, and who may
+        # end somebody else's game. A test reaches a helper where it lives
+        # now; RetroView re-exports every one of them, so `viewmod.<name>`
+        # still works too and test_view.py's MOVED table holds it to that.
+        self.timingmod = sys.modules["retro.timing"]
+        self.textmod = sys.modules["retro.text"]
+        self.restoremod = sys.modules["retro.restore"]
+        self.permissionsmod = sys.modules["retro.permissions"]
         #: name -> the modules self.patch() replaced it on, so a test can
         #: assert that a fake is installed everywhere it has to be.
         self.patched = {}
@@ -1204,6 +1255,30 @@ class RetroEnv:
 
     def control(self, view, name):
         return self.button(view, f"{self.viewmod.CUSTOM_ID_PREFIX}:{name}")
+
+    def drawn(self, view, name):
+        """One control as it goes on the wire, or None when it is not drawn.
+
+        ``control()`` finds the button *object*, which is a different
+        question: the repeat button stays a child of the view at every clip
+        length so that a click on a stale copy of it still routes somewhere
+        that answers, and is left out of the payload when it has nothing to
+        do (see RetroView.to_components). "Is it on the message" is this.
+        """
+        custom_id = f"{self.viewmod.CUSTOM_ID_PREFIX}:{name}"
+        for row in view.to_components():
+            for button in row["components"]:
+                if button.get("custom_id") == custom_id:
+                    return button
+        return None
+
+    def drawn_row(self, view, index=-1):
+        """The labels of one row of the payload, in the order Discord draws
+        them."""
+        return [
+            button.get("label") or button["custom_id"]
+            for button in view.to_components()[index]["components"]
+        ]
 
     def message_edit(self, view, index=-1):
         """An edit of the session's own message, in interaction-snapshot shape.

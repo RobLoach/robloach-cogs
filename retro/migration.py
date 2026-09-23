@@ -309,37 +309,97 @@ class MigrationMixin(MixinMeta):
             )
             return 0
 
-        copied = 0
-        for key, value in (old_globals or {}).items():
-            if key not in DEFAULT_GLOBALS:
-                # A setting this version no longer has. Leave it behind rather
-                # than writing an unregistered key into the new namespace.
-                continue
+        # One write per scope, not one per key. Red's default (JSON) driver
+        # serialises the *whole* settings file on every set(), so the old
+        # key-at-a-time copy cost one whole-file write per global and per
+        # channel key: a bot with three hundred channels rewrote the file
+        # several hundred times, during cog_load, while Discord waited.
+        #
+        # A key this version no longer registers is still left behind rather
+        # than written into the new namespace, which is the filtering below.
+        copied = await self._copy_settings(
+            self.config,
+            {
+                key: value
+                for key, value in (old_globals or {}).items()
+                if key in DEFAULT_GLOBALS
+            },
+            "the settings",
+        )
+        for channel_id, data in (old_channels or {}).items():
             try:
-                await getattr(self.config, key).set(value)
-                copied += 1
+                scope = self.config.channel_from_id(int(channel_id))
             except Exception:
+                # A channel id that is not a number, i.e. not something this
+                # cog ever wrote. One bad key must not cost the rest.
                 log.warning(
-                    "Could not copy the %s setting across from %s.",
-                    key,
+                    "Could not address channel %s from %s, so its settings "
+                    "were left behind.",
+                    channel_id,
                     LEGACY_COG_NAME,
                     exc_info=True,
                 )
-        for channel_id, data in (old_channels or {}).items():
-            for key, value in (data or {}).items():
-                if key not in DEFAULT_CHANNEL:
-                    continue
-                try:
-                    await getattr(
-                        self.config.channel_from_id(int(channel_id)), key
-                    ).set(value)
-                    copied += 1
-                except Exception:
-                    log.warning(
-                        "Could not copy channel %s's %s across from %s.",
-                        channel_id,
-                        key,
-                        LEGACY_COG_NAME,
-                        exc_info=True,
-                    )
+                continue
+            copied += await self._copy_settings(
+                scope,
+                {
+                    key: value
+                    for key, value in (data or {}).items()
+                    if key in DEFAULT_CHANNEL
+                },
+                f"channel {channel_id}'s settings",
+            )
+        return copied
+
+    async def _copy_settings(self, scope, values: dict, what: str) -> int:
+        """
+        Write one Config scope's worth of copied settings, in one call.
+
+        ``scope`` is the group being written to: ``self.config`` itself for
+        the globals (Red delegates attribute access on a Config to its
+        global group, which is what ``getattr(self.config, key).set(...)``
+        has always relied on) or a ``channel_from_id()`` for one channel.
+        ``values`` has already been filtered to the keys this version still
+        registers. Returns how many values were written.
+
+        Writing a scope *whole* is only safe because of the refusal in
+        :meth:`_migrate_config`: this runs only when the new namespace has
+        no channels at all and every global is still its registered default,
+        so there is nothing underneath for a whole-scope write to overwrite.
+        Anything that relaxes that check has to revisit this.
+
+        Failure tolerance moves with the granularity, deliberately: a scope
+        Config will not take in one piece is retried key by key, so a single
+        value it objects to costs that value rather than every value beside
+        it -- and the channel loop above keeps one impossible channel from
+        costing the others. There is no half-written scope to worry about in
+        between: the batched call either stores the lot or raises, and if it
+        raises the per-key pass is what actually lands the values.
+        """
+        if not values:
+            return 0
+        try:
+            await scope.set(values)
+            return len(values)
+        except Exception:
+            log.warning(
+                "Could not copy %s across from %s in one write; trying them "
+                "one at a time.",
+                what,
+                LEGACY_COG_NAME,
+                exc_info=True,
+            )
+        copied = 0
+        for key, value in values.items():
+            try:
+                await getattr(scope, key).set(value)
+                copied += 1
+            except Exception:
+                log.warning(
+                    "Could not copy %s across from %s: %s.",
+                    what,
+                    LEGACY_COG_NAME,
+                    key,
+                    exc_info=True,
+                )
         return copied

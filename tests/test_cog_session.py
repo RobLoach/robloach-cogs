@@ -39,21 +39,21 @@ async def test_the_clip_and_hold_defaults_reach_a_new_install(retro):
 
 
 async def test_an_already_configured_value_survives_a_new_default(retro):
-    await retro.cog.config.clip_seconds.set(9)
+    await retro.cog.config.clip_seconds.set(4)
     await retro.cog.config.hold_ms.set(420)
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(8050, "defaults")
-    assert view.clip_seconds == 9
+    assert view.clip_seconds == 4
     assert view.hold_ms == 420
 
 
 async def test_an_integer_clip_length_in_config_still_loads_as_a_float(retro):
     """Nobody who set `[p]retroset cliplength 4` before it was a float."""
-    await retro.cog.config.clip_seconds.set(7)  # an int, as it was written
+    await retro.cog.config.clip_seconds.set(4)  # an int, as it was written
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(8049, "legacy")
-    assert view.clip_seconds == 7.0 and isinstance(view.clip_seconds, float)
-    assert view.clip_frames(view.emulator) == view.emulator.frames_for_seconds(7)
+    assert view.clip_seconds == 4.0 and isinstance(view.clip_seconds, float)
+    assert view.clip_frames(view.emulator) == view.emulator.frames_for_seconds(4)
 
 
 async def test_a_nonsense_clip_length_in_config_cannot_make_an_empty_clip(retro):
@@ -93,7 +93,7 @@ async def test_retroset_cliplength_reports_and_clamps(retro):
     await cliplength(retro.cog, ctx, 0)
     assert await retro.cog.config.clip_seconds() == retro.emumod.MIN_CLIP_SECONDS == 0.2
     await cliplength(retro.cog, ctx, 9999)
-    assert await retro.cog.config.clip_seconds() == retro.emumod.MAX_CLIP_SECONDS == 15.0
+    assert await retro.cog.config.clip_seconds() == retro.emumod.MAX_CLIP_SECONDS == 5.0
 
 
 async def test_retroset_cliplength_says_what_a_short_clip_does_to_a_press(retro):
@@ -122,23 +122,29 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
 
     Both ways round, which is the whole point of the button being hidden
     rather than greyed out: at 0.2s only one tap fits, so the x3 button goes
-    away entirely, and at 4s it comes back -- in its proper place in the row,
-    between Wait and Undo, rather than tacked on the end.
+    off the message entirely, and at 4s it comes back -- in its proper place
+    in the row, between Wait and Undo, rather than tacked on the end.
+
+    Off the *message*: the button object stays in the view either way, so a
+    click on a message Discord has not re-rendered still reaches a callback
+    that answers it. See RetroView.to_components.
     """
     await retro.install_cores("gambatte")
     view, ctx, _ = await retro.posted_game(8054, "relength")
     cliplength = retro.cogmod.Retro.retroset_cliplength.callback
     assert retro.control(view, "repeat").label == "A x3"
     assert not retro.control(view, "repeat").disabled
+    assert retro.drawn(view, "repeat")["label"] == "A x3"
 
     await cliplength(retro.cog, ctx, 0.2)
     assert view.clip_seconds == 0.2
     # The next press redraws the controls, and the repeat button -- which can
-    # now do no more than the console's own A button -- is gone.
+    # now do no more than the console's own A button -- is gone from them.
     vanishing = retro.interaction(view, message=view.message)
     await view._press(vanishing, "a")
     assert view.repeat_taps == 1
-    assert retro.control(view, "repeat") is None
+    assert retro.drawn(view, "repeat") is None
+    assert retro.control(view, "repeat").hidden, "hidden, not removed"
     # ...and that press says where it went, once. A control that silently
     # disappears reads as removed just as surely as a greyed-out one does,
     # which is exactly how the greyed-out version was reported. It rides on
@@ -153,20 +159,16 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
     assert view.clip_frames(view.emulator) == 12
     # Wait and Undo have not moved, because the row still reserves space for
     # all three controls whether or not the third is drawn.
-    assert [c.label for c in view.children if c.row == 2] == [
-        "Start", "Select", "Wait", "Undo"
-    ]
+    assert retro.drawn_row(view) == ["Start", "Select", "Wait", "Undo"]
 
     coming_back = retro.interaction(view, message=view.message)
     await cliplength(retro.cog, ctx, 4)
     await view._press(coming_back, "a")
-    back = retro.control(view, "repeat")
-    assert back is not None and back.label == "A x3" and not back.disabled
+    back = retro.drawn(view, "repeat")
+    assert back is not None and back["label"] == "A x3" and not back["disabled"]
     # Coming back says nothing: the button is right there saying what it does.
     assert "hidden" not in coming_back.log[-1][1]["content"]
-    assert [c.label for c in view.children if c.row == 2] == [
-        "Start", "Select", "Wait", "A x3", "Undo"
-    ]
+    assert retro.drawn_row(view) == ["Start", "Select", "Wait", "A x3", "Undo"]
 
 
 async def test_can_stop_is_kept_for_retrosleep_reboot_and_end(retro):
@@ -1241,7 +1243,7 @@ async def test_a_queued_press_on_a_sleeping_session_wakes_it_first(retro):
 # to that) but nobody ever saw it, so the picture appeared to lurch.
 #
 # So the *edit* waits until the clip it is replacing has had its playing time
-# on screen. See the note above MAX_PACE_SECONDS in retro/RetroView.py for the
+# on screen. See the note above MAX_PACE_SECONDS in retro/timing.py for the
 # rule, the cap and the numbers behind them.
 #
 # The gate spends its time in exactly one place -- the module-level
@@ -2340,6 +2342,33 @@ async def test_the_idle_task_saves_and_frees_a_sleeping_session(retro):
     assert retro.cog.config.channels[channel.id]["session"]["slug"] == view.slug
 
 
+async def test_the_idle_timeout_is_read_from_config_and_never_carried(retro):
+    """`[p]retroset timeout` applies to the games already running.
+
+    A session used to be handed the timeout at construction, and handed it
+    again by from_record on every restart, and nothing ever read either copy:
+    the sweep asks Config for the current value on every pass. That is the
+    whole reason the setting takes effect immediately -- so the copy is gone,
+    and this is what it would have had to disagree with.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9031, "timeoutless")
+    assert not hasattr(view, "timeout_minutes")
+    # ...including a session rebuilt from a record after a restart, which is
+    # the other place it was threaded through.
+    rebuilt = retro.viewmod.RetroView.from_record(retro.cog, view.to_record())
+    assert not hasattr(rebuilt, "timeout_minutes")
+
+    view.last_active = time.time() - 11 * 60
+    await retro.cog.config.session_timeout_minutes.set(30)
+    await retro.cog._hibernate_idle()
+    assert view.live, "eleven minutes idle is not thirty minutes idle"
+
+    await retro.cog.config.session_timeout_minutes.set(5)
+    await retro.cog._hibernate_idle()
+    assert not view.live, "and the new value reached a session already playing"
+
+
 async def test_a_press_resumes_a_sleeping_session_and_says_so_once(retro):
     """The resume line rides on the clip now, and is cleared by the next press.
 
@@ -3409,9 +3438,9 @@ async def test_the_clip_is_encoded_with_the_core_free(retro):
 
     original = view._encode
 
-    def watched_encode(captured):
+    def watched_encode(captured, limit=None, emulator=None):
         seen["locked"] = retro.cog.emulator_lock.locked()
-        return original(captured)
+        return original(captured, limit, emulator)
 
     view._encode = watched_encode
     interaction = retro.interaction(view, message=view.message)
@@ -3421,3 +3450,38 @@ async def test_the_clip_is_encoded_with_the_core_free(retro):
     assert seen["locked"] is False, "the one core was held while WebP was written"
     # And the press still posted a real clip.
     assert interaction.clip(), "the press posted no picture"
+
+
+async def test_a_press_still_posts_its_clip_if_another_channel_takes_the_core(retro):
+    """
+    Encoding happens after the lock, so eviction must not cost the clip.
+
+    The frames are already captured and encoding touches no core -- but the
+    session's `emulator` is cleared the moment another channel evicts it,
+    which can happen the instant the lock is given back. Reading the encoder
+    off the view at that point would fail a press whose picture was sitting
+    right there, finished.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9350, "evictedmidpress")
+    other, _, _ = await retro.posted_game(9351, "thief")
+    # `other` holds the core now, so this session is asleep; wake it so the
+    # press below is an ordinary one.
+    await view._press(retro.interaction(view, message=view.message), "a")
+    assert view.live
+
+    original = view._encode
+
+    def encode_after_eviction(captured, limit=None, emulator=None):
+        # Exactly what an eviction in another channel does, at the worst
+        # possible moment: the lock is free, the frames are captured, and
+        # the clip has not been encoded yet.
+        view.emulator = None
+        return original(captured, limit, emulator)
+
+    view._encode = encode_after_eviction
+    interaction = retro.interaction(view, message=view.message)
+    await view._press(interaction, "b")
+
+    assert interaction.clip(), "the press lost a clip it had already emulated"
+    assert interaction.kinds() == ["response.defer", "edit_original_response"]

@@ -6,7 +6,7 @@ animated clip of the next second of gameplay, so you see the game react
 instead of a still frame. Anyone in the channel can play, making it a fun
 social feature.
 
-Eight consoles are supported out of the box, from the Nintendo Entertainment
+Nine consoles are supported out of the box, from the Nintendo Entertainment
 System to the Game Boy Advance. Emulation is provided by
 [libretro.py](https://github.com/JesseTG/libretro.py) running cores from the
 [libretro buildbot](https://buildbot.libretro.com).
@@ -28,7 +28,7 @@ Install and load the cog:
 [p]load retro
 ```
 
-The seven emulator cores that cover all eight consoles — about 4.5 MiB to
+The seven emulator cores that cover all nine consoles — about 4.5 MiB to
 download, 31 MiB once unpacked, none of them needing a BIOS — start
 downloading in the background as soon as the cog loads. To do it now, or to
 check on it:
@@ -89,28 +89,40 @@ can start it by name:
 - `[p]retroset diskbudget [megabytes]` (owner, aliased `disk`/`budget`) caps what the whole cog may use on disk, and with no argument reports what is using it. The default is 1024 MiB; `0` is no limit. **No save is ever deleted to make room** — cached ROMs are, oldest first. A download or save that fails part way through cleans its own half-written file up, and any left behind by a process that was killed outright are swept when the cog next loads, so a failed write cannot quietly eat the allowance.
 - `[p]retroset allowprivateurls [true|false]` (owner) lets ROM URLs point inside your own network. Off, and best left off: see [ROM URLs](#rom-urls).
 - `[p]retroset timeout <minutes>` (owner) sets how long a game idles before it sleeps.
-- `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 1 second; anything from 0.2 to 15 works, fractions included (`0.8` is a real answer).
+- `[p]retroset cliplength <seconds>` (owner) sets how much play each clip shows. The default is 1 second; anything from 0.2 to 5 works, fractions included (`0.8` is a real answer). The ceiling was 15 and is 5: a clip that long is one nobody sits through, and it costs memory and encode time on every press to make it.
 - `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it. The default is 160. It is a ceiling: a clip too short to show the button coming back up holds it for less.
 - `[p]retroset settings` (owner) shows the current configuration, including the build that is loaded, the system directory and any BIOS files in it.
 - `[p]retroset version` (owner) answers **“am I running the new code?”** — the declared version, the commit it was installed from, and a fingerprint of the source that was actually loaded. See [Which build is this?](#which-build-is-this).
 
 ## Attaching a ROM
 
-Attach the file to the message you run `[p]retro` with and leave the arguments
-off. Both a raw ROM and a `.zip` work, up to 32 MiB.
+Attach the file to the message you run `[p]retro` with. Both a raw ROM and a
+`.zip` work, up to 32 MiB.
+
+**You can type a name as well.** `[p]retro Super Mario` with the ROM attached
+starts the ROM — the obvious way to use the command, which used to answer
+"there's no saved game called Super Mario" while holding the game it had just
+been handed. A saved name or a URL still wins if the text is one, because
+either of those names a ROM outright and a caption cannot outrank that.
 
 For a `.zip`, the cog looks inside and takes the first file whose extension is
 one of the consoles below, in alphabetical order, and says which one it picked
-if there is more than one. Folders inside the archive are fine. Nothing is ever
-unpacked using the paths stored in the archive, the uncompressed size is checked
-against the 32 MiB limit before anything is read, and a corrupt or
-password-protected archive gets a plain explanation rather than a stack trace.
+if there is more than one. **If you typed a name, it takes that one instead**:
+`[p]retro sonic` with a compilation attached starts `Sonic.md` rather than
+whatever sorts first. The name is matched on the filename inside the zip, with
+or without the extension, and a name that matches nothing falls back to the
+alphabetical pick and says so rather than refusing to start anything.
+
+Folders inside the archive are fine. Nothing is ever unpacked using the paths
+stored in the archive, the uncompressed size is checked against the 32 MiB
+limit before anything is read, and a corrupt or password-protected archive gets
+a plain explanation rather than a stack trace.
 
 ## Consoles
 
 The console is chosen from the ROM's file extension. Every core is BIOS-free —
-nothing but the ROM is needed. Seven cores cover the eight consoles
-(`genesis_plus_gx` runs two of them): about 4.5 MiB of zips from the
+nothing but the ROM is needed. Seven cores cover the nine consoles
+(`genesis_plus_gx` runs three of them): about 4.5 MiB of zips from the
 buildbot, 31 MiB unpacked, which is the figure that counts against
 `[p]retroset diskbudget`.
 
@@ -119,9 +131,10 @@ buildbot, 31 MiB unpacked, which is the figure that counts against
 | Game Boy / Color | `gambatte` | `.gb` `.gbc` `.dmg` |
 | Game Boy Advance | `mgba` | `.gba` |
 | Nintendo Entertainment System | `fceumm` | `.nes` `.unf` `.unif` |
-| Super Nintendo | `snes9x` | `.smc` `.sfc` `.swc` `.fig` `.bs` `.st` |
+| Super Nintendo | `snes9x` | `.smc` `.sfc` `.swc` `.fig` |
 | Sega Genesis / Mega Drive | `genesis_plus_gx` | `.md` `.mdx` `.smd` `.gen` `.68k` `.sgd` |
-| Sega Master System / Game Gear | `genesis_plus_gx` | `.sms` `.gg` `.sg` |
+| Sega Master System | `genesis_plus_gx` | `.sms` `.sg` |
+| Sega Game Gear | `genesis_plus_gx` | `.gg` |
 | PC Engine / TurboGrafx-16 | `mednafen_pce_fast` | `.pce` |
 | Neo Geo Pocket | `mednafen_ngp` | `.ngp` `.ngc` `.ngpc` `.npc` |
 
@@ -130,6 +143,9 @@ about which console a ROM is for — Mega Drive ROMs, Atari cartridges, raw CD
 tracks and BIOS dumps are all `.bin` — so a Genesis ROM has to be renamed to
 `.md` instead. CD formats (`.cue`, `.iso`, `.chd`) and Famicom Disk System
 images (`.fds`) are not supported, because they need disc images or a BIOS.
+Satellaview (`.bs`) and Sufami Turbo (`.st`) games are out for the same
+reason: both plug into a base cartridge (BS-X, STBIOS) that has to be
+supplied as a BIOS file, and every core here is BIOS-free.
 ROMs are capped at 32 MiB. A `.zip` containing any of the above is unpacked
 automatically.
 
@@ -137,7 +153,10 @@ Each console shows its own controls, with the names printed on its own
 controller: the Genesis gets **A B C** (and **X Y Z** and **Mode**), the Master
 System gets **1**, **2** and **Pause**, the PC Engine gets **I** through **VI**
 and **Run**, and the Neo Geo Pocket's **A** and **B** are the right way round
-rather than swapped.
+rather than swapped. The Game Gear runs on the same core as the Master System
+and has the same two buttons, but it is its own console here: a `.gg` game says
+*Game Gear*, and its third button is **Start** — **Pause** is a button on the
+Master System's console deck, which a handheld does not have.
 
 ## The controller
 
@@ -175,7 +194,7 @@ uses once the controls are added:
 | Super Nintendo | 19 | 4 |
 | Sega Genesis | 18 | 4 |
 | PC Engine | 18 | 4 |
-| Master System / Game Gear | 11 | 3 |
+| Master System, Game Gear | 11 | 3 |
 | Neo Geo Pocket | 11 | 3 |
 
 Three controls fit beside every console's bottom row, so none of them needs a
@@ -487,9 +506,20 @@ same three who may `[p]retrosleep` someone else's game.
 ## Playing
 
 Each press records the next **second** of play (configurable with
-`[p]retroset cliplength`, 0.2–15 and fractional) and posts it as a lossless
+`[p]retroset cliplength`, 0.2–5 and fractional) and posts it as a lossless
 animated WebP. The clip plays through once and stops rather than looping
 forever, so a busy channel isn't full of flickering images.
+
+**A clip too big for your server is made smaller rather than refused.**
+Discord's attachment limit depends on the server's boost tier, and a long
+clip of a busy hi-res game can pass it. Such a clip is re-encoded — lossy
+first, and at half size only if that is still not enough — before it is
+posted, instead of being sent, rejected, and answered with advice about a
+setting only the bot owner can change, after the press had already been
+spent. Lossless is still what every ordinary clip is: these are flat-shaded
+console frames with hard edges, which lossless WebP compresses better than
+lossy does, so the fallback is only ever reached when it is needed and is
+never used when it would make the file *larger*.
 
 A second is the default because a turn is a round trip: press, wait for the
 clip, watch it, press again. It used to be four seconds, and three of those
@@ -781,8 +811,8 @@ Four things keep that from costing anything it should not:
   or fsync was latency charged to every other channel's presses;
 * **no edit is held for more than 1.25 seconds.** A default clip really plays
   for 1.005s, so at the length this cog is played at every clip is paced in
-  full — but `[p]retroset cliplength` reaches 15 seconds, and pacing a full
-  queue of those strictly would be 45 seconds of waiting. Capped, the worst a
+  full — but `[p]retroset cliplength` reaches 5 seconds, and pacing a full
+  queue of those strictly would be 15 seconds of waiting. Capped, the worst a
   queue can add is 3.75 seconds, which is inside the four seconds the queue
   depth is already sized on. At the 0.2 second minimum the wait is 0.2
   seconds and pacing is effectively free;
@@ -1084,10 +1114,10 @@ Coming back says nothing: the button is right there saying what it does.
 | 0.67s | 2 | `A ×2` |
 | 0.68s | 3 | `A ×3` |
 | 1s (the default) | 3 | `A ×3` |
-| 15s (the ceiling) | 3 | `A ×3` |
+| 5s (the ceiling) | 3 | `A ×3` |
 
 **Wait and Undo never move.** The controls row reserves space for all three of
-them whether or not the third is drawn, so on every one of the eight consoles
+them whether or not the third is drawn, so on every one of the nine consoles
 the row is the same shape at every clip length and simply has one fewer button
 in it — a Game Boy is `Start Select Wait A ×3 Undo` at a second and
 `Start Select Wait Undo` at a fifth of one. `[p]retroset cliplength` and
@@ -1183,6 +1213,15 @@ A refusal, a connection that is declined and a request that times out all
 come back as **the same sentence**, deliberately: "refused" versus "timed
 out" is exactly the difference a port scanner is looking for. The real reason
 goes to the bot's log instead.
+
+That silence only covers what happens **before a server answers**, though.
+Once one has, its reachability is not a secret any more — whoever pasted the
+link just learned it — so a download that starts and then stalls or dies is
+told apart from a refused address and reported as what it is. The previous
+behaviour sent somebody whose mirror was merely slow off rewriting a URL that
+was never the problem. A whole redirect chain also shares one time budget
+rather than getting a fresh one per hop, so a chain of slow redirects cannot
+tie the fetch up for minutes.
 
 `[p]retroset allowprivateurls true` turns the guard off, and turning it off
 removes the protection **for everybody** — any member who can run `[p]retro`

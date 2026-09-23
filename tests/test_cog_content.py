@@ -18,6 +18,7 @@ import pytest
 
 pytest.importorskip("discord", reason="the cog tests need discord.py")
 
+import aiohttp  # noqa: E402
 import discord  # noqa: E402
 
 from .fakes import NES_BYTES, ROM_BYTES, FakeAttachment, FakeEmulator, zip_of  # noqa: E402
@@ -349,7 +350,7 @@ async def test_the_settings_embed_describes_the_whole_install(retro):
     assert "awake at once" in values, "the one-at-a-time rule is explained"
     # The clip length is a float, and the default must not read "1.0 seconds".
     assert "1 second of play per button press" in values, values
-    assert "0.2-15, fractions allowed" in values, values
+    assert "0.2-5, fractions allowed" in values, values
     assert "160ms per press" in values
 
 
@@ -1340,3 +1341,173 @@ async def test_the_no_cores_path_does_not_charge_the_cooldown(retro):
         retro.cog, ctx, game="https://example.com/x.gb"
     )
     assert forgiven == [ctx]
+
+
+async def test_a_name_and_an_attachment_starts_the_attachment(retro):
+    """
+    `[p]retro Super Mario` with the ROM attached starts the ROM.
+
+    Typing what the game is called and attaching it is the obvious way to
+    use this command, and it used to answer "there's no saved game called
+    Super Mario" while holding the game it had just been handed. A preset or
+    a URL still wins, because either of those names a ROM explicitly and a
+    caption cannot outrank one.
+    """
+    await retro.install_cores()
+    channel = retro.channel(9330)
+    ctx = retro.context(
+        channel, attachments=[FakeAttachment(ROM_BYTES, "attached.gbc")]
+    )
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="Super Mario")
+
+    view = retro.cog.sessions.get(channel.id)
+    assert view is not None and view.live, ctx.said()
+    assert "no saved game called" not in ctx.said()
+
+
+async def test_a_preset_still_beats_an_attachment(retro):
+    """The explicit name wins: a preset resolves to a URL, a caption does not."""
+    await retro.install_cores()
+    retro.serve("preset.gbc", ROM_BYTES)
+    await retro.cog.config.games.set({"preset": "https://example.com/preset.gbc"})
+    channel = retro.channel(9331)
+    ctx = retro.context(
+        channel, attachments=[FakeAttachment(ROM_BYTES, "ignored.gbc")]
+    )
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="preset")
+
+    view = retro.cog.sessions.get(channel.id)
+    assert view is not None and view.game_name == "preset", ctx.said()
+
+
+async def test_an_unknown_name_with_no_attachment_still_explains_itself(retro):
+    """The branch that was there before is untouched when nothing is attached."""
+    await retro.install_cores()
+    channel = retro.channel(9332)
+    ctx = retro.context(channel)
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="nosuchgame")
+
+    assert "no saved game called" in ctx.said()
+    assert retro.cog.sessions.get(channel.id) is None
+
+
+# -- Telling a slow mirror apart from a refused address -----------------------
+#
+# A URL that is refused, one that nothing answers and one that times out
+# before a connection is made all get the same single sentence on purpose:
+# three different answers are a working port scanner (see net.REFUSAL). That
+# reasoning only covers what happens *before* a response arrives, though. Once
+# a server has answered, its reachability is not a secret any more -- the
+# person asking just learned it -- so a body that then dies or runs out of
+# time can say so, and should: "that URL points somewhere the bot will not
+# fetch from" sends somebody with a legitimately slow host off rewriting a URL
+# that was never the problem.
+
+
+async def _download_failing(retro, monkeypatch, error, *, answered):
+    """Run a ROM download whose body or connection fails, and return the reply."""
+
+    class SlowResponse:
+        status = 200
+        content_length = None
+        content_disposition = None
+        url = types.SimpleNamespace(path="/game.gbc")
+
+        class content:
+            @staticmethod
+            async def iter_chunked(size):
+                raise error
+                yield b""  # pragma: no cover - unreachable, makes this a generator
+
+    @contextlib.asynccontextmanager
+    async def fake_guarded_get(url, **kwargs):
+        if not answered:
+            # Nothing ever answered: the failure happens before a response.
+            raise error
+        yield SlowResponse()
+
+    monkeypatch.setattr(retro.netmod, "guarded_get", fake_guarded_get)
+    with pytest.raises(retro.cogmod.DownloadError) as caught:
+        await retro.cog._download_bytes(
+            "https://example.com/game.gbc", 1024 * 1024, "1 MiB", "ROM"
+        )
+    return str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [asyncio.TimeoutError(), aiohttp.ClientConnectionError("dropped")],
+    ids=["timeout", "connection-dropped"],
+)
+async def test_a_failure_before_any_answer_gives_nothing_away(
+    retro, monkeypatch, error
+):
+    said = await _download_failing(retro, monkeypatch, error, answered=False)
+    assert said == retro.netmod.REFUSAL
+
+
+@pytest.mark.parametrize(
+    "error",
+    [asyncio.TimeoutError(), aiohttp.ClientConnectionError("dropped")],
+    ids=["timeout", "connection-dropped"],
+)
+async def test_a_failure_after_the_server_answered_is_explained(
+    retro, monkeypatch, error
+):
+    said = await _download_failing(retro, monkeypatch, error, answered=True)
+    assert said != retro.netmod.REFUSAL
+    assert "will not fetch from" not in said, "still blaming the address"
+    assert "started downloading" in said
+    # And it points at the thing the asker can actually do something about.
+    assert "mirror" in said
+
+
+async def test_a_named_rom_is_taken_out_of_a_multi_game_zip(retro):
+    """
+    `[p]retro sonic` with a compilation zip attached starts Sonic.
+
+    The zip already holds the game somebody asked for, so making them unzip
+    it and re-upload the one file was asking them to do by hand what the bot
+    had already done in memory.
+    """
+    await retro.install_cores()
+    payload = zip_of([("Alex Kidd.gbc", ROM_BYTES), ("Sonic.gbc", ROM_BYTES)])
+    channel = retro.channel(9340)
+    ctx = retro.context(channel, attachments=[FakeAttachment(payload, "pack.zip")])
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="sonic")
+
+    view = retro.cog.sessions.get(channel.id)
+    assert view is not None and view.game_name == "Sonic", ctx.said()
+    # Nothing to apologise for, so nothing is said about the other games.
+    assert "alphabetical" not in ctx.said()
+
+
+async def test_a_name_that_is_not_in_the_zip_still_starts_something(retro):
+    """A caption that matches nothing falls back, and says what it did."""
+    await retro.install_cores()
+    payload = zip_of([("Alex Kidd.gbc", ROM_BYTES), ("Sonic.gbc", ROM_BYTES)])
+    channel = retro.channel(9341)
+    ctx = retro.context(channel, attachments=[FakeAttachment(payload, "pack.zip")])
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game="mario")
+
+    view = retro.cog.sessions.get(channel.id)
+    # Spaces become underscores on the way to disk; see _sanitize_filename.
+    assert view is not None and view.game_name == "Alex_Kidd", ctx.said()
+    said = ctx.said()
+    assert "mario" in said and "not in it" in said
+    assert "alphabetical" in said
+
+
+async def test_a_multi_game_zip_with_no_name_says_how_to_pick(retro):
+    """The unnamed case points at the syntax rather than at re-uploading."""
+    await retro.install_cores()
+    payload = zip_of([("Alex Kidd.gbc", ROM_BYTES), ("Sonic.gbc", ROM_BYTES)])
+    channel = retro.channel(9342)
+    ctx = retro.context(channel, attachments=[FakeAttachment(payload, "pack.zip")])
+    await retro.cogmod.Retro.retro.callback(retro.cog, ctx, game=None)
+
+    view = retro.cog.sessions.get(channel.id)
+    assert view is not None and view.game_name == "Alex_Kidd", ctx.said()
+    said = ctx.said()
+    assert "2 playable ROMs" in said
+    assert "retro Sonic" in said, "it should name a game that is really in there"

@@ -14,12 +14,14 @@ Three separate facts, because only together are they honest:
   ``.py`` here to fall out of step with it, which is the one kind of drift
   that cannot then happen. It is still a number a human has to remember to
   bump, which is exactly why it is not the only thing shown.
-* **the commit**, when the cog was installed from a git checkout: Red's
-  Downloader clones a repo, so ``<repo>/.git`` is usually one directory
-  above this package. Absent (the cog copied in by hand, an installed tree
-  with no ``.git``) it is simply not mentioned. Read from the files, never
-  by running ``git``: there may be no git binary, and a subprocess on a
-  command that answers a question is not worth the risk.
+* **the checkout**, when the cog was installed from one: Red's Downloader
+  clones a repo, so ``<repo>/.git`` is usually one directory above this
+  package. What is shown is the one line of ``.git/HEAD`` -- the branch it
+  is on, or the commit id when HEAD is detached. Absent (the cog copied in
+  by hand, an installed tree with no ``.git``) it is simply not mentioned.
+  Read from the files, never by running ``git``: there may be no git
+  binary, and a subprocess on a command that answers a question is not
+  worth the risk.
 * **a fingerprint of the loaded source**, which is the part that cannot go
   stale. It is a hash of every ``retro/*.py`` as they were when this module
   was imported -- i.e. when the cog was loaded -- so two bots showing the
@@ -54,6 +56,7 @@ __all__ = [
     "GIT_SEARCH_DEPTH",
     "read_version",
     "git_checkout",
+    "scan_sources",
     "code_fingerprint",
     "newest_source_time",
     "describe",
@@ -138,44 +141,39 @@ def _looks_like_a_sha(value: str) -> bool:
     return len(value) in (40, 64) and all(c in "0123456789abcdef" for c in value.lower())
 
 
-def _resolve_ref(git_dir: Path, ref: str) -> typing.Optional[str]:
-    """One ref to a commit id, through the loose file or packed-refs."""
-    loose = git_dir / ref
-    try:
-        if loose.is_file():
-            value = loose.read_text(encoding="utf-8").strip()
-            if _looks_like_a_sha(value):
-                return value
-    except OSError:
-        log.debug("Could not read the git ref %s.", loose, exc_info=True)
-    packed = git_dir / "packed-refs"
-    try:
-        if packed.is_file():
-            for line in packed.read_text(encoding="utf-8").splitlines():
-                if not line or line[0] in "#^":
-                    continue
-                sha, _, name = line.partition(" ")
-                if name.strip() == ref and _looks_like_a_sha(sha):
-                    return sha
-    except OSError:
-        log.debug("Could not read %s.", packed, exc_info=True)
-    return None
-
-
 class Checkout(typing.NamedTuple):
-    """The commit the loaded code was read from, and the branch it was on."""
+    """
+    What ``.git/HEAD`` says, as one of the two things it can say.
 
-    commit: str
+    Exactly one field is filled in: ``branch`` when HEAD is on a branch,
+    ``commit`` when it is detached. Both being optional is the honest shape
+    -- see :func:`git_checkout` for why the commit is not looked up as well.
+    """
+
+    commit: typing.Optional[str]
     branch: typing.Optional[str]
 
 
 def git_checkout(start: typing.Optional[Path] = None) -> typing.Optional[Checkout]:
     """
-    The commit this package was installed from, or None.
+    Where this package was checked out, from one line of ``.git/HEAD``.
 
-    Read straight out of ``.git`` (HEAD, then a loose ref or packed-refs) so
-    it works with no git binary installed and cannot hang. None is an
+    A branch name (``ref: refs/heads/main`` -> ``main``) or, on a detached
+    HEAD, the commit id sitting in the file. Read straight out of the files
+    so it works with no git binary installed and cannot hang. None is an
     ordinary answer, not a failure: plenty of installs have no ``.git``.
+
+    This used to go further and turn a branch into its commit id, which
+    meant reimplementing a chunk of git's on-disk format: the loose ref
+    file, then packed-refs with its comment and peeled-tag lines -- around
+    ninety lines of parsing, all of it to decorate one line of chat output.
+    It was never the fact that answers the question this module exists for:
+    a commit id describes what was *committed*, which a dirty tree or a pull
+    without a reload already disagrees with -- the fingerprint is the one
+    that cannot. And a branch name is what a human compares against the
+    repository anyway. So HEAD's own words are shown as they are written,
+    ref storage stays git's business, and nothing here has to keep up with
+    it.
     """
     git_dir = _git_dir(start)
     if git_dir is None:
@@ -187,24 +185,68 @@ def git_checkout(start: typing.Optional[Path] = None) -> typing.Optional[Checkou
         return None
     if head.startswith("ref:"):
         ref = head.split(":", 1)[1].strip()
-        commit = _resolve_ref(git_dir, ref)
-        if commit is None:
-            return None
+        # The last segment, so refs/heads/main reads as "main". A ref with
+        # nothing after the colon is no answer at all.
         branch = ref.rpartition("/")[2] or None
-        return Checkout(commit, branch)
+        return None if branch is None else Checkout(None, branch)
     if _looks_like_a_sha(head):
         # A detached HEAD, which is what `git checkout <tag>` leaves behind.
         return Checkout(head, None)
     return None
 
 
-def _sources(directory: typing.Optional[Path] = None) -> typing.List[Path]:
+class Sources(typing.NamedTuple):
+    """Both facts about the ``.py`` files, from one walk over them."""
+
+    fingerprint: typing.Optional[str]
+    newest: typing.Optional[float]
+
+
+def scan_sources(directory: typing.Optional[Path] = None) -> Sources:
+    """
+    Hash every ``.py`` in this package and note the newest one, in one pass.
+
+    One glob and one visit per file, because both facts are about the same
+    files and are wanted at the same moment (import time). They were two
+    passes -- glob, read, hash; glob again, stat -- which walked the package
+    twice on every load for no gain.
+
+    The hash covers filenames as well as contents, so adding an empty module
+    changes the answer. A file that cannot be *read* costs the fingerprint
+    entirely, because a partial hash would be a confident wrong answer; a
+    file that cannot be *stat*ed only drops out of the newest-mtime
+    calculation, which is a decoration either way.
+    """
     directory = PACKAGE_DIR if directory is None else Path(directory)
     try:
-        return sorted(directory.glob("*.py"))
+        found = sorted(directory.glob("*.py"))
     except OSError:
         log.debug("Could not list %s.", directory, exc_info=True)
-        return []
+        found = []
+    if not found:
+        return Sources(None, None)
+
+    digest = hashlib.sha256()
+    readable = True
+    times = []
+    for path in found:
+        try:
+            times.append(path.stat().st_mtime)
+        except OSError:
+            log.debug("Could not stat %s.", path, exc_info=True)
+        try:
+            body = path.read_bytes()
+        except OSError:
+            log.debug("Could not read %s.", path, exc_info=True)
+            readable = False
+            continue
+        digest.update(path.name.encode("utf-8"))
+        digest.update(len(body).to_bytes(8, "big"))
+        digest.update(body)
+    return Sources(
+        digest.hexdigest()[:FINGERPRINT_LENGTH] if readable else None,
+        max(times) if times else None,
+    )
 
 
 def code_fingerprint(
@@ -213,53 +255,36 @@ def code_fingerprint(
     """
     A short hash of every ``.py`` in this package, or None.
 
-    Filenames go into the hash as well as their contents, so adding an empty
-    module changes the answer. Called once, at import, which is what makes
-    it a fingerprint of the code that is *running* rather than of whatever
-    is on disk now -- see this module's own docstring.
+    Called once, at import, which is what makes it a fingerprint of the code
+    that is *running* rather than of whatever is on disk now -- see this
+    module's own docstring. Kept as its own name because that is the fact
+    people ask for; :func:`scan_sources` does the work.
     """
-    digest = hashlib.sha256()
-    found = _sources(directory)
-    if not found:
-        return None
-    for path in found:
-        try:
-            body = path.read_bytes()
-        except OSError:
-            log.debug("Could not read %s.", path, exc_info=True)
-            return None
-        digest.update(path.name.encode("utf-8"))
-        digest.update(len(body).to_bytes(8, "big"))
-        digest.update(body)
-    return digest.hexdigest()[:FINGERPRINT_LENGTH]
+    return scan_sources(directory).fingerprint
 
 
 def newest_source_time(
     directory: typing.Optional[Path] = None,
 ) -> typing.Optional[float]:
     """When the most recently changed file in this package was written."""
-    times = []
-    for path in _sources(directory):
-        try:
-            times.append(path.stat().st_mtime)
-        except OSError:
-            log.debug("Could not stat %s.", path, exc_info=True)
-    return max(times) if times else None
+    return scan_sources(directory).newest
 
 
 #: The declared version, from info.json.
 VERSION: str = read_version()
 
 _CHECKOUT = git_checkout()
-#: The commit the loaded code came from, or None if there is no ``.git``.
+#: The commit the loaded code came from -- only on a detached HEAD, which is
+#: the one case where there is no branch name to show instead.
 COMMIT: typing.Optional[str] = None if _CHECKOUT is None else _CHECKOUT.commit
-#: The branch that commit was on, or None (no ``.git``, or a detached HEAD).
+#: The branch HEAD is on, or None (no ``.git``, or a detached HEAD).
 BRANCH: typing.Optional[str] = None if _CHECKOUT is None else _CHECKOUT.branch
 
+_SOURCES = scan_sources()
 #: A hash of the sources as they were when the cog was loaded.
-FINGERPRINT: typing.Optional[str] = code_fingerprint()
+FINGERPRINT: typing.Optional[str] = _SOURCES.fingerprint
 #: The newest source file's mtime, as of the same moment.
-SOURCE_TIME: typing.Optional[float] = newest_source_time()
+SOURCE_TIME: typing.Optional[float] = _SOURCES.newest
 #: And when that moment was, i.e. when this cog was loaded.
 LOADED_AT: float = time.time()
 
@@ -271,11 +296,12 @@ def _stamp(when: typing.Optional[float]) -> str:
 
 
 def summary() -> str:
-    """One line: the version, and the commit if there is one."""
+    """One line: the version, and the checkout if there is one."""
     line = f"v{VERSION}"
-    if COMMIT:
-        line += f" ({COMMIT[:8]}"
-        line += f" on {BRANCH})" if BRANCH else ", detached)"
+    if BRANCH:
+        line += f" (on {BRANCH})"
+    elif COMMIT:
+        line += f" ({COMMIT[:8]}, detached)"
     return line
 
 
@@ -285,8 +311,8 @@ def describe(prefix: str = "") -> str:
 
     Written to be read out loud in a support conversation, which is what it
     is for: the version somebody can compare against the repository, the
-    commit if there is one, and the fingerprint that settles it when the two
-    of them are not enough.
+    branch (or commit) if this is a checkout, and the fingerprint that
+    settles it when the two of them are not enough.
 
     ``prefix`` is the bot's real command prefix. These lines are *sent*, and
     Red only rewrites ``[p]`` in a docstring, so the reload command named at
@@ -298,9 +324,10 @@ def describe(prefix: str = "") -> str:
             "\N{WARNING SIGN}\N{VARIATION SELECTOR-16} `info.json` carries no "
             "readable version, so this is not the cog's own number."
         )
-    if COMMIT:
-        where = f" on `{BRANCH}`" if BRANCH else " (detached HEAD)"
-        lines.append(f"**Commit** `{COMMIT[:12]}`{where}")
+    if BRANCH:
+        lines.append(f"**Checkout** on `{BRANCH}`")
+    elif COMMIT:
+        lines.append(f"**Checkout** `{COMMIT[:12]}` (detached HEAD)")
     if FINGERPRINT:
         lines.append(f"**Loaded code** `{FINGERPRINT}`, newest file {_stamp(SOURCE_TIME)}")
     lines.append(f"**Loaded at** {_stamp(LOADED_AT)}")

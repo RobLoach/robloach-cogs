@@ -69,9 +69,10 @@ class MixinMeta(ABC):
     #: leave a core loaded. Also retro/saves.py.
     _force_hibernate: typing.Callable[..., typing.Awaitable[None]]
     #: Put every *other* live session to sleep, so loading a core here cannot
-    #: make two. Called before a core is loaded for a probe or an option
-    #: change (retro/cores.py) and before a save is inspected with a real
-    #: core (retro/saves.py).
+    #: make two. Called before a save is inspected with a real core
+    #: (retro/saves.py), which is the only caller left outside this class:
+    #: reading a core's options used to evict every session in every channel
+    #: to do it, and now answers from what is already known instead.
     _evict_locked: typing.Callable[..., typing.Awaitable[typing.List[typing.Any]]]
     #: Run one blocking call into a libretro core, on the single thread every
     #: core call is made from. Used wherever a mixin drives a core -- probing

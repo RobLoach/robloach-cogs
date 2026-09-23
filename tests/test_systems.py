@@ -74,7 +74,10 @@ EXPECTED_BUTTONS = {
             "Mode": "select", "Start": "start",
         },
     ),
+    # The Master System's Pause is a button on the console deck; the Game
+    # Gear has no such thing, so the same RetroPad field is its START.
     "sms": ("genesis_plus_gx", {"1": "b", "2": "a", "Pause": "start"}),
+    "gg": ("genesis_plus_gx", {"1": "b", "2": "a", "Start": "start"}),
     "pce": (
         "mednafen_pce_fast",
         {
@@ -294,7 +297,7 @@ def test_every_extension_is_claimed_by_exactly_one_console():
     "extension, key",
     [
         ("gb", "gb"), ("gbc", "gb"), ("nes", "nes"), ("sfc", "snes"), ("smc", "snes"),
-        ("md", "genesis"), ("sms", "sms"), ("gg", "sms"), ("sg", "sms"),
+        ("md", "genesis"), ("sms", "sms"), ("gg", "gg"), ("sg", "sms"),
         ("pce", "pce"), ("ngp", "ngp"), ("npc", "ngp"), ("gba", "gba"),
     ],
 )
@@ -308,10 +311,26 @@ def test_extension_picks_the_right_console(extension, key):
 @pytest.mark.parametrize(
     "extension",
     ["bin", "cue", "iso", "chd", "fds", "m3u", "zip", "txt", "a26", "mvc", "ws", "wsc",
-     "pc2", "vb", "vboy"],
+     "pc2", "vb", "vboy", "bs", "st"],
 )
 def test_an_unsupported_extension_resolves_to_nothing(extension):
     assert S.system_for_extension(extension) is None
+
+
+def test_the_two_snes_slot_formats_are_never_claimed():
+    """``.bs`` and ``.st`` need a base cartridge this cog cannot supply.
+
+    A Satellaview download plugs into BS-X.bin and a Sufami Turbo game into
+    STBIOS.bin; snes9x boots neither without it. They were in the Super
+    Nintendo's extension list, so uploading one started a session that then
+    showed nothing -- which reads as a broken cog rather than as a file
+    nothing here can run. Every core in this module is BIOS-free, and these
+    two are now refused the way `.fds` always was.
+    """
+    for extension in ("bs", "st"):
+        assert extension in S.AMBIGUOUS_EXTENSIONS
+        assert S.system_for_extension(extension) is None
+    assert S.system_by_key("snes").extensions == ("smc", "sfc", "swc", "fig")
 
 
 def test_extension_lookup_ignores_case_and_a_leading_dot():
@@ -345,9 +364,39 @@ def test_a_core_that_this_layout_cannot_render_is_absent(core):
     assert core not in S.CORES
 
 
-def test_a_core_that_runs_two_consoles_says_so():
+def test_a_core_that_runs_several_consoles_says_so():
+    # Three of the nine consoles share genesis_plus_gx, and `[p]retroset`
+    # describes a core by what it plays, so all three have to be in the one
+    # description. Each name appears once however many systems there are.
     described = S.CORES["genesis_plus_gx"]
-    assert "Genesis" in described and "Master System" in described
+    for name in ("Genesis", "Master System", "Game Gear"):
+        assert described.count(name) == 1, described
+    assert len(S.CORES) < len(S.SYSTEMS), "a core may run more than one console"
+
+
+def test_the_game_gear_is_its_own_console_on_the_same_core():
+    """It was folded into the Master System, and both halves showed.
+
+    A `.gg` game announced itself as a "Sega Master System" one, and its
+    Start button was labelled "Pause" -- which is a button on the Master
+    System's *console deck*, not a controller button at all, and the Game
+    Gear has none. Same core, same pad, different console.
+    """
+    gg = S.system_for_extension("gg")
+    sms = S.system_by_key("sms")
+    assert gg.key == "gg" and gg.name == "Sega Game Gear"
+    assert gg.core == sms.core == "genesis_plus_gx"
+    assert gg.extensions == ("gg",)
+    assert gg.label_for("start") == "Start"
+    assert gg.caption_for("start") == "Start"
+    assert sms.label_for("start") == "Pause"
+    # ".sg" is an SG-1000 cartridge, which the same core runs as part of its
+    # Master System support and which shares that console's two buttons.
+    assert S.system_for_extension("sg").key == "sms"
+    # A second console on one core still leaves one core per emulator
+    # download: CORES is keyed by core, not by console.
+    assert S.system_for_core("genesis_plus_gx").key == "genesis"
+    assert S.core_name_from_filename("genesis_plus_gx_libretro.so") == "genesis_plus_gx"
 
 
 def test_core_filename_and_name_round_trip():

@@ -8,12 +8,19 @@ each) and ``system/`` (the libretro system directory, i.e. BIOS files).
 
 Everything in here is either a path, a read, an atomic write, or a deletion.
 Nothing in here talks to Discord.
+
+Every one of those writes and deletions also keeps the running total the disk
+budget is judged against up to date, because the alternative -- measuring the
+whole directory again -- is a full recursive walk, and the budget is checked
+on every single download. See "Measuring without walking" below.
 """
 
 import asyncio
 import logging
 import os
 import re
+import threading
+import time
 import typing
 from pathlib import Path
 
@@ -53,6 +60,70 @@ DEFAULT_DISK_BUDGET_MB = 1024
 # A ceiling on the setting itself, so a typo cannot ask for an exabyte.
 MAX_DISK_BUDGET_MB = 1024 * 1024
 
+# -- Measuring without walking -------------------------------------------------
+#
+# The budget needs one number: how many bytes the data directory holds. The
+# honest way to get that number is _data_usage -- rglob the tree and stat
+# every file -- and _make_room used to ask for it on every incoming download
+# and every BIOS install. That is O(everything the cog has ever stored), it
+# grows with the number of channels (five cached ROMs and four save files
+# each), and it lands on the path a player is waiting on: starting a game.
+# On a networked data directory it is the difference between a game starting
+# and a game seeming not to.
+#
+# So the total is kept as a running number instead. Every write and every
+# delete this module performs adjusts it (_note_usage_change), which is free
+# -- those calls already know how many bytes they moved -- and _make_room
+# then answers from memory.
+#
+# The catch is that this module is not the only thing that can change the
+# directory. An owner can drop a core in by hand, delete a ROM with `rm`, or
+# restore a backup over the top of it; other modules in this cog delete saves
+# without coming through here (see _note_usage_change for the list). So the
+# cached number is treated as an estimate that must never be the reason a
+# download is refused, with two rules that bound how wrong it may be:
+#
+#   * **the margin.** The cache is only trusted for decisions that are
+#     comfortably inside the budget. The moment `cached + incoming` comes
+#     within USAGE_CACHE_MARGIN of the limit, the directory is measured for
+#     real -- so every *refusal*, and every prune, is made on a fresh walk.
+#     One ROM's worth of slack: a full-size cached ROM is the largest single
+#     thing an ordinary download adds, so this keeps a whole download's worth
+#     of room between the last cached decision and the limit.
+#   * **the interval.** Even deep inside the budget the cache is thrown away
+#     after USAGE_CACHE_SECONDS, so drift from hand-edits has a bounded life
+#     rather than lasting until the cog is reloaded. Five minutes: long
+#     enough that a channel working through a pile of games pays for one
+#     walk rather than twenty, short enough that "I deleted some ROMs by
+#     hand" is believed almost immediately.
+#
+# Which direction of error does that leave? Only downwards, and deliberately:
+#
+#   * an *over*count (the cache thinks the disk is fuller than it is, which
+#     is what every unaccounted deletion elsewhere in the cog produces) can
+#     never refuse a download, because a total close enough to the limit to
+#     refuse anything is re-measured first. It costs one extra walk.
+#   * an *under*count (something appeared out of band) can let the directory
+#     creep past the budget, but only by as much as appeared out of band
+#     since the last walk, and only for as long as the margin hides it --
+#     the next near-the-limit decision or the next interval measures it and
+#     the pruner catches up.
+#
+# That is the right way round: a bot that is 30 MiB over its budget for five
+# minutes is a bot nobody notices, while a bot that refuses to start a game
+# because of a number it made up is the whole cog broken.
+USAGE_CACHE_SECONDS = 300.0
+USAGE_CACHE_MARGIN = 32 * 1024 * 1024
+
+# The running total is adjusted from whichever thread did the write --
+# _write_atomic and the pruners are handed to asyncio.to_thread all over the
+# cog -- and `total += delta` is three bytecodes, so two threads finishing a
+# write at once can lose one of them. One module-level lock rather than a
+# per-instance one: it is held for a couple of integer operations, there is
+# normally exactly one cog, and a lock that has to be created lazily on a
+# mixin with no __init__ has a race of its own.
+_usage_lock = threading.Lock()
+
 # -- The previous generation --------------------------------------------------
 #
 # An atomic write cannot leave a truncated save behind, but it is perfectly
@@ -78,6 +149,23 @@ ROLLBACK_SUFFIX = ".rollback"
 
 class StorageMixin(MixinMeta):
     """The data directory: paths, reads, atomic writes, and the budget."""
+
+    #: Bytes the whole data directory held at the last full measurement, or
+    #: None when it has never been measured. Class attributes rather than
+    #: __init__ assignments because the mixin has no __init__ of its own (the
+    #: same reason CoresMixin._cores_scan_cache is one); the first write
+    #: creates the instance attribute, so two cogs in one process -- which
+    #: the tests build -- never share a total.
+    _usage_cached_total: typing.Optional[int] = None
+    #: ``time.monotonic()`` when that measurement was taken. Monotonic, not
+    #: wall clock: a bot that runs for months will see the system clock
+    #: stepped, and a cache that believes it is from the future never expires.
+    _usage_cached_at: float = 0.0
+    #: Every byte this module has been told it *added*, summed and never
+    #: reset. Only the difference between two readings is ever used, to catch
+    #: writes that land while a measurement is walking the tree; see
+    #: _data_usage. Deletions are deliberately not in here -- see there.
+    _usage_added: int = 0
 
     # -- Files --------------------------------------------------------------
 
@@ -269,8 +357,7 @@ class StorageMixin(MixinMeta):
         slug = re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-").lower()[:48]
         return slug or "game"
 
-    @classmethod
-    def _write_atomic(cls, path: Path, data: bytes, keep_backup: bool = False) -> None:
+    def _write_atomic(self, path: Path, data: bytes, keep_backup: bool = False) -> None:
         """
         Replace a file's contents in one step, never leaving half of one.
 
@@ -305,8 +392,25 @@ class StorageMixin(MixinMeta):
         take 32 MiB of the disk budget with it, permanently, and the only cure
         was somebody deleting the file by hand. See _sweep_partial_writes for
         the ones left behind by a process that was killed outright.
+
+        This is also where most of the cog's bytes enter the data directory:
+        Retro.py writes cached ROMs and saves through it, saves.py writes
+        imported ones, cores.py writes the cores. So it is where the disk
+        budget's running total is kept up to date, and every one of those
+        callers gets that for free -- which is why this is an instance method
+        rather than the classmethod it used to be. Only a *successful* write
+        counts: the temporary file is transient, and the accounting is the
+        difference the directory is actually left holding, which with
+        ``keep_backup`` is the new file minus the generation that just fell
+        off the end rather than the whole write.
         """
         temporary = path.with_suffix(path.suffix + ".tmp")
+        # Both stats before anything moves, because after the renames there
+        # is no way to ask what was there. Two stats against a recursive
+        # walk of the entire data directory is the trade this is making.
+        live_before = self._file_size(path)
+        backup_before = self._file_size(self._backup_path(path)) if keep_backup else 0
+        rotated = False
         try:
             # The one place the directory is guaranteed rather than assumed:
             # _data_dir memoizes what it has created, and a directory deleted
@@ -323,11 +427,19 @@ class StorageMixin(MixinMeta):
                     # replace(), not a copy: a rename is atomic and costs
                     # nothing, so the previous generation is never
                     # half-written either.
-                    path.replace(cls._backup_path(path))
+                    path.replace(self._backup_path(path))
+                    rotated = True
                 except FileNotFoundError:
                     # Nothing to rotate. The first save of a new game.
                     pass
             temporary.replace(path)
+            # What the directory holds now, minus what it held before. With a
+            # rotation the old live file survives as the backup and the old
+            # backup is the thing that went; without one the file at `path`
+            # was simply overwritten. `rotated` rather than "the live file had
+            # a size", so a zero-byte save is accounted for like any other.
+            after = len(data) + (live_before if rotated else backup_before)
+            self._note_usage_change(after - (live_before + backup_before))
         except BaseException:
             # BaseException, not OSError: a cancelled task unwinding through
             # here leaves exactly the same orphan behind as a failed write,
@@ -365,7 +477,15 @@ class StorageMixin(MixinMeta):
           destroying the very thing the swap was built to protect.
 
         Load is also the one moment when no write of this cog's can be in
-        flight, so nothing living can be touched out from under itself.
+        flight, so nothing living can be touched out from under itself. It is
+        for that reason the right moment to take the disk budget's baseline
+        measurement too, and this is the only walk of the whole directory the
+        cog makes as a matter of course -- so the sweep finishes by
+        remeasuring, which costs one more walk at load and buys the running
+        total a starting point that owes nothing to whatever happened while
+        the bot was off. (The namespace migration moves files in just before
+        this runs; measuring here rather than earlier is what makes those
+        bytes count.)
 
         Never raises: it is on the cog load path and a cog that will not load
         is worse than a few megabytes nobody can account for.
@@ -398,6 +518,7 @@ class StorageMixin(MixinMeta):
                 )
                 continue
             freed += size
+            self._note_usage_change(-size)
             found += 1
         if found:
             log.info(
@@ -406,6 +527,10 @@ class StorageMixin(MixinMeta):
                 self._humanize_bytes(freed),
                 found,
             )
+        # The baseline, after the deletions above rather than before them.
+        # _measure_usage never raises either, so this keeps the promise in
+        # the docstring: whatever the disk says, the cog still loads.
+        self._measure_usage()
         return freed
 
     def _recover_rollback(self, path: Path) -> int:
@@ -462,6 +587,7 @@ class StorageMixin(MixinMeta):
                 return 0
             size = int(path.stat().st_size)
             path.unlink()
+            self._note_usage_change(-size)
             return size
         except OSError:
             log.warning(
@@ -482,12 +608,29 @@ class StorageMixin(MixinMeta):
             return None
 
     @staticmethod
-    def _discard(path: Path) -> None:
+    def _file_size(path: Path) -> int:
+        """
+        How many bytes a file that may not be there holds. Never raises.
+
+        A missing file and an unreadable one both measure zero, because every
+        caller is asking the same question -- "how much of the disk budget
+        does this account for" -- and the answer for something that cannot be
+        stat()ed is "nothing we can prove".
+        """
+        try:
+            return int(path.stat().st_size)
+        except OSError:
+            return 0
+
+    def _discard(self, path: Path) -> None:
         """Delete a save file that no core will load. Never raises."""
+        size = self._file_size(path)
         try:
             path.unlink(missing_ok=True)
         except OSError:
             log.warning("Could not delete the unusable save %s", path, exc_info=True)
+            return
+        self._note_usage_change(-size)
 
     @staticmethod
     def _humanize_bytes(size: typing.Optional[int]) -> str:
@@ -558,6 +701,7 @@ class StorageMixin(MixinMeta):
             seen += 1
             if seen < MAX_CACHED_GAMES_PER_CHANNEL:
                 continue
+            size = self._file_size(path)
             try:
                 # The ROM and nothing else. The game's four save files are
                 # deliberately left where they are; see the docstring.
@@ -565,6 +709,8 @@ class StorageMixin(MixinMeta):
                 deleted.append(path.name)
             except OSError:
                 log.warning("Could not prune the cached ROM %s", path, exc_info=True)
+                continue
+            self._note_usage_change(-size)
         return deleted
 
     # -- The disk budget ----------------------------------------------------
@@ -577,11 +723,53 @@ class StorageMixin(MixinMeta):
     #
     #   * measure everything, including the cores, the BIOS files and the
     #     previous generation of every save. A budget that only counted ROMs
-    #     would be a budget that could be walked past.
+    #     would be a budget that could be walked past. (Measure, yes; walk
+    #     the whole directory on every download, no -- the total is kept
+    #     running instead, and the rules for when it is trusted are under
+    #     "Measuring without walking" at the top of this file.)
     #   * when it is full, prune *cached ROMs* and nothing else. A ROM is
     #     re-downloadable and a save is not, so a save is never deleted to
     #     make room for somebody else's download. If pruning ROMs is not
     #     enough, the download is refused and says so.
+
+    def _note_usage_change(self, delta: int) -> None:
+        """
+        Tell the running total that this module just moved ``delta`` bytes.
+
+        Positive for bytes written, negative for bytes deleted, and cheap on
+        purpose: every caller already has the number in its hand, and the
+        only other way to learn it is to walk the whole directory again.
+
+        Nothing happens until the directory has been measured once. There is
+        no number to adjust before that, and building one out of the deltas
+        alone would start a bot that already has 31 MiB of cores on disk at
+        "zero bytes used" -- an *under*count, which is the direction that can
+        actually overrun the budget.
+
+        What this cannot see is anything the cog does outside this module:
+        `[p]retrosaves delete` and the save-import path unlink files in
+        retro/saves.py, `[p]retroset bios remove` unlinks one in
+        retro/Retro.py, and an owner with a shell can do whatever they like.
+        Every one of those cog paths is a *deletion*, so they leave the total
+        too high, which the near-the-limit rescan turns into one extra walk
+        rather than a wrong answer. Additions from outside -- a core dropped
+        in by hand -- are what the staleness interval is for. The reasoning
+        for both is under "Measuring without walking" at the top of this file.
+        """
+        if not delta:
+            return
+        with _usage_lock:
+            if delta > 0:
+                # Additions only: see the comment in _data_usage about what
+                # this reading is used for.
+                self._usage_added += delta
+            total = self._usage_cached_total
+            if total is not None:
+                # Clamped at zero: deleting a file nobody counted (one that
+                # arrived before the last measurement was taken, say) must
+                # not be able to drive the total negative and make the cog
+                # think it has room it does not have.
+                self._usage_cached_total = max(0, total + delta)
 
     def _data_usage(self) -> typing.Dict[str, int]:
         """
@@ -592,13 +780,32 @@ class StorageMixin(MixinMeta):
         ``total``. Symlinks are counted as nothing rather than followed:
         nothing here creates one, and following one would let a link into
         somebody's home directory look like the cog's own usage.
+
+        This is the one place the tree is really walked, so it is also where
+        the running total is refreshed -- which means the owner-facing usage
+        report (``Retro._usage_report``) pays off any accumulated drift as a
+        side effect of somebody asking what the bot is using.
         """
         root = cog_data_path(self)
         usage: typing.Dict[str, int] = {"total": 0}
+        # Read before the walk and again after it. A write that finishes
+        # while the walk is in progress may or may not have been seen by it,
+        # so the bytes added meanwhile are added back on the way out: that
+        # counts such a write once or twice, never zero times. Twice is an
+        # overcount, which costs one extra walk and cannot refuse anybody's
+        # download; missing it altogether would be an undercount, which is
+        # the one thing the budget cannot afford. Deletions are left out of
+        # that reading for the mirror-image reason -- subtracting a file the
+        # walk had already skipped would undercount.
+        added = self._usage_added
         try:
             entries = list(root.rglob("*"))
         except OSError:
             log.warning("Could not measure the Retro data directory.", exc_info=True)
+            # Deliberately without touching the cache: a directory that
+            # cannot be read says nothing about how full it is, and leaving
+            # the last real measurement in place is better than replacing it
+            # with a zero that would let every download through.
             return usage
         for path in entries:
             try:
@@ -611,7 +818,62 @@ class StorageMixin(MixinMeta):
             key = "other" if first == path.name else first
             usage[key] = usage.get(key, 0) + size
             usage["total"] += size
+        with _usage_lock:
+            self._usage_cached_total = usage["total"] + max(0, self._usage_added - added)
+            self._usage_cached_at = time.monotonic()
         return usage
+
+    def _measure_usage(self) -> int:
+        """
+        Walk the directory, refresh the running total, return it. Blocking.
+
+        The never-raises wrapper around :meth:`_data_usage`, for the two
+        callers that only want the number and cannot afford an exception:
+        the cog load sweep and the budget check.
+        """
+        try:
+            return self._data_usage().get("total", 0)
+        except Exception:
+            log.exception("Could not measure the Retro data directory.")
+            # Zero, which is the answer that lets the download through. A
+            # measurement that raises is a broken data directory, and the
+            # cog refusing to start games because it cannot count them would
+            # be a worse failure than going over the budget.
+            return 0
+
+    @staticmethod
+    def _usage_margin(budget: int) -> int:
+        """
+        How much room the cached total is not allowed to decide inside.
+
+        One cached ROM's worth (USAGE_CACHE_MARGIN), so the last decision
+        taken on remembered numbers still leaves a whole download's room
+        before the limit -- except on a budget small enough that a fixed
+        32 MiB would swallow it whole, where a quarter of the budget keeps
+        the same shape at a smaller scale. A tiny budget therefore measures
+        for real nearly every time, which is exactly right: the closer the
+        limit is to the files, the less a remembered number is worth.
+        """
+        return min(USAGE_CACHE_MARGIN, budget // 4)
+
+    async def _usage_total(self, incoming: int, budget: int) -> int:
+        """
+        What the directory holds, measured for real only when it matters.
+
+        The running total is trusted when the decision it is about to make is
+        comfortably inside the budget and the number is not stale; otherwise
+        the directory is walked (in a thread -- it is the one blocking thing
+        on the start path). So a refusal, and the prune that precedes it, are
+        always made against the real disk.
+        """
+        total = self._usage_cached_total
+        if (
+            total is not None
+            and time.monotonic() - self._usage_cached_at < USAGE_CACHE_SECONDS
+            and total + incoming + self._usage_margin(budget) <= budget
+        ):
+            return total
+        return await asyncio.to_thread(self._measure_usage)
 
     async def _disk_budget(self) -> int:
         """The ceiling on the whole data directory in bytes; 0 is no limit."""
@@ -676,6 +938,7 @@ class StorageMixin(MixinMeta):
                 log.warning("Could not prune the cached ROM %s", path, exc_info=True)
                 continue
             freed += size
+            self._note_usage_change(-size)
             deleted.append(name)
         return freed, deleted
 
@@ -704,8 +967,11 @@ class StorageMixin(MixinMeta):
         budget = await self._disk_budget()
         if not budget:
             return True, ""
-        usage = await asyncio.to_thread(self._data_usage)
-        total = usage.get("total", 0)
+        # Not a walk of the data directory every time somebody starts a game:
+        # the running total answers the easy cases, and anything close enough
+        # to the limit to prune or refuse measures the disk for real first.
+        # See "Measuring without walking" at the top of this file.
+        total = await self._usage_total(incoming, budget)
         if total + incoming <= budget:
             return True, ""
         keep = self._protected_roms()

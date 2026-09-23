@@ -29,6 +29,7 @@ this one, so `retro.Retro.<NAME>` keeps meaning what it always did.
 
 import asyncio
 import concurrent.futures
+import functools
 import io
 import logging
 import re
@@ -47,6 +48,18 @@ from redbot.core.utils.views import SimpleMenu
 
 from . import archives, net, version
 from .abc import CompositeMetaClass
+from .bios import (
+    BIOS_COOLDOWN_RATE,
+    BIOS_COOLDOWN_SECONDS,
+    MAX_BIOS_ARCHIVE_SIZE,
+    MAX_BIOS_ARCHIVE_SIZE_LABEL,
+    MAX_BIOS_FILES,
+    MAX_BIOS_SIZE,
+    MAX_BIOS_SIZE_LABEL,
+    MAX_BIOS_TOTAL_SIZE,
+    MAX_LISTED_BIOS_FILES,
+    BiosMixin,
+)
 from .cores import (
     AUTO_DOWNLOAD_COOLDOWN_SECONDS,
     BUILDBOT,
@@ -73,6 +86,7 @@ from .migration import (
     LEGACY_COG_NAME,
     MigrationMixin,
 )
+from .net import DownloadError
 from .RetroView import (
     DEFAULT_HOLD_MS,
     DEFAULT_TIMEOUT_MINUTES,
@@ -132,6 +146,16 @@ __all__ = [
     "DEFAULT_DISK_BUDGET_MB",
     "MAX_CACHED_GAMES_PER_CHANNEL",
     "MAX_DISK_BUDGET_MB",
+    # BIOS and firmware files
+    "BIOS_COOLDOWN_RATE",
+    "BIOS_COOLDOWN_SECONDS",
+    "MAX_BIOS_ARCHIVE_SIZE",
+    "MAX_BIOS_ARCHIVE_SIZE_LABEL",
+    "MAX_BIOS_FILES",
+    "MAX_BIOS_SIZE",
+    "MAX_BIOS_SIZE_LABEL",
+    "MAX_BIOS_TOTAL_SIZE",
+    "MAX_LISTED_BIOS_FILES",
     # Cores and their options
     "AUTO_DOWNLOAD_COOLDOWN_SECONDS",
     "BUILDBOT",
@@ -164,12 +188,6 @@ log = logging.getLogger("red.robloach.retro")
 # this is what stops a mistyped link pulling down a disc image.
 MAX_ROM_SIZE = 32 * 1024 * 1024
 MAX_ROM_SIZE_LABEL = "32 MiB"
-
-# Console firmware is small (a Game Boy boot ROM is 256 bytes, a PlayStation
-# BIOS 512 KiB, the largest anyone is likely to install a couple of MiB), so
-# this is only here to stop a mistyped URL filling the bot's disk.
-MAX_BIOS_SIZE = 16 * 1024 * 1024
-MAX_BIOS_SIZE_LABEL = "16 MiB"
 
 # How long one user-supplied download may take in total. A 32 MiB ROM on a
 # slow link is a couple of minutes; past that it is a tarpit rather than a
@@ -232,11 +250,6 @@ CHANNEL_START_COOLDOWN_SECONDS = 60.0
 # `[p]retrosaves import`/`export` carry the other half of this; the
 # numbers live with the commands, in retro/saves.py.
 
-# `[p]retroset bios add` is owner-only and downloads up to 64 MiB, so this is
-# a guard against a fat-fingered loop rather than against a stranger.
-BIOS_COOLDOWN_RATE = 3
-BIOS_COOLDOWN_SECONDS = 60.0
-
 # How long the paginated core option listing stays clickable.
 OPTION_MENU_TIMEOUT = 180.0
 
@@ -247,19 +260,6 @@ OPTION_MENU_TIMEOUT = 180.0
 # that pointed at it (see _forget_pruned_roms), so a busy channel settles at
 # one record per cached game that is not the one playing.
 MAX_RETIRED_PER_CHANNEL = MAX_CACHED_GAMES_PER_CHANNEL
-
-# Firmware sets are distributed as a zip of several files, sometimes with a
-# folder per console. These cap what one `[p]retroset bios add` will unpack:
-# the archive itself, any single file inside it, everything inside it
-# together, and how many files that may be.
-MAX_BIOS_ARCHIVE_SIZE = 64 * 1024 * 1024
-MAX_BIOS_ARCHIVE_SIZE_LABEL = "64 MiB"
-MAX_BIOS_TOTAL_SIZE = 64 * 1024 * 1024
-MAX_BIOS_FILES = 250
-
-# How many of the installed files `[p]retroset bios add` names in its reply
-# before it stops listing and starts counting.
-MAX_LISTED_BIOS_FILES = 12
 
 #: The cog's global settings and their defaults. A module constant rather than
 #: a literal inside register_global() because the migration (retro/migration.py)
@@ -325,14 +325,11 @@ DEFAULT_CHANNEL: typing.Dict[str, typing.Any] = {
 }
 
 
-class DownloadError(RuntimeError):
-    """A download failed for a reason the person who asked should be told."""
-
-
 class Retro(
     MigrationMixin,
     StorageMixin,
     CoresMixin,
+    BiosMixin,
     SavesMixin,
     commands.Cog,
     metaclass=CompositeMetaClass,
@@ -653,7 +650,6 @@ class Retro(
 
     async def _restore_sessions(self) -> None:
         """Rebuild hibernated sessions from Config and re-arm their buttons."""
-        timeout_minutes = await self.config.session_timeout_minutes()
         clip_seconds = await self.config.clip_seconds()
         hold_ms = await self.config.hold_ms()
         forget: typing.List[int] = []
@@ -670,7 +666,7 @@ class Retro(
                 record.setdefault("channel_id", channel_id)
                 try:
                     view = RetroView.from_record(
-                        self, record, timeout_minutes, clip_seconds, hold_ms
+                        self, record, clip_seconds, hold_ms
                     )
                 except Exception:
                     log.exception(
@@ -918,12 +914,7 @@ class Retro(
         view = self.sessions.pop(int(channel_id), None)
         if view is None:
             return
-        view.closed = True
-        emulator, view.emulator = getattr(view, "emulator", None), None
-        if emulator is not None:
-            self._write_state_now(view, emulator)
-            self._free_emulator(emulator)
-        self._release_view(view)
+        self._discard_session_now(view, getattr(view, "emulator", None), save=True)
 
     def _forget_session_view(self, channel_id: int, view: RetroView) -> bool:
         """
@@ -1237,6 +1228,79 @@ class Retro(
         except Exception:
             log.exception("Could not free a libretro core.")
 
+    def _discard_session_now(
+        self,
+        view: RetroView,
+        emulator: typing.Optional[RetroEmulator],
+        *,
+        save: bool,
+    ) -> None:
+        """
+        Free a session's core and retire its view, without awaiting anything.
+
+        The one implementation of "this session is over", for the paths that
+        cannot await: a cancelled task cannot rely on the next ``await``
+        coming back, and a core left loaded is not merely memory -- only one
+        may be live at a time (MAX_LIVE_EMULATORS), so leaking one stops the
+        cog working until the bot restarts.
+
+        The order is the order every path needs: the state is written (if it
+        is worth writing) *before* the core is freed, because after
+        ``stop()`` there is nothing left to read; the view is marked closed
+        before it is handed back, because ``_release_view`` is what stops
+        discord.py routing clicks to it.
+
+        ``save`` is the one thing the callers genuinely differ on. A start or
+        a resume that *failed* passes False: nothing worth keeping was
+        emulated, and writing the state of a boot that did not work would put
+        it over a good save. Everything else passes True -- losing a
+        session's pointer is never meant to cost the channel its progress.
+
+        This sequence used to be written out five times with small
+        variations, and the comments on those copies record what that cost:
+        one of them forgot the ``try`` that frees the core when the write
+        raises, which spent the one emulator slot for the life of the
+        process.
+        """
+        if emulator is not None:
+            if save:
+                self._write_state_now(view, emulator)
+            self._free_emulator(emulator)
+        view.emulator = None
+        view.closed = True
+        self._release_view(view)
+
+    async def _discard_session(
+        self,
+        view: RetroView,
+        emulator: typing.Optional[RetroEmulator],
+        *,
+        save: bool,
+    ) -> None:
+        """
+        :meth:`_discard_session_now` for a path that can still await.
+
+        Same order, same rules; the write and the core unload go to a worker
+        thread rather than blocking the event loop. Never raises: every
+        caller is already handling a failure of its own, and a session that
+        could not be tidied up perfectly must still end with its core freed.
+        """
+        if emulator is not None:
+            if save:
+                try:
+                    await self._write_state(view, emulator)
+                except Exception:
+                    log.exception(
+                        "Could not save the state of a session being discarded."
+                    )
+            try:
+                await self.run_in_emulator_thread(emulator.stop)
+            except Exception:
+                log.exception("Could not stop a discarded session's emulator.")
+        view.emulator = None
+        view.closed = True
+        self._release_view(view)
+
     async def _force_hibernate(self, view: RetroView) -> None:
         """
         Save the game and free the core, whatever state the view is in.
@@ -1414,6 +1478,9 @@ class Retro(
         lock made every third press in one channel delay presses in all the
         others -- and its own clip, which is the one somebody is waiting for.
         """
+        # Read before the lock: it is a cached attribute on the guild, and
+        # the encode that uses it happens in a worker thread.
+        limit = view.upload_limit()
         async with self.emulator_lock:
             await self._wake_locked(view)
             frames = await self.run_in_emulator_thread(
@@ -1427,11 +1494,15 @@ class Retro(
                 if autosave
                 else None
             )
+            # Taken while the lock still holds it still: an eviction in
+            # another channel clears view.emulator, and the encode below runs
+            # after the lock is given back. See RetroView._encode.
+            encoder = view.emulator
         # Out of the lock. Encoding the clip is the most expensive step of a
         # press and touches no core (see RetroView._encode), so it happens
         # here: while this channel's WebP is being written, the next channel
         # is already emulating.
-        clip = await asyncio.to_thread(view._encode, frames)
+        clip = await asyncio.to_thread(view._encode, frames, limit, encoder)
         await self._flush_refreshes()
         if progress is not None:
             await self._write_captured(view, progress)
@@ -1467,7 +1538,10 @@ class Retro(
             # Captured here, written below: see run_press, which explains why
             # neither the encode nor the disk belongs under the lock.
             progress = await self.run_in_emulator_thread(self._capture_progress, view)
-        clip = await asyncio.to_thread(view._encode, frames)
+            encoder = view.emulator
+        clip = await asyncio.to_thread(
+            view._encode, frames, view.upload_limit(), encoder
+        )
         await self._flush_refreshes()
         await self._write_captured(view, progress)
         await self._save_record(view)
@@ -1503,7 +1577,10 @@ class Retro(
             await self._wake_locked(view)
             frames = await self.run_in_emulator_thread(view.capture_reset)
             view.touch()
-        clip = await asyncio.to_thread(view._encode, frames)
+            encoder = view.emulator
+        clip = await asyncio.to_thread(
+            view._encode, frames, view.upload_limit(), encoder
+        )
         await self._flush_refreshes()
         await self._save_record(view)
         return clip
@@ -1632,7 +1709,6 @@ class Retro(
         view = RetroView.from_record(
             self,
             record,
-            await self.config.session_timeout_minutes(),
             await self.config.clip_seconds(),
             await self.config.hold_ms(),
         )
@@ -1681,23 +1757,18 @@ class Retro(
             # to: the interaction is going away with the task. The Resume
             # button is left as it is, which is also how the message looks.
             self._forget_session_view(channel_id, view)
-            view.emulator = None
-            self._free_emulator(emulator)
-            view.closed = True
-            self._release_view(view)
+            # save=False: the boot is what was cancelled, so there is no
+            # progress here worth putting over the save this game already has.
+            self._discard_session_now(view, emulator, save=False)
             raise
         except Exception as error:
             log.warning(
                 "Could not resume %s in channel %s: %s", view.slug, channel_id, error
             )
             self._forget_session_view(channel_id, view)
-            view.emulator = None
-            try:
-                await self.run_in_emulator_thread(emulator.stop)
-            except Exception:
-                log.exception("Could not stop a failed resume's emulator.")
-            view.closed = True
-            self._release_view(view)
+            # save=False: this boot failed, and a failed boot's state must not
+            # be written over the save the Resume button still points at.
+            await self._discard_session(view, emulator, save=False)
             # Put the Resume button back so the click was not destructive.
             self._arm_retired(record)
             await self._restore_retired_message(interaction, retired, record, error)
@@ -1932,11 +2003,15 @@ class Retro(
         cached under the same key, and booting over the top of it would
         quietly throw the player's game away.
 
-        All four files are read, the previous generation of each included, so
-        the boot has everything :func:`RetroView.restore_into` might need. The
-        backups cost a couple of hundred kilobytes of read that is usually
-        wasted, which is a great deal cheaper than being unable to offer them
-        at the moment the newest file turns out to be bad.
+        The two *current* files are read; the previous generation of each is
+        handed over as a path and read only if the newer one turns out to be
+        unusable. That is the rare case -- it takes a core update or a
+        truncated write -- so reading both backups on every start, resume and
+        wake was a couple of megabytes of disk that was nearly always thrown
+        away unlooked at. Nothing is given up by deferring it: the boot can
+        still reach for them, and :meth:`Progress.has_state` answers "is
+        there anything to try?" from the file existing rather than from its
+        contents.
 
         In a worker thread, because four files of a couple of megabytes each
         is not something to read on the event loop -- and one of the three
@@ -1952,15 +2027,19 @@ class Retro(
         state_path, state_backup, sram_path, sram_backup = self._save_paths(
             channel_id, slug
         )
+        # The two *backups* are handed over as paths rather than as bytes:
+        # they are only ever read when the newer file turns out to be
+        # unusable, which is rare, and a save state can be megabytes. See
+        # Progress in retro/restore.py, which reads one on demand.
         progress = Progress(
             state=self._read_file(state_path),
-            state_backup=self._read_file(state_backup),
+            state_backup=state_backup,
             sram=self._read_file(sram_path),
-            sram_backup=self._read_file(sram_backup),
+            sram_backup=sram_backup,
         )
         if progress.state:
             notice = "Picked up from where this channel left off."
-        elif progress.sram or progress.sram_backup:
+        elif progress.has_sram:
             notice = (
                 "Started from the title screen with this channel's in-game "
                 "save already in place \N{EM DASH} load it from the game's own "
@@ -2553,10 +2632,18 @@ class Retro(
         too_big = f"That {what} is bigger than the {size_label} limit."
         timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT_SECONDS)
         allow_private = await self._allow_private_urls()
+        # Whether a response ever came back. Everything before that point is
+        # the guard's business and gets the single REFUSAL sentence; once a
+        # status line has arrived, the host is demonstrably reachable *and*
+        # allowed, so saying what went wrong afterwards tells a scanner
+        # nothing it did not just learn by getting an answer. See the
+        # timeout branch below, and net.REFUSAL for the rule.
+        answered = False
         try:
             async with net.guarded_get(
                 url, timeout=timeout, allow_private=allow_private
             ) as resp:
+                answered = True
                 if resp.status != 200:
                     raise DownloadError(
                         f"Downloading the {what} failed with status {resp.status}."
@@ -2596,9 +2683,25 @@ class Retro(
             log.warning("Refusing to fetch a %s URL: %s", what, error)
             raise DownloadError(net.REFUSAL) from error
         except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as error:
-            # Deliberately indistinguishable from a blocked address: "connection
-            # refused" and "timed out" are exactly the two answers a port
-            # scanner is looking for. The detail is logged instead.
+            if answered:
+                # The body died or ran out of time *after* the server had
+                # already answered, so this is a slow mirror or a truncated
+                # download rather than anything about the bot's network --
+                # and the person who gave us the URL can act on it. Telling
+                # them "that URL points somewhere the bot will not fetch
+                # from" instead, which is what used to happen, sends somebody
+                # with a legitimately slow host off rewriting a URL that was
+                # never the problem.
+                log.info("A %s download failed after it had started: %r", what, error)
+                raise DownloadError(
+                    f"The {what} started downloading and then stopped "
+                    f"(it timed out after {DOWNLOAD_TIMEOUT_SECONDS}s, or the "
+                    "connection dropped). Try again, or use a faster mirror."
+                ) from error
+            # Nothing answered at all. Deliberately indistinguishable from a
+            # blocked address: "connection refused" and "timed out" are
+            # exactly the two answers a port scanner is looking for. The
+            # detail is logged instead.
             log.info("A %s download did not connect: %r", what, error)
             raise DownloadError(net.REFUSAL) from error
         except aiohttp.ClientError as error:
@@ -2650,21 +2753,37 @@ class Retro(
         return None
 
     async def _extract_rom(
-        self, ctx: commands.Context, filename: str, data: bytes
+        self,
+        ctx: commands.Context,
+        filename: str,
+        data: bytes,
+        prefer: typing.Optional[str] = None,
     ) -> typing.Optional[typing.Tuple[str, bytes]]:
         """
-        Pull the first playable ROM out of a zip, or explain why we can't.
+        Pull a playable ROM out of a zip, or explain why we can't.
 
         The member is read into memory and handed back under its own name;
         nothing is ever unpacked using the paths stored in the archive.
+
+        ``prefer`` is the name the caller typed, if they typed one:
+        `[p]retro sonic` with a multi-game zip attached takes `Sonic.md` out
+        of it rather than whatever sorts first. It is matched on the
+        basename, with or without the extension, and a name that matches
+        nothing falls back to the alphabetical pick with the same "this zip
+        holds several" message as before -- a caption that happens not to be
+        in the zip should still start *something*.
         """
         try:
             found = await asyncio.to_thread(
-                archives.extract,
-                data,
-                accept=lambda name: system_for_extension(Path(name).suffix) is not None,
-                max_size=MAX_ROM_SIZE,
-                what="ROM",
+                functools.partial(
+                    archives.extract,
+                    data,
+                    accept=lambda name: system_for_extension(Path(name).suffix)
+                    is not None,
+                    max_size=MAX_ROM_SIZE,
+                    what="ROM",
+                    prefer=prefer,
+                )
             )
         except archives.NoSupportedMember as error:
             lines = [f"`{filename}`: {error}", "", "Supported file types:"]
@@ -2680,12 +2799,20 @@ class Retro(
             await self._safe_send(ctx, f"`{filename}` could not be unpacked.")
             return None
 
-        if len(found.candidates) > 1:
+        if len(found.candidates) > 1 and getattr(found, "preferred", False):
+            # They named one and it was there, so say which was taken and
+            # leave it at that: nothing went wrong and nothing needs doing.
+            log.debug("Extracted the requested %s from %s.", found.name, filename)
+        elif len(found.candidates) > 1:
+            named = f"`{prefer}` is not in it; " if prefer else ""
             await self._safe_send(
                 ctx,
                 f"`{filename}` holds {len(found.candidates)} playable ROMs; "
-                f"starting `{found.name}` (first in alphabetical order). "
-                "Upload the one you want on its own to pick another.",
+                f"{named}starting `{found.name}` (first in alphabetical "
+                f"order). Name the one you want \N{EM DASH} "
+                f"`{ctx.clean_prefix}retro {Path(found.candidates[-1]).stem}` "
+                "with the same zip attached \N{EM DASH} or upload it on its "
+                "own.",
             )
         else:
             log.debug("Extracted %s from %s.", found.name, filename)
@@ -2818,17 +2945,9 @@ class Retro(
         self._forget_session_view(
             getattr(ctx.channel, "id", view.channel_id), view
         )
-        try:
-            await self._write_state(view, emulator)
-        except Exception:
-            log.exception("Could not save the state of an abandoned session.")
-        try:
-            await self.run_in_emulator_thread(emulator.stop)
-        except Exception:
-            log.exception("Could not stop the emulator of an abandoned session.")
-        view.emulator = None
-        view.closed = True
-        self._release_view(view)
+        # save=True: the core really did come up and emulate the first clip,
+        # so whatever was played before the message failed is worth keeping.
+        await self._discard_session(view, emulator, save=True)
 
     # -- Rate limiting ------------------------------------------------------
     #
@@ -2962,6 +3081,18 @@ class Retro(
                 url, source = preset, self._slug(game)
             elif game.lower().startswith(("http://", "https://")):
                 url, source = game, game
+            elif ctx.message.attachments:
+                # A name *and* a ROM attached. The name is not a saved game,
+                # so the obvious reading is the one people actually mean:
+                # they have attached the ROM and typed what it is called.
+                # Answering "there's no saved game called that" while holding
+                # the game they just handed over is the least helpful thing
+                # this command could do with it, so the attachment wins and
+                # the text becomes the game's name.
+                #
+                # The preset and URL branches above still come first: those
+                # name a ROM explicitly, and a caption cannot outrank one.
+                url, source = None, "attachment"
             else:
                 self._forgive_cooldown(ctx)
                 # `[p]retro list` rather than `[p]retroset game list`: the
@@ -2985,22 +3116,35 @@ class Retro(
         # disk budget are spent.
         delay = self._channel_start_delay(ctx)
         if delay:
+            # Only promise a game on screen when there is one. The bucket
+            # trips on starts, not on sessions, so six people each trying a
+            # bad URL in a channel that has never played anything all get
+            # this -- and telling them to press buttons that are not there
+            # reads as the bot being confused about its own state.
+            playing = self.sessions.get(ctx.channel.id) is not None
             await self._safe_send(
                 ctx,
                 "This channel has started a lot of games in the last minute, "
-                f"so this one was not fetched. Try again in {delay:.0f}s "
-                "\N{EM DASH} the game already on screen still works, and "
-                "pressing its buttons is never rate limited.",
+                f"so this one was not fetched. Try again in {delay:.0f}s"
+                + (
+                    " \N{EM DASH} the game already on screen still works, and "
+                    "pressing its buttons is never rate limited."
+                    if playing
+                    else ". The limit is on fetching ROMs; playing a game that "
+                    "is already going is never rate limited."
+                ),
             )
             return
         # There is deliberately no disk check here any more, only the one in
-        # _start_session that knows the real size. _make_room measures the
-        # whole data directory (a recursive walk and a stat per file, growing
-        # with every channel that has ever played), and doing it twice per
-        # start bought nothing: MAX_ROM_SIZE already bounds what a download
-        # can cost, the pruning the pre-flight did is pruning the real check
-        # does a moment later, and a fetch refused before it starts is the
-        # rare case rather than the one to optimise for.
+        # _start_session that knows the real size. Checking twice per start
+        # bought nothing: MAX_ROM_SIZE already bounds what a download can
+        # cost, the pruning the pre-flight did is pruning the real check does
+        # a moment later, and a fetch refused before it starts is the rare
+        # case rather than the one to optimise for. It is also no longer
+        # free to ask -- _make_room answers from a running total while there
+        # is room to spare, but anywhere near the budget it walks the whole
+        # data directory for real, because that is the answer a refusal has
+        # to be made on. See "Measuring without walking" in retro/storage.py.
 
         async with ctx.typing():
             rom = await self._fetch_rom(ctx, url)
@@ -3011,7 +3155,12 @@ class Retro(
             # Homebrew is nearly always distributed zipped, so look inside
             # before deciding there is no console for this file.
             if archives.is_zip(data) or filename.lower().endswith(".zip"):
-                unpacked = await self._extract_rom(ctx, Path(filename).name, data)
+                # `game` is whatever they typed. For a zip that is a request
+                # for one of the ROMs inside it; for anything else it was
+                # already used to find the preset or the URL.
+                unpacked = await self._extract_rom(
+                    ctx, Path(filename).name, data, prefer=game
+                )
                 if unpacked is None:
                     return
                 filename, data = unpacked
@@ -3122,7 +3271,6 @@ class Retro(
             )
             return
 
-        timeout_minutes = await self.config.session_timeout_minutes()
         view = RetroView(
             self,
             game_name=game_name,
@@ -3133,7 +3281,6 @@ class Retro(
             guild_id=ctx.guild.id if ctx.guild else None,
             starter_id=ctx.author.id,
             source=source,
-            timeout_minutes=timeout_minutes,
             clip_seconds=await self.config.clip_seconds(),
             hold_ms=await self.config.hold_ms(),
         )
@@ -3235,11 +3382,7 @@ class Retro(
             self._forget_session_view(
                 getattr(ctx.channel, "id", view.channel_id), view
             )
-            self._write_state_now(view, emulator)
-            self._free_emulator(emulator)
-            view.emulator = None
-            view.closed = True
-            self._release_view(view)
+            self._discard_session_now(view, emulator, save=True)
             raise
         except Exception:
             await self._abandon_session(ctx, view, emulator)
@@ -3653,9 +3796,10 @@ class Retro(
         `fceumm_region` and `region` both work, as does any unambiguous ending
         of a key. Use `reset` as the value to put the core's own default back.
 
-        Reading a core's options may need to load it, and only one core can be
-        loaded at a time, so a game that is running is saved and put to sleep
-        first — exactly as starting a game in another channel would.
+        Reading a core's options may need to load it, and only one core can
+        be loaded at a time — so while a game is running this answers from
+        what it already knows rather than interrupting it. Start a game on a
+        core once and its options stay listable from then on.
 
         **Examples:**
         - `[p]retroset coreoptions`
@@ -3682,8 +3826,11 @@ class Retro(
 
         A sleeping game is saved and its emulator is freed, but its controls
         keep working: the next button press wakes it up where it left off.
-        The value is clamped between 1 and 120 minutes and applies to
-        sessions started afterwards. The default is 10 minutes.
+        The value is clamped between 1 and 120 minutes and takes effect
+        **immediately, for every game**, including ones already running —
+        the idle sweep reads this setting on every pass rather than
+        remembering what each session started with. The default is 10
+        minutes.
 
         **Examples:**
         - `[p]retroset timeout 30`
@@ -3694,7 +3841,8 @@ class Retro(
         minutes = max(1, min(120, minutes))
         await self.config.session_timeout_minutes.set(minutes)
         await ctx.send(
-            f"Games now go to sleep after {minutes} minutes without input. "
+            f"Games now go to sleep after {minutes} minutes without input "
+            "\N{EM DASH} every game, including any already running. "
             "Pressing a button wakes them up again."
         )
 
@@ -3747,8 +3895,10 @@ class Retro(
         watch, press again — quicker, which is what most of these games want.
         Fractions are allowed, so `0.8` is a real answer.
 
-        The value is clamped between 0.2 and 15 seconds and applies to clips
-        recorded afterwards. The default is 1 second.
+        The value is clamped between 0.2 and 5 seconds and applies to clips
+        recorded afterwards. The default is 1 second. The ceiling used to be
+        15, which was a clip nobody could sit through: a turn is press, watch,
+        press again, and the watching is the part that has to stay short.
 
         A very short clip is also a ceiling on the input inside it: a button
         is never held past the point where the clip can still show it coming
@@ -3763,7 +3913,7 @@ class Retro(
         - `[p]retroset cliplength 4`
 
         **Arguments:**
-        - `<seconds>` - Seconds of play per clip (0.2-15, fractions allowed).
+        - `<seconds>` - Seconds of play per clip (0.2-5, fractions allowed).
         """
         seconds = clamp_clip_seconds(seconds)
         await self.config.clip_seconds.set(seconds)
@@ -4014,190 +4164,7 @@ class Retro(
             await self._install_bios_archive(ctx, source, data, name)
             return
 
-        name = name or self._bios_name(Path(str(source)).name)
-        if name is None:
-            await ctx.send(
-                f"`{Path(str(source)).name}` is not a usable filename. Say "
-                "what the core should see it as: `"
-                f"{ctx.clean_prefix}retroset bios add <filename>"
-                f"{' <url>' if url else ''}`."
-            )
-            return
-        if not data:
-            await ctx.send("That file is empty.")
-            return
-        if len(data) > MAX_BIOS_SIZE:
-            await ctx.send(
-                f"That BIOS file is bigger than the {MAX_BIOS_SIZE_LABEL} limit."
-            )
-            return
-        room, note = await self._make_room(len(data), prefix=ctx.clean_prefix)
-        if note:
-            await self._safe_send(ctx, note)
-        if not room:
-            return
-
-        target = self._system_dir() / name
-        try:
-            await asyncio.to_thread(self._write_atomic, target, data)
-        except OSError as error:
-            log.warning("Could not write the BIOS file %s", target, exc_info=True)
-            await ctx.send(f"The file could not be saved: {error}")
-            return
-        log.info("Installed the BIOS file %s (%s bytes).", name, len(data))
-        await ctx.send(
-            f"Stored `{name}` ({len(data):,} bytes) in the system directory. "
-            f"Cores will find it from now on. See "
-            f"`{ctx.clean_prefix}retroset bios list`."
-        )
-
-    async def _fetch_bios(
-        self,
-        ctx: commands.Context,
-        name: typing.Optional[str],
-        url: typing.Optional[str],
-    ) -> typing.Optional[typing.Tuple[str, bytes]]:
-        """(source name, bytes) from the URL or attachment, or None on error."""
-        if url:
-            try:
-                return await self._download_bytes(
-                    url,
-                    MAX_BIOS_ARCHIVE_SIZE,
-                    MAX_BIOS_ARCHIVE_SIZE_LABEL,
-                    "BIOS file",
-                )
-            except DownloadError as error:
-                await self._safe_send(ctx, str(error))
-                return None
-        if ctx.message.attachments:
-            attachment = ctx.message.attachments[0]
-            if attachment.size > MAX_BIOS_ARCHIVE_SIZE:
-                await self._safe_send(
-                    ctx,
-                    "That file is bigger than the "
-                    f"{MAX_BIOS_ARCHIVE_SIZE_LABEL} limit.",
-                )
-                return None
-            try:
-                return attachment.filename, await attachment.read()
-            except discord.HTTPException as error:
-                log.warning("Could not read a Retro BIOS attachment.", exc_info=True)
-                await self._safe_send(
-                    ctx, f"The attached file could not be downloaded: {error}"
-                )
-                return None
-        await self._safe_send(
-            ctx,
-            "Attach the BIOS file (or a `.zip` of them) to your message, or "
-            f"pass a direct URL: `{ctx.clean_prefix}retroset bios add "
-            f"{name or '<url>'}{' <url>' if name else ''}`.",
-        )
-        return None
-
-    async def _install_bios_archive(
-        self,
-        ctx: commands.Context,
-        source: str,
-        data: bytes,
-        name: typing.Optional[str],
-    ) -> None:
-        """
-        Unpack a whole firmware archive into the system directory.
-
-        On where things land: libretro's *system directory* is the one folder
-        a core is handed, and cores disagree about what is in it. Most ask for
-        a bare filename at its root (`disksys.rom`, `scph5501.bin`); a good
-        few ask for a subfolder of it (`dc/dc_boot.bin`, `np2kai/FONT.ROM`,
-        `Mupen64plus/*`). So the archive's own layout is preserved, relative
-        to the system directory, which is the layout every firmware set is
-        packaged in and the only one that can satisfy both kinds of core. Each
-        path component is validated (never rewritten) first: cores look for an
-        exact filename, so a name that cannot be stored truthfully is refused
-        rather than mangled into one the core will never ask for.
-        """
-        try:
-            unpacked = await asyncio.to_thread(
-                archives.extract_all,
-                data,
-                max_total_size=MAX_BIOS_TOTAL_SIZE,
-                max_file_size=MAX_BIOS_SIZE,
-                max_files=MAX_BIOS_FILES,
-                what="BIOS file",
-            )
-        except archives.NoSupportedMember as error:
-            await self._safe_send(ctx, f"`{source}`: {error}")
-            return
-        except archives.ArchiveError as error:
-            await self._safe_send(ctx, f"That zip could not be read: {error}")
-            return
-        except Exception:
-            log.exception("Unpacking the BIOS zip %s failed unexpectedly.", source)
-            await self._safe_send(ctx, f"`{source}` could not be unpacked.")
-            return
-
-        renamed = ""
-        files = list(unpacked.files)
-        if name and len(files) == 1:
-            # One file in the zip and a name was given: the old behaviour,
-            # which is how somebody puts `bios.bin` in as `scph5501.bin`.
-            if files[0].path != name:
-                renamed = f" `{files[0].member}` was stored as `{name}`."
-            files = [files[0]._replace(path=name)]
-        elif name:
-            renamed = (
-                f" The `{name}` you named was ignored: a zip of "
-                f"{len(files)} files keeps its own names."
-            )
-
-        room, budget_note = await self._make_room(
-            sum(len(f.data) for f in files), prefix=ctx.clean_prefix
-        )
-        if budget_note:
-            await self._safe_send(ctx, budget_note)
-        if not room:
-            return
-
-        try:
-            written, total = await asyncio.to_thread(self._write_bios_files, files)
-        except OSError as error:
-            log.warning("Could not unpack a BIOS archive.", exc_info=True)
-            await self._safe_send(
-                ctx,
-                f"The files could not be saved: {error}. The bot may be out "
-                "of disk space.",
-            )
-            return
-
-        if not written:
-            await self._safe_send(
-                ctx, f"Nothing from `{source}` could be written to disk."
-            )
-            return
-        log.info(
-            "Installed %s BIOS file(s) from %s (%s bytes).", len(written), source, total
-        )
-
-        listed = ", ".join(f"`{path}`" for path in written[:MAX_LISTED_BIOS_FILES])
-        if len(written) > MAX_LISTED_BIOS_FILES:
-            listed += f", and {len(written) - MAX_LISTED_BIOS_FILES} more"
-        lines = [
-            f"Installed **{len(written)}** file(s) from `{source}`, "
-            f"{total:,} bytes in total, into the system directory: {listed}."
-            + renamed
-        ]
-        if unpacked.skipped:
-            lines.append(
-                f"{len(unpacked.skipped)} entr(y/ies) in the zip were skipped: "
-                "an unusable name, a symlink, an empty file, or one over the "
-                f"{MAX_BIOS_SIZE_LABEL} per-file limit."
-            )
-        lines.append(
-            "Folders inside the zip were kept, since some cores look for "
-            "their firmware in one. See "
-            f"`{ctx.clean_prefix}retroset bios list`."
-        )
-        for page in pagify("\n".join(lines)):
-            await self._safe_send(ctx, page)
+        await self._install_bios_file(ctx, source, data, name)
 
     @retroset_bios.command(name="list")
     async def retroset_bios_list(self, ctx: commands.Context) -> None:

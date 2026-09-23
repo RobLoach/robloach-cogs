@@ -86,6 +86,23 @@ _REFUSED_PROPERTIES = (
 )
 
 
+class DownloadError(RuntimeError):
+    """
+    A download failed for a reason the person who asked should be told.
+
+    Here rather than on the cog, so that a module the cog *imports* can raise
+    and catch it: retro/bios.py fetches firmware through the cog's downloader
+    and cannot import retro/Retro.py back without a cycle. ``retro.Retro``
+    re-exports it, which is where everything else still reaches for it.
+
+    The distinction from :class:`BlockedURL` is who the message is for. A
+    BlockedURL's message is for the log and never for Discord (it names an
+    address the guard refused); a DownloadError's *is* the sentence the asker
+    sees, which is why the guard's own refusals are re-raised as one of these
+    carrying :data:`REFUSAL` instead of the reason.
+    """
+
+
 class BlockedURL(Exception):
     """
     A URL this cog will not fetch.

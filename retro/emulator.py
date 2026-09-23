@@ -15,9 +15,10 @@ release available on Python 3.11, which Red-DiscordBot requires) and the
 Session constructor API of libretro.py >= 0.7.
 
 The clip arithmetic, the animation encoder and the fast frame grab live next
-door in retro/clips.py, which needs no libretro at all; every one of their
-names is re-exported here, so importing them from this module still works
-and still gets the same objects.
+door in retro/clips.py, which needs no libretro at all. The names of theirs
+that the rest of the cog imports from *here* are re-exported below, so the
+split cost nothing at the call sites; anything else in clips.py is imported
+from clips.py, which is where it lives.
 """
 
 import io
@@ -27,33 +28,23 @@ import typing
 from pathlib import Path
 
 from .clips import (
-    _SLOW_GRAB_LOGGED,
     CLIP_EXTENSION,
     CLIP_FPS,
     CLIP_SECONDS,
-    FAST_POINT_TABLES,
     FAST_RAW_MODES,
     FAST_ROTATIONS,
     MAX_CLIP_SCALE,
     MAX_CLIP_SECONDS,
-    MIN_AFTERMATH_FRAMES,
     MIN_CLIP_FRAMES,
     MIN_CLIP_SECONDS,
-    MIN_CLIP_WIDTH,
-    PREROLL_SECONDS,
-    WEBP_METHOD,
-    WEBP_MINIMIZE_SIZE,
     CapturedClip,
     EmulatorError,
-    _channel_expansion_table,
-    _note_slow_frame_grab,
     _pillow,
     capture_plan,
     capture_step,
     clamp_clip_seconds,
     clip_frame_count,
     clip_plan,
-    clip_scale,
     clip_size,
     describe_seconds,
     encode_animation,
@@ -67,56 +58,57 @@ from .clips import (
     preroll_budget,
 )
 
+# This module's own names.
 __all__ = [
     "RetroEmulator",
-    "EmulatorError",
     "BUTTONS",
     "MIN_ROM_SIZE",
     "DEFAULT_FPS",
-    "CLIP_SECONDS",
-    "CLIP_FPS",
-    "MIN_CLIP_SECONDS",
-    "MAX_CLIP_SECONDS",
-    "MIN_CLIP_FRAMES",
-    "MIN_AFTERMATH_FRAMES",
-    "MIN_CLIP_WIDTH",
-    "PREROLL_SECONDS",
-    "MAX_CLIP_SCALE",
-    "CLIP_EXTENSION",
     "MAX_SRAM_SIZE",
     "RETRO_MEMORY_SAVE_RAM",
-    "CapturedClip",
+    "describe_definitions",
+    "probe_core_options",
+    # ...and the re-export shim. These live in retro/clips.py; they are
+    # listed here because something else in this cog imports them from
+    # ``retro.emulator``, which is what made splitting clips.py out cost
+    # nothing at the call sites.
+    #
+    # It is exactly that list and no more. The shim used to carry every name
+    # clips.py defines, private ones included (`_pillow`, `_SLOW_GRAB_LOGGED`,
+    # `_channel_expansion_table`, `_note_slow_frame_grab`) -- which is a
+    # promise nobody is owed. A Red cog is installed as a whole and imported
+    # by name from Red's cog manager; nothing outside this repository can
+    # import `retro.emulator` at all, let alone depend on a leading
+    # underscore in it. So the ones nothing here uses are gone, and the
+    # place to import a clips name that is not below is retro/clips.py.
+    #
+    # A few clips names are still *imported* above without being re-exported,
+    # because this module's own code uses them: CLIP_FPS and MAX_CLIP_SCALE
+    # are method defaults, CapturedClip and clip_size are what record_frames
+    # builds, and _pillow is what the frame grabs import Pillow with.
+    "CLIP_EXTENSION",
+    "CLIP_SECONDS",
+    "EmulatorError",
+    "FAST_RAW_MODES",
+    "FAST_ROTATIONS",
+    "MAX_CLIP_SECONDS",
+    "MIN_CLIP_FRAMES",
+    "MIN_CLIP_SECONDS",
     "capture_plan",
     "capture_step",
     "clamp_clip_seconds",
     "clip_frame_count",
     "clip_plan",
-    "clip_scale",
-    "clip_size",
-    "describe_definitions",
     "describe_seconds",
     "encode_animation",
     "encode_clip",
+    "fast_frame_image",
+    "fast_frame_size",
     "format_seconds",
     "frame_count",
     "input_budget",
     "playback_seconds",
     "preroll_budget",
-    "probe_core_options",
-    # Split out into retro/clips.py and re-exported here, which is the only
-    # reason that split cost nothing downstream. Anything importing these
-    # from retro.emulator still gets the same objects.
-    "fast_frame_image",
-    "fast_frame_size",
-    "FAST_POINT_TABLES",
-    "FAST_RAW_MODES",
-    "FAST_ROTATIONS",
-    "WEBP_METHOD",
-    "WEBP_MINIMIZE_SIZE",
-    "_channel_expansion_table",
-    "_note_slow_frame_grab",
-    "_pillow",
-    "_SLOW_GRAB_LOGGED",
 ]
 
 log = logging.getLogger("red.robloach.retro.emulator")
@@ -1034,15 +1026,12 @@ class RetroEmulator:
         return 0 if memory is None else len(memory)
 
     # -- Video --------------------------------------------------------------
-
-    @staticmethod
-    def _pillow():
-        """Import Pillow, turning a missing dependency into an EmulatorError."""
-        try:
-            from PIL import Image
-        except Exception as exc:  # ImportError or a broken install
-            raise EmulatorError(f"Pillow could not be loaded: {exc}") from exc
-        return Image
+    #
+    # Pillow is imported through :func:`clips._pillow`, which is where the
+    # lazy import and its "Pillow could not be loaded" EmulatorError live.
+    # There used to be a byte-for-byte copy of it here as a staticmethod, on
+    # a module that already imports the original -- two definitions of the
+    # same four lines, either of which could be fixed without the other.
 
     def _screenshot(self):
         """
@@ -1105,7 +1094,7 @@ class RetroEmulator:
         instead of every frame being enlarged before the encoder merges the
         identical ones anyway.
         """
-        Image = self._pillow()
+        Image = _pillow()
         image = fast_frame_image(self._video, Image)
         if image is None:
             shot = self._screenshot()
@@ -1127,7 +1116,7 @@ class RetroEmulator:
         the single-picture traffic: :meth:`screenshot`, and the tests that
         compare a clip's pictures against the screen.
         """
-        Image = self._pillow()
+        Image = _pillow()
         image = self._native_frame_image()
         if size is None:
             size = self.output_size(scale=scale)
@@ -1156,7 +1145,7 @@ class RetroEmulator:
         picture. A geometry change mid-clip shows up as a different length
         and so reads as a change, which it is.
         """
-        Image = self._pillow()
+        Image = _pillow()
         image = fast_frame_image(self._video, Image)
         return None if image is None else image.tobytes()
 

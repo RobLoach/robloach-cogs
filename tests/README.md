@@ -59,6 +59,19 @@ clip arithmetic and the animation encoder live in `retro/clips.py`, which
 imports no libretro at all, with `retro/emulator.py` re-exporting every name
 so nothing downstream had to change.
 
+The controller does the same thing one level down. `retro/RetroView.py` was
+2,700 lines with about a third of them not about the view at all, and four
+modules took that third: `retro/timing.py` (how long a button is held, how
+many taps fit in a clip, how long an edit waits before it may replace the one
+on screen), `retro/text.py` (every line the session writes, and the
+sanitising a display name goes through before it can be one),
+`retro/restore.py` (`Progress` and the save state -> previous state ->
+in-game save chain) and `retro/permissions.py` (`may_manage`). `RetroView`
+re-exports every name they took, so `retro.viewmod.<name>` still works in the
+tests that use it; `tests/test_view.py`'s `MOVED` table holds that promise,
+and `RetroEnv` also offers `timingmod`, `textmod`, `restoremod` and
+`permissionsmod` for a test that would rather say where the thing lives.
+
 Two consequences for the tests:
 
 * **`retro.patch(name, value, monkeypatch)`, never `monkeypatch.setattr` on
@@ -251,7 +264,7 @@ control that can have nothing to do has to argue with that comment first.
 ×3 presence/absence table is
 `test_the_repeat_button_is_drawn_only_when_it_can_do_something` in
 `test_view.py` -- `REPEAT_BY_LENGTH` × all eight consoles, from the 0.2s
-settings floor to the 15s ceiling, checking the tap count, whether the button
+settings floor to the 5s ceiling, checking the tap count, whether the button
 exists, its label, that the layout still fits Discord's grid, and that Wait
 and Undo have not moved.
 `test_changing_the_clip_length_adds_and_removes_the_button_in_place` walks a

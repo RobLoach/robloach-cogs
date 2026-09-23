@@ -1,3 +1,33 @@
+"""
+The controller under a game's message: its layout, its clicks and the one
+edit each of them makes.
+
+This file was 2,700 lines, and about a third of them were not about the view
+at all -- a session is not a grid of buttons, and four things that had grown
+up in here have moved out to modules of their own:
+
+* :mod:`retro.timing` -- how long a button is held, how many taps fit in a
+  clip, and how long an edit waits before it may replace the clip on screen;
+* :mod:`retro.text` -- every line the session writes, and the sanitising a
+  display name or a ROM's filename goes through before it can be one;
+* :mod:`retro.restore` -- what a channel has saved for a game and the order a
+  boot tries it in;
+* :mod:`retro.permissions` -- who may sleep, reboot or end somebody else's
+  game.
+
+**Every name they took with them is re-exported below**, so
+``retro.RetroView.press_plan``, ``retro.RetroView.Progress`` and the rest
+still resolve exactly as they did: this was a move, not a change, and no
+import site outside this package had to be touched for it. New code should
+import from the module the thing actually lives in.
+
+Two of those re-exports are load-bearing rather than merely convenient.
+``pace_wait`` is looked up in *this* module's globals by
+:meth:`RetroView.pace`, which is what lets the test suite swap it out and not
+spend a real second per press; and ``restore_into`` is what ``Retro.py``
+imports today.
+"""
+
 import asyncio
 import collections
 import io
@@ -5,13 +35,13 @@ import logging
 import re
 import time
 import typing
-import unicodedata
 import zlib
 from pathlib import Path
 
 import discord
 from redbot.core import commands
 
+from .clips import shrink_clip
 from .emulator import (
     CLIP_EXTENSION,
     CLIP_SECONDS,
@@ -20,9 +50,21 @@ from .emulator import (
     RetroEmulator,
     clamp_clip_seconds,
     clip_frame_count,
-    frame_count,
-    input_budget,
     playback_seconds,
+)
+
+# The four modules this file was split into. Most of what comes in from them
+# is used right here; the rest is imported *because* it is re-exported, which
+# is what the `noqa` on each of them says -- every name they took with them
+# still resolves as `retro.RetroView.<name>`, so nothing outside this package
+# had to be touched by the move. See the docstring above.
+from .permissions import may_manage  # noqa: F401  (re-exported)
+from .restore import (  # noqa: F401  (re-exported)
+    BackupSource,
+    Progress,
+    backup_offered,
+    read_backup,
+    restore_into,
 )
 from .systems import (
     CONTROL_BUTTONS,
@@ -39,154 +81,57 @@ from .systems import (
     system_by_key,
     system_for_extension,
 )
+from .text import (  # noqa: F401  (re-exported)
+    ACTION_NOTES,
+    ASLEEP_MARK,
+    DROPPED_NOTE,
+    HEADER,
+    HEADER_SEPARATOR,
+    INVISIBLE_CATEGORIES,
+    LEADING_ORDINAL,
+    MARKDOWN_ESCAPES,
+    MAX_GAME_NAME,
+    MAX_PRESSER_NAME,
+    NO_PINGS,
+    QUEUE_ENTRY,
+    QUEUE_NOTE,
+    QUEUED_WAIT,
+    REPEAT_GONE_NOTE,
+    REPEAT_STALE_NOTE,
+    RESUMED_NOTE,
+    action_note,
+    escape_label,
+    presser_name,
+)
+from .timing import (  # noqa: F401  (re-exported)
+    BOOT_SECONDS,
+    DEFAULT_HOLD_MS,
+    MAX_HOLD_MS,
+    MAX_PACE_SECONDS,
+    MIN_HOLD_MS,
+    MIN_PACE_SECONDS,
+    MIN_REPEAT_GAP_MS,
+    MIN_REPEAT_TAPS,
+    REPEAT_GAP_MS,
+    REPEAT_TAPS,
+    pace_wait,
+    press_plan,
+)
 
 log = logging.getLogger("red.robloach.retro")
 
-# How long a button is held down at the start of a clip, in milliseconds, for
-# every button including the directions.
-#
-# Measured on a commercial Game Boy RPG under Gambatte (59.73 fps), with the
-# player already facing the way they were pushed and two clear tiles ahead:
-#
-#     hold    frames   tiles walked
-#     400ms       24        2          <- the old d-pad hold
-#     300ms       18        2
-#     250ms       15        1
-#     160ms       10        1
-#     100ms        6        1
-#
-# A Game Boy walk cycle is 16 frames, so any hold that outlasts it starts a
-# second step and the character crosses two tiles for one button press. 160ms
-# is ten frames: long enough that a game polling its controller a few times a
-# second cannot miss it (the old 8-frame, ~133ms hold could), and short enough
-# that one press is always one step and one menu entry.
-#
-# It is a ceiling, not a promise: a clip has to have room to show the button
-# come back up, so on a short clip the hold is cut to fit. See press_plan.
-DEFAULT_HOLD_MS = 160
-MIN_HOLD_MS = 50
-MAX_HOLD_MS = 2000
 
-# The repeat button taps the console's confirm button this many times, spaced
-# this far apart, so text boxes and menus take one round trip instead of
-# three.
+# How long a session may sit untouched before the cog hibernates it and
+# frees its core, until `[p]retroset timeout` says otherwise.
 #
-# 3 x 160ms held with 250ms between them is 1.4 seconds of schedule, which
-# was nothing inside a four second clip and does not fit inside a one second
-# one at all -- the third tap would have been shoved onto the clip's last
-# frame and the player would have seen two taps and a twitch. So the spacing
-# is squeezed down to MIN_REPEAT_GAP_MS to make the taps fit (three taps
-# closer together are still three taps), and only when even that will not fit
-# is a tap dropped; the button then says how many it really does. See
-# press_plan.
-#
-# The floor on the spacing is what a game needs to see the button come back
-# up between taps: five frames at 59.73 fps, comfortably more than the one or
-# two frames a per-frame input poll needs and still tight enough to fit three
-# taps into a one second clip.
-REPEAT_TAPS = 3
-REPEAT_GAP_MS = 250
-MIN_REPEAT_GAP_MS = 80
-
-# The fewest taps worth having a button for. One tap is not a repeat at all --
-# it is precisely what the console's own confirm button does, one row over --
-# so at that point the button is not drawn.
-#
-# It used to be drawn and greyed out, which was worse than useless: a control
-# that is present, dead and unexplained reads as broken, and it was reported
-# as the repeat button having been *removed from the cog*. A control that
-# cannot do anything is clearer gone, and going frees a component. It comes
-# back by itself the moment the clip is long enough, because the row is drawn
-# again on every redraw (see RetroView._update_repeat_label), so changing
-# `[p]retroset cliplength` corrects it on the next press.
-#
-# Measured against press_plan at DEFAULT_FPS with the default 160ms hold --
-# the clip lengths where it appears at all:
-#
-#     clip    taps    the button
-#     0.2s      1     not drawn
-#     0.4s      1     not drawn
-#     0.5s      2     "A x2"
-#     0.8s      3     "A x3"
-#     1s        3     "A x3"   <- the default
-#     4s        3     "A x3"
-#
-# CONTROL_BUTTONS still reserves room for the whole cluster either way, so
-# Wait and Undo do not move when it comes and goes.
-MIN_REPEAT_TAPS = 2
-
-#: Said once, on the next line the session writes, when the repeat button has
-#: had to go. A control that vanishes with no explanation reads as removed
-#: just as surely as a greyed-out one does -- that is precisely how the
-#: greyed-out version was reported -- so the moment it goes is the moment to
-#: say why, and where it went. It rides on an edit that was happening anyway.
-REPEAT_GONE_NOTE = (
-    "The **{button} x3** button is hidden while clips are this short: only "
-    "one tap fits, which is what **{button}** already does. A longer "
-    "`cliplength` brings it back."
-)
-
-# Seconds of emulation to run before the first clip, so the console's boot
-# logo is out of the way. Converted to frames with the core's real frame rate.
-#
-# Deliberately not tied to the clip length: how long a Game Boy takes to get
-# past its logo has nothing to do with how much of the game a press shows, so
-# a one second clip still gets three seconds of boot. It is skipped entirely
-# when a save state comes back, since that is already past the title screen.
-BOOT_SECONDS = 3
-
+# Nothing in this module reads it, and nothing in this module reads the
+# setting either: the idle sweep asks Config for the current value on every
+# pass (Retro._hibernate_idle), which is what makes a change to it apply to
+# the sessions that are already running. It lives here because the view is
+# where a session's defaults are written down, and Retro.py imports it for
+# its Config defaults.
 DEFAULT_TIMEOUT_MINUTES = 10
 
-# What a press says when it had to wake the session up first. Past tense on
-# purpose: it is shown *with* the clip rather than before it, because a press
-# makes exactly one edit to the message now (see RetroView._ack_now), so by
-# the time anybody reads it the game is already back. Cleared by the next
-# press, like every other one-off line.
-#
-# It is only half of saying "this session is asleep", and it is the half that
-# arrives *late*: a wake is the longest wait in the cog (a core to dlopen, a
-# save state to load) and this line is written at the end of it. The other
-# half is ASLEEP_MARK, which the edit that *puts* the session to sleep leaves
-# on the header, so the message reads "asleep" for the whole time it is --
-# and the wake's one edit takes the mark off and adds this. Two states, two
-# edits that were happening anyway, no third one.
-RESUMED_NOTE = "Woke up where you left off."
-
-#: Appended to the header (see :meth:`RetroView.header`) whenever there is no
-#: core loaded for this session, which is exactly "asleep": stopped, evicted
-#: by another channel, idle-timed-out, or waiting out a bot restart. The next
-#: press wakes it, and the edit that press makes drops the mark again.
-ASLEEP_MARK = "asleep"
-
-#: How the game is named on the line above the clip. A stable prefix rather
-#: than a status card: the first clip of a cold boot used to go out with *no*
-#: text at all, and after that the only text was the press line, so somebody
-#: scrolling past saw an animation, a grid of buttons and "Rob pressed A."
-#: with nothing anywhere saying what game it was.
-#:
-#: It rides on the content that is already rewritten by every press, so it
-#: costs nothing: no card, no embed, no extra edit. One line, always.
-#:
-#: **The console used to be in here** and is not any more. The line read
-#: ``**µCity** · Game Boy — Rob pressed A.`` and now reads
-#: ``**µCity** · Rob pressed A.``: the game's name is the thing nobody could
-#: work out from the picture, and the console is the thing everybody can --
-#: it is on screen in the boot logo, in the shape of the frame, and in the
-#: controller laid out underneath. It was costing a third of a short line to
-#: repeat it on every press. `[p]retro` on its own still lists every console
-#: this bot emulates, which is where somebody actually asks.
-HEADER = "**{game}**"
-
-#: What separates the header from whatever just happened. The same middle dot
-#: that separates the pieces of the header, so the whole line is one list of
-#: short facts rather than a header and a sentence joined by a dash.
-HEADER_SEPARATOR = " \N{MIDDLE DOT} "
-
-# How much of a game's name goes in the header. Game names come from a ROM
-# filename that has already been through Retro._sanitize_filename (which caps
-# it at 64 characters), so this is a second, independent bound for a name that
-# arrives from a stored session record written by an older version.
-MAX_GAME_NAME = 48
 
 # -- Queued presses -----------------------------------------------------------
 #
@@ -240,136 +185,6 @@ MAX_QUEUED_PRESSES = 3
 #: for as long as the view is.
 MAX_REPLACED_NOTICES = 25
 
-#: What a queued Wait is called in the listing. The other entries name the
-#: console's own button (or the d-pad's arrow) through System.caption_for,
-#: exactly as the press line does.
-QUEUED_WAIT = "wait"
-
-#: The suffix that shows what is waiting. Italic and parenthetical on purpose:
-#: the sentence in front of it is what just happened, and this is a footnote
-#: to it rather than a second announcement.
-QUEUE_NOTE = "*Queued: {queued}*"
-
-#: One entry in that listing: the button, and only the button.
-#:
-#: It used to be ``"{who} {button}"`` -- ``*Queued: Ada ⬅️*`` -- and the name
-#: is gone to keep the whole line short enough to read at a glance next to
-#: the picture. What that costs is worth knowing: with one waiting press per
-#: person (see MAX_QUEUED_PRESSES) the name was how somebody confirmed that
-#: the press in the list was *theirs* rather than somebody else's identical
-#: one. A queue of "⬅️, ⬅️" no longer says which of the two is yours.
-#:
-#: Putting it back is this string and :meth:`RetroView.queued_label`, which
-#: is why :attr:`Pending.who` is still captured at the moment of the click.
-QUEUE_ENTRY = "{button}"
-
-#: Said once, on the next line the session writes, when something threw the
-#: queue away: a reset, an undo, a stop. Without it the presses simply
-#: vanish, which is the bug this whole mechanism exists to fix -- so the one
-#: case where dropping them is *right* has to say so out loud.
-DROPPED_NOTE = "*{count} queued press{plural} dropped*"
-
-# -- Pacing: a clip is not replaced before it has been watched ----------------
-#
-# A clip costs far less to make than it does to watch. Measured on the real
-# thing -- gambatte running Libbet, one second clips, libretro.py 0.6.0, on a
-# Raspberry Pi 5 -- three presses back to back:
-#
-#     clip   emulated + encoded in   plays for
-#       1              92 ms          1005 ms
-#       2              68 ms          1005 ms
-#       3              42 ms          (one picture, static screen)
-#
-# So producing a clip is 11-24x faster than playing it. Nothing noticed that
-# while a press needed a human to decide on it: by the time somebody had
-# looked at the picture and clicked again, the clip had long since played
-# through and was holding its last frame (clips are encoded with ``loop=1``;
-# see encode_animation). The press *queue* removed the human from the gap --
-# queued presses drain one after another with nothing between them but the
-# lock -- so each new clip replaced the previous one after about a tenth of
-# it had played. What that looks like is the picture lurching: the animation
-# never reaches the frame the next clip carries on from, so the game appears
-# to jump back a little on every press. The seam itself is exact (see
-# capture_plan and PREROLL_SECONDS, which between them make the last picture
-# of one clip the state the next one starts from), and the pacing below is
-# what makes it exact *on screen* rather than only in the emulation.
-#
-# The rule: **an edit that replaces a clip waits until that clip has had its
-# playing time on screen.** The playing time is known exactly before the edit
-# is made -- it is the sum of the frame durations the encoder was handed; see
-# clips.playback_seconds, which is the same arithmetic RetroEmulator.record
-# writes into the clip's ANMF chunks -- so it is a deadline rather than a
-# guess, and the time already spent emulating, encoding and uploading the new
-# clip counts against it.
-#
-# Four things bound the cost of that, and all four matter:
-#
-# * **nothing playing, no wait.** The deadline is in the past for any press
-#   that arrives more than a clip after the last one, which is every ordinary
-#   single press. It is the common case and it is untouched.
-# * **the emulator is never held waiting.** The wait happens after
-#   ``Retro.run_press`` has returned, so the cog's emulator lock -- the one
-#   core, shared by every channel -- is free throughout, and another
-#   channel can start a game or press a button during it. Only the *edit*
-#   waits.
-# * **MAX_PACE_SECONDS caps a single wait**, so a long clip cannot turn a
-#   queue into a minute of staring.
-# * **teardown never waits at all.** Sleeping, ending, rebooting, undoing,
-#   eviction and cog unload all call :meth:`RetroView.cancel_pacing` before
-#   they take anything, which releases a wait already in progress and stops
-#   the next one from starting. No timer is left behind: the wait is an
-#   ``await`` inside the press it belongs to, not a scheduled callback.
-#
-# What the cap is worth, at the three clip lengths that matter. A full queue
-# is MAX_QUEUED_PRESSES waiting behind the one running, so the pacing a whole
-# drain can add is at most MAX_QUEUED_PRESSES * MAX_PACE_SECONDS:
-#
-#   cliplength   clip plays for   wait per edit      full queue adds
-#     0.2s          0.201s          0.2s (in full)      0.6s
-#     1s (default)  1.005s          1.005s (in full)    3.0s
-#     15s (max)     15.0s           1.25s (capped)      3.75s
-#
-# 1.25 seconds is therefore the smallest cap that still paces a default clip
-# *in full* (a one second clip plays for 1.005s, so a cap of 1.0 would clip
-# the last 5ms off every single one of them) while keeping a full queue
-# inside the four seconds the queue was already designed around -- see
-# MAX_QUEUED_PRESSES, which sizes itself on "about four seconds of latency,
-# which is the most that is still recognisably 'I pressed that'".
-#
-# Capping each wait rather than budgeting the drain as a whole is deliberate:
-# a budget spent on the first edit would give the head of the queue its full
-# second and let the tail lurch exactly as it does today, and the lurch is
-# the complaint. A cap gives every clip in a drain the same time on screen.
-MAX_PACE_SECONDS = 1.25
-
-#: A wait shorter than this is not worth taking. One picture of a clip is
-#: 67ms at CLIP_FPS, so 50ms cannot cost a visible frame, and a Discord edit
-#: takes longer than that anyway -- the wait would be spent before the
-#: request it is delaying had been sent.
-MIN_PACE_SECONDS = 0.05
-
-
-async def pace_wait(release: asyncio.Event, delay: float) -> None:
-    """
-    Wait ``delay`` seconds, or until ``release`` says there is no point.
-
-    ``release`` is the session's :attr:`RetroView._pace_release`, set by
-    :meth:`RetroView.cancel_pacing` when the game is being torn down or moved
-    somewhere the clip on screen no longer describes. It is checked by
-    waiting on it rather than by polling, so teardown is immediate.
-
-    A module-level function, and the only place pacing actually spends time,
-    so that a test can watch the wait -- or act during it, which is how "the
-    emulator lock is not held while this is happening" is proved -- instead
-    of paying for it. Nothing in the cog rebinds it.
-    """
-    try:
-        await asyncio.wait_for(release.wait(), delay)
-    except (asyncio.TimeoutError, TimeoutError):
-        # The ordinary ending: the clip finished playing and nothing
-        # interrupted us.
-        pass
-
 
 class Pending(typing.NamedTuple):
     """
@@ -405,244 +220,6 @@ class Pending(typing.NamedTuple):
 # A crash or a power cut therefore costs at most this many presses of play.
 SAVE_STATE_EVERY_PRESSES = 3
 
-# -- Saying who did what ------------------------------------------------------
-#
-# Every action names itself, and its author, on the message it edits: one
-# short line above the clip, in one voice for all five of them --
-#
-#     Rob pressed A.
-#     Rob pressed \N{LEFTWARDS BLACK ARROW}\N{VARIATION SELECTOR-16}.
-#     Rob pressed A x3.
-#     Rob waited.
-#     Rob undid the last press.
-#     Rob reset the game.
-#
-# -- and the impersonal form of the same sentence ("Pressed A.", "Waited.")
-# whenever there is no name to use, which is the one thing that must never
-# fail: a click always gets a line, even from a user object that turns out to
-# have no usable name at all.
-#
-# It rides on the one edit the action already makes (see RetroView._show), so
-# it costs nothing: no extra request, no extra rate-limit budget, and nothing
-# that could re-render the message a second time and rewind the clip.
-#
-# The name of a *button* comes from the console's own Button in systems.py,
-# via System.caption_for -- never from a second table here. That is what makes
-# a Genesis press read "pressed C." rather than "pressed A." (its C is
-# RetroPad *a*) and what keeps the line in step with the label on the button
-# that was clicked. The d-pad has no labels at all, so it names itself with
-# its arrow emoji, which has already been through systems.validate_emoji() at
-# import time; a bare codepoint with no U+FE0F is what caused a 400 in
-# production once, and it cannot get in here without failing that check first.
-#
-#: action -> (the line when the author is known, the line when it is not).
-#: Table-driven on purpose: five actions in one voice is a property of this
-#: dict rather than of five string literals scattered through the file, and
-#: the tests read it back.
-ACTION_NOTES: typing.Dict[str, typing.Tuple[str, str]] = {
-    "press": ("{who} pressed {button}.", "Pressed {button}."),
-    "wait": ("{who} waited.", "Waited."),
-    "undo": ("{who} undid the last press.", "Undid the last press."),
-    "reset": ("{who} reset the game.", "Reset the game."),
-}
-
-# How much of a display name goes on the line. 32 is Discord's own ceiling for
-# both a nickname and a global display name, so no real name is ever cut; the
-# cap is here for a name that arrives from somewhere else (a cached member
-# object, a future API, a test) and to make "one presser cannot own the line"
-# a property of this module rather than a hope about Discord's limits. The
-# worst case is therefore a 32 character name plus " undid the last press.",
-# which is 54 characters -- still one short line above the clip.
-MAX_PRESSER_NAME = 32
-
-# Unicode general categories that take up no space on screen: control
-# characters (Cc, which includes the newlines that would turn one line into
-# three), format characters (Cf, which is the zero-width space, the
-# zero-width joiner, the soft hyphen, the byte-order mark and the
-# right-to-left override), lone surrogates, private use, unassigned, and the
-# line/paragraph separators.
-#
-# Whitespace is handled before this, so a name written with newlines or tabs
-# in it still reads as separate words rather than having them run together.
-INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
-
-# Every character Discord reads as markup, escaped unconditionally with a
-# backslash -- which Discord renders as the plain character, so "Jean\-Luc"
-# reads "Jean-Luc" and the only cost is a backslash nobody sees.
-#
-# Deliberately a table here rather than discord.utils.escape_markdown, for
-# two reasons that both matter for a *name*:
-#
-# * that helper defaults to ignore_links=True and leaves markdown inside
-#   anything URL-shaped alone, so a display name of
-#   "http://example.com/__x__" would come back unescaped. A display name is
-#   not prose with links in it;
-# * it also leaves the start-of-line syntax alone (`#` headers, `-`/`+`
-#   lists, `>` quotes), which is exactly where a presser's name sits. A
-#   display name of "# hello" would render the whole line as a header --
-#   precisely the "one user dominates the line" problem the length cap is
-#   for.
-#
-# (On Python 3.13 it additionally emits a DeprecationWarning from inside
-# discord.py, once per call, which a cog should not be minting on every
-# button press.)
-#
-# `<` is in here for the family of things angle brackets open: `<@123>` (a
-# mention), `<#123>` (a channel), `<:name:123>` (a custom emoji) and `<t:0>`
-# (a timestamp). Brackets and parentheses are for `[text](url)` masked links.
-# The backslash itself is first, and a single str.translate pass maps every
-# character from the *input*, so escaping it cannot cascade into the
-# backslashes this adds.
-#
-# @everyone, @here and <@id> are still handed to discord.py's own
-# escape_mentions afterwards: it is the maintained answer for those, it is
-# warning-free, and a second opinion on the one class of markup that can
-# actually notify somebody is worth having.
-MARKDOWN_ESCAPES = str.maketrans(
-    {character: f"\\{character}" for character in "\\*_~`|#-+<>[]()"}
-)
-
-#: A leading "1." starts an ordered list, so the stop after a leading run of
-#: digits is escaped too. The digits themselves are fine, and "1)" is already
-#: covered by the bracket in MARKDOWN_ESCAPES.
-LEADING_ORDINAL = re.compile(r"^(\d+)(\.)")
-
-# Nothing this cog writes may ping anybody, and the press line is why: a
-# notification on every button press, from everybody in the channel, would be
-# intolerable in a way that no amount of "well, it is only one line" fixes.
-#
-# Two independent guards, because one of them is a promise about a string and
-# the other is a promise to Discord:
-#
-# * presser_name() emits *no mention syntax at all*. The name is plain text
-#   with every mention-shaped thing escaped, so there is nothing for Discord
-#   to resolve into a ping in the first place;
-# * every edit that can carry a name also carries this, so even a line that
-#   somehow contained a live mention could not deliver one.
-#
-# Belt and braces on purpose: the first guard is the one that matters and the
-# second is the one that cannot be got wrong by a future edit to the wording.
-NO_PINGS = discord.AllowedMentions.none()
-
-
-def presser_name(user: typing.Any) -> str:
-    """
-    A person's display name, safe to drop into the middle of a sentence.
-
-    Returns ``""`` for anybody who cannot be named, which is the caller's
-    signal to use the impersonal form of the line. Never raises: a click must
-    never fail because of whatever somebody called themselves.
-
-    ``display_name`` is asked for first and works for every kind of author
-    this cog sees -- a :class:`discord.Member` (their per-guild nickname), a
-    plain :class:`discord.User` with no guild at all (their global display
-    name, or their username), and a member object left over from somebody who
-    has since left the guild (the nickname Discord last told us about). The
-    two fallbacks after it are for an object that has only one of the others.
-
-    What comes back is then made safe, in this order:
-
-    1. **whitespace is collapsed**, so a name with a newline in it cannot
-       turn one line above the clip into three;
-    2. **invisible characters are dropped** (see INVISIBLE_CATEGORIES): a
-       name made entirely of zero-width spaces is indistinguishable from
-       having no name, and is treated as such rather than producing
-       " pressed A.";
-    3. **the length is capped** at MAX_PRESSER_NAME, before escaping, so a
-       trailing backslash can never be cut off from the character it escapes;
-    4. **markdown and mentions are escaped** -- MARKDOWN_ESCAPES for every
-       character Discord reads as markup, LEADING_ORDINAL for the one piece
-       of it that is positional, and discord.py's ``escape_mentions`` for
-       ``@everyone``/``@here``/``<@id>``. The result contains no mention
-       syntax at all, which is the first of the two guarantees described
-       above NO_PINGS.
-    """
-    raw = ""
-    for attribute in ("display_name", "global_name", "name"):
-        value = getattr(user, attribute, None)
-        if isinstance(value, str) and value.strip():
-            raw = value
-            break
-    if not raw:
-        return ""
-
-    characters = []
-    for character in raw:
-        if character.isspace():
-            characters.append(" ")
-        elif unicodedata.category(character) not in INVISIBLE_CATEGORIES:
-            characters.append(character)
-    name = " ".join("".join(characters).split())
-    if not name:
-        return ""
-    if len(name) > MAX_PRESSER_NAME:
-        name = name[: MAX_PRESSER_NAME - 1].rstrip() + "\N{HORIZONTAL ELLIPSIS}"
-
-    return escape_label(name)
-
-
-def escape_label(name: str) -> str:
-    """
-    Make a name safe to drop into a sentence Discord will render.
-
-    MARKDOWN_ESCAPES for every character Discord reads as markup,
-    LEADING_ORDINAL for the one piece of it that is positional, and
-    discord.py's ``escape_mentions`` for ``@everyone``/``@here``/``<@id>``.
-    The result contains no mention syntax at all.
-
-    Shared by :func:`presser_name` and :meth:`RetroView.header`, because the
-    two things that go on that one line -- who clicked and what game it is --
-    have exactly the same problem: a game called ``__x__`` or a nickname of
-    ``# hello`` would otherwise reformat the line it sits on.
-    """
-    escaped = LEADING_ORDINAL.sub(r"\1\\\2", str(name).translate(MARKDOWN_ESCAPES))
-    return discord.utils.escape_mentions(escaped)
-
-
-async def may_manage(bot, user: typing.Any, starter_id: typing.Optional[int]) -> bool:
-    """
-    Whether this person may do the things that are not open to everybody.
-
-    Anyone in the channel can play. Putting someone else's game to sleep
-    (`[p]retrosleep`), rebooting it (`[p]retroreboot`), finishing with it
-    (`[p]retroend`) and destroying or replacing its saves (the `[p]retrosaves`
-    group) all cost the whole channel its progress-in-flight, so they are the
-    same three people: whoever started the game, anybody who can moderate the
-    channel, and the bot owner.
-
-    **The one implementation.** It used to be two -- `RetroView.can_stop` and
-    `SavesMixin._may_manage_saves` -- which each claimed to be the single
-    source and checked the same three things in different orders.
-
-    The cheap checks come first, so ``is_owner`` (which can hit Red's config)
-    is only reached for somebody who is neither the starter nor a moderator.
-    ``guild_permissions`` is duck-typed rather than gated on
-    ``isinstance(user, discord.Member)``: a Member has the attribute and a
-    plain User does not, which *is* the question being asked, and an
-    isinstance check on a library class only makes the branch impossible to
-    exercise in a test.
-    """
-    if user is None:
-        return False
-    if starter_id and getattr(user, "id", None) == starter_id:
-        return True
-    permissions = getattr(user, "guild_permissions", None)
-    if permissions is not None and getattr(permissions, "manage_messages", False):
-        return True
-    return bool(await bot.is_owner(user))
-
-
-def action_note(action: str, user: typing.Any = None, button: str = "") -> str:
-    """
-    The one line an action puts on the message, with its author's name in it.
-
-    ``action`` is a key of ACTION_NOTES. The impersonal form is used whenever
-    :func:`presser_name` cannot name the author, so this always returns a
-    sentence.
-    """
-    named, plain = ACTION_NOTES[action]
-    who = presser_name(user)
-    return (named if who else plain).format(who=who, button=button)
 
 # -- Undo ----------------------------------------------------------------------
 #
@@ -716,165 +293,48 @@ CUSTOM_ID_PREFIX = "libretro"
 # command with the same permission check `[p]retrosleep` has, rather than one
 # more thing a passer-by can click by mistake.
 #
-# A click on a button a message was drawn with but this view no longer has
-# resolves to an unknown custom_id, which discord.py's
-# ViewStore.dispatch_view drops silently rather than raising.
+# -- Why no control is ever taken out of the view -----------------------------
+#
+# A message Discord has not re-rendered still shows exactly the buttons it
+# was drawn with, and a click on one of them is routed by its custom_id
+# alone. discord.py learns which custom_ids are routable by walking a view's
+# children (ViewStore.add_view, on every add_view and on every edit that
+# carries view=), and ViewStore.dispatch_view *drops* a click whose custom_id
+# no view has: it returns without touching the interaction. Nothing
+# acknowledges it, and three seconds later Discord shows the person who
+# clicked its red "This interaction failed".
+#
+# That is the real price of taking an item out of a view, and this file used
+# to claim it was free ("dropped silently rather than raising") -- true of
+# the log and false of the player. The window is not theoretical either: a
+# session laid out while hibernated counts its taps against DEFAULT_FPS (see
+# RetroView.fps) and a real core's rate can disagree, so the repeat button
+# can disappear on the very first press after a boot, with every message in
+# the channel still showing it.
+#
+# So nothing is ever taken out. The one control that comes and goes -- the
+# repeat button; see MIN_REPEAT_TAPS for why it goes rather than greying out
+# -- stays a child of the view for the session's whole life and is left out
+# of the *payload* instead (see RetroView.to_components). That is the only
+# half of "removed" Discord needs: the button is not drawn, the component is
+# not spent on the wire, Wait and Undo close up behind it -- and a click on a
+# stale copy still arrives at _RepeatButton.callback, which answers it
+# privately rather than leaving it to time out. Discord has no invisible
+# component, so there is no way to have this both ways on the wire; keeping
+# the item and dropping it from the payload is how it is had on ours.
+#
+# The alternative is to intercept the unknown-custom_id case, and there is no
+# hook for it: dispatch_view's only escape is the dynamic-item pattern table,
+# which routes clicks to a throwaway view rebuilt from the message rather
+# than to the session, and which ViewStore.add_view un-registers again the
+# moment a view stops carrying the item (_get_snapshot_diff). A button that
+# never leaves the view needs no interception at all.
 _STYLES = {
     "primary": discord.ButtonStyle.primary,
     "secondary": discord.ButtonStyle.secondary,
     "success": discord.ButtonStyle.success,
     "danger": discord.ButtonStyle.danger,
 }
-
-
-def press_plan(
-    fps: float,
-    clip_seconds: float,
-    hold_ms: float = DEFAULT_HOLD_MS,
-    taps: int = 1,
-) -> typing.List[typing.Tuple[int, int]]:
-    """
-    When to hold a button, and for how long, inside one clip.
-
-    Returns ``(start frame, hold frames)`` pairs measured against the frames
-    of the clip itself, which is exactly what ``RetroEmulator.record`` takes.
-    A plain press is one pair starting at frame 0; the repeat button asks for
-    ``REPEAT_TAPS`` of them.
-
-    Everything it returns is released by :func:`input_budget`, i.e. by the
-    last frame of the clip that is actually captured, so the clip's final
-    picture always shows the game *after* the input. That is the whole reason
-    this is not two lines: a clip used to be four seconds, where a 160ms hold
-    and three taps 250ms apart fitted with two seconds to spare, and at a
-    fifth of a second neither fits at all.
-
-    Two things give, in this order:
-
-    * **the spacing**, down to MIN_REPEAT_GAP_MS. Three taps 117ms apart are
-      still three taps, and this is what keeps the repeat button useful at
-      0.8-1s clips.
-    * **the number of taps**, one at a time, when even the floor will not
-      fit. Two taps is a worthwhile repeat button; one is just the confirm
-      button, and the view does not draw a button for it at all -- see
-      MIN_REPEAT_TAPS and :meth:`RetroView._update_repeat_label`. Measured at
-      DEFAULT_FPS with the default 160ms hold, the boundaries are 0.48s for
-      the second tap and 0.68s for the third.
-
-    The hold itself is clamped last-ditch: it can never be longer than the
-    budget, so a 0.2s clip (12 frames, budget 8) with a 400ms hold holds the
-    button for 8 frames -- about 134ms -- and shows one picture of the
-    release. The configured hold is a ceiling, not a promise, and
-    `[p]retroset hold` says so when the clip is too short to honour it.
-    """
-    frames = clip_frame_count(fps, clip_seconds)
-    budget = input_budget(fps, frames)
-    hold = max(1, min(frame_count(fps, float(hold_ms) / 1000.0), budget))
-    gap = frame_count(fps, REPEAT_GAP_MS / 1000.0)
-    floor = min(gap, frame_count(fps, MIN_REPEAT_GAP_MS / 1000.0))
-    taps = max(1, int(taps))
-    while taps > 1:
-        room = budget - taps * hold
-        if room >= floor * (taps - 1):
-            gap = min(gap, room // (taps - 1))
-            break
-        taps -= 1
-    return [(tap * (hold + gap), hold) for tap in range(taps)]
-
-
-class Progress(typing.NamedTuple):
-    """
-    One game's saved progress, in the order a boot is willing to try it.
-
-    Four files rather than two, because every save keeps one previous
-    generation (see BACKUP_SUFFIX in storage.py): a successful write of a *bad*
-    save is not something an atomic write can protect anybody from, and a save
-    state is the thing players care most about. The backups are only ever
-    reached when the newer file cannot be used.
-    """
-
-    #: The most recent save state, and the generation before it.
-    state: typing.Optional[bytes] = None
-    state_backup: typing.Optional[bytes] = None
-    #: The cartridge's battery memory, and the generation before it.
-    sram: typing.Optional[bytes] = None
-    sram_backup: typing.Optional[bytes] = None
-
-    @property
-    def has_state(self) -> bool:
-        """Whether there is any save state at all to try."""
-        return bool(self.state or self.state_backup)
-
-
-def restore_into(
-    emulator: RetroEmulator,
-    progress: typing.Optional[Progress] = None,
-    slug: str = "",
-) -> str:
-    """
-    Start a core and put back as much of a game as is restorable.
-
-    The one implementation of the save state -> previous save state -> battery
-    save -> previous battery save -> cold boot chain. Both paths that bring a
-    game up go through it: starting a game the channel has played before
-    (:meth:`RetroView._boot`) and waking a hibernated session
-    (``Retro._wake_locked``). They used to have a copy each and were kept in
-    step by the tests rather than by construction.
-
-    The order is the order of confidence. A save state is the exact moment and
-    is tried first; its previous generation is the same thing one autosave
-    older, which is worth far more than the title screen. The cartridge's
-    battery save is not a moment at all but it survives a core update, so it
-    comes after both states, and its own previous generation after it.
-
-    Returns what actually happened, which is what the cog reads to decide
-    whether to say anything and whether to throw a save state away:
-
-    * ``"state"`` - the exact moment came back;
-    * ``"backup-state"`` - the newest state was unusable, the one before it
-      was not;
-    * ``"sram"`` - no state could be used, but the cartridge's battery save
-      went in;
-    * ``"backup-sram"`` - the same, from the previous generation of it;
-    * ``"fresh"`` - there was nothing to restore, or none of it could be used.
-
-    Blocking, so callers run it in a worker thread.
-    """
-    progress = progress if progress is not None else Progress()
-    emulator.start()
-    for data, outcome in ((progress.state, "state"), (progress.state_backup, "backup-state")):
-        if not data:
-            continue
-        try:
-            emulator.load_state(data)
-            # Straight back to the exact moment, so none of the boot frames
-            # below are wanted: the game is already past its title screen.
-            return outcome
-        except EmulatorError as error:
-            # A state from a different build of the core, a truncated file, or
-            # -- the case the battery save exists for -- a state whose size no
-            # longer matches because the core was updated. That should cost
-            # the exact moment, not the session and not the player's own
-            # in-game save.
-            log.warning(
-                "Discarding an unusable Libretro save state (%s) for %s: %s",
-                outcome,
-                slug,
-                error,
-            )
-    # Cold boot. The core only allocates the cartridge's save memory once it
-    # has loaded the game, so the battery save goes in after start(), and the
-    # boot frames run afterwards so the game reaches its own title screen with
-    # the save already in place.
-    restored = "fresh"
-    for data, outcome in ((progress.sram, "sram"), (progress.sram_backup, "backup-sram")):
-        # load_sram() answers False for a save that is the wrong size for this
-        # cartridge, which is exactly when the generation before it is worth a
-        # try: an import or a core update can leave a mismatched newest file.
-        if data and emulator.load_sram(data):
-            restored = outcome
-            break
-    emulator.advance(emulator.frames_for_seconds(BOOT_SECONDS))
-    return restored
 
 
 class _GameButton(discord.ui.Button):
@@ -923,10 +383,18 @@ class _RepeatButton(discord.ui.Button):
     Discord keeps routing clicks to it, and the line the press puts on the
     message counts the same taps the label does.
 
-    Below MIN_REPEAT_TAPS this button is not built at all, so it is never
-    drawn saying "A x1". A click on a stale one still sitting on a message
-    Discord has not re-rendered resolves to a custom_id the view no longer
-    has, which discord.py's ViewStore.dispatch_view drops silently.
+    Below MIN_REPEAT_TAPS it is **hidden rather than removed**: it stays a
+    child of the view, so Discord keeps routing clicks to it, and
+    :meth:`RetroView.to_components` leaves it out of the payload, so it is
+    never drawn saying "A x1". The two halves are what make a click on a
+    stale copy of it -- one still sitting on a message Discord has not
+    re-rendered -- reach :meth:`callback` and get an answer, instead of
+    resolving to a custom_id no view has and leaving the player looking at
+    "This interaction failed". See the note above _STYLES.
+
+    :attr:`hidden` is therefore the one piece of state on this button, and
+    it is set from the tap count both at build time and on every redraw; see
+    :meth:`RetroView._update_repeat_label`.
     """
 
     def __init__(self, spec, row: int, taps: int = REPEAT_TAPS) -> None:
@@ -938,8 +406,25 @@ class _RepeatButton(discord.ui.Button):
         )
         self.field: str = spec.field
         self.name: str = spec.label
+        # Whether this clip length has anything for it to do. Set here as
+        # well as on redraw so that a session *built* on a short clip starts
+        # out with it undrawn and says nothing about it: there is no news in
+        # a control that was never there. Only a button that goes away
+        # mid-session is worth a line; see REPEAT_GONE_NOTE.
+        self.hidden: bool = int(taps) < MIN_REPEAT_TAPS
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if self.hidden and not self.view.closed:
+            # A stale button on a message that still shows it. Nothing is
+            # emulated and nothing is edited -- see REPEAT_STALE_NOTE.
+            #
+            # Not on a closed view, though: "this message's game has been
+            # replaced" is the bigger fact and the one that says where the
+            # game went, so a retired controller answers with that whether or
+            # not the button that was clicked is one it still draws. _press
+            # settles it; see RetroView._replaced_ack.
+            await self.view._stale_repeat_ack(interaction)
+            return
         # REPEAT_TAPS is what is *asked* for; press_plan decides how many of
         # them fit, and the label above says which it was.
         await self.view._press(interaction, self.field, repeat=REPEAT_TAPS)
@@ -1115,7 +600,6 @@ class RetroView(discord.ui.View):
         starter_id: typing.Optional[int] = None,
         source: str = "",
         message_id: typing.Optional[int] = None,
-        timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
         clip_seconds: float = CLIP_SECONDS,
         hold_ms: int = DEFAULT_HOLD_MS,
     ) -> None:
@@ -1134,7 +618,15 @@ class RetroView(discord.ui.View):
         self.starter_id: typing.Optional[int] = starter_id
         self.source: str = source
         self.message_id: typing.Optional[int] = message_id
-        self.timeout_minutes: int = timeout_minutes
+        # There is deliberately no `timeout_minutes` here. A session used to
+        # be handed the idle timeout at construction, and to be handed it
+        # again by from_record on every restart, and nothing ever read it:
+        # the sweep that hibernates idle sessions re-reads
+        # `session_timeout_minutes` from Config on every pass (see
+        # Retro._hibernate_idle), which is what makes `[p]retroset timeout` apply
+        # to every session that is already running rather than only to the
+        # next one started. A copy on the view could only ever have been the
+        # stale answer.
         # Fractional, and clamped on the way in: the setting is a float now,
         # an installation that set it before it was has an int in Config, and
         # neither must be able to ask for a clip of no frames at all.
@@ -1197,8 +689,8 @@ class RetroView(discord.ui.View):
         # When the clip now on the message went out, on the monotonic clock,
         # and how long it plays for. A playback of 0 means "nothing is
         # playing", which is both the state before the first clip and what
-        # teardown puts this back to. See the pacing note above
-        # MAX_PACE_SECONDS.
+        # teardown puts this back to. See the pacing note in retro/timing.py,
+        # above MAX_PACE_SECONDS.
         self._posted_at: float = 0.0
         self._posted_playback: float = 0.0
         # Set to release a pacing wait that is already in progress, and
@@ -1230,6 +722,11 @@ class RetroView(discord.ui.View):
         MIN_REPEAT_TAPS): Wait and Undo must not move between one clip length
         and another, and a layout that only fits on a short clip would be a
         layout that breaks the day somebody lengthens the clip.
+
+        All three are also *built* either way, at every clip length, and the
+        repeat button is hidden from the payload rather than left out of the
+        view when it has nothing to do -- which is what keeps a click on a
+        stale copy of it routable. See the note above _STYLES.
         """
         rows = self.system.rows
         if len(rows) > MAX_LAYOUT_ROWS:
@@ -1263,19 +760,59 @@ class RetroView(discord.ui.View):
             )
         self.add_item(_WaitButton(control_row))
         confirm = self.system.button(self.system.confirm)
-        taps = self.repeat_taps
-        if confirm is not None and taps >= MIN_REPEAT_TAPS:
+        if confirm is not None:
             # Built with the taps this clip length can fit, so a session
             # started on a short clip never shows a promise it cannot keep --
-            # and not built at all on a clip too short for a repeat to mean
-            # anything, so it is never drawn dead. See MIN_REPEAT_TAPS.
-            self.add_item(_RepeatButton(confirm, control_row, taps))
+            # and built hidden on a clip too short for a repeat to mean
+            # anything, so it is never *drawn* dead while still catching the
+            # clicks a message drawn before then can still send. See
+            # MIN_REPEAT_TAPS and _RepeatButton.hidden.
+            self.add_item(_RepeatButton(confirm, control_row, self.repeat_taps))
         self.add_item(_UndoButton(control_row))
         if len(self.children) > MAX_COMPONENTS:
             raise ValueError(
                 f"{self.system.name} needs {len(self.children)} components; "
                 f"Discord allows {MAX_COMPONENTS}."
             )
+
+    def to_components(self) -> typing.List[typing.Dict[str, typing.Any]]:
+        """
+        The rows Discord is sent, which are the children minus the hidden one.
+
+        The one place "hidden" means anything. discord.py builds a message's
+        ``components`` from this (see HTTPClient's payload assembly), and
+        builds its *routing table* from ``children`` instead
+        (ViewStore.add_view) -- so leaving an item out here takes it off the
+        screen and leaves it reachable, which is exactly the split the repeat
+        button needs. See the note above _STYLES.
+
+        Filtering the payload the superclass built, rather than the children
+        it builds it from, on purpose: what a row is and how a button becomes
+        a dict stays discord.py's business, and this only has to drop one
+        entry by custom_id and then drop a row that has nothing left in it
+        (Discord refuses an empty action row). Nothing this cog lays out can
+        empty a row -- the control cluster is three buttons and only the
+        middle one hides -- but a future layout that could must not produce a
+        payload Discord will 400.
+        """
+        rows = super().to_components()
+        hidden = {
+            child.custom_id
+            for child in self.children
+            if getattr(child, "hidden", False)
+        }
+        if not hidden:
+            return rows
+        drawn = []
+        for row in rows:
+            components = [
+                component
+                for component in row["components"]
+                if component.get("custom_id") not in hidden
+            ]
+            if components:
+                drawn.append({**row, "components": components})
+        return drawn
 
     # -- Session records ----------------------------------------------------
 
@@ -1303,11 +840,19 @@ class RetroView(discord.ui.View):
         cls,
         cog: commands.Cog,
         record: dict,
-        timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES,
         clip_seconds: float = CLIP_SECONDS,
         hold_ms: int = DEFAULT_HOLD_MS,
     ) -> "RetroView":
-        """Rebuild a hibernated session from Config after a restart."""
+        """
+        Rebuild a hibernated session from Config after a restart.
+
+        The two settings that arrive here are the two a *layout* depends on:
+        how long a clip is and how long a button is held decide how many taps
+        the repeat button can do, and therefore whether it is drawn at all
+        (see :meth:`_update_repeat_label`). The idle timeout used to be
+        threaded through here as well and was never read by anything; see the
+        note in :meth:`__init__`.
+        """
         rom_filename = record.get("rom_filename") or ""
         # Sessions written before multi-console support have no "system", so
         # fall back to the ROM's extension and then to the Game Boy.
@@ -1325,7 +870,6 @@ class RetroView(discord.ui.View):
             starter_id=record.get("starter_id"),
             source=record.get("source") or "",
             message_id=record.get("message_id"),
-            timeout_minutes=timeout_minutes,
             clip_seconds=clip_seconds,
             hold_ms=hold_ms,
         )
@@ -1398,8 +942,8 @@ class RetroView(discord.ui.View):
         screen: at the default second a Game Boy clip is 60 frames, emulates
         1.0046 seconds and plays for 1.005. See :func:`playback_seconds`.
 
-        This is the number a clip is paced against; see the note above
-        MAX_PACE_SECONDS.
+        This is the number a clip is paced against; see the pacing note in
+        retro/timing.py, above MAX_PACE_SECONDS.
         """
         fps = self.fps if emulator is None else emulator.fps
         return playback_seconds(fps, self.clip_frames(emulator))
@@ -1474,7 +1018,13 @@ class RetroView(discord.ui.View):
         return action_note("reset", user)
 
     def _repeat_button(self) -> typing.Optional["_RepeatButton"]:
-        """The repeat button, or None on a clip too short to draw one."""
+        """
+        The repeat button, which every console with a confirm button has.
+
+        There either way, drawn or not: it is hidden from the payload on a
+        clip too short to repeat in rather than taken out of the view. See
+        :meth:`to_components` and the note above _STYLES.
+        """
         return next(
             (child for child in self.children if isinstance(child, _RepeatButton)), None
         )
@@ -1488,63 +1038,50 @@ class RetroView(discord.ui.View):
         to follow it rather than stating REPEAT_TAPS for ever.
 
         At one tap the button does nothing the console's own confirm button
-        does not, and it is **removed from the row** rather than greyed out.
-        That is a change from how it used to behave, and the reason is that
-        the greyed-out version was reported as the feature having been taken
-        out of the cog: a dead control with no explanation looks broken. A
-        missing control says "not at this clip length", which is the truth.
-        It also frees a component.
+        does not, and it is **taken out of the payload** rather than greyed
+        out. That is a change from how it used to behave, and the reason is
+        that the greyed-out version was reported as the feature having been
+        taken out of the cog: a dead control with no explanation looks
+        broken. A missing control says "not at this clip length", which is
+        the truth.
 
-        A control that silently *disappears* reads as removed too, though, so
-        going sets :attr:`notice` -- one line on the next edit the session
-        makes, which is an edit that was happening anyway. Coming back says
-        nothing: the button is right there saying what it does.
+        Out of the payload and not out of the view, though, which is the
+        other half of the same honesty: a message Discord has not re-rendered
+        still shows the button, and a click on it has to land somewhere that
+        answers rather than on a custom_id nothing is registered for. See
+        :meth:`to_components`, :class:`_RepeatButton` and the note above
+        _STYLES. Nothing here rebuilds the row any more, so the button also
+        cannot come back in the wrong place: it never leaves its seat between
+        Wait and Undo.
+
+        A control that silently *disappears* reads as removed too, so going
+        sets :attr:`notice` -- one line on the next edit the session makes,
+        which is an edit that was happening anyway. Coming back says nothing:
+        the button is right there saying what it does. Only a change is news;
+        a session that was built this way says nothing at all, which is why
+        :class:`_RepeatButton` decides its own starting state.
 
         Called on every redraw (see :meth:`_set_disabled`), so changing
-        `[p]retroset cliplength` mid-game adds or removes the button on the
+        `[p]retroset cliplength` mid-game hides or shows the button on the
         next press, both ways round -- and so does booting a core, since a
         session laid out while hibernated used DEFAULT_FPS and a 50 fps PAL
         core can fit a tap the fallback said would not fit (and vice versa).
-
-        Coming or going means rebuilding the whole row, because a Discord
-        action row is ordered by insertion: adding the button back would
-        otherwise land it after Undo and read "Wait Undo A x3". The rebuild
-        is a couple of dozen Button objects and only happens when the answer
-        actually changes, which is on a settings change and once per boot.
         """
-        taps = self.repeat_taps
         button = self._repeat_button()
-        wanted = taps >= MIN_REPEAT_TAPS
-        if wanted != (button is not None):
-            if not wanted:
-                self.notice = REPEAT_GONE_NOTE.format(
-                    button=self.system.label_for(self.system.confirm)
-                )
-            self._rebuild_controls()
+        if button is None:
+            # A console with no confirm button at all, which none of the ones
+            # in systems.py is.
             return
-        if button is not None:
-            button.label = f"{button.name} x{taps}"
-
-    def _rebuild_controls(self) -> None:
-        """
-        Draw the whole controller again, in row order.
-
-        Only :meth:`_update_repeat_label` needs this, and only when the
-        repeat button has to appear or disappear. The custom_ids are fixed
-        strings, so the freshly built buttons route exactly as the old ones
-        did and the view stays persistent.
-
-        Every caller edits the message with ``view=self`` immediately
-        afterwards, and both ``edit_original_response`` and ``Message.edit``
-        re-register the view's children as they go, so Discord is routing
-        clicks to the new buttons from that edit on. A click that lands in
-        the moment between the rebuild and the edit resolves to one of the
-        old, now detached items, which discord.py's ViewStore drops with a
-        log line rather than raising (it checks ``item.view is None``) -- the
-        same treatment a click on any button this cog has removed gets.
-        """
-        self.clear_items()
-        self._build_controls()
+        taps = self.repeat_taps
+        hidden = taps < MIN_REPEAT_TAPS
+        if hidden and not button.hidden:
+            self.notice = REPEAT_GONE_NOTE.format(
+                button=self.system.label_for(self.system.confirm)
+            )
+        button.hidden = hidden
+        # Written even while hidden, so the label is already honest on the
+        # redraw that brings the button back rather than one press later.
+        button.label = f"{button.name} x{taps}"
 
     # -- The undo history ---------------------------------------------------
 
@@ -1748,7 +1285,8 @@ class RetroView(discord.ui.View):
 
     # -- Pacing the clips ---------------------------------------------------
     #
-    # See the note above MAX_PACE_SECONDS for the measurements and the rule.
+    # See the note above MAX_PACE_SECONDS in retro/timing.py for the
+    # measurements and the rule.
     # Three small methods and one await, and none of them touches a lock.
 
     def note_posted(self, playback: float) -> None:
@@ -2382,7 +1920,12 @@ class RetroView(discord.ui.View):
         """:meth:`capture_reset` and encode it; see :meth:`run_press`."""
         return self._encode(self.capture_reset())
 
-    def _encode(self, captured) -> bytes:
+    def _encode(
+        self,
+        captured,
+        limit: typing.Optional[int] = None,
+        emulator: typing.Optional[RetroEmulator] = None,
+    ) -> bytes:
         """
         Turn captured frames into the clip's bytes. No core is touched.
 
@@ -2391,11 +1934,60 @@ class RetroView(discord.ui.View):
         nothing but Pillow, so the cog runs it with the emulator lock given
         back. It is on the view only so that a caller holding one does not
         have to reach for the emulator module.
+
+        ``emulator`` is the one the frames were captured with, and passing it
+        is what makes running outside the lock safe. Nothing here *uses* a
+        core -- ``encode_captured`` is a staticmethod -- but reading it off
+        ``self`` would be reading state another channel is entitled to change
+        the moment the lock is free: an eviction sets ``self.emulator`` to
+        None, and a press whose frames were already captured would then fail
+        to encode a clip that was sitting right there. Falls back to the
+        session's own for a caller that has no particular one in mind.
+
+        ``limit`` is what this server will accept as an attachment, when the
+        caller knows it. A clip over it is re-encoded smaller rather than
+        posted and refused: Discord's rejection costs the whole round trip
+        (emulate, encode, upload), spends the press, and answers with advice
+        aimed at the bot owner rather than at the person who pressed the
+        button. See :func:`clips.shrink_clip` for what is given up, in order.
         """
-        emulator = self.emulator
+        emulator = emulator if emulator is not None else self.emulator
         if emulator is None:
             raise EmulatorError("The emulator is not running.")
-        return emulator.encode_captured(captured)
+        clip = emulator.encode_captured(captured)
+        if limit and len(clip) > limit:
+            log.info(
+                "A clip for %s came out at %s bytes, over this server's %s "
+                "byte limit; re-encoding it smaller.",
+                self.slug,
+                len(clip),
+                limit,
+            )
+            # `clip` is handed over as the baseline: lossy is not reliably
+            # smaller on console art, so shrink_clip compares against what
+            # we already have and never returns anything bigger.
+            smaller = shrink_clip(captured, limit, clip)
+            if smaller is not None and len(smaller) < len(clip):
+                clip = smaller
+        return clip
+
+    def upload_limit(self) -> typing.Optional[int]:
+        """
+        The biggest attachment this server will take, or None if unknown.
+
+        Read on the event loop and handed to :meth:`_encode`, which runs in a
+        worker thread: ``Guild.filesize_limit`` is a cached attribute and
+        reaching into discord.py's state from another thread is not something
+        to do for a size check. None means "do not second-guess it", which is
+        what a session with no guild in the cache gets.
+        """
+        try:
+            guild = self.cog.bot.get_guild(self.guild_id) if self.guild_id else None
+            limit = getattr(guild, "filesize_limit", None)
+            return int(limit) if limit else None
+        except Exception:
+            log.debug("Could not read the upload limit.", exc_info=True)
+            return None
 
     # -- Interactions -------------------------------------------------------
 
@@ -2513,7 +2105,7 @@ class RetroView(discord.ui.View):
         # played about a tenth of the way through and the picture lurched.
         # The emulator lock was given back by ``cog.run_press`` above, so
         # nothing else is held up by this -- see the note above
-        # MAX_PACE_SECONDS.
+        # MAX_PACE_SECONDS in retro/timing.py.
         await self.pace()
         # The press names itself, and whoever made it, on the message --
         # on the very same edit that carries the clip (see
@@ -2627,6 +2219,38 @@ class RetroView(discord.ui.View):
             except discord.HTTPException:
                 log.debug("Could not answer a replaced-session click.", exc_info=True)
         await self._silent_ack(interaction)
+
+    async def _stale_repeat_ack(self, interaction: discord.Interaction) -> None:
+        """
+        Answer a click on a repeat button that is no longer drawn.
+
+        The click can only have come from a message Discord has not
+        re-rendered since the clip length last changed -- the button is on
+        that message, the view has stopped putting it in the payload, and it
+        stays in the view precisely so that this can be reached. Without it
+        the interaction would never be acknowledged at all and the player
+        would be shown "This interaction failed" three seconds later; see the
+        note above _STYLES.
+
+        Private, and one interaction response with no edit of the message:
+        editing it would re-render the attachment and rewind the clip that is
+        playing (see :meth:`_ack_now`), which is a real cost to everybody in
+        the channel for one person's stale click. Every other answer this view
+        gives to a click it cannot act on is shaped the same way.
+
+        Falls back to a plain defer, because the one thing that must not
+        happen is the click going unanswered.
+        """
+        try:
+            await interaction.response.send_message(
+                REPEAT_STALE_NOTE.format(
+                    button=self.system.label_for(self.system.confirm)
+                ),
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            log.debug("Could not answer a hidden repeat click.", exc_info=True)
+            await self._silent_ack(interaction)
 
     def _refusal_note(self, interaction: discord.Interaction) -> str:
         """

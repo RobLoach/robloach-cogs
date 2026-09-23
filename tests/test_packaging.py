@@ -349,7 +349,34 @@ def test_the_fingerprint_changes_with_the_code_and_with_a_new_file(tmp_path):
     assert V.code_fingerprint(tmp_path / "empty") is None
 
 
-def test_the_commit_is_read_from_the_files_and_never_from_a_subprocess():
+def test_both_source_facts_come_from_one_walk_over_the_files(tmp_path):
+    """One glob, one visit per file: the two answers are about the same files.
+
+    They were two passes -- glob, read, hash; glob again, stat -- run back
+    to back at import. Folding them together must not move either answer, so
+    both are checked against the named functions that still exist for
+    callers who only want one of them.
+    """
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.py").write_text("y = 2\n")
+    (tmp_path / "notes.txt").write_text("not a source file\n")
+    scan = V.scan_sources(tmp_path)
+    assert scan.fingerprint == V.code_fingerprint(tmp_path)
+    assert scan.newest == V.newest_source_time(tmp_path)
+    assert scan.newest == max(
+        (tmp_path / name).stat().st_mtime for name in ("a.py", "b.py")
+    )
+    assert V.scan_sources(tmp_path / "empty") == (None, None)
+    # ...and the module's own two constants came from one scan of its own
+    # package, captured at import. Asserted on the source rather than by
+    # re-scanning retro/, which would only be re-reading the same files.
+    source = (REPO_ROOT / "retro" / "version.py").read_text()
+    assert "_SOURCES = scan_sources()" in source
+    assert "FINGERPRINT: typing.Optional[str] = _SOURCES.fingerprint" in source
+    assert "SOURCE_TIME: typing.Optional[float] = _SOURCES.newest" in source
+
+
+def test_the_checkout_is_read_from_the_files_and_never_from_a_subprocess():
     # There may be no git binary, and a command that answers a question must
     # not be able to hang on one.
     importers = imported_names().get("subprocess", set())
@@ -358,13 +385,36 @@ def test_the_commit_is_read_from_the_files_and_never_from_a_subprocess():
     assert "GIT_SEARCH_DEPTH = 2" in source, "a deeper walk finds other repos"
 
 
-def test_the_commit_of_this_checkout_is_found_and_is_a_real_sha():
+def test_only_head_is_read_and_git_s_ref_storage_is_left_to_git():
+    """One line of HEAD, and no reimplementation of anything else.
+
+    Resolving a branch to its commit id meant parsing loose refs *and*
+    packed-refs -- around ninety lines of git's on-disk format, for one
+    decoration on one line of chat output. The fingerprint is what actually
+    answers "am I running the new code?", so the branch name is shown as
+    HEAD writes it and nothing here has to keep up with how git stores refs.
+    """
+    # The prose still explains what was dropped and why, so the file name is
+    # looked for as a string the code could open rather than as a word.
+    literals = {value for _lineno, value in string_literals_outside_docstrings(
+        REPO_ROOT / "retro" / "version.py"
+    )}
+    assert "packed-refs" not in literals, literals
+    assert not hasattr(V, "_resolve_ref")
+
+
+def test_the_checkout_of_this_copy_is_the_branch_head_is_on():
     if not (REPO_ROOT / ".git").exists():
         pytest.skip("this copy of the cog is not in a git checkout")
     checkout = V.git_checkout()
     assert checkout is not None
-    assert len(checkout.commit) in (40, 64), checkout.commit
-    assert all(c in "0123456789abcdef" for c in checkout.commit)
+    # Exactly one of the two, always: a branch name, or a detached HEAD's
+    # commit id. Which one this checkout is depends on the machine, so both
+    # shapes are asserted properly against a made-up .git below.
+    assert bool(checkout.branch) != bool(checkout.commit), checkout
+    if checkout.commit:
+        assert len(checkout.commit) in (40, 64), checkout.commit
+        assert all(c in "0123456789abcdef" for c in checkout.commit)
 
 
 def test_a_missing_git_directory_is_an_ordinary_answer(tmp_path):
@@ -377,26 +427,42 @@ def test_a_missing_git_directory_is_an_ordinary_answer(tmp_path):
     assert V._git_dir(package) is None
 
 
-def test_a_broken_git_directory_is_also_an_ordinary_answer(tmp_path):
+def test_a_branch_is_named_and_a_detached_head_is_a_commit(tmp_path):
     package = tmp_path / "repo" / "retro"
     package.mkdir(parents=True)
     git = tmp_path / "repo" / ".git"
     git.mkdir()
     assert V.git_checkout(package) is None, "no HEAD at all"
-    (git / "HEAD").write_text("ref: refs/heads/main\n")
-    assert V.git_checkout(package) is None, "a ref that resolves to nothing"
     (git / "HEAD").write_text("this is not a commit id\n")
     assert V.git_checkout(package) is None
-    # ...and the two shapes that do work: a packed ref, and a detached HEAD.
+    # A branch is reported by name, with no ref file anywhere: what HEAD
+    # says is the whole answer, which is the point of reading only HEAD.
     (git / "HEAD").write_text("ref: refs/heads/main\n")
-    (git / "packed-refs").write_text(
-        "# pack-refs with: peeled fully-peeled sorted \n"
-        f"{'a' * 40} refs/heads/main\n"
-        f"^{'b' * 40}\n"
-    )
-    assert V.git_checkout(package) == ("a" * 40, "main")
+    assert V.git_checkout(package) == (None, "main")
+    assert not (git / "refs").exists(), "and nothing else was needed"
+    (git / "HEAD").write_text("ref: refs/heads/feature/long-name\n")
+    assert V.git_checkout(package) == (None, "long-name")
+    # ...and a detached HEAD, which is what `git checkout <tag>` leaves, has
+    # no branch to name, so the commit id in the file is shown instead.
     (git / "HEAD").write_text("c" * 40 + "\n")
     assert V.git_checkout(package) == ("c" * 40, None)
+
+
+def test_a_worktree_or_submodule_gitdir_file_is_followed(tmp_path):
+    """``.git`` is a file, not a directory, in a worktree or a submodule.
+
+    Kept (it is a handful of lines) because it is exactly the layout a
+    developer checking "am I running the new code?" tends to be in, and
+    without it those installs silently report no checkout at all.
+    """
+    package = tmp_path / "wt" / "retro"
+    package.mkdir(parents=True)
+    real = tmp_path / "main" / ".git" / "worktrees" / "wt"
+    real.mkdir(parents=True)
+    (real / "HEAD").write_text("ref: refs/heads/side\n")
+    (tmp_path / "wt" / ".git").write_text(f"gitdir: {real}\n")
+    assert V._git_dir(package) == real
+    assert V.git_checkout(package) == (None, "side")
 
 
 def test_the_load_bearing_constants_are_still_in_the_source():

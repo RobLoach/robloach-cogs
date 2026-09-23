@@ -329,6 +329,10 @@ def _face(label: str, field: str) -> Button:
 #                         ⬅  ⬇  ➡  1  2
 #                         Pause  [Wait  1 x3  Undo]
 #
+#   Game Gear             ·  ⬆                       11 components, 3 rows
+#                         ⬅  ⬇  ➡  1  2
+#                         Start  [Wait  1 x3  Undo]
+#
 #   Neo Geo Pocket        ·  ⬆                       11 components, 3 rows
 #                         ⬅  ⬇  ➡  A  B
 #                         Option  [Wait  A x3  Undo]
@@ -435,6 +439,15 @@ class System(typing.NamedTuple):
 # Extensions we never claim. ".fds" needs Nintendo's disksys.rom BIOS, and
 # the disc-image formats all need a CD image plus (usually) a console BIOS.
 #
+# ".bs" (Satellaview) and ".st" (Sufami Turbo) are here for the same reason
+# as ".fds", and were in the Super Nintendo's extension list until somebody
+# read this module's own header: both formats are *slot* cartridges, and
+# snes9x cannot start one without the base cartridge they plug into --
+# BS-X.bin for a Satellaview download, STBIOS.bin for a Sufami Turbo game.
+# Every core here is BIOS-free, which is a condition of being here at all, so
+# claiming these two meant a session that started, showed nothing, and looked
+# like a broken cog rather than an unsupported file.
+#
 # ".bin" used to be excluded because three of the cores here claimed it
 # (stella2014, mednafen_vb and genesis_plus_gx); with the first two gone only
 # genesis_plus_gx claims it, so it is no longer ambiguous *within this set*.
@@ -445,7 +458,7 @@ class System(typing.NamedTuple):
 # mean silently loading somebody's PlayStation disc track as a Mega Drive
 # game. Genesis ROMs should be named ".md" instead.
 AMBIGUOUS_EXTENSIONS = frozenset(
-    {"bin", "cue", "iso", "chd", "toc", "m3u", "ccd", "img", "fds"}
+    {"bin", "cue", "iso", "chd", "toc", "m3u", "ccd", "img", "fds", "bs", "st"}
 )
 
 
@@ -495,7 +508,9 @@ SYSTEMS: typing.Tuple[System, ...] = (
         key="snes",
         name="Super Nintendo",
         core="snes9x",
-        extensions=("smc", "sfc", "swc", "fig", "bs", "st"),
+        # No ".bs" or ".st": both need a base cartridge BIOS, which no core
+        # here does. See AMBIGUOUS_EXTENSIONS.
+        extensions=("smc", "sfc", "swc", "fig"),
         # The SNES diamond (X on top, Y left, A right, B below) flattened into
         # the 2x2 block everyone draws it as: Y X over B A.
         rows=(
@@ -530,11 +545,40 @@ SYSTEMS: typing.Tuple[System, ...] = (
         key="sms",
         name="Sega Master System",
         core="genesis_plus_gx",
-        extensions=("sms", "gg", "sg"),
+        # ".sg" is an SG-1000 cartridge, which genesis_plus_gx runs as part
+        # of its Master System support (the SG-1000 is the same 8-bit line,
+        # and its pad is the same two buttons). It stays here rather than
+        # becoming a system of its own: the controls and the console name a
+        # player sees would both be right either way, and a third entry on
+        # this core would buy nothing but a longer list.
+        extensions=("sms", "sg"),
+        # "Pause" really is the Master System's own name for this: the
+        # console has a Pause button on the deck, not on the pad, and
+        # start/pause is the RetroPad field the core reads for it.
         rows=(
             (SPACER, UP),
             (LEFT, DOWN, RIGHT, _face("1", "b"), _face("2", "a")),
             (Button("Pause", "start"),),
+        ),
+        confirm="b",
+    ),
+    System(
+        key="gg",
+        name="Sega Game Gear",
+        core="genesis_plus_gx",
+        # Its own console, not a Master System: the Game Gear was folded in
+        # with the SMS because genesis_plus_gx runs both, which announced a
+        # ".gg" game as a "Sega Master System" one and put "Pause" on its
+        # Start button. The handheld has no console-deck Pause -- the button
+        # beside the screen is START, and every Game Gear manual calls it
+        # that -- so the label was wrong for every Game Gear game.
+        extensions=("gg",),
+        # Same pad as the Master System otherwise: a d-pad and two buttons,
+        # numbered 1 and 2 on the shell.
+        rows=(
+            (SPACER, UP),
+            (LEFT, DOWN, RIGHT, _face("1", "b"), _face("2", "a")),
+            (Button("Start", "start"),),
         ),
         confirm="b",
     ),
