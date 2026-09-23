@@ -855,9 +855,10 @@ so out loud, once, on the next line the session writes:
 
 **Undo is deliberately not queueable.** A click that arrives while a press is
 being emulated is dropped rather than taken down: "one press back" queued
-three presses deep means undoing a press its author never saw. It answers
-privately — "a press is still being emulated, click Undo again when its clip
-appears" — rather than doing nothing visible at all.
+several presses deep means undoing a press its author never saw. It is
+acknowledged and nothing more — the press already running posts its clip a
+moment later, which answers the question by itself, so there is nothing worth
+whispering about.
 
 **A press that lands while the game is being undone, rebooted or put to sleep
 is dealt with rather than left in the queue.** Those three take the session's

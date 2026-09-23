@@ -1658,10 +1658,8 @@ async def test_an_undo_that_lands_during_pacing_is_dropped_rather_than_waiting(r
     """Undo is not queueable, and pacing does not make it so.
 
     A click that arrives while a press is running -- which now includes the
-    moment it is holding its edit back -- is answered and dropped, as it
-    always was. It does not wait, and it does not edit the message: the
-    answer is one private line telling the clicker to try again when the
-    next clip lands, which costs an interaction response and nothing else.
+    moment it is holding its edit back -- is acknowledged and dropped, as it
+    always was. It does not wait, and it does not edit the message.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9211, "undoduring")
@@ -1678,9 +1676,9 @@ async def test_an_undo_that_lands_during_pacing_is_dropped_rather_than_waiting(r
     retro.pace_wait(wait)
     await view._press(retro.interaction(view, message=view.message), "b")
 
-    # One interaction response and no edit of the message: the pacing wait
-    # was not extended and the clip on screen was not replaced.
-    assert clicked["kinds"] == ["response.send_message"], clicked
+    # One acknowledgement and no edit of the message: the pacing wait was
+    # not extended and the clip on screen was not replaced.
+    assert clicked["kinds"] == ["response.defer"], clicked
 
 
 async def test_an_undo_s_own_clip_is_never_paced(retro):
@@ -2550,25 +2548,23 @@ async def test_a_state_the_core_will_not_take_back_is_reported_once(retro):
     assert not retro.control(view, "undo").disabled, "still clickable"
 
 
-async def test_an_undo_while_the_session_is_busy_says_to_try_again(retro):
+async def test_an_undo_while_the_session_is_busy_is_quietly_dropped(retro):
     """
-    Undo is never queued, so a click that cannot run has to say so.
+    Undo is never queued, and a click that cannot run says nothing.
 
     Queueing it would mean undoing a press its author never saw -- see
-    RetroView._undo -- so the click is refused. It used to be refused with a
-    bare defer, i.e. with nothing: clicking Undo and watching the message
-    carry on as though you had not is exactly the "did that register?"
-    failure the press queue was built to answer.
+    RetroView._undo -- so the click is refused. It is acknowledged and
+    nothing more: the press already being emulated posts its clip a moment
+    later, which answers the question by itself, and a whisper explaining
+    the refusal is one more thing to read for something the next picture
+    settles.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9213, "busyundo")
     await view._press(retro.interaction(view, message=view.message), "a")
     async with view.lock:
         interaction = await undo(retro, view)
-    assert interaction.kinds() == ["response.send_message"]
-    (_, said), = interaction.log
-    assert said["ephemeral"] is True, "only the person who clicked is told"
-    assert "Undo" in said["content"]
+    assert interaction.kinds() == ["response.defer"]
     assert view.history, "and the history was not touched"
 
 

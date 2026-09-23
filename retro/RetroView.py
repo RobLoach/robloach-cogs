@@ -2241,23 +2241,12 @@ class RetroView(SessionMixin, discord.ui.View):
         # working through it is not a reason to refuse an undo, and an undo
         # that runs is exactly what should throw that queue away.
         if self.running:
-            # Not queueable (see above), so this click is genuinely not going
-            # to happen -- which used to be answered with a defer that
-            # changes nothing on screen, i.e. with nothing at all. Clicking
-            # Undo and watching the message carry on as if you had not is the
-            # same "did that register?" failure the press queue exists to
-            # stop, so it is said out loud, privately, at the cost of one
-            # interaction response and no edits.
-            try:
-                await interaction.response.send_message(
-                    "A press is still being emulated, and Undo is deliberately "
-                    "never queued \N{EM DASH} stepping back through presses "
-                    "nobody has seen yet is how one undo becomes three. Click "
-                    "**Undo** again once the next clip appears.",
-                    ephemeral=True,
-                )
-            except discord.HTTPException:
-                log.debug("Could not answer a busy Undo click.", exc_info=True)
+            # Not queueable (see above), so this click is not going to happen.
+            # It is acknowledged and nothing else: the clip that is already
+            # being emulated lands a moment later and is the answer, so a
+            # whisper explaining the refusal is one more thing to read for
+            # something the next picture settles by itself.
+            await self._silent_ack(interaction)
             return
         if not self.history:
             try:
