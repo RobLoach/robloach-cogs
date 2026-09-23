@@ -102,7 +102,6 @@ from .systems import (
 )
 from .text import (  # noqa: F401  (re-exported)
     ACTION_NOTES,
-    ASLEEP_MARK,
     DROPPED_NOTE,
     HEADER,
     HEADER_SEPARATOR,
@@ -1468,18 +1467,29 @@ class RetroView(SessionMixin, discord.ui.View):
         """
         What game this is, and on what, in the few characters it deserves.
 
-        ``**µCity**``, plus ``· asleep`` while there is no core loaded. It is
-        the *stable* part of the one line the message carries, and it exists
-        because the line used to be nothing but "Rob pressed A." -- and, on
-        the first clip of a cold boot, nothing at all. Anybody scrolling into
-        the channel saw an animation, a grid of unlabelled arrows and a name,
-        with nothing anywhere saying what was being played.
+        ``**µCity**``, and nothing else. It is the *stable* part of the one
+        line the message carries, and it exists because the line used to be
+        nothing but "Rob pressed A." -- and, on the first clip of a cold
+        boot, nothing at all. Anybody scrolling into the channel saw an
+        animation, a grid of unlabelled arrows and a name, with nothing
+        anywhere saying what was being played.
 
         The console is deliberately no longer part of it; see HEADER.
 
+        **Whether the session is asleep is deliberately not part of it
+        either.** It used to append ``· asleep`` whenever no core was
+        loaded, which was accurate and unhelpful: sleeping is an
+        implementation detail of how this cog fits one emulator across every
+        channel, the controls stay live through it, and the next press wakes
+        the game with no more ceremony than any other press. Labelling a
+        perfectly usable controller "asleep" invites somebody to think it is
+        broken, or that they have to do something to it first. The wake
+        press says RESUMED_NOTE, which is the one moment the delay is worth
+        explaining.
+
         Deliberately not a status card: the card this cog used to have was
-        removed, and this is one line rather than a second attempt at it. See
-        HEADER and ASLEEP_MARK.
+        removed, and this is one line rather than a second attempt at it.
+        See HEADER.
 
         The game's name is escaped the same way a presser's is: it comes from
         a ROM filename, so it can perfectly well contain the underscores and
@@ -1487,8 +1497,6 @@ class RetroView(SessionMixin, discord.ui.View):
         """
         name = str(self.game_name or "Game")[:MAX_GAME_NAME]
         line = HEADER.format(game=escape_label(name))
-        if not self.live:
-            line = f"{line}{HEADER_SEPARATOR}{ASLEEP_MARK}"
         return line
 
     def _line(self, text: typing.Optional[str] = None) -> str:

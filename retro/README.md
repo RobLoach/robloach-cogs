@@ -316,9 +316,9 @@ between.
 **An idle timeout says nothing.** It clears whatever the last press wrote and
 leaves the header, rather than announcing itself — a game going quietly to
 sleep on its own is not an event, and a sentence about it would sit under the
-picture until somebody played again. The header still carries `· asleep` for
-anybody who looks. Being *evicted* by another channel is the opposite case and
-is still explained: that is something done to the game rather than by it.
+picture until somebody played again. Nothing marks the message as asleep
+either — see below. Being *evicted* by another channel is the opposite case
+and is still explained: that is something done to the game rather than by it.
 
 One game runs at a time across the whole bot. A libretro core is a shared
 library with global state, so two emulators running at once would corrupt each
@@ -771,7 +771,7 @@ was making anyway:
    grid of unlabelled arrows and "Rob pressed A." with nothing anywhere
    saying what was being played. It is not the status card this cog used to
    have and that is not coming back — it is a prefix on a line that already
-   existed. While the session is asleep it reads `**µCity** · asleep`;
+   existed. It is the game's name and nothing else, awake or asleep;
 2. **what just happened** — who pressed which button, or whatever had to be
    said instead (see below);
 3. **what is queued** behind it, which is the whole acknowledgement a queued
@@ -1197,12 +1197,16 @@ gone to sleep and come back, or a save state that could not be restored — and
 the next press rewrites it either way. See
 [What the message says](#what-the-message-says).
 
-**Whether the session is asleep is legible without an extra edit.** The edit
-that *puts* a game to sleep leaves `· asleep` on that line, so the message
-reads asleep for as long as it is one; the waking press's single edit takes
-the mark off and says *Woke up where you left off.* A wake is the longest wait
-in the cog (a core to load, a save state to restore), and both halves of
-saying so ride on edits that were happening anyway.
+**A sleeping session does not advertise itself.** The header used to gain a
+`· asleep` mark for as long as there was no core loaded. It was accurate and
+unhelpful: sleeping is an implementation detail of fitting one emulator
+across every channel, the controls stay live throughout, and the next press
+wakes the game with no more ceremony than any other press — so labelling a
+working controller "asleep" only invites somebody to think it is broken, or
+that they have to do something to it first. The one moment worth explaining
+is the wake itself, which is the longest wait in the cog (a core to load, a
+save state to restore), and the press that causes it says *Woke up where you
+left off.* on the edit it was making anyway.
 
 **The game only runs while a clip is being recorded.** Between one press and the
 next the console is frozen mid-frame — it is not ticking away in the background,

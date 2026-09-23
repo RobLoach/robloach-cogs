@@ -69,20 +69,19 @@ REPEAT_STALE_NOTE = (
 # the time anybody reads it the game is already back. Cleared by the next
 # press, like every other one-off line.
 #
-# It is only half of saying "this session is asleep", and it is the half that
-# arrives *late*: a wake is the longest wait in the cog (a core to dlopen, a
-# save state to load) and this line is written at the end of it. The other
-# half is ASLEEP_MARK, which the edit that *puts* the session to sleep leaves
-# on the header, so the message reads "asleep" for the whole time it is --
-# and the wake's one edit takes the mark off and adds this. Two states, two
-# edits that were happening anyway, no third one.
+# It is the *only* thing that says a session was asleep, and it arrives at
+# the one moment that is worth: a wake is the longest wait in the cog (a core
+# to dlopen, a save state to load), and this line is written at the end of it
+# on the edit that press was making anyway.
+#
+# There used to be a second half -- an ASLEEP_MARK appended to the header for
+# the whole time a session had no core -- and it is gone. It was accurate and
+# unhelpful. Sleeping is an implementation detail of fitting one emulator
+# across every channel: the controls stay live, and the next press wakes the
+# game with no more ceremony than any other press. Labelling a working
+# controller "asleep" invites somebody to think it is broken or that they
+# have to do something to it first, which is the opposite of true.
 RESUMED_NOTE = "Woke up where you left off."
-
-#: Appended to the header (see :meth:`RetroView.header`) whenever there is no
-#: core loaded for this session, which is exactly "asleep": stopped, evicted
-#: by another channel, idle-timed-out, or waiting out a bot restart. The next
-#: press wakes it, and the edit that press makes drops the mark again.
-ASLEEP_MARK = "asleep"
 
 #: How the game is named on the line above the clip. A stable prefix rather
 #: than a status card: the first clip of a cold boot used to go out with *no*

@@ -1234,22 +1234,23 @@ class RetroEnv:
     # form is pinned once, against a known game, in test_view.py.
 
     @staticmethod
-    def header(view, asleep=False):
-        """``**ucity**``, plus ``· asleep`` when it is.
+    def header(view):
+        """``**ucity**``, and nothing else.
 
-        The console used to be in here and is not any more; see HEADER.
+        The console used to be in here, and so did a `· asleep` marker while
+        the session had no core; neither is any more. See HEADER, and
+        RetroView.header for why the sleep marker went.
         """
-        line = f"**{view.game_name}**"
-        return f"{line} \N{MIDDLE DOT} asleep" if asleep else line
+        return f"**{view.game_name}**"
 
-    def line(self, view, text=None, asleep=False, suffixes=()):
+    def line(self, view, text=None, suffixes=()):
         """The whole content: header, what happened, then any suffixes.
 
         ``**ucity** · Tester pressed A. *Queued: ⬅️*`` -- one middle dot
         throughout, rather than a dot inside the header and an em dash in
         front of the sentence.
         """
-        parts = [self.header(view, asleep)]
+        parts = [self.header(view)]
         if text:
             parts.append(text)
         whole = " \N{MIDDLE DOT} ".join(parts)

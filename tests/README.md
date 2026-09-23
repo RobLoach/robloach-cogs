@@ -228,9 +228,11 @@ back off the view -- a test that agreed with whatever `RetroView._line` did
 would assert nothing -- and the literal form is pinned once, against a known
 game, in `test_the_line_names_the_game_before_anything_else`:
 `**ucity** · Tester pressed A.`, one middle dot throughout.
-`test_the_header_says_when_the_session_is_asleep` covers the other half:
-`· asleep` goes on by the edit that puts the game to sleep and comes off by
-the edit the waking press makes, so neither state costs an extra edit.
+`test_the_header_never_says_the_session_is_asleep` covers the other side:
+the header is the game's name whatever state the session is in. A `· asleep`
+mark used to go on it, and pinning its absence is what stops it coming back
+-- the wake press's *Woke up where you left off.* is the whole of what gets
+said now.
 
 The console used to sit between the two (`**ucity** · Game Boy — ...`) and the
 queue listing used to name the presser (`*Queued: Ada ⬅️*`). Both are gone from

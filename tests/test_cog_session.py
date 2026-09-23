@@ -512,29 +512,31 @@ async def test_the_line_names_the_game_before_anything_else(retro):
     )
 
 
-async def test_the_header_says_when_the_session_is_asleep(retro):
-    """Legible while asleep, and legible again the moment it wakes.
+async def test_the_header_never_says_the_session_is_asleep(retro):
+    """The header is the game's name and nothing else, awake or not.
 
-    Both halves ride on edits that were happening anyway: the one that puts
-    the session to sleep, and the one the waking press makes. See
-    ASLEEP_MARK and RESUMED_NOTE.
+    It used to append `· asleep` whenever there was no core loaded. That was
+    accurate and unhelpful: the controls stay live through a sleep and the
+    next press wakes the game with no more ceremony than any other press, so
+    labelling a working controller "asleep" only invites somebody to think
+    it is broken. The wake press says RESUMED_NOTE, which is the one moment
+    the delay is worth explaining.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(8411, "sleepy")
-    assert "asleep" not in view.header
+    assert view.header == "**sleepy**"
 
     await retro.cog.hibernate(view, "Put to sleep.")
     assert not view.live
-    assert view.header == "**sleepy** \N{MIDDLE DOT} asleep"
-    # ...and that header is on the message the sleep edited, unasked.
+    assert view.header == "**sleepy**", "the header must not change with state"
     said = retro.message_edit(view)["content"]
-    assert said.startswith(view.header) and "Put to sleep." in said
+    assert "asleep" not in said and "Put to sleep." in said
 
     interaction = retro.interaction(view, message=view.message)
     await view._press(interaction, "a")
     woken = interaction.log[-1][1]["content"]
     assert "asleep" not in woken
-    assert retro.viewmod.RESUMED_NOTE in woken
+    assert retro.viewmod.RESUMED_NOTE in woken, "the wake is what gets said"
 
 
 async def test_a_one_off_notice_is_shown_once_and_then_forgotten(retro):
@@ -2681,8 +2683,8 @@ async def test_a_press_resumes_a_sleeping_session_and_says_so_once(retro):
     landed = interaction.log[-1][1]
     assert landed["content"] == retro.line(view, retro.viewmod.RESUMED_NOTE)
     assert "Woke up" in landed["content"]
-    # The header no longer says "asleep", because it is not: both halves of
-    # "what state is this session in" ride on edits that happen anyway.
+    # Nothing anywhere says "asleep": the header never carries it, and the
+    # wake is announced by RESUMED_NOTE alone.
     assert "asleep" not in landed["content"]
     assert not landed["has_embed"]
     assert landed["n_attachments"] == 1, "and the clip came with it"
@@ -2911,9 +2913,10 @@ async def test_retrosleep_saves_frees_and_keeps_the_session(retro):
     stopped = view.message.edits[-1] if view.message.edits else {}
     said = stopped.get("content") or ""
     assert "Put to sleep by Tester." in said
-    # The header on that same edit says the session is asleep, which is the
-    # state it will be in until somebody presses something.
-    assert said.startswith(retro.header(view, asleep=True)), said
+    # The header on that same edit is the game's name, unchanged: a sleeping
+    # session does not advertise itself. See RetroView.header.
+    assert said.startswith(retro.header(view)), said
+    assert "asleep" not in said
     assert "embed" not in stopped
 
 
@@ -3842,11 +3845,12 @@ async def test_a_game_that_falls_asleep_by_itself_clears_its_line(retro):
 
     assert not view.live
     content = view.message.edits[-1]["content"]
-    assert content == retro.line(view, asleep=True), content
-    # The press line is gone, and nothing replaced it.
+    assert content == retro.line(view), content
+    # The press line is gone, and nothing replaced it -- not a sentence, and
+    # not a marker on the header either.
     assert "pressed" not in content
     assert "Asleep after" not in content
-    assert "minutes" not in content
+    assert "asleep" not in content
 
 
 async def test_an_evicted_game_still_explains_itself(retro):
