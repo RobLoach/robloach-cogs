@@ -448,15 +448,15 @@ class System(typing.NamedTuple):
 # claiming these two meant a session that started, showed nothing, and looked
 # like a broken cog rather than an unsupported file.
 #
-# ".bin" used to be excluded because three of the cores here claimed it
-# (stella2014, mednafen_vb and genesis_plus_gx); with the first two gone only
-# genesis_plus_gx claims it, so it is no longer ambiguous *within this set*.
-# It stays out anyway, because the ambiguity was never really about our core
-# list: ".bin" is the one extension that carries no console information at
-# all. An Atari 2600 cartridge, a Mega Drive ROM, a Virtual Boy ROM, a raw CD
-# track and a BIOS dump are all ".bin" in the wild, so accepting it would
-# mean silently loading somebody's PlayStation disc track as a Mega Drive
-# game. Genesis ROMs should be named ".md" instead.
+# ".bin" is refused even though exactly one core here claims it
+# (genesis_plus_gx), which makes it the one entry in this set that is not
+# about a collision at all. It is about the extension itself: ".bin" carries
+# no console information whatsoever. An Atari 2600 cartridge, a Mega Drive
+# ROM, a Virtual Boy ROM, a raw CD track and a BIOS dump are all ".bin" in
+# the wild, so claiming it would mean silently loading somebody's PlayStation
+# disc track as a Mega Drive game and showing them the result. Genesis ROMs
+# should be named ".md" instead, which is what the unsupported-extension
+# reply tells people.
 AMBIGUOUS_EXTENSIONS = frozenset(
     {"bin", "cue", "iso", "chd", "toc", "m3u", "ccd", "img", "fds", "bs", "st"}
 )
