@@ -756,15 +756,15 @@ async def test_a_press_that_lands_mid_emulation_is_queued_rather_than_dropped(re
     assert queued_names(view) == ["B", "A x3", "wait"]
 
 
-async def test_a_full_queue_says_so_rather_than_swallowing_the_click(retro):
+async def test_a_press_with_no_room_left_is_quietly_dropped(retro):
     """
-    The other refusal, and the reason both are worth a sentence.
+    A full queue refuses the click and says nothing about it.
 
-    A press that cannot be queued is a press that will never happen, and the
-    two reasons it can be refused are genuinely different things to be told:
-    "wait your turn" and "you are already in the queue". Both used to be
-    answered with a defer that changes nothing on screen -- i.e. with
-    nothing.
+    The queue is already listed on the message (see queue_note), so a full
+    one is visible to anybody who looks, and the moment somebody is clicking
+    fast enough to fill it is the worst moment to answer every click with a
+    message of its own. The click is acknowledged so Discord never shows
+    "interaction failed", and that is all.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9011, "full")
@@ -783,10 +783,8 @@ async def test_a_full_queue_says_so_rather_than_swallowing_the_click(retro):
         )
         await view._press(latecomer, "b")
 
-    assert latecomer.kinds() == ["response.send_message"]
-    (_, said), = latecomer.log
-    assert said["ephemeral"] is True
-    assert str(retro.viewmod.MAX_QUEUED_PRESSES) in said["content"]
+    # Acknowledged and nothing else -- no ephemeral, no edit of the message.
+    assert latecomer.kinds() == ["response.defer"]
     assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES, "and nothing jumped in"
 
 

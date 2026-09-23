@@ -1819,16 +1819,17 @@ class RetroView(SessionMixin, discord.ui.View):
             # between two of them). Take this one down and answer with a
             # plain defer: the acknowledgement is the suffix the running
             # press's own edit puts on the line, which costs no edit here.
-            if not self.enqueue_press(interaction, field, repeat):
-                # Refused, which used to be indistinguishable from accepted:
-                # the click got the same contentless defer either way, so a
-                # full queue looked exactly like the controller ignoring you
-                # -- the complaint the queue was built to fix. Whoever
-                # clicked is told why, privately, and nobody else sees
-                # anything. See _refusal_note.
-                await self._whisper_refusal(interaction)
-                return
+            #
+            # A press with no room left in the queue gets exactly the same
+            # answer and is simply dropped. It is deliberately not explained:
+            # the queue is already listed on the message (see queue_note), so
+            # a full one is visible to anybody who looks, and a whisper per
+            # refused click is a message per click at the very moment
+            # somebody is clicking fastest.
+            queued = self.enqueue_press(interaction, field, repeat)
             await self._silent_ack(interaction)
+            if not queued:
+                return
             # A queue with nothing working through it strands every entry in
             # it and makes `busy` permanently true; see :attr:`busy`. It is
             # not supposed to happen, and it did -- so rather than trusting
@@ -2040,32 +2041,6 @@ class RetroView(SessionMixin, discord.ui.View):
             )
         except discord.HTTPException:
             log.debug("Could not answer a hidden repeat click.", exc_info=True)
-            await self._silent_ack(interaction)
-
-    def _refusal_note(self) -> str:
-        """
-        Why a press could not be queued, in a sentence for whoever clicked.
-
-        There is only one reason left. A closed session is answered before
-        this is reached (see :meth:`_replaced_ack`), and the per-person limit
-        that used to be the other reason is gone -- one person may hold every
-        slot now, so the only way to be refused is that the queue is full.
-        Saying so beats the contentless acknowledgement this used to be,
-        which was indistinguishable from the controller ignoring the click.
-        """
-        return (
-            f"{MAX_QUEUED_PRESSES} presses are already waiting, so this one "
-            "was not added. They play in order, a clip each \N{EM DASH} try "
-            "again once the queue has cleared."
-        )
-
-    async def _whisper_refusal(self, interaction: discord.Interaction) -> None:
-        """Tell just the clicker why their press was not queued."""
-        note = self._refusal_note()
-        try:
-            await interaction.response.send_message(note, ephemeral=True)
-        except discord.HTTPException:
-            log.debug("Could not answer a refused Libretro press.", exc_info=True)
             await self._silent_ack(interaction)
 
     async def _ack_now(self, interaction: discord.Interaction) -> None:

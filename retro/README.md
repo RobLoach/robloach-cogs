@@ -810,12 +810,12 @@ Four rules, and each of them is there for a reason:
   dead for exactly the person using it most. The depth cap above is what
   bounds the queue now, and it bounds it the same way whoever is clicking:
   five waiting is five waiting, and somebody who fills all five only ever
-  costs themselves the wait for their own presses to play. **A refusal is said, privately**:
-  whoever clicked is told the queue is full, which nobody else sees and which
-  costs no edit of the game's message. It used to be answered with the same
-  contentless acknowledgement an accepted press gets, so a refused click and
-  a queued one looked identical — which is the "controller feels dead"
-  complaint the queue was built to answer, reintroduced at its edge;
+  costs themselves the wait for their own presses to play. **A press with no
+  room left is quietly dropped**: the click is acknowledged so Discord never
+  shows "interaction failed", and nothing else is said. The queue is already
+  on the message for anybody who looks, and the moment somebody is clicking
+  fast enough to fill it is the worst possible moment to answer every click
+  with a message of its own;
 * **every waiting press is visible.** An input nobody can see is an input that
   feels lost, which is the whole complaint. The queue is listed as a suffix on
   the very line the running press is already rewriting, so it costs **no extra
