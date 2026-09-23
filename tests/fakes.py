@@ -1061,9 +1061,11 @@ class RetroEnv:
         #: fake was reached rather than merely installed.
         self.data_path_calls = []
         # Pacing, recorded rather than spent. A clip is not replaced until it
-        # has had its playing time on screen (see MAX_PACE_SECONDS), which at
-        # the default clip length is a real second per press -- far too much
-        # to pay in a suite that makes hundreds of them. So the one place
+        # has had its whole playing time on screen (see the note above
+        # MAX_PACE_SECONDS in retro/timing.py), which at the default clip
+        # length is a real second per press -- far too much to pay in a suite
+        # that makes hundreds of them, and a whole clip per press at any
+        # setting above it now that the 1.25s cap is gone. So the one place
         # pacing spends time is swapped for a recorder: the gate itself still
         # runs, every delay it asks for is kept here and in
         # ``view.last_pace_seconds``, and nothing waits. The tests that are

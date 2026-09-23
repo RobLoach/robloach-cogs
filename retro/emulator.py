@@ -1271,8 +1271,18 @@ class RetroEmulator:
         # because the cog has to know the same total *before* it has a clip:
         # an edit does not replace the clip already on the message until that
         # one has had its playing time on screen (see MAX_PACE_SECONDS in
-        # retro/RetroView.py), and "how long does it play for" must be the
-        # same question there as here.
+        # retro/timing.py), and "how long does it play for" must be the same
+        # question there as here.
+        #
+        # What this loop produces still plays for exactly as long as it
+        # emulated. One thing downstream may shorten it, and only in one
+        # direction: RetroView drops any opening picture that is byte
+        # identical to the still already on the message, along with its
+        # duration, so the clip opens on something the viewer has not just
+        # spent a picture looking at (see clips.trim_repeated_opening). That
+        # happens after this, on the captured value, and it drops playback
+        # and never emulation -- every frame below is still run exactly once
+        # and the window's last frame is still the picture the clip ends on.
         plan = dict(clip_plan(core_fps, frames, fps))
         durations: typing.List[int] = []
         # `index` counts the clip's own frames and is the only counter there

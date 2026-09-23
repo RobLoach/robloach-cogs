@@ -41,7 +41,12 @@ from pathlib import Path
 import discord
 from redbot.core import commands
 
-from .clips import shrink_clip
+from .clips import (
+    captured_playback,
+    picture_hash,
+    shrink_clip,
+    trim_repeated_opening,
+)
 from .emulator import (
     CLIP_EXTENSION,
     CLIP_SECONDS,
@@ -146,10 +151,26 @@ DEFAULT_TIMEOUT_MINUTES = 10
 # So a click that cannot run now is queued instead, under four rules that are
 # each there for a reason:
 #
-# * **at most MAX_QUEUED_PRESSES waiting.** Each one costs a second, and a
-#   queued press is emulated against a game state its author has not seen
-#   yet. Three waiting plus the one running is about four seconds of latency,
-#   which is the most that is still recognisably "I pressed that".
+# * **at most MAX_QUEUED_PRESSES waiting.** Each one costs a whole clip, and
+#   a queued press is emulated against a game state its author has not seen
+#   yet. Five waiting plus the one running is about six seconds of latency at
+#   the one second default -- the last person to click waits that long to
+#   find out what their press did.
+#
+#   It was three, on the reasoning that four seconds was the most that is
+#   still recognisably "I pressed that". Five is a deliberate trade made
+#   after the per-person limit came off: what people actually do with a
+#   d-pad is tap it several times in a row, and a run of four or five taps
+#   is one intent rather than five, so a depth that cannot hold a whole run
+#   refuses the tail of it. The latency is the honest price and it is paid
+#   by whoever queued the run.
+#
+#   It multiplies with the clip length, which is the part worth watching:
+#   every edit now waits out the whole clip it replaces (see
+#   MAX_PACE_SECONDS in retro/timing.py), so a full drain takes about
+#   MAX_QUEUED_PRESSES * cliplength -- five seconds at the default, and
+#   twenty-five at the five second ceiling. Both numbers in that product are
+#   the owner's own settings.
 # * **first come, first served, whoever it is.** There is deliberately no
 #   per-person limit any more. There used to be one -- one waiting press
 #   each -- on the theory that it made a roomful of people take turns
@@ -158,9 +179,9 @@ DEFAULT_TIMEOUT_MINUTES = 10
 #   is four clicks in a row, and the second, third and fourth were all
 #   refused because the first was still waiting, so the controller went back
 #   to feeling dead for exactly the person using it most. Taking turns is
-#   what the cap above already does -- three waiting is three waiting
-#   whoever queued them, and a fast clicker filling all three only ever
-#   costs themselves the next three seconds.
+#   what the cap above already does -- five waiting is five waiting whoever
+#   queued them, and a fast clicker filling all five only ever costs
+#   themselves the wait for their own presses to play.
 # * **every waiting press is visible.** An input nobody can see is an input
 #   that feels lost, which is the whole complaint. The queue is listed as a
 #   suffix on the very line the running press is already rewriting, so it
@@ -176,7 +197,7 @@ DEFAULT_TIMEOUT_MINUTES = 10
 # deferred interaction -- a component defer is a DEFERRED_UPDATE_MESSAGE and
 # leaves edit_original_response available for the next fifteen minutes -- so
 # "one press, one edit" still holds exactly.
-MAX_QUEUED_PRESSES = 3
+MAX_QUEUED_PRESSES = 5
 
 #: How many different people one replaced controller will explain itself to.
 #:
@@ -218,6 +239,32 @@ class Pending(typing.NamedTuple):
     field: typing.Optional[str]
     repeat: int
     epoch: int
+
+
+class EncodedClip(typing.NamedTuple):
+    """
+    The two facts about a clip that only the encode knows, carried forward.
+
+    :meth:`RetroView._encode` runs in a worker thread and hands back nothing
+    but bytes (``Retro.run_press`` is the caller, and that is its contract),
+    so the two numbers the *session* needs from it ride here instead until
+    the edit either goes through or does not. Both are about the clip that is
+    really going out rather than the window it was captured from, which is
+    the distinction :func:`trim_repeated_opening` introduces.
+
+    ``playback`` is what the next edit is paced against; ``last_picture`` is
+    :func:`picture_hash` of the still this clip will leave in the channel,
+    which is what the next clip's opening is compared against.
+
+    Promoted by :meth:`RetroView.note_posted`, i.e. only once the edit has
+    succeeded, and dropped on the floor when it has not: a clip Discord
+    refused is not on anybody's screen, and the picture that is still there
+    is the one before it.
+    """
+
+    playback: float
+    last_picture: typing.Optional[bytes]
+
 
 # Writing a save state costs a few milliseconds and a couple of hundred
 # kilobytes of disk, so it happens every few presses rather than every press.
@@ -697,6 +744,19 @@ class RetroView(discord.ui.View):
         # above MAX_PACE_SECONDS.
         self._posted_at: float = 0.0
         self._posted_playback: float = 0.0
+        # The still the last posted clip left in the channel, as a
+        # picture_hash and never as pixels: a SNES hi-res frame is 688 KiB
+        # and this is per channel, for the life of the session. It is what
+        # the next clip's opening pictures are compared against so that none
+        # of the previous clip is shown again; see _encode and
+        # clips.trim_repeated_opening. None means "nothing on screen is this
+        # session's own to compare with", which is where it starts and what
+        # forget_pacing puts it back to.
+        self._last_picture: typing.Optional[bytes] = None
+        # What the most recent _encode measured about the clip it produced,
+        # waiting for the edit that posts it to make it true. See EncodedClip
+        # and note_posted.
+        self._encoded: typing.Optional[EncodedClip] = None
         # Set to release a pacing wait that is already in progress, and
         # cleared by the edit that posts the next clip. Only ever set on the
         # event loop; see cancel_pacing and forget_pacing.
@@ -946,7 +1006,11 @@ class RetroView(discord.ui.View):
         screen: at the default second a Game Boy clip is 60 frames, emulates
         1.0046 seconds and plays for 1.005. See :func:`playback_seconds`.
 
-        This is the number a clip is paced against; see the pacing note in
+        A property of the *window*, so it is answerable before anything has
+        been captured, which is what a session that has not encoded a clip
+        yet needs. A clip whose opening was trimmed as already-on-screen
+        plays for less than this, and that is what :meth:`posted_playback`
+        reads; the pacing gate uses that one. See the pacing note in
         retro/timing.py, above MAX_PACE_SECONDS.
         """
         fps = self.fps if emulator is None else emulator.fps
@@ -1322,7 +1386,24 @@ class RetroView(discord.ui.View):
     #
     # See the note above MAX_PACE_SECONDS in retro/timing.py for the
     # measurements and the rule.
-    # Three small methods and one await, and none of them touches a lock.
+    # Four small methods and one await, and none of them touches a lock.
+
+    def posted_playback(self) -> float:
+        """
+        How long the clip that is about to go on the message plays for.
+
+        :meth:`clip_playback` is the same question asked of the *window* --
+        answerable at any time, and what a session that has not encoded
+        anything yet has to fall back on. This is the figure read off the
+        clip that was really encoded, which is shorter by exactly the
+        durations :func:`trim_repeated_opening` dropped when a clip opened on
+        the still already in the channel.
+
+        Paired with :meth:`note_posted`, which is the only caller that
+        matters: the edit reads this, posts, and then says it posted.
+        """
+        encoded = self._encoded
+        return self.clip_playback() if encoded is None else encoded.playback
 
     def note_posted(self, playback: float) -> None:
         """
@@ -1333,9 +1414,18 @@ class RetroView(discord.ui.View):
         edit has gone through, because that is when the clip starts playing
         in somebody's client rather than when it was encoded.
 
+        This is also where the still that clip will leave in the channel
+        becomes the one the *next* clip's opening is compared against, for
+        the same reason and at the same moment: an edit that Discord refused
+        put nothing on anybody's screen, so its :class:`EncodedClip` is
+        dropped here unpromoted and the picture from the edit before it stays
+        the one on screen. See :meth:`_encode`.
+
         Also clears the release flag: a new clip is a fresh start, and the
         reason the last wait was cut short does not apply to this one.
         """
+        encoded, self._encoded = self._encoded, None
+        self._last_picture = None if encoded is None else encoded.last_picture
         self._posted_at = time.monotonic()
         self._posted_playback = max(0.0, float(playback))
         self._pace_release.clear()
@@ -1350,13 +1440,24 @@ class RetroView(discord.ui.View):
         goes out immediately rather than waiting behind the one they have
         just made wrong.
 
+        The remembered still goes with it, and for the same reason: a picture
+        this session is no longer entitled to call its own must not be
+        allowed to trim the opening off the clip that replaces it. That is
+        what stops a stale hash from cutting the first clip after a wake --
+        every path that takes the game away (sleep, reboot, undo, retire,
+        eviction, unload) comes through here or through
+        :meth:`cancel_pacing`. The clip that has been *encoded* but not yet
+        posted is deliberately left alone: it is not on screen, so it is not
+        what this is about.
+
         Safe from a worker thread, which is why it is separate from
-        :meth:`cancel_pacing`: it writes one float and nothing else. It
-        cannot release a wait that is already in progress, and it does not
-        have to -- both callers run under :attr:`lock`, which a waiting press
-        is holding.
+        :meth:`cancel_pacing`: it writes two plain attributes and nothing
+        else. It cannot release a wait that is already in progress, and it
+        does not have to -- both callers run under :attr:`lock`, which a
+        waiting press is holding.
         """
         self._posted_playback = 0.0
+        self._last_picture = None
 
     def cancel_pacing(self) -> None:
         """
@@ -1385,12 +1486,19 @@ class RetroView(discord.ui.View):
 
         Zero -- meaning "go now" -- whenever nothing is playing, the session
         is finished with, or the clip has already played through. Otherwise
-        the time left on it, capped at MAX_PACE_SECONDS.
+        **all** of the time left on it, however long the clip is.
+
+        MAX_PACE_SECONDS bounds the answer, but it is a second clear of the
+        longest clip this cog can be asked to make, so it only ever bites on
+        a ``_posted_playback`` no clip could have produced. It used to be
+        1.25 seconds flat, which truncated every clip above that length and
+        jumped the player forward over the footage it cut; see the pacing
+        note in retro/timing.py for the measurements.
         """
         if self.closed or self._posted_playback <= 0.0:
             return 0.0
         left = (self._posted_at + self._posted_playback) - time.monotonic()
-        return min(max(0.0, left), max(0.0, MAX_PACE_SECONDS))
+        return max(0.0, min(left, max(0.0, MAX_PACE_SECONDS)))
 
     async def pace(self) -> None:
         """
@@ -1725,6 +1833,13 @@ class RetroView(discord.ui.View):
         hibernate, which has just cancelled pacing on purpose, and whose next
         press is a wake: a core to load and a save state to restore, which
         takes far longer than any clip plays for.
+
+        Not re-arming the gate also means not re-remembering the still: the
+        clip kept here is one this session has stopped being able to reason
+        about, and its picture must not be allowed to trim the opening off
+        the first clip after the wake. That is the same ``cancel_pacing`` the
+        hibernate already made, in the same order -- it happens before this
+        edit is queued. See :meth:`forget_pacing`.
         """
         message = await self.resolve_message()
         if message is None:
@@ -1767,7 +1882,7 @@ class RetroView(discord.ui.View):
                 allowed_mentions=NO_PINGS,
             )
             # The next press paces itself against this clip; see note_posted.
-            self.note_posted(self.clip_playback())
+            self.note_posted(self.posted_playback())
         except discord.HTTPException:
             log.warning(
                 "Failed to put a new clip on the Libretro message in channel %s.",
@@ -1841,7 +1956,7 @@ class RetroView(discord.ui.View):
         self.message_id = self.message.id
         # The first clip is playing from here, so the first press is paced
         # against it exactly as every later one is; see note_posted.
-        self.note_posted(self.clip_playback())
+        self.note_posted(self.posted_playback())
         return self.message
 
     async def start(
@@ -1915,7 +2030,17 @@ class RetroView(discord.ui.View):
     def _record(
         self, emulator: RetroEmulator, field: typing.Optional[str], repeat: int = 1
     ) -> bytes:
-        return emulator.encode_captured(self._capture(emulator, field, repeat))
+        """Capture and encode in one call, for a caller with one emulator.
+
+        Goes through :meth:`_encode` rather than straight to
+        ``encode_captured`` so that the clip it produces is measured and
+        remembered like any other. That matters for the one caller that is
+        not a press: :meth:`_boot` makes the first clip of a session, and
+        without this the still it leaves in the channel would not be
+        remembered, so the *first press* of every game would be the one press
+        whose opening could not be trimmed.
+        """
+        return self._encode(self._capture(emulator, field, repeat), emulator=emulator)
 
     def capture_press(self, field: typing.Optional[str], repeat: int = 1):
         """
@@ -1985,10 +2110,19 @@ class RetroView(discord.ui.View):
         (emulate, encode, upload), spends the press, and answers with advice
         aimed at the bot owner rather than at the person who pressed the
         button. See :func:`clips.shrink_clip` for what is given up, in order.
+
+        **This is also where a clip's opening is trimmed of the picture that
+        is already on screen**, because this is the one place the captured
+        clip is in hand and the core is not needed: it costs no emulation and
+        no core time, and it runs on the worker thread that was going to
+        spend tens of milliseconds encoding anyway. See :meth:`_trim_opening`
+        for the rules and :func:`clips.trim_repeated_opening` for why there
+        are any.
         """
         emulator = emulator if emulator is not None else self.emulator
         if emulator is None:
             raise EmulatorError("The emulator is not running.")
+        captured = self._trim_opening(captured)
         clip = emulator.encode_captured(captured)
         if limit and len(clip) > limit:
             log.info(
@@ -2005,6 +2139,55 @@ class RetroView(discord.ui.View):
             if smaller is not None and len(smaller) < len(clip):
                 clip = smaller
         return clip
+
+    def _trim_opening(self, captured):
+        """
+        Cut the opening the viewer is already looking at, and measure what is
+        left.
+
+        **The owner's requirement is that none of the previous clip is shown
+        in the new one**, and pacing alone does not get there: the shutter
+        falls ``step`` frames into the window (four on a Game Boy at
+        CLIP_FPS), and a core slower than that to react -- mgba takes eleven
+        frames -- opens its clip on a picture byte-identical to the still
+        sitting in the channel. Those pictures are dropped here, with their
+        durations, so the clip opens on something new. The final picture is
+        never dropped and a frozen screen is left whole;
+        :func:`clips.trim_repeated_opening` carries the rules and the reasons.
+
+        Whatever comes back is then *measured* rather than assumed: the clip
+        no longer necessarily plays for as long as its window emulated, so
+        the pacing deadline has to come from the durations that are really
+        being encoded. Both numbers are parked in :attr:`_encoded` for
+        :meth:`note_posted` to promote once the edit has actually landed.
+
+        Runs in a worker thread (see :meth:`_encode`), and writes exactly one
+        attribute of the session, which is the same discipline
+        :meth:`forget_pacing` follows. The session's own lock is held by the
+        press this belongs to throughout, so nothing else is producing a clip
+        for this view at the same time.
+        """
+        trimmed = trim_repeated_opening(captured, self._last_picture)
+        images = getattr(trimmed, "images", None)
+        if not images:
+            # A stand-in emulator that carries finished bytes rather than
+            # pictures; there is nothing to measure and nothing to remember,
+            # so the window's own arithmetic stands. See posted_playback.
+            self._encoded = None
+            return trimmed
+        self._encoded = EncodedClip(
+            captured_playback(trimmed), picture_hash(images[-1])
+        )
+        dropped = len(captured.images) - len(images)
+        if dropped:
+            log.debug(
+                "Dropped %s opening picture(s) of a clip in channel %s: the "
+                "game had not answered the button yet, so they were the "
+                "still already on the message.",
+                dropped,
+                self.channel_id,
+            )
+        return trimmed
 
     def upload_limit(self) -> typing.Optional[int]:
         """
@@ -2426,7 +2609,7 @@ class RetroView(discord.ui.View):
             # This clip is now the one playing, so it is the one the next
             # edit is paced against. After the edit, not before: what is
             # being timed is the picture on somebody's screen.
-            self.note_posted(self.clip_playback())
+            self.note_posted(self.posted_playback())
         except discord.HTTPException as error:
             # The game itself is fine, so say so rather than leaving the
             # controls looking broken. The traceback goes to the log: this is

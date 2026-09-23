@@ -635,8 +635,25 @@ rather than a stutter — and it is the truth about the game.
 
 A core slower than one picture can still open on a repeat: mgba's eleven
 frames is nearly three pictures, so a Game Boy Advance clip may hold its
-opening picture once or twice before the game answers. There is no honest way
-to remove that, only to show it.
+opening picture once or twice before the game answers, and so can any console
+on a game that takes its time about a text box.
+
+**Those repeats are dropped from the clip, and only those.** An opening
+picture that is byte-identical to the still the previous clip left sitting in
+the channel is the viewer looking at the same frame twice, so it is left out
+of the clip along with the time it would have been shown for. Two rules keep
+that safe, and both are what a previous attempt at this got wrong:
+
+* the clip's **final** picture is never dropped — it is the exact state the
+  next clip carries on from — so a clip is never emptied;
+* a clip in which **nothing** moved is left completely alone. The game really
+  has not moved and the clip saying so for its whole length is the honest
+  answer. Trimming that case down to the one picture the rule above obliges
+  it to keep is how a 1005ms clip once played as a 17ms flash.
+
+Nothing is skipped to achieve it: this drops *playback*, never emulation.
+Every frame of the window is still run, once, in order, and the clip still
+ends on the window's final frame, so the seam above is untouched.
 
 **The frame rate is not a lever on any of this**, which is the first thing
 tried. A clip photographs its window's final frame whatever the sampling
@@ -650,13 +667,19 @@ the frame rate.
 A clip with no input in it — **Wait**, **Undo**, a boot, `[p]retroreboot` —
 always resumed on the very next frame and is unchanged.
 
-**A clip plays for exactly as long as it emulated** — start to finish, with
-nothing dropped off either end. Not "about as long", and not "as much of it as
-had something new in it". A second of clip is a second of console. That is
-also what rules out the other fix that was tried for the original report: a
-*trim* of the clip's leading duplicate pictures, which on a static screen
-wants to trim everything and leave the single picture it is obliged to keep —
-a 1005ms clip played as a 17ms flash.
+**A clip plays for as long as it emulated, minus any opening you were already
+looking at.** That is the whole of the exception, and it is worth stating
+precisely because the rule used to have none. The recording itself still
+covers its window start to finish with nothing dropped off either end: a
+picture stands for the frames ending on it, and the durations tile the window
+with no hole and no overlap. The only thing that ever comes off is a run of
+opening pictures identical to the still already on the message, and that time
+is not lost to you — the message edit is held back until the clip on screen
+has played in full, so you really did spend it looking at that very picture.
+
+It is emphatically not "as much of the clip as had something new in it". A
+clip of a game that never moves is a full-length clip of a game that never
+moves.
 
 `tests/test_emulator.py` holds all of it against real cores: the timing rule,
 the tables above, the static screen that must still get a whole clip, the
@@ -746,10 +769,17 @@ a direction, nothing happens, press it again.
 
 Four rules, and each of them is there for a reason:
 
-* **at most three presses wait.** Each one is a second of latency, and a
+* **at most five presses wait.** Each one is a whole clip of latency, and a
   queued press is emulated against a game state its author has not seen yet.
-  Three waiting plus the one running is about four seconds, which is the most
-  that is still recognisably "I pressed that";
+  Five waiting plus the one running is about six seconds at the one second
+  default — the last person to click waits that long to see what their press
+  did. It was three, on the reasoning that four seconds was the limit of
+  "I pressed that"; five is a deliberate trade for the thing people actually
+  do with a d-pad, which is tap it several times in a row. A depth that
+  cannot hold a whole run refuses the tail of it. Note that it multiplies
+  with the clip length, since every edit waits out the clip it replaces: a
+  full drain is about five clips, so five seconds at the default and
+  twenty-five at the five second ceiling;
 * **first come, first served, and one person may hold every slot.** There
   used to be a one-waiting-press-per-person rule, on the theory that it made
   a group take turns. What it actually did was break the commonest way one
@@ -758,8 +788,8 @@ Four rules, and each of them is there for a reason:
   because the first was still waiting. The controller went back to feeling
   dead for exactly the person using it most. The depth cap above is what
   bounds the queue now, and it bounds it the same way whoever is clicking:
-  three waiting is three waiting, and somebody who fills all three only ever
-  costs themselves the next three seconds. **A refusal is said, privately**:
+  five waiting is five waiting, and somebody who fills all five only ever
+  costs themselves the wait for their own presses to play. **A refusal is said, privately**:
   whoever clicked is told the queue is full, which nobody else sees and which
   costs no edit of the game's message. It used to be answered with the same
   contentless acknowledgement an accepted press gets, so a refused click and
@@ -841,15 +871,42 @@ because the animation never reached that picture before the next clip landed
 on top of it. What that looks like from the channel's side is the picture
 lurching, and it was reported as the clip "going back a bit".
 
-So the **edit** now waits for the clip it is replacing to finish playing. The
-same drain, unchanged in every other respect:
+So the **edit** now waits for the clip it is replacing to finish playing — all
+of it, at every clip length. The same drain, unchanged in every other respect:
 
 | | 4 clips (one press plus a full queue of three) | each clip on screen |
 | --- | --- | --- |
 | before | 207 ms | 42–68 ms of 1005 ms |
 | after | 3.08 s | 1006–1007 ms |
 
-Four things keep that from costing anything it should not:
+**The wait used to be capped at 1.25 seconds, and that cap was itself a
+stutter.** It is gone. A clip cut off part-played is not merely a shorter
+pause: the next clip picks the console up one frame after the truncated one's
+last *emulated* frame, not after the last frame you saw, so you were jumped
+forward over footage that was emulated, encoded, uploaded and then painted
+over. And because the gap grew with the clip length, it was exactly the
+complaint that a long `cliplength` still stuttered:
+
+| cliplength | plays for | old wait | you never saw |
+| --- | --- | --- | --- |
+| 1 s (default) | 1.005 s | 1.005 s | — |
+| 1.5 s | 1.507 s | 1.25 s | 0.26 s |
+| 2 s | 1.993 s | 1.25 s | 0.74 s |
+| 4 s | 4.003 s | 1.25 s | **2.75 s** |
+| 5 s (max) | 5.008 s | 1.25 s | 3.76 s |
+
+What that costs is the drain, and it is said plainly rather than hidden: a
+full queue is three presses behind the one running, so draining it takes
+about three clips — three seconds at the default (unchanged: 1.005 was always
+under the old cap), twelve at four seconds, fifteen at the five second
+ceiling. That is the right way round. A clip nobody is allowed to finish
+watching is emulation, encoding and upload spent on frames no human ever
+sees, and both numbers in that product are already yours: `cliplength` says
+how long a press is worth watching, and the queue depth says how many presses
+may be lined up. Every waiting press is listed on the message while it waits,
+so a channel that has queued fifteen seconds of play can see that it has.
+
+Four things keep the waiting from costing anything it should not:
 
 * **a press that arrives when nothing is playing is still instant.** One
   person pressing a button and watching the result — which is most play — is
@@ -867,13 +924,11 @@ Four things keep that from costing anything it should not:
   that tells another channel its game went to sleep. Each of those used to be
   done while holding the core, which meant one channel's slow Discord request
   or fsync was latency charged to every other channel's presses;
-* **no edit is held for more than 1.25 seconds.** A default clip really plays
-  for 1.005s, so at the length this cog is played at every clip is paced in
-  full — but `[p]retroset cliplength` reaches 5 seconds, and pacing a full
-  queue of those strictly would be 15 seconds of waiting. Capped, the worst a
-  queue can add is 3.75 seconds, which is inside the four seconds the queue
-  depth is already sized on. At the 0.2 second minimum the wait is 0.2
-  seconds and pacing is effectively free;
+* **a wait is still bounded**, at a second past the longest clip the setting
+  can ask for. Nothing a session can produce comes near it — a 5 second clip
+  plays for 5.008 — so it is a guard against a nonsense number rather than
+  something to tune. At the 0.2 second minimum a wait is 0.2 seconds and
+  pacing is effectively free;
 * **nothing that takes the game away waits at all.** `[p]retrosleep`,
   `[p]retroend`, `[p]retroreboot`, **Undo**, an idle timeout, another channel
   taking the emulator and unloading the cog all cut a wait short the moment
@@ -883,8 +938,22 @@ Four things keep that from costing anything it should not:
   showing you the very thing you asked to take away.
 
 It is not a setting. The number that matters — how long a clip plays for — is
-already `[p]retroset cliplength`, and the cap exists to stop that setting's
-own extremes from becoming unusable rather than to be tuned alongside it.
+already `[p]retroset cliplength`, and the bound exists to stop a nonsense
+value from holding an edit for an hour rather than to be tuned alongside it.
+
+**And none of the previous clip is shown in the new one.** Pacing gets the
+clip on screen watched in full; it does not by itself stop the next clip from
+*opening* on the very same picture, because the shutter falls a quarter of a
+second into the window and some games are slower than that to react — mgba
+takes eleven frames to draw a button press. Any opening picture that is
+byte-identical to the still already on the message is therefore left out of
+the clip, with its duration, so a clip always opens on something you have not
+just been looking at. The final picture is never dropped and a clip in which
+nothing moved is left whole; see "A clip plays for as long as it emulated,
+minus any opening you were already looking at" above. It costs nothing — the
+comparison is sixteen bytes per picture, made on the thread that was about to
+spend tens of milliseconds encoding the clip anyway, and no extra emulation
+at all.
 
 **Who pressed which button is written on the message.** Every action replaces
 the one line above the clip with a sentence naming both — in one voice for all

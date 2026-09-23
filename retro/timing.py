@@ -17,7 +17,12 @@ file.
 import asyncio
 import typing
 
-from .emulator import clip_frame_count, frame_count, input_budget
+from .emulator import (
+    MAX_CLIP_SECONDS,
+    clip_frame_count,
+    frame_count,
+    input_budget,
+)
 
 # How long a button is held down at the start of a clip, in milliseconds, for
 # every button including the directions.
@@ -136,10 +141,12 @@ BOOT_SECONDS = 3
 # The rule: **an edit that replaces a clip waits until that clip has had its
 # playing time on screen.** The playing time is known exactly before the edit
 # is made -- it is the sum of the frame durations the encoder was handed; see
-# clips.playback_seconds, which is the same arithmetic RetroEmulator.record
-# writes into the clip's ANMF chunks -- so it is a deadline rather than a
-# guess, and the time already spent emulating, encoding and uploading the new
-# clip counts against it.
+# clips.playback_seconds for the arithmetic and clips.captured_playback for
+# the same total read off the clip that is really going out (the two differ
+# only when a clip's opening pictures were trimmed as already-on-screen; see
+# clips.trim_repeated_opening and RetroView.posted_playback) -- so it is a
+# deadline rather than a guess, and the time already spent emulating,
+# encoding and uploading the new clip counts against it.
 #
 # Four things bound the cost of that, and all four matter:
 #
@@ -151,35 +158,82 @@ BOOT_SECONDS = 3
 #   core, shared by every channel -- is free throughout, and another
 #   channel can start a game or press a button during it. Only the *edit*
 #   waits.
-# * **MAX_PACE_SECONDS caps a single wait**, so a long clip cannot turn a
-#   queue into a minute of staring.
+# * **MAX_PACE_SECONDS is the ceiling on a single wait**, and it is a guard
+#   against a nonsense ``_posted_playback`` rather than a policy: it is
+#   MAX_CLIP_SECONDS and a second, so no clip a session can produce is ever
+#   cut short by it. (The spare second is there because a clip *plays* for a
+#   hair longer than its window: each picture's duration is a whole number of
+#   milliseconds and the rounding only ever goes up, so 5 seconds is 5.008 on
+#   a Game Boy and at most 5.04 on the slowest frame rate a core reports.
+#   A second is more than twenty times that, and the point of the margin is
+#   that the number is obviously not a dial.)
 # * **teardown never waits at all.** Sleeping, ending, rebooting, undoing,
 #   eviction and cog unload all call :meth:`RetroView.cancel_pacing` before
 #   they take anything, which releases a wait already in progress and stops
 #   the next one from starting. No timer is left behind: the wait is an
 #   ``await`` inside the press it belongs to, not a scheduled callback.
 #
-# What the cap is worth, at the three clip lengths that matter. A full queue
-# is MAX_QUEUED_PRESSES waiting behind the one running, so the pacing a whole
-# drain can add is at most MAX_QUEUED_PRESSES * MAX_PACE_SECONDS:
+# That ceiling used to be a flat 1.25 seconds, and it was the stutter that
+# kept being reported at long clip lengths. A wait capped below the clip's
+# playing time does not merely shorten a pause: the next clip's window begins
+# one frame after the truncated one's *last emulated frame*, not after the
+# last frame anybody saw, so the player is jumped forward over game time that
+# was emulated, encoded, uploaded -- and then painted over before it reached
+# the screen. Measured here on gambatte, one press with another already
+# queued behind it, at the five lengths `[p]retroset cliplength` is set to
+# most:
 #
-#   cliplength   clip plays for   wait per edit      full queue adds
-#     0.2s          0.201s          0.2s (in full)      0.6s
-#     1s (default)  1.005s          1.005s (in full)    3.0s
-#     5s (max)       5.008s          1.25s (capped)      3.75s
+#   cliplength   plays for   old wait (cap 1.25)   never displayed
+#     1.0s         1.005s       1.005s (in full)      0.000s
+#     1.5s         1.507s       1.250s                0.257s
+#     2.0s         1.993s       1.250s                0.743s
+#     4.0s         4.003s       1.250s                2.753s  <- the report
+#     5.0s         5.008s       1.250s                3.758s
 #
-# 1.25 seconds is therefore the smallest cap that still paces a default clip
-# *in full* (a one second clip plays for 1.005s, so a cap of 1.0 would clip
-# the last 5ms off every single one of them) while keeping a full queue
-# inside the four seconds the queue was already designed around -- see
-# MAX_QUEUED_PRESSES, which sizes itself on "about four seconds of latency,
-# which is the most that is still recognisably 'I pressed that'".
+# The last column is the whole of the complaint, and it grows with the
+# setting -- which is exactly how it arrived ("the game still stutters at a 4
+# second cliplength").
 #
-# Capping each wait rather than budgeting the drain as a whole is deliberate:
-# a budget spent on the first edit would give the head of the queue its full
-# second and let the tail lurch exactly as it does today, and the lurch is
-# the complaint. A cap gives every clip in a drain the same time on screen.
-MAX_PACE_SECONDS = 1.25
+# So the gate waits for the clip's whole playing time: what a wait is worth
+# is the clip's own number now, and the constant below has stopped being an
+# answer to it at all. What that costs is worth stating
+# plainly rather than hiding behind a cap. A full queue is
+# MAX_QUEUED_PRESSES waiting behind the one running, so a drain at cliplength
+# L now takes about 3L to work through:
+#
+#   cliplength   wait per edit   a full queue drains in
+#     0.2s          0.201s            ~0.6s
+#     1s (default)  1.005s            ~3.0s   unchanged: 1.005 was under 1.25
+#     2s            1.993s            ~6.0s   was ~3.75s, 0.74s per clip unseen
+#     4s            4.003s           ~12.0s   was ~3.75s, 2.75s per clip unseen
+#     5s (max)      5.008s           ~15.0s   was ~3.75s, 3.76s per clip unseen
+#
+# The default is untouched, which is the length this cog is actually played
+# at; everything above it trades drain time for footage that is now delivered
+# instead of discarded. That is the right way round. A clip nobody is allowed
+# to finish watching is emulation, encoding and upload spent on frames no
+# human ever sees, and the two numbers in that product are both the owner's:
+# `[p]retroset cliplength` is how long a press is worth watching for, and
+# MAX_QUEUED_PRESSES is how many presses may be in flight at once. Somebody
+# who sets a five second clip has said a press is worth five seconds; a cap
+# that silently overrode that was answering a question nobody asked, and
+# answering it by throwing the footage away.
+#
+# MAX_QUEUED_PRESSES still sizes itself on "about four seconds of latency,
+# which is the most that is still recognisably 'I pressed that'", and that
+# was written -- and is still true -- at a one second clip. At longer
+# settings a full queue is longer than four seconds, and it is *visible*
+# rather than silent: every waiting press is listed on the message as it
+# waits (see RetroView.queue_note), so a channel that has queued fifteen
+# seconds of play can see that it has.
+#
+# The constant keeps its name. "The most a single pacing wait may be" is
+# exactly what MAX_PACE_SECONDS says and exactly what it still is; what
+# changed is that it bounds nonsense rather than policy. There is
+# deliberately still no drain-wide budget: a budget spent on the first edit
+# would give the head of the queue its whole clip and let the tail lurch
+# exactly as the old cap did, and the lurch is the complaint.
+MAX_PACE_SECONDS = MAX_CLIP_SECONDS + 1.0
 
 #: A wait shorter than this is not worth taking. One picture of a clip is
 #: 67ms at CLIP_FPS, so 50ms cannot cost a visible frame, and a Discord edit

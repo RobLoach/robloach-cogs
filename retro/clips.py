@@ -21,6 +21,7 @@ both halves raise it and this is the half that cannot import the other one.
 ``retro.emulator`` re-exports every name below.
 """
 
+import hashlib
 import io
 import logging
 import math
@@ -146,10 +147,14 @@ CLIP_FPS = 15
 # second rather than four -- a press is a round trip, and the clip is the
 # part the player spends watching. At 15 seconds the watching is fifteen
 # times the default and almost all of it is a game that has finished
-# reacting. The pacing gate does not even deliver that footage reliably: it
-# holds an edit for playback_seconds but caps one wait at MAX_PACE_SECONDS
-# (1.25s, see retro/RetroView.py), so anything longer than that is replaced
-# before it has played out whenever somebody is queued behind it.
+# reacting. The pacing gate charges the whole of it, too: an edit waits for
+# the clip it replaces to have had its complete playing time on screen (see
+# MAX_PACE_SECONDS in retro/timing.py), so a full queue of three at 15
+# seconds would be three quarters of a minute of drain. The gate used to cap
+# a wait at 1.25s, which made a long clip look free and was not -- it was
+# paid in footage that was emulated, encoded, uploaded and then replaced
+# before anybody saw it. Priced honestly, 15 seconds is not a length a chat
+# box should be able to ask for.
 #
 # 5 seconds still covers the thing the long end was wanted for -- letting a
 # cutscene or a long text box play out without pressing anything -- at five
@@ -283,8 +288,25 @@ MIN_AFTERMATH_FRAMES = 1
 #
 # A core slower than ``step`` can still open on a repeated picture: mgba's 11
 # frames is nearly three pictures' worth, so a GBA clip may hold its opening
-# picture once or twice before the game answers. That is the game's own
-# latency and there is no honest way to remove it -- only to show it.
+# picture once or twice before the game answers, and so can any console on a
+# game that takes its time (a commercial RPG opening a text box).
+#
+# **That last case is where the trim came back, and where it stops.** See
+# :func:`trim_repeated_opening`: an opening picture byte-identical to the
+# still the previous clip left in the channel is the viewer looking at the
+# same frame twice, so it is dropped along with its duration -- but only
+# while there is a picture after it that is genuinely new, and never at all
+# on the frozen screen above. The rejected version had no such exemption: it
+# trimmed a static clip down to the one picture it was obliged to keep and
+# played a 1005ms clip as a 17ms flash. The three bottom rows of the table
+# above are exactly the input that broke it and are exactly what it now
+# leaves alone.
+#
+# The trim is also not a substitute for sampling the end of each span, and
+# does not make that arithmetic a lever again: it drops *playback*, never
+# emulation. Every frame of the window is still run, in order, exactly once,
+# and the clip still ends on the window's final frame, so the seam is
+# untouched by it.
 #
 # **The frame rate is not a lever on any of this**, which is the first thing
 # that was tried. :func:`capture_plan` photographs the final frame whatever
@@ -665,7 +687,10 @@ def capture_plan(
     exactly what ``RetroEmulator.record_frames`` counts with. The picture taken
     on index ``i`` shows the game after ``i + 1`` emulated frames and stands
     for the run of frames *ending* on it, so the durations always add up to
-    ``frames`` and the clip plays for as long as it emulated.
+    ``frames``: the clip this plans plays for exactly as long as it emulated,
+    with nothing dropped off either end. (The one thing that may drop pictures
+    afterwards is :func:`trim_repeated_opening`, and it only ever drops an
+    opening the viewer is already looking at.)
 
     **Each span is photographed at its end, not its start.** A 60 frame Game
     Boy clip at ``step`` 4 is frames 3, 7, 11 ... 59 -- fifteen pictures, every
@@ -767,10 +792,17 @@ def playback_seconds(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> float
     emulates 1.0046 seconds and plays for 1.005, because each picture's
     duration is a whole number of milliseconds.
 
-    This is the number the message edits are paced against -- a clip is not
-    replaced until it has had this long on screen -- which is why it is worth
-    being the *encoded* duration rather than an approximation of it. See
-    MAX_PACE_SECONDS in retro/RetroView.py.
+    This is what the message edits are paced against -- a clip is not
+    replaced until it has had its playing time on screen -- which is why it
+    is worth being the *encoded* duration rather than an approximation of it.
+    See MAX_PACE_SECONDS in retro/timing.py.
+
+    It measures a window, not a clip, and stays that way on purpose: it has
+    to be answerable before there is a clip to read. A clip that went out
+    whole plays for exactly this long; one whose opening pictures were
+    dropped as already-on-screen plays for this *minus* the durations that
+    went with them, and that figure is :func:`captured_playback` of the clip
+    that is really being posted. See :func:`trim_repeated_opening`.
     """
     return sum(duration for _, duration in clip_plan(fps, frames, clip_fps)) / 1000.0
 
@@ -1093,6 +1125,130 @@ class CapturedClip(typing.NamedTuple):
     #: changes resolution mid-clip (libretro's SET_GEOMETRY; the SNES does)
     #: cannot change the answer part-way through.
     size: typing.Tuple[int, int]
+
+
+#: How many bytes of BLAKE2b stand in for one captured picture.
+#:
+#: 16, because the only question ever asked of it is "is this the same
+#: picture?" between two consecutive clips of the same console. A 128-bit
+#: digest collides once in 2**64 comparisons by the birthday bound, and a
+#: session makes one comparison per press; the cost of being wrong is one
+#: opening picture dropped that need not have been, which is a sixteenth of a
+#: second of a clip. The reason it is a hash at all is memory: see
+#: :func:`picture_hash`.
+PICTURE_HASH_BYTES = 16
+
+
+def picture_hash(image) -> bytes:
+    """
+    A fingerprint of one captured picture, for "is this the same frame?".
+
+    A hash rather than the picture, because the thing that has to remember
+    one is a *session*, across the gap between one press and the next, and a
+    picture is not a small thing to hold onto: a SNES hi-res frame is 512x448
+    RGB, 688 KiB, and there is one live session per channel. Sixteen bytes is
+    43,000 times smaller and answers the only question anybody asks of it.
+
+    Taken over ``tobytes()``, i.e. the raw pixels at the core's own
+    resolution, so it is exactly as strict as the comparison
+    :func:`encode_clip` already makes when it spots a run of identical frames
+    -- byte-identical, not "looks similar". Two pictures that differ by one
+    pixel are two different pictures here, which is the honest answer: the
+    game moved.
+
+    BLAKE2b rather than sha256 because it is the faster of the two on the
+    64-bit hosts this runs on and takes a digest size directly. It is not a
+    security boundary -- nobody is choosing the frames -- so the choice is
+    purely speed and width.
+    """
+    return hashlib.blake2b(
+        image.tobytes(), digest_size=PICTURE_HASH_BYTES
+    ).digest()
+
+
+def captured_playback(captured: CapturedClip) -> float:
+    """
+    How long an already-captured clip plays for, in seconds.
+
+    :func:`playback_seconds` answers the same question from the *window*, in
+    advance and without a clip in hand, and the two agree for any clip that
+    went out whole. This one reads the durations that are really about to be
+    written into the clip's ANMF chunks, which is what the pacing gate needs
+    once :func:`trim_repeated_opening` has been given a chance to drop some
+    of them. The ``max(1, ...)`` is the encoder's own floor (see
+    :func:`encode_animation`), applied here so the two totals cannot disagree
+    about a duration of zero.
+    """
+    return sum(max(1, int(value)) for value in captured.durations) / 1000.0
+
+
+def trim_repeated_opening(
+    captured: CapturedClip, last_picture: typing.Optional[bytes]
+) -> CapturedClip:
+    """
+    Drop the opening pictures that are already the picture on screen.
+
+    ``last_picture`` is :func:`picture_hash` of the final picture of the clip
+    the session last *posted* -- the still sitting in the channel, since a
+    clip plays through once and holds its last frame. Any opening picture of
+    this clip that is byte-identical to it would be that same still shown
+    again, so it is dropped along with its duration, and the clip opens on
+    the first picture that is actually new.
+
+    This is the insurance behind "none of the previous clip is shown in the
+    new one", and it is needed because :func:`capture_plan` can only give the
+    console ``step`` frames -- 67ms at CLIP_FPS -- to answer the button
+    before the shutter falls. Measured first-reaction latencies, button held
+    from frame 0: gambatte/uCity 1 frame, fceumm/nestest 2, snes9x 4,
+    **mgba 11**. Eleven frames is nearly three pictures, so a Game Boy
+    Advance clip really can open on two or three copies of the still it is
+    replacing, and a game slower to react than any of those (a commercial
+    RPG stepping a text box) can do it on any console.
+
+    Three rules, and every one of them is load-bearing:
+
+    * **the final picture is never dropped.** It is the seam anchor -- the
+      state the next clip carries on from, exactly (see the seam block at the
+      top of this file) -- so the search only ever runs over
+      ``images[:-1]``.
+    * **a clip is never emptied.** Falls out of the rule above: there is
+      always at least one picture left.
+    * **a frozen screen is left completely alone.** If *every* picture is the
+      one already on screen then the game has not moved, and the clip saying
+      so for its whole length is the honest answer. Trimming that case down
+      to the single picture the rule above obliges us to keep is the "17ms
+      flash" the trim-of-leading-duplicates was tried and rejected for once
+      already, before the pre-roll; the seam block above says so and this is
+      what honours it. The encoder folds such a run into one stored frame
+      with the durations added together, so it costs a few hundred bytes and
+      plays as a held picture rather than as a stutter.
+
+    ``last_picture`` of None -- a fresh session, or one whose picture on
+    screen has stopped being its own (see ``RetroView.forget_pacing``) --
+    means there is nothing to compare against and the clip goes out whole.
+    So does a ``captured`` with no images to look at, which is what a
+    stand-in emulator that carries finished bytes hands over.
+
+    Costs one ``tobytes()`` and one BLAKE2b per leading duplicate and one
+    more for the picture that ends the run: sub-millisecond on a native-size
+    frame, against the tens of milliseconds the encode it precedes takes.
+    """
+    images = getattr(captured, "images", None)
+    if not last_picture or not images or len(images) < 2:
+        return captured
+    repeated = 0
+    for image in images[:-1]:
+        if picture_hash(image) != last_picture:
+            break
+        repeated += 1
+    if repeated == 0:
+        return captured
+    if repeated == len(images) - 1 and picture_hash(images[-1]) == last_picture:
+        # Nothing moved for the whole clip. See the third rule above.
+        return captured
+    return captured._replace(
+        images=images[repeated:], durations=captured.durations[repeated:]
+    )
 
 
 def encode_clip(

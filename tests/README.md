@@ -144,8 +144,17 @@ dropped" in `test_cog_session.py` is all of it:
 
 A clip takes 42-92ms to make and 1005ms to watch, so a queue drain used to
 replace each one after about 5% of it had played. The fix is that the *edit*
-waits; the rule, the 1.25 second cap and the numbers behind them are in the
-note above `MAX_PACE_SECONDS` in `retro/RetroView.py`.
+waits, for the clip's whole playing time at every clip length; the rule and
+the numbers behind it are in the note above `MAX_PACE_SECONDS` in
+`retro/timing.py`.
+
+That wait was capped at 1.25 seconds once, which meant every clip longer than
+that was replaced part-played and the player was jumped forward over the
+difference -- 2.75 seconds of a 4 second clip. `MAX_PACE_SECONDS` is now a
+second past the longest clip the setting can ask for, i.e. a guard against a
+nonsense figure rather than a policy, and
+`test_every_clip_length_is_paced_for_its_whole_playing_time` holds that at
+1.5, 2, 4 and 5 seconds as well as at the default.
 
 **The gate spends its time in exactly one place** -- the module-level
 `pace_wait` in `retro/RetroView.py` -- and `RetroEnv` swaps that for a
@@ -164,10 +173,14 @@ That is why the fast suite still runs in about the same time it did. Paying
 for it would be a real second per press, several hundred times over.
 
 The section "A clip is not replaced before it has been watched" in
-`test_cog_session.py` is all of it, and the four statements worth knowing are:
+`test_cog_session.py` is all of it, and the statements worth knowing are:
 
 * `test_a_press_with_nothing_playing_is_not_held_back` -- the common case, one
   person pressing one button at a time, must stay instant;
+* `test_the_queue_drains_with_real_pacing_and_still_finishes` -- four presses
+  and four *real* waits, one after another, with an empty queue at the end.
+  Every edit now waits longer than it used to at any length above a second,
+  so a gate that could fail to come back would fail here first;
 * `test_pacing_never_holds_the_emulator_lock` -- a whole press on *another
   channel*, run from inside the wait itself. There is one libretro core for
   the whole bot, and a recent bug was a lock held across Discord calls, so
@@ -280,11 +293,24 @@ and the second clip's first picture to be one capture step into the next
 window. `tests/test_clips.py` makes the same statement about `capture_plan` at
 every clip length and frame rate, with no core.
 
-**A clip plays for exactly as long as it emulated**, and that rule is
-unconditional -- see `test_a_clip_plays_for_as_long_as_it_emulated`, whose
-docstring states it and says why it was nearly weakened. It is also what rules
-out trimming a clip's leading duplicate pictures, which on a static screen
-wants to trim the whole clip and leave a 17ms flash.
+**A recorded clip plays for exactly as long as it emulated**, and that rule is
+unconditional of the recording -- see
+`test_a_clip_plays_for_as_long_as_it_emulated`, whose docstring states it and
+says why it was nearly weakened.
+
+One thing shortens a clip afterwards, and it does it to playback rather than
+to emulation: `clips.trim_repeated_opening` drops the opening pictures that
+are byte-identical to the still the previous clip left in the channel, so a
+clip always opens on something new even on a core as slow to react as mgba.
+The three rules that make it safe are in `test_clips.py`, under "None of the
+previous clip is shown in the new one" -- the final picture is never dropped,
+a clip is never emptied, and **a clip of a screen where nothing moved is left
+completely alone**. That last one is a regression that has already shipped:
+trimming it leaves the single picture the first rule obliges it to keep and
+plays a 1005ms clip as a 17ms flash. `test_cog_session.py` pins the session
+half -- who remembers the still (a 16 byte hash, never the pixels), that only
+a *successful* edit promotes it, what the pacing gate then waits for, and
+every teardown path that has to forget it.
 
 **A clip starts exactly one emulated frame after the last one ended.** A
 picture is taken *after* an emulated frame, so the last picture of a clip is

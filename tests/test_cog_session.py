@@ -821,13 +821,18 @@ async def test_one_person_may_hold_every_waiting_slot(retro):
     view, _, _ = await retro.posted_game(9013, "fair")
     rob = FakeUser(uid=11, name="Rob")
 
+    depth = retro.viewmod.MAX_QUEUED_PRESSES
     async with view.lock:
-        for field in ("up", "up", "down"):
+        # A run as long as the queue is deep, all from one person. Derived
+        # from the constant rather than written out, so raising the depth
+        # cannot leave this test quietly checking less than it says.
+        for index in range(depth):
+            field = "up" if index % 2 == 0 else "down"
             assert view.enqueue_press(retro.interaction(view, user=rob), field)
         # The cap still bites, and it bites on depth rather than on who.
         assert not view.enqueue_press(retro.interaction(view, user=rob), "down")
-        assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES
-        assert [entry.who for entry in view.queue] == ["Rob", "Rob", "Rob"]
+        assert len(view.queue) == depth
+        assert [entry.who for entry in view.queue] == ["Rob"] * depth
 
 
 async def test_one_person_s_run_reads_as_one_run(retro):
@@ -1266,8 +1271,12 @@ async def test_a_queued_press_on_a_sleeping_session_wakes_it_first(retro):
 # one before it) but nobody ever saw it, so the picture appeared to lurch.
 #
 # So the *edit* waits until the clip it is replacing has had its playing time
-# on screen. See the note above MAX_PACE_SECONDS in retro/timing.py for the
-# rule, the cap and the numbers behind them.
+# on screen -- all of it, at every clip length. See the note above
+# MAX_PACE_SECONDS in retro/timing.py for the rule and the numbers behind it.
+# The wait was capped at 1.25 seconds once, which meant every clip longer
+# than that was replaced part-played and the player was jumped forward over
+# the difference (2.75 seconds of a 4 second clip). That is the stutter these
+# tests now pin shut at 1.5, 2, 4 and 5 seconds as well as at the default.
 #
 # The gate spends its time in exactly one place -- the module-level
 # `pace_wait` -- and `RetroEnv` swaps that for a recorder, so these tests read
@@ -1383,60 +1392,124 @@ async def test_a_wait_too_short_to_see_is_not_taken_at_all(retro):
 
 
 @pytest.mark.parametrize(
-    "seconds, capped",
-    [(0.2, False), (0.8, False), (1.0, False), (2.0, True), (15.0, True)],
+    "seconds", [0.2, 0.8, 1.0, 1.5, 2.0, 4.0, 5.0]
 )
-async def test_a_long_clip_is_paced_up_to_the_cap_and_no_further(
-    retro, seconds, capped
+async def test_every_clip_length_is_paced_for_its_whole_playing_time(
+    retro, seconds
 ):
-    """The bound, at both extremes of `[p]retroset cliplength`.
+    """The fix, across the whole of `[p]retroset cliplength`.
 
-    0.2s clips pace almost instantly; a 15s clip would otherwise make a queue
-    unbearable, so a single edit is never held for more than
-    MAX_PACE_SECONDS. The cap is above a default clip's real playing time
-    (1.005s, not 1s) on purpose, so the length this cog is actually played at
-    is always paced in full.
+    The wait used to be capped at a flat 1.25 seconds, so everything from 1.5
+    upwards was replaced part-played and the player was jumped forward over
+    the rest: 0.26s of a 1.5s clip, 0.74s of a 2s one, 2.75s of a 4s one.
+    That was the reported stutter, and it got worse the longer the clip,
+    which is exactly how it was reported.
+
+    So the deadline is now the clip's own playing time at every length the
+    setting can reach, and MAX_PACE_SECONDS only bounds a figure no clip
+    could produce. 4.0 is in the list because it is the length the report
+    came from.
     """
+    assert retro.emumod.MAX_CLIP_SECONDS == 5.0, "the list above stops at the ceiling"
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9204, "long")
     view.clip_seconds = seconds
     playback = view.clip_playback()
     playing_now(view)
 
-    delay = view.pace_delay()
+    assert view.pace_delay() == pytest.approx(playback, abs=0.01)
+    assert playback <= retro.viewmod.MAX_PACE_SECONDS, (
+        "no clip length the setting can reach may be cut short by the ceiling"
+    )
+
+
+async def test_the_ceiling_only_bounds_a_playback_no_clip_could_produce(retro):
+    """MAX_PACE_SECONDS as what it now is: a guard, not a policy.
+
+    It is a whole second clear of MAX_CLIP_SECONDS, so the only way to reach
+    it is to put a playing time into the session that no recording could have
+    made -- a corrupt figure, or a clip length from a future where the
+    ceiling moved. The margin is for the millisecond rounding, which only
+    ever goes up: a 5 second clip plays for 5.008 on a Game Boy and up to
+    5.04 on the slowest frame rate a core reports, so a bound of exactly
+    MAX_CLIP_SECONDS would quietly shave the end off the longest clip the
+    setting can ask for. The wait is bounded at all, rather than left open,
+    because a session must not be able to hold an edit for an hour.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9213, "ceiling")
     cap = retro.viewmod.MAX_PACE_SECONDS
-    assert delay <= cap
-    if capped:
-        assert delay == cap
-    else:
-        assert delay == pytest.approx(playback, abs=0.01)
-        assert playback <= cap, "the default clip length must never be capped"
+    assert cap == retro.emumod.MAX_CLIP_SECONDS + 1.0
+
+    view.clip_seconds = retro.emumod.MAX_CLIP_SECONDS
+    assert view.clip_playback() == 5.008 < cap, "and 5.04 on a slow core"
+
+    view.note_posted(cap * 20)
+    assert view.pace_delay() == pytest.approx(cap, abs=0.01)
 
 
-async def test_a_full_queue_cannot_add_more_than_its_bound(retro):
-    """What a whole drain can cost, stated as the arithmetic it is.
+async def test_a_full_queue_costs_its_clips_and_says_so(retro):
+    """What a whole drain costs, stated as the arithmetic it is.
 
-    The queue is bounded (MAX_QUEUED_PRESSES) and every edit's wait is
-    bounded (MAX_PACE_SECONDS), so the pacing a drain can add is bounded by
-    their product -- inside the ~4 seconds MAX_QUEUED_PRESSES already sizes
-    itself on.
+    The queue is bounded (MAX_QUEUED_PRESSES) and each edit now waits out the
+    whole of the clip it replaces, so a drain at cliplength L takes about
+    MAX_QUEUED_PRESSES * L -- three seconds at the default, and fifteen at
+    the five second ceiling. That is a real cost and it is the right one:
+    the alternative was a cap that made a long clip look free by throwing
+    away the footage nobody was allowed to reach. Both numbers in the product
+    are the owner's own settings.
     """
     viewmod = retro.viewmod
-    worst = viewmod.MAX_QUEUED_PRESSES * viewmod.MAX_PACE_SECONDS
-    assert worst <= 4.0, worst
-
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9205, "bound")
+    playback = view.clip_playback()
+    assert playback == pytest.approx(1.005, abs=0.001), playback
     playing_now(view)
     await fill_the_queue(retro, view, viewmod.MAX_QUEUED_PRESSES)
 
     # One wait per edit: the press that ran, then every queued one. The
     # running press's own wait is its author's latency and was paid whether
-    # anybody queued behind it or not; what the *queue* adds is the rest, and
-    # that is what has to stay inside the bound.
+    # anybody queued behind it or not; what the *queue* adds is the rest.
     assert len(retro.pace_waits) == viewmod.MAX_QUEUED_PRESSES + 1
-    assert all(delay <= viewmod.MAX_PACE_SECONDS for delay in retro.pace_waits)
-    assert sum(retro.pace_waits[1:]) <= worst
+    assert all(delay <= playback for delay in retro.pace_waits)
+    queued = sum(retro.pace_waits[1:])
+    # An upper bound and a generous lower one, rather than an equality.
+    # Each wait is the time *left* on the clip it replaces, so it is shortened
+    # by however long that entry actually spent emulating and encoding -- real
+    # work, on a machine running the rest of this suite at the same time. The
+    # drift is per entry, so it accumulates with MAX_QUEUED_PRESSES, and an
+    # `approx(..., abs=0.2)` here failed intermittently in a full-suite run
+    # while passing alone. What the test is for is the *shape* of the cost --
+    # a drain is a clip per entry, not a flat cap -- and half a clip each is
+    # far below anything the old 1.25s cap could have produced at the lengths
+    # that cap actually bit.
+    assert queued <= viewmod.MAX_QUEUED_PRESSES * playback
+    assert queued >= 0.5 * viewmod.MAX_QUEUED_PRESSES * playback, retro.pace_waits
+    assert not view.queue and not view._draining
+
+
+async def test_a_long_clip_drains_in_its_clips_rather_than_the_old_cap(retro):
+    """The same drain at the length the stutter was reported from.
+
+    Four seconds a clip: every edit waits about four seconds rather than the
+    old 1.25, so the four clips of a full queue are four whole clips instead
+    of four clips with 2.75 seconds cut off each. The waits are recorded
+    rather than spent, so this costs nothing to check.
+    """
+    viewmod = retro.viewmod
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9214, "longdrain")
+    view.clip_seconds = 4.0
+    playback = view.clip_playback()
+    assert playback == pytest.approx(4.003, abs=0.001), playback
+    playing_now(view)
+
+    await fill_the_queue(retro, view, viewmod.MAX_QUEUED_PRESSES)
+
+    assert len(retro.pace_waits) == viewmod.MAX_QUEUED_PRESSES + 1
+    for delay in retro.pace_waits:
+        assert delay == pytest.approx(playback, abs=0.2), retro.pace_waits
+        assert delay > 1.25, "the old cap would have truncated every one"
     assert not view.queue and not view._draining
 
 
@@ -1465,7 +1538,13 @@ async def test_the_queue_drains_with_real_pacing_and_still_finishes(retro):
     Short clips so the test costs tenths of a second rather than seconds, and
     real waiting so that "the drain finishes" is a statement about the gate
     rather than about the recorder. Every clip gets its full playing time,
-    because 0.2s is well under the cap.
+    which is now true at every clip length; 0.2s is simply the cheapest one
+    to prove it at.
+
+    **That the drain terminates at all is the load-bearing part.** Every edit
+    now waits longer than it used to at any length above a second, so a gate
+    that could fail to come back would fail here first: four presses, four
+    real waits, one after another, and an empty queue at the end.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9207, "draining")
@@ -1625,6 +1704,193 @@ async def test_an_undo_s_own_clip_is_never_paced(retro):
     playing_now(view)
     await reset_command(retro)(retro.cog, ctx)
     assert retro.pace_waits == [], retro.pace_waits
+
+
+# -- None of the previous clip is shown in the new one ------------------------
+#
+# Pacing gets the clip on screen watched in full. It does not stop the *next*
+# clip from opening on the very same picture, because the shutter falls a
+# step into the window (four frames on a Game Boy at CLIP_FPS) and a core can
+# be slower than that to answer a button: measured first-reaction latencies
+# are gambatte/uCity 1 frame, fceumm/nestest 2, snes9x 4, mgba 11. Eleven is
+# nearly three pictures.
+#
+# So the session remembers the still its last posted clip left in the channel
+# -- as a 16 byte hash, never as pixels; a SNES frame is 688 KiB and there is
+# one session per channel -- and drops any opening picture of the next clip
+# that is byte-identical to it. The rules, and the frozen-screen case that
+# must be left alone, are pinned against clips.trim_repeated_opening in
+# test_clips.py; what is pinned here is the session wiring: who remembers,
+# when it is promoted, what the pacing gate then waits for, and every path
+# that has to forget.
+
+
+def synthetic_clip(*seeds, ms=67):
+    """A captured clip of ``len(seeds)`` pictures; equal seeds are identical.
+
+    The fake emulator carries finished bytes rather than Pillow images (see
+    fakes._FakeCapture), which is right for every other test in this file and
+    useless for this one: the trim compares pixels. So these tests hand the
+    view a real CapturedClip and read back the one it decided to encode --
+    FakeEmulator.encode_captured returns whatever it was given, so the return
+    value of _encode *is* the trimmed clip.
+    """
+    from PIL import Image
+
+    from retro.clips import CapturedClip
+
+    images = []
+    for seed in seeds:
+        image = Image.new("RGB", (16, 12), (20, 40, 60))
+        image.putpixel((seed % 16, seed % 12), (seed % 251, 90, 7))
+        images.append(image)
+    return CapturedClip(images, [ms] * len(images), (32, 24))
+
+
+def post(view, captured):
+    """Encode a clip the way a press does, and say the edit went through."""
+    encoded = view._encode(captured, None, view.emulator)
+    view.note_posted(view.posted_playback())
+    return encoded
+
+
+async def test_a_clip_opening_on_the_still_it_replaces_is_trimmed(retro):
+    """The owner's requirement, end to end through a session.
+
+    The first clip leaves picture 2 in the channel. The second opens on two
+    copies of picture 2 -- a game that had not answered the button by the
+    time the shutter fell -- and what goes out starts on picture 3.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9215, "trimmed")
+
+    first = synthetic_clip(1, 2)
+    post(view, first)
+    assert view._last_picture is not None
+
+    second = view._encode(synthetic_clip(2, 2, 3, 4), None, view.emulator)
+
+    assert len(second.images) == 2
+    assert second.durations == [67, 67]
+    assert second.images[0].tobytes() != first.images[-1].tobytes(), (
+        "nothing the viewer is already looking at is shown again"
+    )
+
+
+async def test_a_trimmed_clip_is_paced_for_what_it_really_plays(retro):
+    """The invariant this changes, stated precisely.
+
+    A clip no longer always plays for as long as it emulated: it plays for
+    that *minus any opening already on screen*. So the pacing deadline has to
+    come from the durations really being encoded rather than from the window,
+    or the gate would hold the next edit for footage this clip does not
+    contain.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9216, "trimpace")
+
+    post(view, synthetic_clip(1, 2))
+    # Four pictures at 67ms, two of them the still already on screen.
+    view._encode(synthetic_clip(2, 2, 3, 4), None, view.emulator)
+
+    assert view.posted_playback() == pytest.approx(0.134, abs=0.0005)
+    assert view.clip_playback() == pytest.approx(1.005, abs=0.001), (
+        "the window's own arithmetic is unchanged and still honest about the window"
+    )
+    view.note_posted(view.posted_playback())
+    assert view.pace_delay() == pytest.approx(0.134, abs=0.01)
+
+
+async def test_a_frozen_screen_still_gets_a_whole_clip(retro):
+    """The 17ms flash, at the session level.
+
+    Every picture is the still already on screen, so the game has not moved
+    and the clip says so for its whole length. Trimming it to the one picture
+    the "never drop the last" rule keeps is the regression a previous attempt
+    shipped, and it would also tell the pacing gate this clip is worth 67ms.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9217, "frozen")
+
+    post(view, synthetic_clip(1, 5))
+    frozen = synthetic_clip(5, 5, 5, 5)
+    encoded = view._encode(frozen, None, view.emulator)
+
+    assert encoded is frozen
+    assert len(encoded.images) == 4
+    assert view.posted_playback() == pytest.approx(0.268, abs=0.0005)
+
+
+async def test_a_clip_discord_refused_is_not_what_the_next_one_is_trimmed_against(
+    retro,
+):
+    """The still on screen is the last one *posted*, not the last one encoded.
+
+    An edit that failed put nothing on anybody's screen, so the picture still
+    sitting there is the one from the edit before it -- and that is what the
+    next clip has to be compared with. The measurement rides in _encoded
+    until note_posted promotes it, which only a successful edit calls.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9218, "refused")
+
+    post(view, synthetic_clip(1, 6))
+    on_screen = view._last_picture
+
+    # Encoded, and then the edit fails: note_posted is never reached.
+    view._encode(synthetic_clip(7, 8), None, view.emulator)
+    assert view._last_picture == on_screen, "picture 6 is still the one on screen"
+
+    # The next clip opens on picture 6 again, and is still trimmed against it.
+    trimmed = view._encode(synthetic_clip(6, 9), None, view.emulator)
+    assert len(trimmed.images) == 1
+
+
+@pytest.mark.parametrize("name, teardown", TEARDOWNS, ids=[n for n, _ in TEARDOWNS])
+async def test_a_teardown_forgets_the_still_it_is_taking_away(retro, name, teardown):
+    """Sleeping, ending, rebooting, eviction and unloading, all the same.
+
+    Once the picture on the message stops being this session's own to reason
+    about, a hash of it must not be allowed to trim the opening off whatever
+    replaces it -- the first clip after a wake is the case that matters,
+    since a save state comes back on the exact frame it left and its opening
+    picture is very likely the one still sitting in the channel. Every one of
+    these paths already calls cancel_pacing (or forget_pacing, from a worker
+    thread); the hash is forgotten in the same place.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(9219, "forgets")
+    post(view, synthetic_clip(1, 2))
+    assert view._last_picture is not None
+
+    await teardown(retro, view, ctx)
+
+    assert view._last_picture is None, name
+    # And a clip that opens on that very picture now goes out whole.
+    if view.emulator is not None:
+        whole = synthetic_clip(2, 2, 3)
+        assert view._encode(whole, None, view.emulator) is whole
+
+
+async def test_an_undo_forgets_the_still_from_the_press_it_is_undoing(retro):
+    """A correction is never trimmed against the thing it corrects.
+
+    capture_undo and capture_reset call forget_pacing from the worker thread
+    before they touch the machine, so by the time their clip is encoded there
+    is nothing to compare it with. Otherwise an undo whose first picture
+    happened to match the undone press's last one would open by dropping it.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9220, "undotrim")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    post(view, synthetic_clip(1, 2))
+    assert view._last_picture is not None
+
+    view.capture_undo()
+    assert view._last_picture is None
+
+    whole = synthetic_clip(2, 2, 3)
+    assert view._encode(whole, None, view.emulator) is whole
 
 
 # -- Which button was pressed -------------------------------------------------

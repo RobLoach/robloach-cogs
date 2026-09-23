@@ -16,6 +16,7 @@ import hashlib
 import io
 import logging
 import struct
+import sys
 
 import pytest
 
@@ -26,6 +27,14 @@ pytestmark = [pytest.mark.emulator, pytest.mark.slow]
 
 E = load_standalone("retro_emulator_standalone", "emulator.py")
 S = load_standalone("retro_systems_for_emulator", "systems.py")
+
+#: The clips module ``E`` itself imported. ``picture_hash`` and
+#: ``trim_repeated_opening`` are deliberately not on the emulator's re-export
+#: shim (see test_clips.py's SHIMMED, which is grepped rather than guessed:
+#: RetroView imports them from retro/clips.py), so they are reached here the
+#: same way the view reaches them -- and off the very module the emulator is
+#: holding, so this cannot end up testing a second copy.
+CL = sys.modules[f"{E.__package__}.clips"]
 
 
 @pytest.fixture
@@ -663,7 +672,7 @@ def test_a_clip_plays_for_as_long_as_it_emulated(emu, gambatte, ucity, seconds):
     assert abs(sum(durations) - emulated) / emulated < 0.01, (sum(durations), emulated)
     # And the cog can work that total out *before* it has a clip, which is
     # what lets it hold the next edit back until this one has played through
-    # (see MAX_PACE_SECONDS in retro/RetroView.py). Merged frames or not, the
+    # (see MAX_PACE_SECONDS in retro/timing.py). Merged frames or not, the
     # arithmetic and the bytes agree exactly.
     assert sum(durations) == round(1000 * E.playback_seconds(emulator.fps, frames))
     # Every picture of the clip is worth having: a fifth of a second is three
@@ -1064,11 +1073,14 @@ def test_a_completely_static_screen_still_produces_a_whole_clip(assets, emu, pro
     rows it never found, so it spent a quarter of a second of game time and
     opened the clip on the repeated picture regardless.
 
-    What must not happen is the other failure: a rule that trimmed the opening
-    duplicates would trim the entire clip and leave the single picture it is
-    obliged to keep, i.e. a one second clip played as a 17ms flash. So this
-    pins the full length -- every picture the plan asked for, durations adding
-    up to the whole second that was emulated.
+    What must not happen is the other failure: trimming the opening
+    duplicates of *this* clip would trim all of it and leave the single
+    picture the rule is obliged to keep, i.e. a one second clip played as a
+    17ms flash. That trim exists again -- `clips.trim_repeated_opening`, the
+    insurance behind "none of the previous clip is shown in the new one" --
+    and these four rows are exactly the input it must refuse to touch, so it
+    is run here against the real thing rather than only against synthetic
+    pictures in test_clips.py.
     """
     core, rom_name, button, boot, _moves = SEAM_PROBES[probe]
     emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
@@ -1083,7 +1095,11 @@ def test_a_completely_static_screen_still_produces_a_whole_clip(assets, emu, pro
     # between nestest answering the button and nestest ignoring it.
     emulator.record(frames, presses=presses)
     held = held_picture(emulator)
-    payload, shots = photographed(emulator, frames, presses)
+    on_screen = CL.picture_hash(emulator._native_frame_image())
+    captured = emulator.record_frames(frames, presses=presses)
+    shots = [
+        hashlib.sha1(picture.tobytes()).hexdigest()[:10] for picture in captured.images
+    ]
 
     if opening_repeats(shots, held) != len(shots):
         pytest.skip(
@@ -1102,8 +1118,15 @@ def test_a_completely_static_screen_still_produces_a_whole_clip(assets, emu, pro
     emulated = 1000 * frames / emulator.fps
     assert abs(sum(durations) - emulated) / emulated < 0.01
     assert sum(durations) == round(1000 * E.playback_seconds(emulator.fps, frames))
+
+    # And the trim leaves every one of them alone, because the game really
+    # has not moved and a clip saying so is the honest answer.
+    trimmed = CL.trim_repeated_opening(captured, on_screen)
+    assert trimmed is captured, "a frozen screen was trimmed"
+    assert CL.captured_playback(trimmed) == E.playback_seconds(emulator.fps, frames)
+
     # ...and it is still a clip, not an error.
-    assert len(payload) > 0
+    assert len(emulator.encode_captured(trimmed)) > 0
 
 
 #: Probes for reaction latency: (core, ROM, button, boot seconds, the first
@@ -1198,6 +1221,68 @@ def test_a_clip_opens_on_the_game_already_reacting_to_the_press(assets, emu, pro
     # ...and it is the sampling phase that did it, not luck about this core:
     # the opening picture is a whole step into the window.
     assert plan[0] == step - 1, "the opening picture is not a whole step in"
+
+
+@pytest.mark.parametrize("probe", sorted(PRESS_LATENCY))
+def test_no_clip_ever_opens_on_the_previous_clips_last_picture(assets, emu, probe):
+    """The owner's requirement, on every core in the latency table.
+
+    The test above excludes the cores that are slower to react than one
+    picture, because no sampling phase can fix those: mgba takes eleven
+    frames and a picture is four, so the clip genuinely opens on the still
+    the previous one left in the channel. `clips.trim_repeated_opening` is
+    what covers that last gap -- those opening pictures are left out of the
+    clip, with their durations -- so this asserts the requirement itself,
+    with no core excluded and nothing skipped for being slow.
+
+    Two outcomes are allowed and they are the only two:
+
+    * the clip opens on a picture nobody has seen. That is the whole point,
+      whether the core answered within the step (nothing was trimmed) or
+      later (something was);
+    * the game did not move *at all* for the whole window, in which case the
+      clip is left exactly as it was recorded. That case has its own test
+      against four static screens; it is restated here so this one cannot
+      pass by quietly trimming a frozen clip down to a flash.
+    """
+    core, rom_name, button, boot, _latency = PRESS_LATENCY[probe]
+    emulator = emu(assets.need_core(core), assets.need_rom(rom_name))
+    emulator.advance(emulator.frames_for_seconds(boot))
+    frames = emulator.clip_frames(E.CLIP_SECONDS)
+    presses = [(button, 0, frames_for_ms(emulator, 160))]
+
+    # One press first, so the picture on the message is a real one and the
+    # screen is where a *second* press finds it.
+    emulator.record(frames, presses=presses)
+    on_screen = CL.picture_hash(emulator._native_frame_image())
+    captured = emulator.record_frames(frames, presses=presses)
+    whole = [CL.picture_hash(picture) for picture in captured.images]
+
+    trimmed = CL.trim_repeated_opening(captured, on_screen)
+    kept = [CL.picture_hash(picture) for picture in trimmed.images]
+
+    # The seam anchor is never given up, whatever else happens: it is the
+    # state the next clip carries on from.
+    assert kept and kept[-1] == whole[-1]
+    assert len(trimmed.durations) == len(trimmed.images)
+
+    if set(whole) == {on_screen}:
+        assert trimmed is captured, "a frozen clip must be left whole"
+        assert kept == whole
+        return
+
+    assert kept[0] != on_screen, (
+        f"{core}/{rom_name} opens its clip on the picture already on screen"
+    )
+    # Nothing was cut that had anything new in it, and nothing was cut that
+    # was not at the very front.
+    dropped = len(whole) - len(kept)
+    assert whole[dropped:] == kept
+    assert all(picture == on_screen for picture in whole[:dropped])
+    # The clip plays for what it kept, which is what the pacing gate is told.
+    assert CL.captured_playback(trimmed) == pytest.approx(
+        sum(trimmed.durations) / 1000.0
+    )
 
 
 def test_a_games_own_reaction_latency_is_shown_rather_than_skipped(

@@ -249,7 +249,7 @@ def test_input_is_released_before_the_last_picture_is_taken(fps, seconds):
 # The same plan in milliseconds, which is what the encoder is handed and
 # therefore what ends up in the clip's ANMF chunks. It is also what the cog
 # paces its message edits against -- a clip is not replaced until it has had
-# this long on screen (see MAX_PACE_SECONDS in retro/RetroView.py) -- so the
+# this long on screen (see MAX_PACE_SECONDS in retro/timing.py) -- so the
 # number has to be knowable before there is a clip to measure, which is the
 # whole reason it is arithmetic rather than a read of the bytes.
 
@@ -765,6 +765,179 @@ def test_a_mid_clip_geometry_change_still_encodes_frames_of_one_size():
         [67, 17],
     )
     assert data == expected
+
+
+# -- None of the previous clip is shown in the new one ------------------------
+#
+# Pacing (see MAX_PACE_SECONDS in retro/timing.py) guarantees the clip on
+# screen is played in full before anything replaces it. It does not guarantee
+# that the replacement *opens* on something new: the shutter falls `step`
+# frames into the window, and a core slower than that to answer the button --
+# mgba takes eleven frames, nearly three pictures -- produces an opening
+# picture byte-identical to the still the previous clip left in the channel.
+#
+# trim_repeated_opening drops exactly those pictures, with their durations.
+# Three rules make it safe, and the third one is a regression that has
+# already shipped once: trimming a clip of a screen where *nothing* moved
+# leaves the one picture the second rule obliges it to keep, and a 1005ms
+# clip plays as a 17ms flash. See the seam block in retro/clips.py.
+
+
+def _clip(*seeds, ms=67, size=(16, 12)):
+    """A synthetic CapturedClip, one picture per seed; equal seeds are equal.
+
+    Equality is byte equality of the pixels, which is what the trim compares,
+    so two pictures built from the same seed are as identical as two captures
+    of a console that did not move.
+    """
+    Image = pytest.importorskip("PIL.Image", reason="the trim needs Pillow")
+    images = []
+    for seed in seeds:
+        image = Image.new("RGB", size, (20, 40, 60))
+        image.putpixel((seed % size[0], seed % size[1]), (seed % 251, 90, 7))
+        images.append(image)
+    return C.CapturedClip(images, [ms] * len(images), (32, 24))
+
+
+def _seeds(captured, reference):
+    """Which of ``reference``'s pictures ``captured`` kept, by position."""
+    keys = [image.tobytes() for image in reference.images]
+    return [keys.index(image.tobytes()) for image in captured.images]
+
+
+def test_an_opening_that_is_already_on_screen_is_dropped_with_its_durations():
+    """The whole of Change B, in one clip.
+
+    Two opening pictures identical to the still in the channel, then the game
+    answers. The clip that goes out starts where the player's eyes already
+    are, and it plays for the two pictures it kept rather than the four it
+    captured -- the dropped time is time spent looking at a picture that was
+    already there.
+    """
+    whole = _clip(1, 1, 2, 3)
+    on_screen = C.picture_hash(whole.images[0])
+
+    trimmed = C.trim_repeated_opening(whole, on_screen)
+
+    assert _seeds(trimmed, whole) == [2, 3]
+    assert trimmed.durations == [67, 67]
+    assert C.captured_playback(trimmed) == 0.134
+    assert C.captured_playback(whole) == 0.268
+    # Nothing else about the clip moves: the posted size is pinned by the
+    # first *captured* frame and a trim must not repoint it.
+    assert trimmed.size == whole.size
+
+
+def test_a_clip_of_a_frozen_screen_is_left_completely_alone():
+    """The 17ms flash, which must not come back.
+
+    Every picture is the one already on screen, so the game genuinely has not
+    moved and the honest clip is the whole length of one saying so. The
+    rejected trim cut this to the single picture the "never drop the last
+    one" rule obliges it to keep and played a full clip as a flash. The
+    encoder folds the run into one stored frame with the durations added
+    together, so it costs a few hundred bytes and reads as a held picture.
+    """
+    frozen = _clip(4, 4, 4, 4)
+    on_screen = C.picture_hash(frozen.images[0])
+
+    trimmed = C.trim_repeated_opening(frozen, on_screen)
+
+    assert trimmed is frozen, "a frozen screen is returned untouched"
+    assert len(trimmed.images) == 4
+    assert C.captured_playback(trimmed) == C.captured_playback(frozen) == 0.268
+
+
+def test_the_final_picture_is_never_dropped():
+    """It is the seam anchor: the state the next clip carries on from.
+
+    A game that answers on the very last picture of the window is the tightest
+    case there is -- everything before it is the held still -- and what comes
+    out is that one new picture, never an empty clip.
+    """
+    late = _clip(5, 5, 5, 6)
+    trimmed = C.trim_repeated_opening(late, C.picture_hash(late.images[0]))
+
+    assert _seeds(trimmed, late) == [3]
+    assert trimmed.durations == [67]
+    assert trimmed.images[-1].tobytes() == late.images[-1].tobytes(), (
+        "the picture the next clip resumes from must survive"
+    )
+
+    # And a one picture clip has nothing to give up whatever it shows.
+    single = _clip(7)
+    assert C.trim_repeated_opening(single, C.picture_hash(single.images[0])) is single
+
+
+def test_a_clip_that_opens_on_something_new_is_not_touched():
+    """The common case: a core that answers within the step, or a Wait."""
+    moving = _clip(8, 9, 10)
+    elsewhere = _clip(11)
+
+    assert C.trim_repeated_opening(moving, C.picture_hash(elsewhere.images[0])) is moving
+    # A repeat *inside* the clip is the game going back to a frame it had
+    # before, which is the game's own business and not a repeat of the still.
+    inner = _clip(12, 13, 12, 14)
+    assert C.trim_repeated_opening(inner, C.picture_hash(elsewhere.images[0])) is inner
+
+
+def test_nothing_to_compare_against_means_nothing_is_trimmed():
+    """A fresh session, or one whose screen stopped being its own.
+
+    ``RetroView.forget_pacing`` puts the remembered still back to None on
+    every path that takes the game somewhere the message is not, so this is
+    the shape the first clip after a wake, a reboot or an undo arrives in.
+    """
+    clip = _clip(15, 15, 16)
+    assert C.trim_repeated_opening(clip, None) is clip
+    assert C.trim_repeated_opening(clip, b"") is clip
+
+
+def test_a_stand_in_capture_with_no_pictures_is_handed_straight_back():
+    """tests/fakes.py carries finished bytes rather than Pillow images."""
+    import typing
+
+    class Fake(typing.NamedTuple):
+        payload: bytes
+
+    fake = Fake(b"RIFF")
+    assert C.trim_repeated_opening(fake, b"x" * 16) is fake
+
+
+def test_a_picture_hash_is_small_stable_and_exact():
+    """Sixteen bytes rather than the picture: a SNES frame is 688 KiB.
+
+    Exact rather than approximate, too -- one pixel of difference is a
+    different picture, which is the same comparison encode_clip already makes
+    when it spots a run of identical frames.
+    """
+    Image = pytest.importorskip("PIL.Image", reason="the trim needs Pillow")
+    one = Image.new("RGB", (16, 12), (10, 20, 30))
+    same = one.copy()
+    nearly = one.copy()
+    nearly.putpixel((15, 11), (10, 20, 31))
+
+    assert len(C.picture_hash(one)) == C.PICTURE_HASH_BYTES == 16
+    assert C.picture_hash(one) == C.picture_hash(same)
+    assert C.picture_hash(one) != C.picture_hash(nearly)
+    # Why it is a hash at all, at the size the session would otherwise hold:
+    # a SNES hi-res frame is 512x448 RGB, and a session per channel keeps one
+    # between every pair of presses.
+    snes = Image.new("RGB", (512, 448))
+    assert len(snes.tobytes()) == 688128
+    assert len(C.picture_hash(snes)) * 43000 < len(snes.tobytes())
+
+
+def test_captured_playback_is_the_durations_the_encoder_is_handed():
+    """And agrees with playback_seconds for any clip that went out whole."""
+    fps, frames = FPS["gb"], 60
+    plan = C.clip_plan(fps, frames)
+    whole = C.CapturedClip([None] * len(plan), [ms for _, ms in plan], (32, 24))
+
+    assert C.captured_playback(whole) == C.playback_seconds(fps, frames) == 1.005
+    # The encoder's own 1ms floor, so the two totals cannot disagree about a
+    # duration of zero. See encode_animation.
+    assert C.captured_playback(C.CapturedClip([None], [0], (1, 1))) == 0.001
 
 
 # -- What retro.emulator re-exports from here ----------------------------------
