@@ -1457,8 +1457,18 @@ class Retro(
         the edit itself is not, so it is recorded here and made by
         :meth:`_flush_refreshes` afterwards.
 
-        A reason of None means there is nothing to say, so nothing is
-        recorded: eviction and sleeping say something, retiring does not.
+        Three states rather than two, which is what lets a caller clear a
+        line without writing one:
+
+        * a **sentence** -- put it on the message. Eviction does this: the
+          channel is owed an explanation for a game it did not stop.
+        * ``""`` -- edit the message, but with nothing to say, so whatever
+          the last press wrote is cleared and the header is left on its own.
+          The idle timeout does this: a game going to sleep by itself is not
+          news, and "Asleep after 10 minutes" was a sentence nobody needed
+          sitting under the picture until somebody played again.
+        * ``None`` -- do not edit at all. Retiring does this, because it is
+          about to replace the whole message anyway.
         """
         if reason is None:
             return
@@ -2485,15 +2495,23 @@ class Retro(
                 log.exception("The Libretro hibernation task hit an error.")
 
     async def _hibernate_idle(self) -> None:
+        """
+        Put sessions that nobody has touched for a while to sleep.
+
+        The message is edited to *clear* the last press's line rather than to
+        announce anything. A game going quietly to sleep on its own is not an
+        event: the controls still work, the next press wakes it, and the
+        header already carries the asleep marker for anybody who looks. The
+        sentence that used to go here -- "Asleep after 10 minutes without
+        input" -- was an announcement nobody asked for, left sitting under
+        the picture until somebody played again. See _queue_refresh for the
+        difference between an empty reason and no reason at all.
+        """
         minutes = await self.config.session_timeout_minutes()
         cutoff = time.time() - minutes * 60
         for view in list(self.sessions.values()):
             if view.live and view.last_active < cutoff:
-                await self.hibernate(
-                    view,
-                    f"Asleep after {minutes} minutes without input. Press a "
-                    "button to pick up where you left off.",
-                )
+                await self.hibernate(view, "")
 
     # -- Talking to Discord safely -------------------------------------------
 

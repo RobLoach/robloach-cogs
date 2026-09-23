@@ -313,6 +313,13 @@ shuts down. Sleeping frees the emulator but keeps the controls live: the next bu
 press wakes the game up exactly where it was, even if the bot has restarted in
 between.
 
+**An idle timeout says nothing.** It clears whatever the last press wrote and
+leaves the header, rather than announcing itself — a game going quietly to
+sleep on its own is not an event, and a sentence about it would sit under the
+picture until somebody played again. The header still carries `· asleep` for
+anybody who looks. Being *evicted* by another channel is the opposite case and
+is still explained: that is something done to the game rather than by it.
+
 One game runs at a time across the whole bot. A libretro core is a shared
 library with global state, so two emulators running at once would corrupt each
 other's games; when a second channel starts playing, the first channel's game is

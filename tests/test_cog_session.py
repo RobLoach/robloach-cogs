@@ -3819,3 +3819,49 @@ async def test_the_whole_line_reads_as_one_person_walking(retro):
         f"**Pokemon** \N{MIDDLE DOT} Rob pressed {up}. "
         f"*Queued: Rob {up}{down}{down}*"
     ), edit["content"]
+
+
+async def test_a_game_that_falls_asleep_by_itself_clears_its_line(retro):
+    """
+    An idle timeout is not news, so it does not write a sentence.
+
+    It used to leave "Asleep after 10 minutes without input. Press a button
+    to pick up where you left off." sitting under the picture until somebody
+    played again. Nobody asked for it: the controls still work, the next
+    press wakes the game, and the header already carries the asleep marker
+    for anybody who looks. So the message *is* edited -- what the last press
+    wrote is cleared -- but nothing is announced.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9031, "quietly")
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    await retro.cog.config.session_timeout_minutes.set(10)
+    view.last_active = time.time() - 11 * 60
+    await retro.cog._hibernate_idle()
+
+    assert not view.live
+    content = view.message.edits[-1]["content"]
+    assert content == retro.line(view, asleep=True), content
+    # The press line is gone, and nothing replaced it.
+    assert "pressed" not in content
+    assert "Asleep after" not in content
+    assert "minutes" not in content
+
+
+async def test_an_evicted_game_still_explains_itself(retro):
+    """The contrast: a game stopped *for* the channel is owed a sentence.
+
+    Falling asleep is something a game does on its own after nobody plays.
+    Being evicted is something another channel did to it, which is exactly
+    the case where saying nothing would look like a fault.
+    """
+    await retro.install_cores("gambatte")
+    first, _, _ = await retro.posted_game(9032, "evicted")
+    assert first.live
+
+    second, _, _ = await retro.posted_game(9033, "thief")
+    assert not first.live and second.live
+
+    content = first.message.edits[-1]["content"]
+    assert "Another channel" in content, content
