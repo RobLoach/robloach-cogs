@@ -1433,3 +1433,92 @@ async def test_the_round_trip_is_a_round_trip(battery):
     assert cog._sram_path(9281, "ucity").read_bytes() == marker
     await cog.run_press(view, None)
     assert view.emulator.save_sram() == marker
+
+
+# -- The undo history is progress, so it is wiped with the progress -----------
+#
+# Every entry in it is a save state, so a history left behind by a command that
+# destroys or replaces progress is an Undo button that walks straight back into
+# what was just thrown away. There are two lines of defence and they meet in
+# the middle: a save command on a *live* session calls forget_history(), and the
+# save that follows removes the now-empty file (see Retro._write_undo_now); a
+# game with no live session has no history in memory to clear, so the file is
+# removed by whatever walks SavePaths.
+
+
+async def test_a_save_command_clears_a_live_history_and_the_file_with_it(battery):
+    """The first line of defence: the history dies with the command's pause."""
+    view, _, channel = await playing(battery, 9260, "ucity")
+    cog = battery.cog
+    await cog.run_press(view, "a")
+    await cog._write_state(view)
+    undo = cog._undo_path(9260, "ucity")
+    assert undo.is_file() and view.history, "nothing to prove otherwise"
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(channel, author=FakeUser(uid=view.starter_id))
+
+    await command(battery, "retrosaves_delete")(cog, ctx, game="ucity")
+
+    assert not view.history, "the pause must invalidate the undo points"
+    assert not undo.is_file(), "and the emptied history must not be left on disk"
+
+
+async def test_delete_removes_a_stored_history_and_names_it(battery):
+    """The second: no live session, so the file is all there is to go on."""
+    view, _, channel = await playing(battery, 9261, "ucity")
+    cog = battery.cog
+    await cog.run_press(view, "a")
+    await cog._write_state(view)
+    undo = cog._undo_path(9261, "ucity")
+    assert undo.is_file()
+    # Put the game away so the delete finds nothing live, which is the
+    # ordinary case for a game a channel has moved on from.
+    await cog.hibernate(view)
+    cog.sessions.pop(channel.id, None)
+    assert undo.is_file(), "hibernating must not have removed it"
+    FakeConfirm.reset(answer=True)
+    # The bot owner: with no live session there is no starter_id to match, so
+    # the starter is no longer recognisable as one.
+    ctx = battery.context(channel, author=FakeUser(uid=1))
+
+    await command(battery, "retrosaves_delete")(cog, ctx, game="ucity")
+
+    assert not undo.is_file()
+    assert "undo history" in ctx.said().lower(), ctx.said()
+
+
+async def test_dropstate_takes_a_stored_undo_history_with_the_state(battery):
+    """Every undo point is from *after* the state being dropped."""
+    view, _, channel = await playing(battery, 9262, "ucity")
+    cog = battery.cog
+    view.emulator.load_sram(marker_bytes(SRAM_BYTES))
+    await cog.run_press(view, "a")
+    await cog._write_state(view)
+    undo = cog._undo_path(9262, "ucity")
+    assert undo.is_file()
+    await cog.hibernate(view)
+    cog.sessions.pop(channel.id, None)
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(channel, author=FakeUser(uid=1))
+
+    await command(battery, "retrosaves_dropstate")(cog, ctx, game="ucity")
+
+    assert not cog._state_path(9262, "ucity").is_file()
+    assert not undo.is_file(), (
+        "Undo would step back into the progress dropstate just threw away"
+    )
+
+
+async def test_an_import_drops_the_undo_history_it_would_otherwise_reverse(battery):
+    """Undoing into the overwritten save would silently undo the import."""
+    view, _, channel = await playing(battery, 9263, "ucity")
+    cog = battery.cog
+    await cog.run_press(view, "a")
+    await cog._write_state(view)
+    undo = cog._undo_path(9263, "ucity")
+    assert undo.is_file()
+
+    written = cog._write_import(9263, "ucity", marker_bytes(SRAM_BYTES), None)
+
+    assert written, "the import wrote nothing, so nothing is proved"
+    assert not undo.is_file()

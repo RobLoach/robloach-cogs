@@ -149,7 +149,7 @@ ROLLBACK_SUFFIX = ".rollback"
 
 class SavePaths(typing.NamedTuple):
     """
-    The four files one channel's progress in one game lives in.
+    The five files one channel's progress in one game lives in.
 
     A plain 4-tuple until now, which read perfectly wherever all four were
     unpacked at once and badly everywhere else: ``_save_paths(...)[:2]`` meant
@@ -160,8 +160,12 @@ class SavePaths(typing.NamedTuple):
     thing holding the pairing together.
 
     Still a tuple, deliberately: ``SavesMixin._delete_saves`` zips it against
-    ``DELETE_LABELS`` and two callers unpack all four, and none of them should
-    have to change to gain a name for the halves.
+    ``DELETE_LABELS``, and that zip is ``strict=True`` precisely so a file
+    added here and not there stops the delete instead of silently leaving the
+    new file behind. ``undo`` is the fifth, and it is in here rather than
+    off to one side for that reason: everything that wipes a game's progress
+    walks this tuple, so the undo history cannot be the one thing left on disk
+    pointing at progress that has been deleted.
     """
 
     #: The save state -- the exact moment the game was left at.
@@ -172,6 +176,8 @@ class SavePaths(typing.NamedTuple):
     sram: Path
     #: The generation before that one.
     sram_backup: Path
+    #: The Undo button's history: the save states it steps back through.
+    undo: Path
 
 
 class StorageMixin(MixinMeta):
@@ -370,11 +376,34 @@ class StorageMixin(MixinMeta):
         """
         return path.with_name(path.name + BACKUP_SUFFIX)
 
+    def _undo_path(self, channel_id: int, slug: str) -> Path:
+        """
+        Where the Undo button's history is kept between runs.
+
+        Beside the save state, and for the same reasons: it is the same kind of
+        thing (save states of this core, of this game, in this channel), it is
+        pruned and budgeted with the rest of ``states/``, and it is deleted by
+        whatever deletes the save it belongs to.
+
+        No ``.bak``. :meth:`_write_atomic` is called without ``keep_backup``
+        for this one file: a previous *generation* of an undo history is of no
+        use to anybody -- the whole file is already a history -- and keeping
+        one would double what the largest thing a session writes costs on
+        disk for nothing.
+        """
+        return self._data_dir("states") / f"{channel_id}-{slug}.undo"
+
     def _save_paths(self, channel_id: int, slug: str) -> SavePaths:
-        """``(state, state backup, sram, sram backup)``; see :class:`SavePaths`."""
+        """Every file one game's progress lives in; see :class:`SavePaths`."""
         state = self._state_path(channel_id, slug)
         sram = self._sram_path(channel_id, slug)
-        return SavePaths(state, self._backup_path(state), sram, self._backup_path(sram))
+        return SavePaths(
+            state,
+            self._backup_path(state),
+            sram,
+            self._backup_path(sram),
+            self._undo_path(channel_id, slug),
+        )
 
     @staticmethod
     def _slug(name: str) -> str:

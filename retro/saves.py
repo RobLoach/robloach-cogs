@@ -123,6 +123,7 @@ DELETE_LABELS = (
     "the previous save state",
     "its in-game save",
     "the previous in-game save",
+    "its undo history",
 )
 
 # The words `[p]retrosaves export` accepts in front of a game name to say what
@@ -452,9 +453,9 @@ class SavesMixin(MixinMeta):
         session: typing.Optional[RetroView],
     ) -> SaveInfo:
         """Gather one game's files and whatever is known about it."""
-        state_path, state_backup_path, sram_path, sram_backup_path = self._save_paths(
-            channel_id, slug
-        )
+        paths = self._save_paths(channel_id, slug)
+        state_path, state_backup_path = paths.state, paths.state_backup
+        sram_path, sram_backup_path = paths.sram, paths.sram_backup
         state = self._file_facts(state_path)
         sram = self._file_facts(sram_path)
         state_backup = self._file_facts(state_backup_path)
@@ -1321,7 +1322,11 @@ class SavesMixin(MixinMeta):
             # straight through to the backup and the game would come back at
             # almost exactly the moment that was just dropped.
             paths = self._save_paths(ctx.channel.id, entry.slug)
-            for path in (paths.state, paths.state_backup):
+            # The undo history goes with them. Every entry in it is a save
+            # state from *after* the one being dropped, so leaving it would
+            # leave an Undo button that walks straight back into the progress
+            # this command exists to throw away.
+            for path in (paths.state, paths.state_backup, paths.undo):
                 path.unlink(missing_ok=True)
 
         try:
@@ -2344,4 +2349,10 @@ class SavesMixin(MixinMeta):
             # no-op on the next boot.
             paths.state.unlink(missing_ok=True)
             paths.state_backup.unlink(missing_ok=True)
+        # Whatever was imported, the undo history describes the progress that
+        # has just been replaced. Keeping it would put an Undo button on the
+        # imported game that steps back into the save it overwrote -- silently
+        # undoing the import, which is the one thing this command must not do
+        # by accident.
+        paths.undo.unlink(missing_ok=True)
         return written

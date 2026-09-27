@@ -164,6 +164,69 @@ UNDO_DEPTH = 8
 # built, uploaded and dropped inside one press.
 MAX_UNDO_BYTES = 2 * 1024 * 1024
 
+# -- The undo history on disk --------------------------------------------------
+#
+# The history used to be memory-only, which meant every message that outlived a
+# bot restart had a dead Undo button and a paragraph explaining why. It is now
+# written beside the save state (see StorageMixin._undo_path) and read back when
+# the session is restored, so Undo reaches back across a restart exactly as it
+# reaches back across a sleep.
+#
+# The container is deliberately dull: a magic number, then each entry as a
+# four-byte big-endian length followed by that many bytes. The entries are the
+# zlib blobs that are already in memory, so nothing is compressed twice and
+# writing is a concatenation. No pickle, no JSON, no marshal -- this is a file
+# somebody else's process could have written, so it is parsed as bytes with
+# every length checked rather than handed to anything that can execute or
+# allocate on trust.
+UNDO_FILE_MAGIC = b"RETROUNDO1\n"
+
+#: Refuse a file bigger than a history could legitimately be, before reading
+#: it. MAX_UNDO_BYTES is the bound on the entries; the slack covers the magic
+#: and one length prefix per entry, with room to spare.
+MAX_UNDO_FILE_BYTES = MAX_UNDO_BYTES + 4096
+
+
+def encode_history(entries: typing.Iterable[bytes]) -> bytes:
+    """Pack undo entries into the bytes :meth:`_undo_path` holds.
+
+    Takes the blobs exactly as the history holds them -- already compressed,
+    oldest first -- so this is framing and nothing else.
+    """
+    out = bytearray(UNDO_FILE_MAGIC)
+    for blob in entries:
+        out += len(blob).to_bytes(4, "big")
+        out += blob
+    return bytes(out)
+
+
+def decode_history(data: bytes) -> typing.List[bytes]:
+    """The inverse, for a file that may be anything at all.
+
+    Returns the entries, oldest first, or ``[]`` for a file this cog did not
+    write, a truncated one, or one whose lengths do not add up. Never raises
+    and never trusts a length it has not checked against what is really there:
+    a corrupt undo history is worth exactly one empty Undo button, and must
+    not be worth a failed session restore.
+
+    A partially-written file is read up to the point it stops making sense
+    rather than rejected whole, so a crash during the write costs the newest
+    entries instead of all of them. The entries are independent save states,
+    which is what makes that safe.
+    """
+    if not data.startswith(UNDO_FILE_MAGIC) or len(data) > MAX_UNDO_FILE_BYTES:
+        return []
+    entries: typing.List[bytes] = []
+    offset = len(UNDO_FILE_MAGIC)
+    while offset + 4 <= len(data):
+        size = int.from_bytes(data[offset : offset + 4], "big")
+        offset += 4
+        if size <= 0 or offset + size > len(data):
+            break
+        entries.append(data[offset : offset + size])
+        offset += size
+    return entries
+
 
 class EncodedClip(typing.NamedTuple):
     """
@@ -229,6 +292,13 @@ class SessionMixin:
         """
         self.history: typing.Deque[bytes] = collections.deque()
         self._history_bytes: int = 0
+        #: Whether the on-disk history has been looked for yet. False on a
+        #: session that has just been built, whether from a record or from a
+        #: fresh start: both may have a `.undo` file waiting for them, since
+        #: both are keyed by the same channel and game.
+        #: See ``Retro.load_undo_history``, which is the only thing that
+        #: sets it.
+        self.history_loaded: bool = False
 
     @property
     def history_bytes(self) -> int:
@@ -281,6 +351,29 @@ class SessionMixin:
         """Throw the undo history away, leaving the game exactly as it is."""
         self.history.clear()
         self._history_bytes = 0
+
+    def adopt_history(self, entries: typing.Iterable[bytes]) -> int:
+        """Take an undo history read off disk, and say how many entries stuck.
+
+        Replaces whatever is there rather than appending to it: the only
+        caller is the restore of a session that has just been built, so there
+        is nothing to append to, and "replace" is the behaviour that cannot
+        leave a restored session holding two games' worth of undo points.
+
+        Everything goes through :meth:`_trim_history` afterwards, so a file
+        written by a build with a larger UNDO_DEPTH -- or one somebody has
+        edited -- cannot make this session hold more than the bounds allow.
+        Whatever the entries are, they are only ever *loaded* as save states,
+        and a save state the core refuses costs the history and nothing else
+        (see :meth:`capture_undo`).
+        """
+        self.history.clear()
+        self._history_bytes = 0
+        for blob in entries:
+            self.history.append(blob)
+            self._history_bytes += len(blob)
+        self._trim_history()
+        return len(self.history)
 
     # -- Booting ------------------------------------------------------------
 

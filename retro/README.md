@@ -1063,12 +1063,41 @@ The history is capped by bytes as well as by count (2 MiB), because the sizes
 above are what *today's* cores cost and a
 count alone bounds nothing.
 
-**The history is in memory only** — and it is cheap to lose, because the real
-save state is on disk either way. So a bot restart empties it, which means
-*every* message that has outlived a restart has nothing to undo until somebody
-presses something.
+**The history is kept on disk**, in one `.undo` file beside the game's save
+state, so it survives a restart: a message that has outlived one still undoes.
+It used to be memory-only, which meant *every* message that outlived a restart
+had a dead Undo button and a paragraph explaining why.
 
-**The button stays clickable for that case.** It used to grey itself out, on
+It is **read lazily** — when a game is woken, or when somebody actually clicks
+Undo, never at load. Reading every stored channel's history when the cog loads
+would hold up to 2 MiB *per channel* for as long as the cog is loaded, for
+games nobody may ever touch again; this way the memory is proportional to what
+is being played rather than to what has ever been played. It is only ever read
+into an *empty* history, which is what makes it safe to do from both of those
+places at once: a session that already has undo points in memory has newer ones
+than the file.
+
+The file is written next to the save state and only once that state has landed,
+so the two always describe the same game — a history saved beside a state that
+failed to write would step back into a past the next boot never reaches. An
+emptied history *removes* the file rather than writing an empty one, so "no
+file" and "nothing to undo" stay the same thing on disk and a history that has
+just been cleared cannot come back on the next restart. Nothing here can cost
+anybody their game: a history that will not write, or will not parse, is worth
+exactly one empty Undo button.
+
+**Wiping progress wipes the history with it.** Every entry is a save state from
+*after* the moment being discarded, so a history left behind would be an Undo
+button that walks straight back into what was just thrown away — and on
+`[p]retrosaves import`, one that silently undid the import. There are two
+defences: a `[p]retrosaves` command that pauses a live game clears the history
+as it pauses (and the save that follows removes the file), and a game with no
+live session has its file removed by whatever deletes the rest of its saves.
+`SavePaths` in `retro/storage.py` lists every file a game's progress lives in
+and `[p]retrosaves delete` walks it, so the undo history cannot be the one
+thing left behind pointing at saves that are gone.
+
+**The button stays clickable even with nothing to undo.** It used to grey itself out, on
 the theory that a dead button beats a lying one, and that turned out to hide
 the only explanation there is: a disabled Discord button cannot be clicked, so
 the line below could never be reached by the person looking at the dead
@@ -1080,9 +1109,11 @@ undo now costs one private reply and **no edit of the message at all**:
 > Nothing to undo here yet — press any button and Undo works from there. The
 > game is exactly where you left it.
 
-It says what to do and stops there. The depth, and the fact that a restart is
-what emptied the history, are the reasons this branch exists and are of no use
-to somebody who just wants their button back.
+It says what to do and stops there. The depth is of no use to somebody who just
+wants their button back. It is reached now by a game nobody has pressed yet, and
+by one whose history a `[p]retrosaves` command has just invalidated — no longer
+by every message that outlived a restart, which is what the sentence this reply
+used to carry was about.
 
 A game going to *sleep* is different: the session object
 survives, and a save state can be loaded into any instance of the same core

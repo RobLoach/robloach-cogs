@@ -126,6 +126,7 @@ from .saves import (
     SaveInfo,
     SavesMixin,
 )
+from .session import decode_history, encode_history
 from .storage import (
     BACKUP_SUFFIX,
     DEFAULT_DISK_BUDGET_MB,
@@ -2173,10 +2174,61 @@ class Retro(
         # channel's edit. See _queue_refresh and _flush_refreshes.
         self._queue_refresh(view, reason)
 
+    async def load_undo_history(self, view: RetroView) -> None:
+        """
+        Read this session's undo history off disk, if it has not got one.
+
+        **Lazy on purpose.** Doing this in ``RetroView.from_record`` would read
+        every stored channel's history at load and hold all of them for as long
+        as the cog is loaded -- up to MAX_UNDO_BYTES *per channel*, for
+        sessions nobody may touch again. Loading it when a session is actually
+        woken or actually asked to undo keeps that memory proportional to what
+        is being played rather than to what has ever been played.
+
+        **Only ever into an empty history**, which is what makes it safe to
+        call from more than one place: :meth:`SessionMixin.adopt_history`
+        replaces rather than appends, so a session that already has entries in
+        memory has newer ones than the file and is left alone. Together with
+        the flag, that means the disk is read at most once per session and can
+        never overwrite a press that has just happened.
+
+        Never raises. A history that cannot be read is an Undo button that
+        starts empty, which is exactly what it used to be on every restart.
+        """
+        if view.history_loaded or view.history:
+            return
+        # Before the read, not after: a file that cannot be read must not be
+        # retried on every press for the rest of the session's life.
+        view.history_loaded = True
+        path = self._undo_path(view.channel_id, view.slug)
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError:
+            # Missing is the ordinary case -- a game nobody has undone, or one
+            # saved by a build from before this existed.
+            return
+        entries = decode_history(data)
+        if not entries:
+            if data:
+                log.warning(
+                    "The undo history for %s could not be read, so Undo starts "
+                    "empty for it.",
+                    view.slug,
+                )
+            return
+        log.debug(
+            "Restored %s undo point(s) for %s from disk.",
+            view.adopt_history(entries),
+            view.slug,
+        )
+
     async def _wake_locked(self, view: RetroView) -> None:
         """Load the core and the last save state for a hibernated session."""
         if view.live:
             return
+        # Before the core, so the first press after a wake cannot append to an
+        # empty history and then save that over the real one on disk.
+        await self.load_undo_history(view)
         core_path = await self._core_path(view.core)
         if core_path is None:
             raise EmulatorError(
@@ -2265,9 +2317,9 @@ class Retro(
         self, channel_id: int, slug: str
     ) -> typing.Tuple[Progress, typing.Optional[str]]:
         """The blocking half of :meth:`_saved_progress`."""
-        state_path, state_backup, sram_path, sram_backup = self._save_paths(
-            channel_id, slug
-        )
+        paths = self._save_paths(channel_id, slug)
+        state_path, state_backup = paths.state, paths.state_backup
+        sram_path, sram_backup = paths.sram, paths.sram_backup
         # The two *backups* are handed over as paths rather than as bytes:
         # they are only ever read when the newer file turns out to be
         # unusable, which is rare, and a save state can be megabytes. See
@@ -2328,7 +2380,8 @@ class Retro(
         good copy the channel has, and the next boot finds it in the same way.
         """
         outcome = getattr(view, "boot_outcome", "fresh")
-        state_path, state_backup, _, _ = self._save_paths(view.channel_id, view.slug)
+        paths = self._save_paths(view.channel_id, view.slug)
+        state_path, state_backup = paths.state, paths.state_backup
         if outcome == "backup-state":
             self._discard(state_path)
             view.notice = (
@@ -2596,7 +2649,39 @@ class Retro(
                 "Could not write the save state for %s.", view.slug, exc_info=True
             )
             return False
+        self._write_undo_now(view)
         return True
+
+    def _write_undo_now(self, view: RetroView) -> None:
+        """
+        Put the Undo button's history on disk beside the state. Never raises.
+
+        Written here, after the state and only once the state has landed, so
+        the two always describe the same game: a history saved next to a state
+        that failed to write would step back into a past that the next boot
+        never reaches.
+
+        The history is already in memory and already compressed, so this needs
+        no core and no lock -- which is why it can live in this thread with the
+        rest of the writing. An empty history removes the file rather than
+        writing an empty one, so that "no file" and "nothing to undo" stay the
+        same state on disk and a history somebody has just had cleared (a
+        reboot, a core update) cannot come back on the next restart.
+
+        Failure costs the undo history and nothing else, like every other write
+        on the press path: the game and its save state are already safe.
+        """
+        path = self._undo_path(view.channel_id, view.slug)
+        entries = list(getattr(view, "history", ()) or ())
+        try:
+            if not entries:
+                path.unlink(missing_ok=True)
+                return
+            self._write_atomic(path, encode_history(entries))
+        except Exception:
+            log.warning(
+                "Could not write the undo history for %s.", view.slug, exc_info=True
+            )
 
     async def _write_state(
         self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None

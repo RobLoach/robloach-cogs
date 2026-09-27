@@ -12,11 +12,14 @@ state, then the cartridge's battery save, then the beginning -- and the part
 that has to keep working after the bot has been restarted.
 """
 
+import pathlib
 import types
 
 import pytest
 
 pytest.importorskip("discord", reason="the cog tests need discord.py")
+
+from retro import session as S  # noqa: E402
 
 from .fakes import ROM_BYTES, FakeEmulator  # noqa: E402
 
@@ -576,3 +579,215 @@ async def test_an_unreadable_retired_record_is_ignored_not_fatal(retro):
     cog2, bot2 = retro.make_cog()
     bot2.channels[channel.id] = channel
     await cog2._restore_sessions()  # must not raise
+
+
+# -- The undo history across a restart ----------------------------------------
+#
+# It used to be memory-only: every message that outlived a restart had a dead
+# Undo button and a paragraph explaining why. It is now a file beside the save
+# state, read back lazily (see Retro.load_undo_history for why lazily).
+
+
+def test_the_undo_container_round_trips():
+    blobs = [b"first", b"second" * 100, b"\x00\xff" * 50]
+    assert S.decode_history(S.encode_history(blobs)) == blobs
+
+
+def test_an_empty_undo_history_encodes_to_just_its_magic():
+    assert S.encode_history([]) == S.UNDO_FILE_MAGIC
+    assert S.decode_history(S.encode_history([])) == []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"",
+        b"not a retro undo file at all",
+        S.UNDO_FILE_MAGIC[:-1],
+        # A length that runs off the end of the file.
+        S.UNDO_FILE_MAGIC + (999999).to_bytes(4, "big") + b"short",
+        # A zero length, which would otherwise loop forever on nothing.
+        S.UNDO_FILE_MAGIC + (0).to_bytes(4, "big") + b"whatever",
+    ],
+)
+def test_a_file_this_cog_did_not_write_decodes_to_nothing(data):
+    """Never raises: a corrupt history is worth one empty Undo button."""
+    assert S.decode_history(data) == []
+
+
+def test_a_file_bigger_than_a_history_could_be_is_refused_unread():
+    fat = S.UNDO_FILE_MAGIC + b"\x00" * (S.MAX_UNDO_FILE_BYTES + 1)
+    assert S.decode_history(fat) == []
+
+
+def test_a_truncated_history_keeps_the_entries_that_are_whole():
+    """A crash mid-write costs the newest entries, not all of them."""
+    whole = S.encode_history([b"one", b"two"])
+    assert S.decode_history(whole[:-1]) == [b"one"]
+
+
+async def test_undo_still_works_after_a_bot_restart(retro):
+    """The headline: the button that used to be dead now steps back."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9610, "undopersists")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog._write_state(view)
+    assert view.history, "the press should have left an undo point"
+    depth = len(view.history)
+    assert retro.cog._undo_path(channel.id, view.slug).is_file()
+
+    # Everything in memory goes away.
+    cog2, bot2 = retro.make_cog()
+    bot2.channels[channel.id] = channel
+    await cog2._restore_sessions()
+    revived = cog2.sessions[channel.id]
+    assert not revived.history, "not read at restore: that is the lazy part"
+
+    await cog2.load_undo_history(revived)
+
+    assert len(revived.history) == depth
+    assert list(revived.history) == list(view.history)
+
+
+async def test_a_restored_session_reads_its_history_at_most_once(retro, monkeypatch):
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9611, "readonce")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog._write_state(view)
+
+    cog2, bot2 = retro.make_cog()
+    bot2.channels[channel.id] = channel
+    await cog2._restore_sessions()
+    revived = cog2.sessions[channel.id]
+
+    reads = []
+    original = S.decode_history
+    monkeypatch.setattr(
+        retro.cogmod, "decode_history", lambda data: reads.append(1) or original(data)
+    )
+    await cog2.load_undo_history(revived)
+    await cog2.load_undo_history(revived)
+    await cog2.load_undo_history(revived)
+
+    assert len(reads) == 1, reads
+
+
+async def test_a_session_with_no_history_on_disk_still_only_looks_once(retro):
+    """What the flag is actually for: not retrying a read that found nothing.
+
+    The previous test would pass without it -- one successful load leaves
+    entries in memory, and those alone stop a second read. A game nobody has
+    ever undone has no file, so there is nothing in memory afterwards either,
+    and only the flag stops every press of the session going back to the disk.
+    """
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9617, "nohistory")
+    retro.cog._undo_path(channel.id, view.slug).unlink(missing_ok=True)
+    view.history_loaded = False
+    view.forget_history()
+
+    looks = []
+    real = type(retro.cog._undo_path(channel.id, view.slug)).read_bytes
+
+    def spy(self):
+        looks.append(self)
+        return real(self)
+
+    original = pathlib.Path.read_bytes
+    pathlib.Path.read_bytes = spy
+    try:
+        await retro.cog.load_undo_history(view)
+        await retro.cog.load_undo_history(view)
+    finally:
+        pathlib.Path.read_bytes = original
+
+    assert not view.history
+    assert len(looks) == 1, looks
+    assert view.history_loaded is True
+
+
+async def test_loading_never_clobbers_a_history_already_in_memory(retro):
+    """What makes it safe to call from both the wake and the Undo button."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9612, "noclobber")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog._write_state(view)
+
+    cog2, bot2 = retro.make_cog()
+    bot2.channels[channel.id] = channel
+    await cog2._restore_sessions()
+    revived = cog2.sessions[channel.id]
+    # Pretend a press got there first.
+    revived.history.append(b"a fresher undo point")
+    revived._history_bytes = len(b"a fresher undo point")
+
+    await cog2.load_undo_history(revived)
+
+    assert list(revived.history) == [b"a fresher undo point"]
+
+
+async def test_an_unreadable_history_file_costs_only_the_undo_button(retro, caplog):
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9613, "corrupthist")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog._write_state(view)
+    retro.cog._undo_path(channel.id, view.slug).write_bytes(b"not an undo file")
+
+    cog2, bot2 = retro.make_cog()
+    bot2.channels[channel.id] = channel
+    await cog2._restore_sessions()
+    revived = cog2.sessions[channel.id]
+
+    await cog2.load_undo_history(revived)  # must not raise
+
+    assert not revived.history
+    assert "could not be read" in caplog.text
+
+
+async def test_clearing_the_history_removes_the_file_rather_than_emptying_it(retro):
+    """So "no file" and "nothing to undo" stay the same thing on disk."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9614, "clearedhist")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    await retro.cog._write_state(view)
+    path = retro.cog._undo_path(channel.id, view.slug)
+    assert path.is_file()
+
+    view.forget_history()
+    await retro.cog._write_state(view)
+
+    assert not path.exists(), "an emptied history must not come back on restart"
+
+
+async def test_the_history_is_not_written_beside_a_state_that_failed(retro, monkeypatch):
+    """They must describe the same game or Undo steps into an unreachable past."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9615, "statefailed")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    path = retro.cog._undo_path(channel.id, view.slug)
+    path.unlink(missing_ok=True)
+
+    original = retro.cog._write_atomic
+
+    def refuse_state(target, data, keep_backup=False):
+        if str(target).endswith(".state"):
+            raise OSError("no room")
+        return original(target, data, keep_backup)
+
+    monkeypatch.setattr(retro.cog, "_write_atomic", refuse_state)
+    await retro.cog._write_state(view)
+
+    assert not path.exists(), "the history outlived the state it belongs to"
+
+
+async def test_adopting_a_history_respects_the_depth_cap(retro):
+    """A file from a build with a bigger cap cannot make this session hold more."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9616, "deepfile")
+
+    kept = view.adopt_history([bytes([n]) * 10 for n in range(S.UNDO_DEPTH + 6)])
+
+    assert kept == S.UNDO_DEPTH
+    assert len(view.history) == S.UNDO_DEPTH
+    # The newest are the ones kept.
+    assert view.history[-1] == bytes([S.UNDO_DEPTH + 5]) * 10

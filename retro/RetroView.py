@@ -2592,6 +2592,11 @@ class RetroView(SessionMixin, discord.ui.View):
             # something the next picture settles by itself.
             await self._ack_now(interaction)
             return
+        # The history may be sitting on disk rather than in memory: a session
+        # rebuilt after a restart has not read it yet, and this check is what
+        # stands between somebody and their save states. Cheap after the first
+        # call, and a no-op for a session that has already pressed something.
+        await self.cog.load_undo_history(self)
         if not self.history:
             # `ephemeral` rather than a bare send_message, which is how this
             # branch came by the defer fallback every other answer-and-do-

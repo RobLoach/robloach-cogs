@@ -1196,7 +1196,12 @@ async def test_discord_py_still_has_no_public_way_to_unregister_a_view():
 
 
 def saves_of(retro, channel_id, slug):
-    """Which of a game's four save files are on disk, by name."""
+    """Which of a game's save files are on disk, by name.
+
+    Walks SavePaths rather than naming the files, so a save file added to the
+    cog turns up here without this helper being edited -- which is how the undo
+    history arrived in these counts.
+    """
     return [p.name for p in retro.cog._save_paths(channel_id, slug) if p.is_file()]
 
 
@@ -1218,7 +1223,8 @@ async def test_a_rom_pruned_by_the_disk_budget_takes_its_resume_button_with_it(r
     await retro.cog._write_state(view)
     retro.cog._write_atomic(retro.cog._sram_path(channel.id, slug), b"battery2", True)
     before = saves_of(retro, channel.id, slug)
-    assert len(before) == 4, before
+    # Both generations of both saves, plus the undo history the presses left.
+    assert len(before) == 5, before
 
     # Retire it, so its ROM is no longer protected by a live session, and
     # then squeeze the budget until the ROM has to go.
@@ -1285,7 +1291,9 @@ async def test_a_deleted_channel_is_forgotten_and_keeps_its_saves(retro):
     await retro.cog._write_state(view)
     retro.cog._sram_path(channel.id, view.slug).write_bytes(b"battery")
     saved = saves_of(retro, channel.id, view.slug)
-    assert len(saved) == 2, saved
+    # The state, the battery save, and the undo history from the press.
+    assert len(saved) == 3, saved
+    assert any(name.endswith('.undo') for name in saved), saved
     emulator = view.emulator
     assert emulator is not None and emulator.started, "the game was not awake"
     played = emulator.frame
