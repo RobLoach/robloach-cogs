@@ -121,6 +121,11 @@ COMMANDS = {
     # says part of the same thing and the whole retroset group is owner-only,
     # so players were being pointed at a command they cannot run.
     "retro list",
+    # "Does this install actually work?", as opposed to `[p]retroset settings`'
+    # "what is it configured to do?". Top-level rather than under retroset
+    # because it is the command somebody is told to run when something is
+    # wrong, and it answers about the whole install rather than the settings.
+    "retrodiagnose",
     # Finish with a game and retire its controls -- the thing `[p]retrostop`
     # never did despite the name.
     "retroend",
