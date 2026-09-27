@@ -479,17 +479,17 @@ you.
 | Command | What it does |
 | --- | --- |
 | `[p]retroset download [core]` | Downloads every supported core for your platform from the buildbot, or refreshes one. |
-| `[p]retroset autodownload [true\|false]` | Whether missing cores are fetched when the cog loads. On by default. |
+| `[p]retroset autodownload [true\|false]` | Whether missing cores are fetched when the cog loads. See [Settings](#settings). |
 | `[p]retroset game add <name> <url>` | Saves a game so anyone can start it by name. |
 | `[p]retroset game remove <name>` | Forgets one. |
 | `[p]retroset game list` | Lists them. `[p]retro list` is the version players can run. |
 | `[p]retroset coreoptions [core] [key] [value]` | Reads and changes a core's own settings. Also `/retroset coreoptions`, which autocompletes all three arguments. |
 | `[p]retroset bios add\|list\|remove` | BIOS files for cores that need one. See [BIOS files](#bios-files). |
-| `[p]retroset cliplength <seconds>` | How much play each clip shows. Default 1.6. |
-| `[p]retroset hold <milliseconds>` | How long a button is held. Default 80. |
-| `[p]retroset timeout <minutes>` | How long a game idles before it sleeps. Default 10. |
-| `[p]retroset diskbudget [megabytes]` | Caps what the cog may use on disk; with no argument, reports what is using it. |
-| `[p]retroset allowprivateurls [true\|false]` | Lets ROM URLs point inside your own network. Off, and best left off. |
+| `[p]retroset cliplength <seconds>` | How much play each clip shows. See [Settings](#settings). |
+| `[p]retroset hold <milliseconds>` | How long a button is held. See [Settings](#settings). |
+| `[p]retroset timeout <minutes>` | How long a game idles before it sleeps. See [Settings](#settings). |
+| `[p]retroset diskbudget [megabytes]` | Caps what the cog may use on disk; with no argument, reports what is using it. See [Settings](#settings). |
+| `[p]retroset allowprivateurls [true\|false]` | Lets ROM URLs point inside your own network. See [Settings](#settings). |
 | `[p]retroset settings` | The current configuration. |
 | `[p]retroset version` | Answers **"am I running the new code?"** |
 | `[p]retrodiagnose [true]` | Answers **"does this install actually work?"** |

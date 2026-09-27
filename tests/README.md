@@ -163,8 +163,9 @@ dropped" in `test_cog_session.py` is all of it:
 
 ## Pacing: a clip is not replaced before it has been watched
 
-A clip takes 42-92ms to make and 1005ms to watch, so a queue drain used to
-replace each one after about 5% of it had played. The fix is that the *edit*
+A clip takes 42-92ms to make and well over a second to watch (1608ms at the
+1.6s default, 1005ms at the 1s it used to be), so a queue drain used to replace
+each one after about 5% of it had played. The fix is that the *edit*
 waits, for the clip's whole playing time at every clip length; the rule and
 the numbers behind it are in the note above `MAX_PACE_SECONDS` in
 `retro/timing.py`.
@@ -330,7 +331,7 @@ previous clip is shown in the new one" -- the final picture is never dropped,
 a clip is never emptied, and **a clip of a screen where nothing moved is left
 completely alone**. That last one is a regression that has already shipped:
 trimming it leaves the single picture the first rule obliges it to keep and
-plays a 1005ms clip as a 17ms flash. `test_cog_session.py` pins the session
+plays a whole clip as a 17ms flash. `test_cog_session.py` pins the session
 half -- who remembers the still (a 16 byte hash, never the pixels), that only
 a *successful* edit promotes it, what the pacing gate then waits for, and
 every teardown path that has to forget it.

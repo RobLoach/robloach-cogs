@@ -200,8 +200,8 @@ milliseconds rather than centiseconds, so it can hold the 67 ms a frame of a
 ## Pacing: one clip at a time
 
 **A clip is not replaced until it has had its playing time on screen.** A clip
-costs far less to make than it does to watch, and once the queue above removed
-the human from between two presses that stopped being harmless. Measured on
+costs far less to make than it does to watch, and once the press queue (below)
+removed the human from between two presses that stopped being harmless. Measured on
 gambatte running Libbet, one second clips, on a Raspberry Pi 5 — three presses
 back to back, as a queue drains them:
 
