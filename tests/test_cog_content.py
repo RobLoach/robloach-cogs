@@ -1910,3 +1910,205 @@ async def test_retrodiagnose_says_no_games_are_running_when_none_are(retro):
     await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
 
     assert "No games are running." in ctx.said()
+
+
+# -- Autocomplete: learning a game's name while typing it ---------------------
+#
+# `[p]retro <name>` needs the name up front, and the only way to learn one was
+# to run `[p]retro list` first. These callbacks are what make `/retro play` and
+# `/retroset coreoptions` answerable without that second command.
+
+
+async def autocompleting(retro, name, current, *args):
+    """Call one of the cog's autocomplete callbacks and return the names.
+
+    The interaction is a bare namespace on purpose: none of these callbacks
+    touches it, and a test that had to build a convincing one would be
+    asserting something about the harness instead of about the cog.
+    """
+    callback = getattr(retro.cogmod.Retro, name)
+    choices = await callback(retro.cog, types.SimpleNamespace(), *args, current)
+    return [choice.name for choice in choices]
+
+
+async def test_typing_nothing_offers_every_saved_game(retro):
+    await retro.cog.config.games.set(
+        {"ucity": "u", "libbet": "l", "dmg-acid2": "d"}
+    )
+
+    assert await autocompleting(retro, "retro_game_autocomplete", "") == [
+        "dmg-acid2",
+        "libbet",
+        "ucity",
+    ]
+
+
+async def test_a_game_matches_on_any_part_of_its_name_in_any_case(retro):
+    """The memorable part of `pokemon-red-1996` is in the middle of it."""
+    await retro.cog.config.games.set(
+        {"pokemon-red-1996": "p", "zelda": "z", "Metroid": "m"}
+    )
+
+    assert await autocompleting(retro, "retro_game_autocomplete", "RED") == [
+        "pokemon-red-1996"
+    ]
+    assert await autocompleting(retro, "retro_game_autocomplete", "metroid") == [
+        "Metroid"
+    ]
+    assert await autocompleting(retro, "retro_game_autocomplete", "nope") == []
+
+
+async def test_no_more_choices_are_offered_than_discord_will_show(retro):
+    """Discord silently drops a longer list, so the cap has to be ours."""
+    await retro.cog.config.games.set({f"game{n:03d}": "u" for n in range(60)})
+
+    offered = await autocompleting(retro, "retro_game_autocomplete", "")
+
+    assert len(offered) == retro.cogmod.MAX_AUTOCOMPLETE_CHOICES
+    # Sorted, so the cap lands on a predictable set rather than on whatever
+    # order the stored dict happened to have.
+    assert offered == sorted(offered)
+    assert offered[0] == "game000"
+
+
+async def test_an_autocomplete_that_cannot_read_the_games_offers_nothing(retro):
+    """Raising would show the person typing nothing at all, with no clue why."""
+
+    class Angry:
+        async def __call__(self):
+            raise RuntimeError("the config is down")
+
+    retro.cog.config.games = Angry()
+
+    assert await autocompleting(retro, "retro_game_autocomplete", "u") == []
+
+
+def namespace(**kwargs):
+    """Stand in for `interaction.namespace`: the options already filled in."""
+    return types.SimpleNamespace(namespace=types.SimpleNamespace(**kwargs))
+
+
+async def completing(retro, name, current, **filled):
+    """A coreoptions autocomplete, with the other options already answered."""
+    callback = getattr(retro.cogmod.Retro, name)
+    choices = await callback(retro.cog, namespace(**filled), current)
+    return [(choice.name, choice.value) for choice in choices]
+
+
+DEFINITIONS = {
+    "gambatte": {
+        "gambatte_gb_colorization": {
+            "default": "auto",
+            "values": ["auto", "GBC", "SGB", "internal"],
+        },
+        "gambatte_gb_internal_palette": {"default": "GBC - Grayscale", "values": []},
+    },
+    "fceumm": {"fceumm_region": {"default": "Auto", "values": ["Auto", "NTSC", "PAL"]}},
+}
+
+
+async def test_only_installed_cores_are_offered(retro):
+    await retro.install_cores("gambatte", "fceumm")
+
+    offered = await completing(retro, "retroset_coreoptions_autocomplete_core", "")
+
+    assert [name for name, _ in offered] == ["fceumm", "gambatte"]
+
+
+async def test_the_option_keys_offered_are_the_named_core_s_own(retro):
+    """Reading one slash option off another is what makes this answerable."""
+    await retro.cog.config.core_option_definitions.set(DEFINITIONS)
+
+    offered = await completing(
+        retro, "retroset_coreoptions_autocomplete_key", "", core="gambatte"
+    )
+
+    assert [value for _, value in offered] == [
+        "gambatte_gb_colorization",
+        "gambatte_gb_internal_palette",
+    ]
+    assert "fceumm_region" not in [value for _, value in offered]
+
+
+async def test_an_option_key_matches_on_the_part_worth_typing(retro):
+    await retro.cog.config.core_option_definitions.set(DEFINITIONS)
+
+    offered = await completing(
+        retro, "retroset_coreoptions_autocomplete_key", "COLOR", core="gambatte"
+    )
+
+    assert [value for _, value in offered] == ["gambatte_gb_colorization"]
+
+
+async def test_a_core_whose_options_were_never_read_offers_no_keys(retro):
+    """It must not load one to find out: see CoresMixin._cached_definitions."""
+    await retro.install_cores("gambatte")
+
+    assert await completing(
+        retro, "retroset_coreoptions_autocomplete_key", "", core="gambatte"
+    ) == []
+    assert await completing(
+        retro, "retroset_coreoptions_autocomplete_key", "", core=""
+    ) == []
+
+
+async def test_the_values_offered_are_the_ones_the_core_declared(retro):
+    await retro.cog.config.core_option_definitions.set(DEFINITIONS)
+
+    offered = await completing(
+        retro,
+        "retroset_coreoptions_autocomplete_value",
+        "",
+        core="gambatte",
+        key="gambatte_gb_colorization",
+    )
+
+    # `reset` first, then the core's own values in the core's own order, with
+    # the default marked rather than moved.
+    assert offered == [
+        ("reset", "reset"),
+        ("auto (default)", "auto"),
+        ("GBC", "GBC"),
+        ("SGB", "SGB"),
+        ("internal", "internal"),
+    ]
+
+
+async def test_an_option_with_no_declared_values_still_offers_reset(retro):
+    await retro.cog.config.core_option_definitions.set(DEFINITIONS)
+
+    offered = await completing(
+        retro,
+        "retroset_coreoptions_autocomplete_value",
+        "",
+        core="gambatte",
+        key="gambatte_gb_internal_palette",
+    )
+
+    assert offered == [("reset", "reset")]
+
+
+async def test_typing_narrows_the_values_and_can_exclude_reset(retro):
+    await retro.cog.config.core_option_definitions.set(DEFINITIONS)
+
+    offered = await completing(
+        retro,
+        "retroset_coreoptions_autocomplete_value",
+        "PA",
+        core="fceumm",
+        key="fceumm_region",
+    )
+
+    assert offered == [("PAL", "PAL")]
+
+
+async def test_a_value_autocomplete_for_an_unknown_key_offers_only_reset(retro):
+    await retro.cog.config.core_option_definitions.set(DEFINITIONS)
+
+    assert await completing(
+        retro,
+        "retroset_coreoptions_autocomplete_value",
+        "",
+        core="gambatte",
+        key="not_a_real_key",
+    ) == [("reset", "reset")]

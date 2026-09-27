@@ -43,6 +43,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 import discord
+from discord import app_commands
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
@@ -233,6 +234,11 @@ EXAMPLE_ROM_URL = (
 # a multi-second clip, so keeping a single core loaded and evicting the least
 # recently used one is effectively free and removes the hazard entirely.
 MAX_LIVE_EMULATORS = 1
+
+# Discord shows at most 25 autocomplete choices and silently drops the rest of
+# a longer list, so every autocomplete in this cog caps itself here rather than
+# letting Discord decide which ones vanish.
+MAX_AUTOCOMPLETE_CHOICES = 25
 
 # How often the background task looks for sessions to put to sleep.
 IDLE_CHECK_SECONDS = 60
@@ -3578,7 +3584,18 @@ class Retro(
     # still reach the body below untouched. The cost is that a saved game
     # called "list" (or "games", or "consoles") could not be started by bare
     # name any more, so `[p]retroset game add` refuses those names.
-    @commands.group(invoke_without_command=True)
+    #
+    # **Hybrid**, so the same command is a slash command with a `game:` option
+    # that autocompletes over the saved games -- which is the only way anybody
+    # discovers what this bot can start without being told to run a second
+    # command first. `fallback="play"` is what makes that possible at all:
+    # Discord does not let a *group* be invoked, only its subcommands, so
+    # without it `/retro` would offer nothing but `/retro list` and there
+    # would be no slash way to start a game. With it, the group's own callback
+    # is published as `/retro play`, and the prefix form is untouched -- see
+    # test_the_slash_form_of_starting_a_game_is_retro_play.
+    @commands.hybrid_group(invoke_without_command=True, fallback="play")
+    @app_commands.describe(game="A saved game's name, or a URL to a ROM.")
     async def retro(self, ctx: commands.Context, *, game: typing.Optional[str] = None) -> None:
         """
         Play a retro console game in this channel.
@@ -3901,6 +3918,45 @@ class Retro(
         # write that down while it is in front of us.
         await self._learn_options(system.core, emulator)
         await self._save_record(view)
+
+    @retro.autocomplete("game")
+    async def retro_game_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> typing.List[app_commands.Choice]:
+        """
+        Offer the saved games as somebody types `/retro play game:`.
+
+        The whole point of the hybrid form: `[p]retro <name>` requires already
+        knowing the name, and the only way to learn one was to run a second
+        command (`[p]retro list`) first. Here the answer arrives while the
+        question is being typed.
+
+        A substring match rather than a prefix one, because these names are
+        whatever the owner called them and the memorable part of
+        ``pokemon-red-1996`` is in the middle. Case-insensitive for the same
+        reason.
+
+        Discord takes at most 25 choices and silently drops a longer list, so
+        this caps at MAX_AUTOCOMPLETE_CHOICES and sorts, which makes the cap
+        land on a predictable set rather than on whatever order a dict
+        happened to be in.
+
+        Never raises. An autocomplete callback that throws shows the person
+        typing nothing at all, with no clue why, so a Config that will not
+        answer degrades to an empty list -- exactly what a bot with no saved
+        games shows -- and they can still type a URL or a name by hand.
+        """
+        try:
+            games = await self.config.games()
+        except Exception:
+            log.debug("Could not read the saved games to autocomplete.", exc_info=True)
+            return []
+        typed = (current or "").strip().lower()
+        matched = sorted(name for name in games if typed in name.lower())
+        return [
+            app_commands.Choice(name=name, value=name)
+            for name in matched[:MAX_AUTOCOMPLETE_CHOICES]
+        ]
 
     @commands.guild_only()
     @retro.command(name="list", aliases=["games", "consoles"])
@@ -4361,14 +4417,21 @@ class Retro(
         )
         await self._send_pages(ctx, body)
 
-    @commands.group()
+    # A hybrid group for exactly one child: `[p]retroset coreoptions` needs to
+    # be a slash command, because autocomplete does not exist for a prefix
+    # command and its arguments are libretro option keys nobody remembers.
+    # Every other subcommand is `with_app_command=False`, so the slash
+    # surface grows by that one command rather than by the whole owner-only
+    # settings group -- which would put a dozen entries in everybody's slash
+    # menu that only the owner can actually run.
+    @commands.hybrid_group(with_app_command=True)
     @commands.is_owner()
     async def retroset(self, ctx: commands.Context):
         """
         Configure the Retro cog.
         """
 
-    @retroset.command(name="download")
+    @retroset.command(name="download", with_app_command=False)
     async def retroset_download(
         self, ctx: commands.Context, core: typing.Optional[str] = None
     ) -> None:
@@ -4487,6 +4550,12 @@ class Retro(
         for page in pagify("\n".join(lines)):
             await self._safe_send(ctx, page)
 
+    # Hybrid for the autocomplete, which is the one command in the cog where
+    # it is close to essential: the arguments are libretro's own option keys
+    # (`gambatte_gb_colorization`, `genesis_plus_gx_audio_filter`), nobody
+    # remembers them, and reading them used to mean running the command bare,
+    # then again with a core, and only then for real. See
+    # retroset_coreoptions_autocomplete_key.
     @retroset.command(name="coreoptions", aliases=["coreopts"])
     async def retroset_coreoptions(
         self,
@@ -4531,7 +4600,103 @@ class Retro(
         # module; everything it does is in CoresMixin. See cores.py.
         await self._coreoptions(ctx, core, key, value)
 
-    @retroset.command(name="timeout")
+    # -- ...and the three things it can finish for you.
+    #
+    # All three answer from what is already *known* -- the installed cores, and
+    # the option definitions cached in Config -- and never from
+    # CoresMixin._definitions_for, which is allowed to fall through to a
+    # ROM-less probe. A probe loads a libretro core; Discord gives an
+    # autocomplete about three seconds and there is one emulator thread shared
+    # with whatever is being played. So a core whose options have never been
+    # read offers nothing here, and the command's own reply is what explains
+    # that -- see _coreoptions_list.
+    #
+    # Each one is guarded the same way and for the same reason as
+    # retro_game_autocomplete: an autocomplete that raises shows an empty box
+    # with no clue why, and every one of these arguments can still be typed
+    # out by hand.
+
+    @retroset_coreoptions.autocomplete("core")
+    async def retroset_coreoptions_autocomplete_core(
+        self, interaction: discord.Interaction, current: str
+    ) -> typing.List[app_commands.Choice]:
+        """The cores that are installed, since those are the ones with options."""
+        try:
+            installed = await self._installed_cores()
+        except Exception:
+            log.debug("Could not list the cores to autocomplete.", exc_info=True)
+            return []
+        typed = (current or "").strip().lower()
+        return [
+            app_commands.Choice(name=name, value=name)
+            for name in sorted(installed)
+            if typed in name.lower()
+        ][:MAX_AUTOCOMPLETE_CHOICES]
+
+    @retroset_coreoptions.autocomplete("key")
+    async def retroset_coreoptions_autocomplete_key(
+        self, interaction: discord.Interaction, current: str
+    ) -> typing.List[app_commands.Choice]:
+        """
+        The named core's own option keys.
+
+        ``interaction.namespace`` is how one option of a slash command reads
+        another that has already been filled in, which is what makes this
+        answerable at all: the keys belong to a particular core and there is no
+        useful answer without knowing which.
+
+        The *full* key is offered even though the command accepts an
+        unambiguous ending of one (`region` for `fceumm_region`): a list of
+        suffixes would be a list of things that are only valid for as long as
+        nothing else ends the same way, and the point of a completion is that
+        what it inserts is certain to work.
+        """
+        core = getattr(getattr(interaction, "namespace", None), "core", None) or ""
+        definitions = await self._cached_definitions(core)
+        typed = (current or "").strip().lower()
+        return [
+            app_commands.Choice(name=key, value=key)
+            for key in sorted(definitions)
+            if typed in key.lower()
+        ][:MAX_AUTOCOMPLETE_CHOICES]
+
+    @retroset_coreoptions.autocomplete("value")
+    async def retroset_coreoptions_autocomplete_value(
+        self, interaction: discord.Interaction, current: str
+    ) -> typing.List[app_commands.Choice]:
+        """
+        What the named option will actually accept, plus `reset`.
+
+        libretro options are very nearly all enumerations -- a region is one of
+        four strings, a palette one of a dozen -- and the core declares them, so
+        this is the one argument where a completion can offer the whole correct
+        set rather than a guess at it. ``reset`` is offered first because it is
+        the command's own word for "put the core's default back" and is not one
+        of the core's values.
+
+        The default is marked rather than reordered: seeing which value a core
+        ships with is most of the reason for reading these at all, and moving it
+        to the top would make the list stop matching the order the core gave.
+        """
+        core = getattr(getattr(interaction, "namespace", None), "core", None) or ""
+        key = getattr(getattr(interaction, "namespace", None), "key", None) or ""
+        definitions = await self._cached_definitions(core)
+        definition = definitions.get(key) or {}
+        values = definition.get("values") or []
+        default = definition.get("default")
+        typed = (current or "").strip().lower()
+        choices = []
+        if typed in OPTION_RESET:
+            choices.append(app_commands.Choice(name=OPTION_RESET, value=OPTION_RESET))
+        for value in values:
+            text = str(value)
+            if typed not in text.lower():
+                continue
+            label = f"{text} (default)" if text == str(default) else text
+            choices.append(app_commands.Choice(name=label[:100], value=text))
+        return choices[:MAX_AUTOCOMPLETE_CHOICES]
+
+    @retroset.command(name="timeout", with_app_command=False)
     async def retroset_timeout(self, ctx: commands.Context, minutes: int) -> None:
         """
         Set how long a game can idle before it goes to sleep.
@@ -4638,7 +4803,7 @@ class Retro(
             "for the last person who clicked to wait, so keep it in mind."
         )
 
-    @retroset.command(name="cliplength", aliases=["clip"])
+    @retroset.command(name="cliplength", aliases=["clip"], with_app_command=False)
     async def retroset_cliplength(self, ctx: commands.Context, seconds: float) -> None:
         """
         Set how many seconds of play each clip shows.
@@ -4694,7 +4859,7 @@ class Retro(
             f"{' ' + notes if notes else ''}"
         )
 
-    @retroset.command(name="hold")
+    @retroset.command(name="hold", with_app_command=False)
     async def retroset_hold(self, ctx: commands.Context, milliseconds: int) -> None:
         """
         Set how long a button is held down when someone presses it.
@@ -4728,7 +4893,7 @@ class Retro(
             f"{milliseconds}ms.{' ' + fit if fit else ''}"
         )
 
-    @retroset.group(name="game")
+    @retroset.group(name="game", with_app_command=False)
     async def retroset_game(self, ctx: commands.Context) -> None:
         """
         Manage the games players can start by name.
@@ -4841,7 +5006,7 @@ class Retro(
     # "system" is what libretro calls the directory they go in, what a player
     # calls a console, and what `[p]retroset settings` prints three of. One
     # word for one thing.
-    @retroset.group(name="bios", aliases=["firmware"])
+    @retroset.group(name="bios", aliases=["firmware"], with_app_command=False)
     async def retroset_bios(self, ctx: commands.Context) -> None:
         """
         Manage the BIOS/firmware files cores can use.
@@ -5002,7 +5167,7 @@ class Retro(
             return
         await ctx.send(f"`{name}` was deleted from the system directory.")
 
-    @retroset.command(name="autodownload")
+    @retroset.command(name="autodownload", with_app_command=False)
     async def retroset_autodownload(
         self, ctx: commands.Context, enabled: typing.Optional[bool] = None
     ) -> None:
@@ -5048,7 +5213,7 @@ class Retro(
                 f"them with `{ctx.clean_prefix}retroset download`."
             )
 
-    @retroset.command(name="diskbudget", aliases=["disk", "budget"])
+    @retroset.command(name="diskbudget", aliases=["disk", "budget"], with_app_command=False)
     async def retroset_diskbudget(
         self, ctx: commands.Context, megabytes: typing.Optional[int] = None
     ) -> None:
@@ -5135,7 +5300,7 @@ class Retro(
         lines.append(f"`{cog_data_path(self)}`")
         return "\n".join(lines)
 
-    @retroset.command(name="allowprivateurls", aliases=["allowprivate"])
+    @retroset.command(name="allowprivateurls", aliases=["allowprivate"], with_app_command=False)
     async def retroset_allowprivateurls(
         self, ctx: commands.Context, enabled: typing.Optional[bool] = None
     ) -> None:
@@ -5209,7 +5374,7 @@ class Retro(
             "is refused, and so is a public URL that redirects to one."
         )
 
-    @retroset.command(name="version")
+    @retroset.command(name="version", with_app_command=False)
     async def retroset_version(self, ctx: commands.Context) -> None:
         """
         Say which build of this cog is actually loaded.
@@ -5309,7 +5474,7 @@ class Retro(
             value += f"\nOption definitions are known for {len(known)} core(s)."
         return value
 
-    @retroset.command(name="settings")
+    @retroset.command(name="settings", with_app_command=False)
     @commands.bot_has_permissions(embed_links=True)
     async def retroset_settings(self, ctx: commands.Context) -> None:
         """

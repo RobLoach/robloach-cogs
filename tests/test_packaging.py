@@ -210,6 +210,11 @@ def published_commands():
     a command declared in a mixin. A subcommand's decorator names its group
     (``@retroset.command(name="version")``), which is what gives the
     qualified name.
+
+    ``hybrid_command`` and ``hybrid_group`` count: a hybrid is published twice
+    over, as a prefix command *and* as a slash command. Leaving them out is how
+    `[p]retro list` briefly came back as a top-level ``list`` -- its group had
+    stopped being recognised as one, so there was nothing to qualify it with.
     """
     found = {}
     for module in ("Retro.py", "saves.py", "cores.py", "storage.py", "migration.py"):
@@ -221,7 +226,9 @@ def published_commands():
                 if not isinstance(decorator, ast.Call):
                     continue
                 target = ast.unparse(decorator.func)
-                if not target.endswith((".command", ".group")):
+                if not target.endswith(
+                    (".command", ".group", ".hybrid_command", ".hybrid_group")
+                ):
                     continue
                 name = next(
                     (

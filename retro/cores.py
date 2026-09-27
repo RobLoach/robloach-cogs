@@ -583,7 +583,23 @@ class CoresMixin(MixinMeta):
             log.exception("Could not cache the %s core's option definitions.", core)
 
     async def _cached_definitions(self, core: str) -> typing.Dict[str, dict]:
-        return (await self.config.core_option_definitions()).get(core) or {}
+        """What is already known about a core's options, without loading it.
+
+        Never raises and never probes, which is what makes it the only half of
+        :meth:`_definitions_for` an autocomplete may call: Discord allows an
+        autocomplete about three seconds, and a probe dlopens a core on the one
+        emulator thread that whatever is being played is using. A Config that
+        will not answer is an empty completion rather than an empty box with a
+        traceback behind it. See ``Retro.retroset_coreoptions_autocomplete_key``.
+        """
+        if not core:
+            return {}
+        try:
+            known = await self.config.core_option_definitions()
+        except Exception:
+            log.debug("Could not read the cached core options.", exc_info=True)
+            return {}
+        return known.get(core) or known.get(core.strip().lower()) or {}
 
     def _live_emulator_for(self, core: str) -> typing.Optional[RetroEmulator]:
         """A running emulator for this core, if some channel is playing one."""

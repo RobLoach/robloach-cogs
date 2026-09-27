@@ -307,6 +307,52 @@ def test_the_listeners_are_exactly_what_they_were(retro):
         assert method.__self__ is retro.cog, name
 
 
+# -- The slash surface --------------------------------------------------------
+#
+# `[p]retro` is a hybrid group, which is how a slash command with a game:
+# option that autocompletes exists at all. The shape below is the whole reason
+# for `fallback`, and nothing but the real Red can show it: the stub's
+# hybrid_group keeps the callback and throws the app command away.
+
+
+@pytest.mark.redbot
+def test_the_slash_form_of_starting_a_game_is_retro_play(retro):
+    """Discord will not let a group be invoked, only its subcommands.
+
+    So without a fallback there would be no slash way to start a game at all
+    -- `/retro` would offer nothing but `/retro list`. The fallback publishes
+    the group's own callback as a subcommand instead.
+    """
+    group = type(retro.cog).retro
+    assert group.fallback == "play"
+    published = {
+        command.qualified_name: command
+        for command in group.app_command.walk_commands()
+    }
+    assert set(published) == {"retro play", "retro list"}
+
+    # ...and the game option is the one that autocompletes.
+    play = published["retro play"]
+    autocompleting = {
+        param.name for param in play.parameters if param.autocomplete
+    }
+    assert autocompleting == {"game"}
+
+
+@pytest.mark.redbot
+def test_the_prefix_form_still_takes_a_whole_name_with_spaces(retro):
+    """The hybrid must not have turned `game` into a single-word argument.
+
+    `[p]retro some long name` and `[p]retro <url>` both depend on the
+    keyword-only `*, game` consuming the rest of the line.
+    """
+    import inspect
+
+    signature = inspect.signature(type(retro.cog).retro.callback)
+    game = signature.parameters["game"]
+    assert game.kind is inspect.Parameter.KEYWORD_ONLY
+
+
 def test_the_config_schema_is_exactly_what_it_was(retro):
     assert set(retro.cog.config._global_defaults) == GLOBAL_KEYS
     assert set(retro.cog.config._channel_defaults) == CHANNEL_KEYS
