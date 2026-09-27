@@ -9,7 +9,12 @@ here is for somebody changing the code, and most of it is here because getting
 it wrong once was expensive. Several sections describe behaviour that no longer
 exists — that is the point of keeping them.
 
-Measurements are on a Raspberry Pi 5 unless stated otherwise.
+Measurements are on a Raspberry Pi 5 unless stated otherwise, and were taken
+at **the defaults of the time** — for most of this document a one second clip
+and a 160ms hold. The defaults are now 1.6s and 80ms (see
+`CLIP_SECONDS` in retro/clips.py and `DEFAULT_HOLD_MS` in retro/timing.py);
+the numbers below are left exactly as measured rather than rescaled, because
+what they were taken to show is the comparison between the columns.
 
 ## The seam between two clips
 
@@ -17,7 +22,8 @@ Both halves have been got wrong, and the history is worth keeping because
 every attempt was aimed at the same report.
 
 **First, the pre-roll.** A press does not show up the instant the button goes
-down — the hold is 160ms and a game takes a moment longer than that to react —
+down — the hold was 160ms then and a game takes a moment longer than that to
+react —
 so on a game that sits still until it is prodded (an overworld, a menu, a text
 box, which is most of what this cog is played on) the clip's opening picture
 was byte-identical to the one the previous clip had left in the channel. That
@@ -309,7 +315,7 @@ Four rules, and each of them is there for a reason:
 
 * **at most five presses wait.** Each one is a whole clip of latency, and a
   queued press is emulated against a game state its author has not seen yet.
-  Five waiting plus the one running is about six seconds at the one second
+  Five waiting plus the one running is about ten seconds at the 1.6 second
   default — the last person to click waits that long to see what their press
   did. It was three, on the reasoning that four seconds was the limit of
   "I pressed that"; five is a deliberate trade for the thing people actually

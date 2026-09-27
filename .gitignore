@@ -4,3 +4,8 @@ __pycache__
 .hypothesis/
 # Cores and ROMs for the slow tests; see tests/README.md.
 test-assets/
+# Local environments. `.venv-stub` is one built from requirements-dev.txt
+# alone, i.e. without Red-DiscordBot, which is what CI's fast job runs against
+# and the only way to catch a break in tests/stubs; see the root README.
+.venv/
+.venv-stub/

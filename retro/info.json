@@ -4,9 +4,9 @@
     ],
     "install_msg": "Retro installed. Load it with `[p]load retro`, then attach a ROM to `[p]retro` and play, or run `[p]retro list` to see what this bot can start. The console emulators download themselves in the background on the first load, so give them a minute. Upgrading? See the README.",
     "name": "Retro",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "short": "Play retro console games in Discord",
-    "description": "Play retro console games together in Discord, emulated with libretro.\n\nStart a game by name, URL, or an attached ROM or .zip and control it with buttons under the screen. Every press posts an animated clip of the next second of play. Nine consoles, from the NES to the Game Boy Advance, each with its own controller layout, picked from the file extension.\n\nGames save automatically and resume where they left off, even after the bot restarts. Undo steps back through the last eight presses.",
+    "description": "Play retro console games together in Discord, emulated with libretro.\n\nStart a game by name, URL, or an attached ROM or .zip and control it with buttons under the screen. Every press posts an animated clip of the next second and a half of play. Nine consoles, from the NES to the Game Boy Advance, each with its own controller layout, picked from the file extension.\n\nGames save automatically and resume where they left off, even after the bot restarts. Undo steps back through the last eight presses.",
     "required_cogs": {},
     "requirements": [
         "libretro.py",

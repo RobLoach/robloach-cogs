@@ -247,26 +247,25 @@ def test_the_repeat_button_taps_this_console_s_confirm_button(view, system):
 #
 # The table is every clip length that changes the answer, against every
 # console, because this is what every player's controller looks like. The
-# boundaries (measured at DEFAULT_FPS with the default 160ms hold) are 0.46s
-# for the second tap and 0.73s for the third. They were 0.48 and 0.68: the
-# input budget moved when capture_plan started photographing the end of each
-# span, which shifts the last frame on the capture cadence by one step in
-# phase and so jitters both boundaries by a few hundredths in either
-# direction. None of the lengths anybody actually sets changed answer -- 0.5s
-# is still two taps and 0.8s, 1s and 4s are still three.
+# boundaries (measured at DEFAULT_FPS with the default 80ms hold) are 0.26s
+# for the second tap and 0.46s for the third. They were 0.46 and 0.73 at the
+# old 160ms hold: a tap costs its hold plus the gap after it, so halving the
+# hold moves both boundaries down by most of a hold. Every length anybody
+# actually sets is unaffected -- 0.5s and up is still three taps -- and the
+# button now appears at 0.26s rather than 0.46s, so it is hidden only in the
+# bottom quarter of the settable range.
 
 #: clip seconds -> (taps, whether the button is drawn, the "xN" it says)
 REPEAT_BY_LENGTH = [
     (0.2, 1, False, None),   # the settings floor
-    (0.3, 1, False, None),
-    (0.4, 1, False, None),
-    (0.45, 1, False, None),  # the last length with only one tap
-    (0.46, 2, True, "x2"),   # ...and the first with two
-    (0.5, 2, True, "x2"),
-    (0.72, 2, True, "x2"),
-    (0.73, 3, True, "x3"),   # the first with all three
+    (0.25, 1, False, None),  # the last length with only one tap
+    (0.26, 2, True, "x2"),   # ...and the first with two
+    (0.3, 2, True, "x2"),
+    (0.45, 2, True, "x2"),   # the last with two
+    (0.46, 3, True, "x3"),   # ...and the first with all three
+    (0.5, 3, True, "x3"),
     (0.8, 3, True, "x3"),
-    (1.0, 3, True, "x3"),    # the default
+    (1.6, 3, True, "x3"),    # the default
     (4.0, 3, True, "x3"),
     (5.0, 3, True, "x3"),    # the settings ceiling
 ]
@@ -348,12 +347,14 @@ def test_changing_the_clip_length_adds_and_removes_the_button_in_place(view, sys
     short = [b.get("label") for b in view.to_components()[-1]["components"]]
     assert short == [label for label in full if label != f"{confirm} x3"]
 
-    view.clip_seconds = 0.5
+    # 0.3s rather than 0.5: at the 80ms hold, half a second fits all three
+    # taps, and the two-tap band is 0.26s to 0.46s.
+    view.clip_seconds = 0.3
     view._update_repeat_label()
     two = [b.get("label") for b in view.to_components()[-1]["components"]]
     assert two == [f"{confirm} x2" if label == f"{confirm} x3" else label for label in full]
 
-    view.clip_seconds = 1.0
+    view.clip_seconds = 1.6
     view._update_repeat_label()
     assert [b.get("label") for b in view.to_components()[-1]["components"]] == full
     # And it is still a view Discord will register for a message.
@@ -946,12 +947,16 @@ def test_a_real_button_still_routes_to_its_view(retro):
 def test_the_hold_and_clip_defaults():
     from retro.emulator import CLIP_SECONDS, MAX_CLIP_SECONDS, MIN_CLIP_SECONDS
 
-    # One second, not four: a turn is press -> watch -> press, and three of
-    # those four seconds were the game sitting still after the press.
-    assert CLIP_SECONDS == 1.0
+    # 1.6 seconds: long enough to watch a move land and for the repeat button
+    # to fit all three taps, short enough that a turn is still press -> watch
+    # -> press. It was 4 (three of which were the game sitting still) and then
+    # 1.
+    assert CLIP_SECONDS == 1.6
     assert (MIN_CLIP_SECONDS, MAX_CLIP_SECONDS) == (0.2, 5.0)
     assert isinstance(CLIP_SECONDS, float), "the clip length is fractional now"
-    assert viewmod.DEFAULT_HOLD_MS == 160
+    # 80ms, halved from 160. See the note above DEFAULT_HOLD_MS in
+    # retro/timing.py, which records what that trades away.
+    assert viewmod.DEFAULT_HOLD_MS == 80
     assert (viewmod.MIN_HOLD_MS, viewmod.MAX_HOLD_MS) == (50, 2000)
 
 
@@ -1043,7 +1048,8 @@ def test_a_clip_is_never_fewer_frames_than_an_animation_needs():
     # ...and the floor never bites at a length the settings can reach, on any
     # console here (50fps PAL through 60.10fps NES). The budget at the floor
     # is 8 frames on a PAL core and 11 on the NTSC ones, which is comfortably
-    # past the ten frames the default 160ms hold asks for.
+    # past the five frames the default 80ms hold asks for, and past the ten
+    # that 160ms used to.
     for fps in (50.0, 59.727, 60.0, 60.0988):
         assert E.clip_frame_count(fps, E.MIN_CLIP_SECONDS) > E.MIN_CLIP_FRAMES
         assert E.input_budget(fps, E.clip_frame_count(fps, E.MIN_CLIP_SECONDS)) >= 8
@@ -1052,18 +1058,23 @@ def test_a_clip_is_never_fewer_frames_than_an_animation_needs():
 @pytest.mark.parametrize(
     "seconds, expected",
     [
-        # Four seconds: exactly what it always did, three taps 250ms apart.
-        (4.0, [(0, 10), (25, 10), (50, 10)]),
-        # One second: 3 x 160ms + 2 x 250ms is 1.4s of schedule, so the
-        # spacing is squeezed to 14 frames (234ms) and all three taps stay.
-        (1.0, [(0, 10), (24, 10), (48, 10)]),
-        (0.8, [(0, 10), (18, 10), (36, 10)]),
-        # Half a second cannot fit three, even touching, so it does two.
-        (0.5, [(0, 10), (17, 10)]),
-        # A fifth of a second fits one tap, and the default hold now fits
-        # inside it whole: a 12 frame clip's budget is frame 11, not the
-        # frame 8 it was before capture_plan moved the cadence.
-        (0.2, [(0, 10)]),
+        # A tap is 5 frames at the 80ms default, not the 10 it was at 160,
+        # so every plan below is the same shape with half the hold -- and the
+        # lengths that used to squeeze or drop a tap no longer need to.
+        #
+        # Four seconds: three taps at the full 250ms spacing.
+        (4.0, [(0, 5), (20, 5), (40, 5)]),
+        # The 1.6s default, and a second: 3 x 80ms + 2 x 250ms is 740ms of
+        # schedule, which fits inside both whole at the full spacing.
+        (1.6, [(0, 5), (20, 5), (40, 5)]),
+        (1.0, [(0, 5), (20, 5), (40, 5)]),
+        (0.8, [(0, 5), (20, 5), (40, 5)]),
+        # Half a second still fits three, squeezed: it did two at 160ms.
+        (0.5, [(0, 5), (11, 5), (22, 5)]),
+        # ...and 0.26s is the first length that fits a second tap at all.
+        (0.26, [(0, 5), (10, 5)]),
+        # A fifth of a second fits one tap, hold whole.
+        (0.2, [(0, 5)]),
     ],
 )
 def test_three_taps_are_squeezed_then_dropped_to_fit_the_clip(seconds, expected):

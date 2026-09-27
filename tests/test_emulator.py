@@ -459,14 +459,15 @@ def test_record_is_exactly_capture_then_encode(emu, gambatte, ucity):
 
 def test_frames_are_counted_from_the_core_s_own_frame_rate(emu, gambatte, ucity):
     emulator = emu(gambatte, ucity)
-    assert frames_for_ms(emulator, 160) == 10, "~10 frames at 59.7fps"
+    assert frames_for_ms(emulator, 80) == 5, "~5 frames at 59.7fps"
+    assert frames_for_ms(emulator, 160) == 10
     assert frames_for_ms(emulator, 400) == 24
     assert frames_for_ms(emulator, 0) == 1, "a hold is never zero frames"
     assert emulator.frames_for_seconds(4) == 239
-    assert E.CLIP_SECONDS == 1.0
+    assert E.CLIP_SECONDS == 1.6
     # The default hold has to stay under a Game Boy walk cycle (16 frames) or
     # one press walks two tiles; see the walk-cycle test below.
-    assert frames_for_ms(emulator, 160) < 16
+    assert frames_for_ms(emulator, 80) < 16
 
 
 # The two ends of what `[p]retroset cliplength` accepts are in this list on
@@ -577,28 +578,35 @@ def test_one_press_walks_exactly_one_tile(assets, emu):
         end = coords()
         return abs(end[0] - start[0]) + abs(end[1] - start[1])
 
-    walked = {ms: tiles(ms) for ms in (400, 300, 250, 200, 160, 150, 100)}
+    walked = {ms: tiles(ms) for ms in (400, 300, 250, 200, 160, 150, 100, 80)}
     assert walked[400] == 2, f"the OLD 400ms d-pad hold no longer walks two tiles: {walked}"
-    assert walked[160] == 1, f"the NEW 160ms hold must walk exactly one: {walked}"
-    assert walked[200] == 1, walked
-    assert all(walked[ms] == 1 for ms in (250, 200, 160, 150, 100)), walked
+    assert walked[80] == 1, (
+        # The one that matters now, and the one nothing had measured before the
+        # default was halved: 80ms is five frames, and the comment above
+        # DEFAULT_HOLD_MS records that the hold before 160 was eight frames
+        # (~133ms) and was raised because a game could miss it. This is the
+        # check that says a real cartridge still sees a five frame press.
+        f"the 80ms default must still walk exactly one tile: {walked}"
+    )
+    assert walked[160] == 1, f"a 160ms hold must walk exactly one: {walked}"
+    assert all(walked[ms] == 1 for ms in (250, 200, 160, 150, 100, 80)), walked
 
-    # One second is enough aftermath to *see* the step complete: the tile has
+    # The clip is enough aftermath to *see* the step complete: the tile has
     # changed by the last frame the clip photographs, not merely by the end of
-    # the emulation. A Game Boy walk cycle is 16 frames and the hold is 10, so
-    # the step lands around frame 26 of 60 and the clip shows the rest.
-    assert tiles(160, input_budget(poke, clip)) == 1, "the step finishes inside the clip"
+    # the emulation. A Game Boy walk cycle is 16 frames and the default hold is
+    # 5, so the step lands well inside the clip and the clip shows the rest.
+    assert tiles(80, input_budget(poke, clip)) == 1, "the step finishes inside the clip"
 
     # The shortest clip the settings allow still registers the press: a 12
-    # frame clip's input budget is frame 11, so the whole 160ms (ten frames)
-    # fits and is not cut at all -- it used to be clamped to the 8 frames the
-    # old capture cadence could show being released, i.e. ~134ms. A walk cycle
+    # frame clip's input budget is frame 11, so the whole 80ms (five frames)
+    # fits and is not cut at all -- and neither was the 160ms it used to be.
+    # A walk cycle
     # is 16 frames and the clip is 12 either way, so the tile it walks to is
     # credited during the *next* clip -- the press is not lost, it lands a
     # clip later, which is the honest cost of a 0.2 second clip.
     short = poke.clip_frames(E.MIN_CLIP_SECONDS)
-    assert tiles(160, short) == 0, "unexpectedly quick: recheck the comment above"
-    assert tiles(160, short * 2) == 1, "a 0.2s clip lost the press altogether"
+    assert tiles(80, short) == 0, "unexpectedly quick: recheck the comment above"
+    assert tiles(80, short * 2) == 1, "a 0.2s clip lost the press altogether"
 
 
 # -- 3. Clip timing: what the player actually sees ----------------------------

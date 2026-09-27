@@ -86,7 +86,7 @@ class EmulatorError(RuntimeError):
 # ragged tail is gone and the counts above are what the plan produces now, so
 # the timings are a hair pessimistic and the comparison between the columns --
 # which is what chose 15 -- is unaffected.
-CLIP_SECONDS = 1.0
+CLIP_SECONDS = 1.6
 CLIP_FPS = 15
 
 # Bounds for the configurable clip length, which is a float: 0.8 is a real

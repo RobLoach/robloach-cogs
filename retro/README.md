@@ -2,8 +2,8 @@
 
 Play retro console games together in Discord. Attach a ROM and control the game
 with a controller built out of Discord buttons. Every press posts a short
-animated clip of the next second of play, so you see the game react instead of
-a still frame. Anyone in the channel can play.
+animated clip of the next second and a half of play, so you see the game
+react instead of a still frame. Anyone in the channel can play.
 
 Nine consoles, from the Nintendo Entertainment System to the Game Boy Advance.
 Emulation is [libretro.py](https://github.com/JesseTG/libretro.py) running
@@ -195,11 +195,11 @@ press as soon as clips are long enough:
 | Clip length | Taps | The button |
 | --- | --- | --- |
 | 0.2s (the floor) | 1 | not shown |
-| 0.45s | 1 | not shown |
-| 0.46s | 2 | `A ×2` |
-| 0.72s | 2 | `A ×2` |
-| 0.73s | 3 | `A ×3` |
-| 1s (the default) | 3 | `A ×3` |
+| 0.25s | 1 | not shown |
+| 0.26s | 2 | `A ×2` |
+| 0.45s | 2 | `A ×2` |
+| 0.46s | 3 | `A ×3` |
+| 1.6s (the default) | 3 | `A ×3` |
 | 5s (the ceiling) | 3 | `A ×3` |
 
 **Wait and Undo never move**, whether or not ×3 is drawn.
@@ -211,10 +211,11 @@ everybody in the channel is playing and none should be one mis-tap away.
 
 ### What a press does
 
-Each press records the next **second** of play (`[p]retroset cliplength`,
+Each press records the next **1.6 seconds** of play (`[p]retroset cliplength`,
 0.2–5s and fractional) and posts it as an animated WebP that plays through
-once and stops. A button is held for 160ms (`[p]retroset hold`) — long enough
-that no game misses it, short enough that one press is one action.
+once and stops. A button is held for 80ms (`[p]retroset hold`) — short, so the
+game reacts early in the clip, and well under a Game Boy walk cycle so one
+press is one step.
 
 **The game only runs while a clip is being recorded.** Between presses the
 console is frozen mid-frame, so nothing can happen to you while nobody is
@@ -359,8 +360,8 @@ All owner-only, all bot-wide.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `[p]retroset cliplength <seconds>` | 1 | How much play each clip shows. 0.2–5, fractions allowed. |
-| `[p]retroset hold <milliseconds>` | 160 | How long a button is held. A ceiling: a short clip holds for less. |
+| `[p]retroset cliplength <seconds>` | 1.6 | How much play each clip shows. 0.2–5, fractions allowed. |
+| `[p]retroset hold <milliseconds>` | 80 | How long a button is held. A ceiling: a short clip holds for less. |
 | `[p]retroset timeout <minutes>` | 10 | How long a game idles before it sleeps. |
 | `[p]retroset diskbudget <MiB>` | 1024 | What the whole cog may use on disk. `0` is no limit. |
 | `[p]retroset autodownload [true\|false]` | on | Fetch missing cores when the cog loads. |
@@ -373,8 +374,8 @@ system directory.
 cached ROMs go, oldest first — never a save.
 
 **Clip length is worth thinking about.** Every edit waits out the clip it
-replaces, so a full queue of five presses is five whole clips: five seconds at
-the default, twenty-five at the ceiling. The command says so when you set
+replaces, so a full queue of five presses is five whole clips: eight seconds
+at the 1.6s default, twenty-five at the ceiling. The command says so when you set
 anything past about two seconds.
 
 ## Core options
@@ -452,35 +453,46 @@ you.
 
 **Playing** — anyone in the channel:
 
-- `[p]retro [name|url]` starts a game from a saved name, a URL, or an attached ROM or `.zip`. With no arguments it brings back the channel's game, or lists what can be started. Also `/retro play`.
-- `[p]retro list` (aliases `games`, `consoles`) shows the saved games and the consoles this bot can play right now.
-- `[p]retrosaves [game]` (alias `saves`) lists what this channel has saved, or shows one game in detail.
-- `[p]retrosaves list` and `[p]retrosaves info <game>` are the same two things named explicitly.
-- `[p]retrosaves export <game>` posts a game's in-game save as a file. `export state <game>` or `export both <game>` sends the save state too.
+| Command | Aliases | What it does |
+| --- | --- | --- |
+| `[p]retro [name\|url]` | | Starts a game from a saved name, a URL, or an attached ROM or `.zip`. With no arguments, brings back the channel's game or lists what can be started. Also `/retro play`. |
+| `[p]retro list` | `games`, `consoles` | The saved games, and the consoles this bot can play right now. |
+| `[p]retrosaves [game]` | `saves` | What this channel has saved, or one game in detail. |
+| `[p]retrosaves list` | | The listing on its own. |
+| `[p]retrosaves info <game>` | | One game in detail, including what starting it now would do. |
+| `[p]retrosaves export <game>` | | Posts the in-game save as a file. `export state` or `export both` sends the save state too. |
 
-**The channel's game** — the person who started it, **Manage Messages**, or the bot owner:
+**The channel's game** — whoever started it, anyone with **Manage Messages**, or the bot owner:
 
-- `[p]retrosleep` (aliases `retrostop`, `retropause`) saves the game and puts it to sleep. The controls keep working.
-- `[p]retroend` (alias `retroretire`) finishes with the game: saved, emulator freed, controller replaced by a single **▶️ Resume**. Nothing is deleted.
-- `[p]retroreboot` (alias `retroreset`) reboots the running game, as if you flipped its power switch. Nothing on disk is deleted, and it is an undo point.
-- `[p]retrosaves import <game>` installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real core first.
-- `[p]retrosaves dropstate <game>` (aliases `reset`, `restart`) deletes the save state, so the game restarts from the last in-game save.
-- `[p]retrosaves rollback <game>` goes back to the previous save-state generation.
-- `[p]retrosaves delete <game>` wipes both halves of a game's save, after asking.
+| Command | Aliases | What it does |
+| --- | --- | --- |
+| `[p]retrosleep` | `retrostop`, `retropause` | Saves the game and puts it to sleep. The controls keep working. |
+| `[p]retroend` | `retroretire` | Finishes with the game: saved, emulator freed, controller replaced by a single **▶️ Resume**. Nothing is deleted. |
+| `[p]retroreboot` | `retroreset` | Reboots the running game, as if you flipped its power switch. Nothing on disk is deleted, and it is an undo point. |
+| `[p]retrosaves import <game>` | | Installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real core first. |
+| `[p]retrosaves dropstate <game>` | `reset`, `restart` | Deletes the save state, so the game restarts from the last in-game save. |
+| `[p]retrosaves rollback <game>` | | Goes back to the previous save-state generation. |
+| `[p]retrosaves delete <game>` | | Wipes both halves of a game's save, after asking. |
 
-**Owner only:**
+**Owner only** — cores, games and settings:
 
-- `[p]retroset download [core]` downloads every supported core for your platform from the buildbot, or refreshes one.
-- `[p]retroset autodownload [true|false]` controls whether missing cores are fetched when the cog loads.
-- `[p]retroset game add <name> <url>`, `[p]retroset game remove <name>`, `[p]retroset game list` manage the games anyone can start by name.
-- `[p]retroset coreoptions [core] [key] [value]` (alias `coreopts`) reads and changes a core's own settings. Also `/retroset coreoptions`.
-- `[p]retroset bios add|list|remove` manage BIOS files for cores that need one.
-- `[p]retroset cliplength <seconds>`, `[p]retroset hold <milliseconds>`, `[p]retroset timeout <minutes>` — see [Settings](#settings).
-- `[p]retroset diskbudget [megabytes]` (aliases `disk`, `budget`) caps what the cog may use on disk, and with no argument reports what is using it.
-- `[p]retroset allowprivateurls [true|false]` lets ROM URLs point inside your own network. Off, and best left off.
-- `[p]retroset settings` shows the current configuration.
-- `[p]retroset version` answers **"am I running the new code?"**
-- `[p]retrodiagnose [true]` (alias `retrodiag`) answers **"does this install actually work?"**
+| Command | Aliases | What it does |
+| --- | --- | --- |
+| `[p]retroset download [core]` | | Downloads every supported core for your platform from the buildbot, or refreshes one. |
+| `[p]retroset autodownload [true\|false]` | | Whether missing cores are fetched when the cog loads. On by default. |
+| `[p]retroset game add <name> <url>` | | Saves a game so anyone can start it by name. |
+| `[p]retroset game remove <name>` | | Forgets one. |
+| `[p]retroset game list` | | Lists them. `[p]retro list` is the version players can run. |
+| `[p]retroset coreoptions [core] [key] [value]` | `coreopts` | Reads and changes a core's own settings. Also `/retroset coreoptions`, which autocompletes all three arguments. |
+| `[p]retroset bios add\|list\|remove` | `firmware` | BIOS files for cores that need one. See [BIOS files](#bios-files). |
+| `[p]retroset cliplength <seconds>` | `clip` | How much play each clip shows. Default 1.6. |
+| `[p]retroset hold <milliseconds>` | | How long a button is held. Default 80. |
+| `[p]retroset timeout <minutes>` | | How long a game idles before it sleeps. Default 10. |
+| `[p]retroset diskbudget [megabytes]` | `disk`, `budget` | Caps what the cog may use on disk; with no argument, reports what is using it. |
+| `[p]retroset allowprivateurls [true\|false]` | `allowprivate` | Lets ROM URLs point inside your own network. Off, and best left off. |
+| `[p]retroset settings` | | The current configuration. |
+| `[p]retroset version` | | Answers **"am I running the new code?"** |
+| `[p]retrodiagnose [true]` | `retrodiag` | Answers **"does this install actually work?"** |
 
 ## Troubleshooting
 
@@ -590,10 +602,35 @@ with the guard left on.
 
 ## Upgrading
 
-**Nothing to do.** Install the new version, reload the cog, and everything —
-settings, downloaded emulators, cached ROMs, save states, in-game saves, BIOS
-files, saved game names and live sessions — moves itself across on the first
-load.
+Three commands, in this order:
+
+```
+[p]repo update robloach-cogs
+[p]cog update retro
+[p]reload retro
+```
+
+| | What it does | Why it is not optional |
+| --- | --- | --- |
+| `[p]repo update robloach-cogs` | Pulls the latest code into Red's copy of the repository. | Without it the next step has nothing new to install: `[p]cog update` compares against what the repo was last fetched at, not against GitHub. |
+| `[p]cog update retro` | Copies the new files into the cog folder Red actually loads. | |
+| `[p]reload retro` | Restarts the cog from those files. | Python holds the old modules in memory until something reloads them. A bot that has pulled and installed but not reloaded is **still running the old code**. |
+
+Then check you are running what you think you are:
+
+```
+[p]retroset version
+```
+
+The **Loaded code** fingerprint is the line that matters — a hash of the `.py`
+files *as they were when the cog was loaded*, so it does not change until you
+reload. See [Am I running the new code?](#am-i-running-the-new-code).
+
+**Your data is safe across all of it.** Settings, downloaded emulators, cached
+ROMs, save states, in-game saves, BIOS files, saved game names and live
+sessions all survive an update, and anything needing migration migrates itself
+on the first load. Games that were playing come back on their next button
+press; `[p]retro` is unavailable only for the moment the reload takes.
 
 The cog's Python class was once called `RetroCog`, and Red derives both of a
 cog's storage locations from the class name. The migration that handles that is

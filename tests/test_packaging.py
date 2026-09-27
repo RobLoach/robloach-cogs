@@ -260,12 +260,15 @@ def test_the_readme_documents_every_command_the_cog_publishes():
     assert len(commands) > 25, commands
     missing = sorted(name for name in commands if f"[p]{name}" not in COG_README)
     assert not missing, f"undocumented commands: {missing}"
-    # ...and the top-level ones are in the summary list, not only in prose.
-    listed = {
-        line.split("`")[1].removeprefix("[p]").split()[0]
-        for line in COG_README.splitlines()
-        if line.startswith("- `[p]retro")
-    }
+    # ...and the top-level ones are in the command reference, not only in
+    # prose. A bullet (`- `[p]retro ...``) or a table row (`| `[p]retro ...``)
+    # both count: the reference is tables now, and what this is actually
+    # holding is that a command is *listed* somewhere a reader can scan rather
+    # than mentioned in the middle of a paragraph about something else.
+    listed = set()
+    for line in COG_README.splitlines():
+        if line.startswith(("- `[p]retro", "| `[p]retro")):
+            listed.add(line.split("`")[1].removeprefix("[p]").split()[0])
     assert {name for name in commands if " " not in name} <= listed
 
 

@@ -38,14 +38,26 @@ from .emulator import (
 #     100ms        6        1
 #
 # A Game Boy walk cycle is 16 frames, so any hold that outlasts it starts a
-# second step and the character crosses two tiles for one button press. 160ms
-# is ten frames: long enough that a game polling its controller a few times a
-# second cannot miss it (the old 8-frame, ~133ms hold could), and short enough
-# that one press is always one step and one menu entry.
+# second step and the character crosses two tiles for one button press. Every
+# hold in the table walks exactly one tile from 250ms down, so the choice
+# between them is not about movement -- it is about the slowest thing that
+# still reads the press.
+#
+# 80ms is five frames. It is deliberately short: it reacts sooner, which is
+# most of what "the press felt slow to land" is about, and five frames is
+# still several polls for anything reading its controller once a frame, which
+# is what these games do.
+#
+# **The risk is real and is on the record.** The measurements above stop at
+# 100ms, and the hold before this one was eight frames (~133ms) and was raised
+# because a game could miss it. Nothing here has been measured below 100ms, so
+# a game that polls its controller only a few times a second may not see an
+# 80ms press at all. If a console starts dropping presses, `[p]retroset hold`
+# is the dial and 160 is the value this was.
 #
 # It is a ceiling, not a promise: a clip has to have room to show the button
 # come back up, so on a short clip the hold is cut to fit. See press_plan.
-DEFAULT_HOLD_MS = 160
+DEFAULT_HOLD_MS = 80
 MIN_HOLD_MS = 50
 MAX_HOLD_MS = 2000
 
@@ -88,16 +100,21 @@ MIN_REPEAT_GAP_MS = 80
 # stale copy of it still routes somewhere that answers. See the note above
 # _STYLES, which is where that costs something if it is got wrong.
 #
-# Measured against press_plan at DEFAULT_FPS with the default 160ms hold --
+# Measured against press_plan at DEFAULT_FPS with the default 80ms hold --
 # the clip lengths where it appears at all:
 #
 #     clip    taps    the button
 #     0.2s      1     not drawn
-#     0.4s      1     not drawn
-#     0.5s      2     "A x2"
-#     0.8s      3     "A x3"
-#     1s        3     "A x3"   <- the default
+#     0.25s     1     not drawn
+#     0.26s     2     "A x2"
+#     0.45s     2     "A x2"
+#     0.46s     3     "A x3"
+#     1.6s      3     "A x3"   <- the default
 #     4s        3     "A x3"
+#
+# A tap costs its hold plus the gap after it, so halving the hold from 160 to
+# 80 moved both boundaries down by most of a hold: the button used to appear
+# at 0.46s and reach three taps at 0.73s.
 #
 # CONTROL_BUTTONS still reserves room for the whole cluster either way, so
 # Wait and Undo do not move when it comes and goes.
@@ -307,8 +324,9 @@ def press_plan(
       fit. Two taps is a worthwhile repeat button; one is just the confirm
       button, and the view does not draw a button for it at all -- see
       MIN_REPEAT_TAPS and :meth:`RetroView._update_repeat_label`. Measured at
-      DEFAULT_FPS with the default 160ms hold, the boundaries are 0.47s for
-      the second tap and 0.73s for the third.
+      DEFAULT_FPS with the default 80ms hold, the boundaries are 0.26s for
+      the second tap and 0.46s for the third; at the 160ms hold they were
+      0.47s and 0.73s.
 
     The hold itself is clamped last-ditch: it can never be longer than the
     budget, so a 0.2s clip (12 frames, budget 11) with a 400ms hold holds the

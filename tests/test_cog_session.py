@@ -33,9 +33,9 @@ from .fakes import (  # noqa: E402
 async def test_the_clip_and_hold_defaults_reach_a_new_install(retro):
     from retro.emulator import CLIP_SECONDS
 
-    assert CLIP_SECONDS == 1.0
-    assert await retro.cog.config.clip_seconds() == 1.0
-    assert await retro.cog.config.hold_ms() == retro.viewmod.DEFAULT_HOLD_MS == 160
+    assert CLIP_SECONDS == 1.6
+    assert await retro.cog.config.clip_seconds() == 1.6
+    assert await retro.cog.config.hold_ms() == retro.viewmod.DEFAULT_HOLD_MS == 80
 
 
 async def test_an_already_configured_value_survives_a_new_default(retro):
@@ -102,17 +102,20 @@ async def test_retroset_cliplength_says_what_a_short_clip_does_to_a_press(retro)
     cliplength = retro.cogmod.Retro.retroset_cliplength.callback
 
     await cliplength(retro.cog, ctx, 1)
-    assert "held for about" not in ctx.sent[-1], "a 160ms hold fits in a second"
+    assert "held for about" not in ctx.sent[-1], "an 80ms hold fits in a second"
     assert "repeat button" not in ctx.sent[-1], "and so do three taps"
 
-    await cliplength(retro.cog, ctx, 0.5)
+    # 0.3s rather than 0.5: at the 80ms hold, half a second fits all three
+    # taps and the two-tap band is 0.26s to 0.45s.
+    await cliplength(retro.cog, ctx, 0.3)
     assert "repeat button taps 2 times" in ctx.sent[-1], ctx.sent[-1]
 
     await cliplength(retro.cog, ctx, 0.2)
-    # The *default* hold fits even at the floor now: a 12 frame clip's input
+    # The *default* hold fits even at the floor: a 12 frame clip's input
     # budget is frame 11 (see clips.input_budget, whose cadence moved when
     # capture_plan started photographing the end of each span), which is more
-    # than the ten frames 160ms asks for. It used to be frame 8, i.e. ~133ms.
+    # than the five frames 80ms asks for -- and was already more than the ten
+    # that 160ms did.
     assert "held for about" not in ctx.sent[-1], ctx.sent[-1]
     # Not "greyed out" any more: at one tap the button is not drawn at all,
     # and the reply says so and says it comes back. See MIN_REPEAT_TAPS.
@@ -445,12 +448,12 @@ async def held(retro):
 async def test_every_button_is_held_for_the_configured_time(retro, held):
     view, _, _ = held
     emulator = view.emulator
-    assert retro.viewmod.DEFAULT_HOLD_MS == 160
+    assert retro.viewmod.DEFAULT_HOLD_MS == 80
     assert view.hold_ms == retro.viewmod.DEFAULT_HOLD_MS
 
     a_hold = view._schedule(emulator, "a", 1)[0][2]
     up_hold = view._schedule(emulator, "up", 1)[0][2]
-    assert a_hold == emulator.frames_for_ms(160)
+    assert a_hold == emulator.frames_for_ms(80)
     # The fix for "pressing right walks two tiles": a direction is
     # held for exactly as long as a face button now.
     assert up_hold == a_hold
@@ -464,7 +467,7 @@ async def test_a_hold_is_under_a_game_boy_walk_cycle_and_uses_the_real_fps(retro
     emulator = view.emulator
     hold = view._schedule(emulator, "a", 1)[0][2]
     assert hold < 16, f"{hold} frames @ {emulator.fps:.4f}fps"
-    assert hold == round(emulator.fps * 0.16)
+    assert hold == round(emulator.fps * 0.08)
     assert emulator.fps != 60, "hold frames must come from the core, not a hardcoded 60"
 
 
@@ -534,7 +537,7 @@ async def test_retroset_hold_stores_clamps_and_reaches_live_sessions(retro, held
     assert await retro.cog.config.hold_ms() == retro.viewmod.MAX_HOLD_MS
 
     await hold_cmd(retro.cog, ctx, retro.viewmod.DEFAULT_HOLD_MS)
-    assert "160ms" in ctx.sent[-1] and "320ms" not in ctx.sent[-1]
+    assert "80ms" in ctx.sent[-1] and "160ms" not in ctx.sent[-1]
     assert "direction" in ctx.sent[-1], "it must say the directions are included"
 
 
@@ -1437,7 +1440,7 @@ async def test_a_clip_is_not_replaced_until_the_one_on_screen_has_played(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9201, "paced")
     playback = view.clip_playback()
-    assert playback == pytest.approx(1.005, abs=0.001), playback
+    assert playback == pytest.approx(1.608, abs=0.001), playback
     playing_now(view)
 
     await view._press(retro.interaction(view, message=view.message), "a")
@@ -1547,7 +1550,7 @@ async def test_a_full_queue_costs_its_clips_and_says_so(retro):
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9205, "bound")
     playback = view.clip_playback()
-    assert playback == pytest.approx(1.005, abs=0.001), playback
+    assert playback == pytest.approx(1.608, abs=0.001), playback
     playing_now(view)
     await fill_the_queue(retro, view, viewmod.MAX_QUEUED_PRESSES)
 
@@ -1885,7 +1888,7 @@ async def test_a_trimmed_clip_is_paced_for_what_it_really_plays(retro):
     view._encode(synthetic_clip(2, 2, 3, 4), None, view.emulator)
 
     assert view.posted_playback() == pytest.approx(0.134, abs=0.0005)
-    assert view.clip_playback() == pytest.approx(1.005, abs=0.001), (
+    assert view.clip_playback() == pytest.approx(1.608, abs=0.001), (
         "the window's own arithmetic is unchanged and still honest about the window"
     )
     view.note_posted(view.posted_playback())
@@ -2038,7 +2041,8 @@ async def test_the_repeat_button_says_how_many_taps_it_really_did(retro):
     # A clip too short to fit three: the line follows press_plan down, like
     # the label on the button does, rather than claiming a tap that did not
     # happen.
-    view.clip_seconds = 0.5
+    # 0.3s rather than 0.5: at the 80ms hold, half a second fits all three.
+    view.clip_seconds = 0.3
     again = retro.interaction(view, message=view.message)
     await retro.control(view, "repeat").callback(again)
     said = again.log[-1][1]["content"]

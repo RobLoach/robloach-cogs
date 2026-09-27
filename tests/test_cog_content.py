@@ -420,15 +420,15 @@ async def test_the_settings_embed_describes_the_whole_install(retro):
     assert any("System directory" in name for name in names)
     assert any("Automatic core" in name for name in names)
     assert "awake at once" in values, "the one-at-a-time rule is explained"
-    # The clip length is a float, and the default must not read "1.0 seconds".
-    assert "1 second of play per button press" in values, values
+    # The clip length is a float; the default is 1.6 and reads as itself.
+    assert "1.6 seconds of play per button press" in values, values
     assert "0.2-5, fractions allowed" in values, values
-    assert "160ms per press" in values
+    assert "80ms per press" in values
 
 
 async def test_the_settings_embed_says_what_a_short_clip_does_to_a_press(retro):
     await retro.cog.config.clip_seconds.set(0.2)
-    # A 400ms hold, because the default 160ms one now fits even at the clip
+    # A 400ms hold, because the default 80ms one fits even at the clip
     # length floor: a 12 frame clip's input budget is frame 11 rather than the
     # frame 8 it was before capture_plan started photographing the end of each
     # span. 400ms is 24 frames, which still does not fit, and the ceiling is
