@@ -9,25 +9,24 @@ this reads them, caches them, and applies the owner's overrides.
 """
 
 import asyncio
-import io
 import logging
 import platform
 import sys
 import time
 import typing
-import zipfile
 from pathlib import Path
 
 import aiohttp
 from redbot.core import commands
 from redbot.core.utils.chat_formatting import humanize_list
 
-from . import net
+from . import archives, net
 from .abc import MixinMeta
 from .emulator import EmulatorError, RetroEmulator, probe_core_options
 from .systems import (
     CORES,
     SYSTEMS,
+    System,
     core_filename,
     core_name_from_filename,
     system_for_core,
@@ -39,6 +38,17 @@ BUILDBOT = "https://buildbot.libretro.com/nightly"
 
 # The core downloads fetch every core in CORES from one host in a row.
 CORE_DOWNLOAD_TIMEOUT_SECONDS = 300
+
+# The most a single core may unpack to. A generous ceiling rather than a tight
+# one: the seven cores this cog installs are about 4.5 MiB of zips from the
+# buildbot and 31 MiB unpacked (see retro/README.md), so the largest of them is
+# a few MiB and 64 MiB leaves room for a debug build, or a core that grows an
+# embedded database, without anybody having to come back here. What it is for
+# is what a size cap is always for: the buildbot is trusted, but "trusted" is
+# not a reason to hand an unbounded decompression a whole process -- a mirror,
+# a caching proxy, or a compromised host answering with a zip bomb should cost
+# this one core's download and nothing else.
+MAX_CORE_SIZE = 64 * 1024 * 1024
 
 # How long to wait before the automatic core download is allowed to try
 # again. Without it, a cog that is reloaded in a loop (or a core the buildbot
@@ -137,6 +147,15 @@ class CoresMixin(MixinMeta):
 
     def _scan_cores_dir(self) -> typing.Dict[str, Path]:
         """Every core this cog knows sitting in the managed cores directory."""
+        # One try around all of the filesystem work, and one handler. This was
+        # two blocks with byte-identical `except OSError:` bodies, and the only
+        # reason they were apart is that the cache-hit check sat between the
+        # stat() and the iterdir() -- a comparison of two integers, which
+        # cannot raise, so there was never anything in the middle that needed
+        # the handlers to differ. A directory that cannot be read deserves the
+        # same answer whichever call noticed: forget the cache (a listing whose
+        # mtime can no longer be re-checked must never be trusted again) and
+        # report nothing installed.
         try:
             directory = self._cores_dir()
             # stat() before iterdir(): a file that lands in between is then
@@ -145,20 +164,22 @@ class CoresMixin(MixinMeta):
             # listing the file is missing from under the post-change mtime,
             # and that would stick.
             mtime_ns = directory.stat().st_mtime_ns
-        except OSError:
-            log.warning("Could not read the Retro cores directory.", exc_info=True)
-            self._cores_scan_cache = None
-            return {}
-        cached = self._cores_scan_cache
-        if cached is not None and cached[0] == mtime_ns:
-            return dict(cached[1])
-        found: typing.Dict[str, Path] = {}
-        try:
+            cached = self._cores_scan_cache
+            if cached is not None and cached[0] == mtime_ns:
+                # Handed back as it is, and stored below as it is: one dict,
+                # not a copy per lookup. Both callers only read it --
+                # _installed_cores copies each entry into a dict of its own and
+                # _core_path does a single .get() -- so the copy was paid for on
+                # every game start and every coreoptions command and bought
+                # nothing. Anything added here that wants to *change* the
+                # listing has to copy it first, or it is editing the cache.
+                return cached[1]
             entries = sorted(directory.iterdir())
         except OSError:
             log.warning("Could not read the Retro cores directory.", exc_info=True)
             self._cores_scan_cache = None
-            return found
+            return {}
+        found: typing.Dict[str, Path] = {}
         for path in entries:
             name = core_name_from_filename(path.name)
             if name is None or name in found:
@@ -170,7 +191,7 @@ class CoresMixin(MixinMeta):
                 continue
             found[name] = path
         if time.time_ns() - mtime_ns > CORES_MTIME_SETTLE_SECONDS * 1_000_000_000:
-            self._cores_scan_cache = (mtime_ns, dict(found))
+            self._cores_scan_cache = (mtime_ns, found)
         else:
             self._cores_scan_cache = None
         return found
@@ -268,7 +289,7 @@ class CoresMixin(MixinMeta):
             f"`{prefix}retroset download` to fetch them now."
         )
 
-    def _missing_core_message(self, prefix: str, system, core: str) -> str:
+    def _missing_core_message(self, prefix: str, system: System) -> str:
         """
         The same, for a console whose own emulator is the one missing.
 
@@ -276,6 +297,13 @@ class CoresMixin(MixinMeta):
         player, so the sentence says *emulator for the Game Boy* and puts the
         core's name in backticks beside it, where it reads as the thing the
         owner has to type rather than as jargon.
+
+        The core is read off ``system`` rather than passed in. It used to be a
+        third parameter, and every caller passed ``system.core`` -- the only
+        value that makes the sentence true, since the rest of it names the
+        system. A parameter that can only be given one way is one more way to
+        get it wrong: passing a mismatched pair would have printed one
+        console's name beside another console's core.
         """
         if self._cores_downloading():
             return (
@@ -285,8 +313,8 @@ class CoresMixin(MixinMeta):
             )
         return (
             f"This bot has no {system.name} emulator installed (it needs "
-            f"`{core}`, the libretro emulator for the {system.name}). Ask the "
-            f"bot owner to run `{prefix}retroset download {core}`."
+            f"`{system.core}`, the libretro emulator for the {system.name}). Ask the "
+            f"bot owner to run `{prefix}retroset download {system.core}`."
         )
 
     @staticmethod
@@ -359,17 +387,30 @@ class CoresMixin(MixinMeta):
             return False, 0, "download timed out"
 
         core_path = self._cores_dir() / name
+        # Through retro/archives.py, like every other zip the cog opens, rather
+        # than a hand-rolled ZipFile here. This used to be its own three lines
+        # of zipfile, and being the second implementation it was quietly the
+        # worse one: no size cap at all (so a mirror or a compromised host
+        # answering with a zip bomb got an unbounded decompression straight
+        # into memory), no sentence for a password-protected member, nothing
+        # for a compression method this Python was not built with, and members
+        # considered in the archive's own order rather than sorted. The shared
+        # one has all four, and retro/archives.py is now the only place in the
+        # cog that imports zipfile at all.
         try:
-            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-                member = next(
-                    (entry for entry in archive.namelist() if entry.endswith(name)),
-                    None,
-                )
-                if member is None:
-                    return False, 0, "the archive did not contain the core"
-                data = archive.read(member)
-        except (zipfile.BadZipFile, OSError) as error:
-            return False, 0, f"the archive could not be read: {error}"
+            extracted = archives.extract(
+                payload,
+                accept=lambda member: member.endswith(name),
+                max_size=MAX_CORE_SIZE,
+                what="core",
+            )
+        except archives.ArchiveError as error:
+            # Catches NoSupportedMember too, which is the "the zip had no core
+            # in it" case. The distinction the two hand-written messages here
+            # used to draw is carried by the sentence archives.py writes, and
+            # that one also lists what *was* in the archive.
+            return False, 0, f"the buildbot archive could not be used: {error}"
+        data = extracted.data
 
         try:
             await asyncio.to_thread(self._write_atomic, core_path, data)
@@ -631,7 +672,7 @@ class CoresMixin(MixinMeta):
         return definitions
 
     async def _definitions_for(
-        self, core: str, probe: bool = True
+        self, core: str
     ) -> typing.Tuple[typing.Dict[str, dict], str]:
         """
         Everything known about a core's options, and where it came from.
@@ -642,6 +683,14 @@ class CoresMixin(MixinMeta):
         first two are free; only the third loads a core, and it declines to
         while anything is playing, so ``({}, "")`` is a perfectly ordinary
         answer for a busy bot. See :meth:`_probe_definitions`.
+
+        The probe is always offered. There used to be a ``probe`` parameter,
+        and the one caller passed ``installed and not playing`` -- both of
+        which :meth:`_probe_definitions` decides for itself anyway, the first
+        with the identical ``_core_path(core) is None`` test and the second
+        under the emulator lock, which is what makes *its* copy the binding one
+        rather than merely the likely one. Asking a caller to pre-compute two
+        guards the callee repeats is how the two eventually disagree.
         """
         async with self.emulator_lock:
             live = self._live_emulator_for(core)
@@ -657,11 +706,10 @@ class CoresMixin(MixinMeta):
         if cached:
             return cached, "the last time this core ran"
 
-        if probe:
-            probed = await self._probe_definitions(core)
-            if probed:
-                await self._remember_definitions(core, probed)
-                return probed, "the core itself"
+        probed = await self._probe_definitions(core)
+        if probed:
+            await self._remember_definitions(core, probed)
+            return probed, "the core itself"
         return {}, ""
 
     @staticmethod
@@ -1010,6 +1058,75 @@ class CoresMixin(MixinMeta):
             "game next starts."
         )
 
+    @staticmethod
+    def _no_definitions_message(
+        prefix: str, core: str, installed: bool, playing: bool
+    ) -> str:
+        """
+        What to say when nothing at all is known about a core's options.
+
+        One sentence that never changes -- an empty answer means "not known
+        yet", never "this core has none", and saying so is the whole reason
+        this message exists -- followed by the one hint that fits the
+        situation. Four of them, in order of how much they override:
+
+        * not installed: nothing else matters, since a core that is not on
+          disk cannot be asked anything and the download is the only way
+          forward. Checked last below, which is what makes it win.
+        * something is playing: the probe stepped aside rather than saving and
+          hibernating a stranger's game, so name both ways out -- the free one
+          (play something on this core, which is what teaches the cog a core
+          that only declares its options with a ROM in) and the one that costs
+          a wait rather than somebody else's session.
+        * idle, and the console is known: point at the command that starts a
+          game on it, by name.
+        * idle, and the core belongs to no console in SYSTEMS: the same advice
+          without the console's name in it.
+
+        Extracted from :meth:`_coreoptions`, where it was fifty lines of
+        message building sitting in the middle of a four-way dispatcher and
+        was the reason that method could not be read top to bottom. ``prefix``
+        is the bot's real prefix (``ctx.clean_prefix``): these lines are
+        *sent*, and Red only rewrites ``[p]`` in a docstring.
+        """
+        system = system_for_core(core)
+        hint = (
+            f"Start a {system.name} game once (`{prefix}retro <rom>`) and its "
+            "options become listable from then on."
+            if system is not None
+            else "Start a game on it once and its options become listable."
+        )
+        if playing:
+            # The old behaviour here was to load the core anyway, which meant
+            # saving and hibernating whoever was playing. Saying "not known"
+            # and stopping would be no better: an owner told only that would
+            # type the same command again. So name both ways forward instead --
+            # one of them is free and the other costs a wait rather than
+            # somebody else's game.
+            start_it = (
+                f"start a {system.name} game (`{prefix}retro <rom>`) on it"
+                if system is not None
+                else "start a game on it"
+            )
+            hint = (
+                "A game is running right now, and only one emulator core can "
+                "be loaded at a time \N{EM DASH} so this core was not loaded "
+                "to ask it, because that would have saved the running game and "
+                f"put it to sleep. Either {start_it}, which is what teaches "
+                "this cog a core's options, or run this again once nothing is "
+                "playing."
+            )
+        if not installed:
+            hint = (
+                f"It is not installed; run `{prefix}retroset download {core}` "
+                "first."
+            )
+        return (
+            f"The `{core}` core has not told us what options it has. That does "
+            "**not** mean it has none: some cores only declare their settings "
+            f"once a ROM is loaded. {hint}"
+        )
+
     async def _coreoptions(
         self,
         ctx: commands.Context,
@@ -1040,59 +1157,22 @@ class CoresMixin(MixinMeta):
             )
             return
 
+        # Neither of these decides whether to probe any more -- see
+        # _definitions_for, which no longer takes the decision from its caller
+        # because _probe_definitions was always making it again for itself.
+        # They are read here for the *message wording* only, which is why the
+        # race is harmless: a game that ends in between costs one skipped probe
+        # and a second run of the command, and a game that starts in between is
+        # refused by the probe (under the emulator lock, which is where the
+        # binding check lives) rather than evicted by it.
         installed = await self._core_path(core) is not None
-        # Whether anybody is mid-game decides two things at once: whether the
-        # ROM-less probe is even offered, and what to say if nothing is known
-        # without it. This read is advisory -- _probe_definitions makes the
-        # binding one under the emulator lock -- and racing it either way is
-        # harmless. A game that ends in between costs one skipped probe and a
-        # second run of the command; a game that starts in between is refused
-        # by the probe rather than evicted by it.
         playing = self._any_session_live()
         async with ctx.typing():
-            definitions, source = await self._definitions_for(
-                core, probe=installed and not playing
-            )
+            definitions, source = await self._definitions_for(core)
 
         if not definitions:
-            system = system_for_core(core)
-            hint = (
-                f"Start a {system.name} game once "
-                f"(`{ctx.clean_prefix}retro <rom>`) and its options become "
-                "listable from then on."
-                if system is not None
-                else "Start a game on it once and its options become listable."
-            )
-            if playing:
-                # The old behaviour here was to load the core anyway, which
-                # meant saving and hibernating whoever was playing. Saying
-                # "not known" and stopping would be no better: an owner told
-                # only that would type the same command again. So name both
-                # ways forward instead -- one of them is free and the other
-                # costs a wait rather than somebody else's game.
-                start_it = (
-                    f"start a {system.name} game (`{ctx.clean_prefix}retro "
-                    "<rom>`) on it"
-                    if system is not None
-                    else "start a game on it"
-                )
-                hint = (
-                    "A game is running right now, and only one emulator core "
-                    "can be loaded at a time \N{EM DASH} so this core was not "
-                    "loaded to ask it, because that would have saved the "
-                    f"running game and put it to sleep. Either {start_it}, "
-                    "which is what teaches this cog a core's options, or run "
-                    "this again once nothing is playing."
-                )
-            if not installed:
-                hint = (
-                    f"It is not installed; run `{ctx.clean_prefix}retroset "
-                    f"download {core}` first."
-                )
-            message = (
-                f"The `{core}` core has not told us what options it has. That "
-                "does **not** mean it has none: some cores only declare their "
-                f"settings once a ROM is loaded. {hint}"
+            message = self._no_definitions_message(
+                ctx.clean_prefix, core, installed, playing
             )
             if key is None or value is None:
                 await self._safe_send(ctx, message)

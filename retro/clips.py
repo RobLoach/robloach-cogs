@@ -9,16 +9,28 @@ enough to cover in the fast test suite. Pillow is needed to *encode* a clip
 and is imported lazily, so even that is only paid for by the callers that do
 it. Encoding is the only direction: nothing here reads a clip back.
 
-Three groups, and they only meet in retro/emulator.py:
+Four groups:
 
 * the clip/timing arithmetic -- seconds in, emulated frames out;
 * the animation encoder;
 * the fast frame grab, which decodes a video driver's framebuffer with
-  Pillow instead of letting libretro.py convert it a pixel at a time.
+  Pillow instead of letting libretro.py convert it a pixel at a time;
+* what becomes of a captured clip between the emulator and the channel --
+  :func:`picture_hash`, :func:`captured_playback`,
+  :func:`trim_repeated_opening` and :func:`shrink_clip`.
+
+The first three meet in retro/emulator.py, which wraps its own methods around
+them so a caller with an emulator in hand does not have to reach past it. The
+fourth does not and should not: retro/session.py imports those four names
+straight from here, because every one of them runs *after* the capture, with
+the emulator lock given back, and none of them has a core to ask anything of.
 
 :class:`EmulatorError` lives here rather than next to the emulator because
 both halves raise it and this is the half that cannot import the other one.
-``retro.emulator`` re-exports every name below.
+``retro.emulator`` re-exports the names of this module that the rest of the
+cog imports from *there* -- a deliberate subset rather than everything below;
+see its ``__all__``, and the test in tests/test_clips.py that holds it to
+exactly that list.
 """
 
 import hashlib
@@ -109,7 +121,7 @@ CLIP_FPS = 15
 #     1s                   15     48ms      8ms      57ms     2.6 MiB
 #     4s                   60    192ms     24ms     216ms    10.0 MiB
 #     5s                   75    243ms     28ms     272ms    12.5 MiB
-#     15s                 225    802ms     83ms     885ms    37.1 MiB
+#     15s                 226    802ms     83ms     885ms    37.1 MiB
 #
 # (The times were measured while capture_plan opened every clip on frame 0,
 # i.e. with one more picture per row than the pics column now says. The tail
@@ -122,7 +134,7 @@ CLIP_FPS = 15
 #
 # Those are the two cheapest consoles here, and they are not what the ceiling
 # is for. The expensive case is a Super Nintendo in hi-res, which posts at
-# 597x448 (see MIN_CLIP_WIDTH) and which the WEBP_METHOD table above measures
+# 597x448 (see MIN_CLIP_WIDTH) and which the WEBP_METHOD table below measures
 # at 342ms of encode for a one second clip and 1,863ms for a four second one
 # at the settings this ships with. At the same per-picture rate 15 seconds is
 # 224 pictures and roughly 7 seconds of encode, for one button press, on the
@@ -168,20 +180,24 @@ MAX_CLIP_SECONDS = 5.0
 # CLIP_FPS against a 60 fps core one picture is four frames, so six frames is
 # two pictures (emulated frames 4 and -- because the closing frame is always
 # photographed, see capture_plan -- 6), which is the least that is still an
-# animation, and leaves room for a press plus the aftermath frame below.
-# MIN_CLIP_SECONDS is well clear of it on every console here (0.2s is 10
-# frames even on a 50 fps PAL core, which is three pictures), so this is a
-# floor for a core that reports a strange frame rate and for direct callers of
-# record(), not something the settings can reach.
+# animation, and leaves room for a press plus the aftermath picture
+# :func:`input_budget` keeps clear of input.
+#
+# MIN_CLIP_SECONDS is well clear of it on every console here: 0.2s is 10
+# frames even on a 50 fps PAL core, which at a step of 3 is three whole
+# pictures plus the 1-frame closing one capture_plan appends -- four in all.
+# So this is a floor for a core that reports a strange frame rate, not
+# something the settings can reach.
+#
+# It is applied in clip_frame_count() and nowhere else, which is the honest
+# scope of it: it bounds every clip length that came from a setting, and
+# nothing else. record_frames() clamps what it is handed to max(1, frames)
+# only. This used to claim to be "a floor for direct callers of record()" too,
+# which was wrong twice over -- record() has no production caller left (see
+# retro/session.py, which captures and encodes in two halves so the encode can
+# run with the emulator lock given back), and a direct caller of it would
+# bypass this floor anyway.
 MIN_CLIP_FRAMES = 6
-
-# How many emulated frames at the end of a clip are kept clear of input, so
-# the last picture shows the game *after* the press rather than still under
-# it. input_budget() turns it into a frame on the capture cadence, which is
-# what makes it one visible picture rather than one invisible frame: the
-# budget is photographed by definition, and the clip's appended closing
-# picture -- which can be worth a single emulated frame -- comes after it.
-MIN_AFTERMATH_FRAMES = 1
 
 # -- The seam: where one clip stops and the next one starts -------------------
 #
@@ -816,10 +832,9 @@ def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     whole step of playback, and a clip whose closing pictures are still
     mid-press does not show the player what their press did. Only every
     ``capture_step``-th frame is captured, so this is the last frame on that
-    cadence (less MIN_AFTERMATH_FRAMES - 1 further pictures), not simply
-    ``frames - 1``: :func:`capture_plan` may append a closing picture worth as
-    little as one emulated frame, and a release seen only there is a release
-    that flashes past in 17ms.
+    cadence, not simply ``frames - 1``: :func:`capture_plan` may append a
+    closing picture worth as little as one emulated frame, and a release seen
+    only there is a release that flashes past in 17ms.
 
     The cadence is ``step - 1, 2 * step - 1, ...`` (see :func:`capture_plan`,
     which photographs the *end* of each span), so the last frame on it is
@@ -838,6 +853,22 @@ def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     table in :func:`capture_plan` -- so this is a floor on where input may
     stop, not a claim about pixels.
 
+    **One aftermath picture, and why it is not a dial.** What is being bought
+    is that the last picture worth a whole step of playback shows the game
+    *after* the press rather than still under it, and one picture on the
+    capture cadence is the whole of what that takes. It is a visible picture
+    rather than an invisible frame precisely because the budget frame is
+    photographed by definition and the appended closing picture comes after
+    it. This spent a while as a ``MIN_AFTERMATH_FRAMES = 1`` constant, read
+    here as ``reserved = max(1, int(MIN_AFTERMATH_FRAMES)) - 1`` -- which is
+    always ``0``, so the formula the paragraph above quotes was already the
+    unconditional answer. Nothing ever varied the constant and no test
+    parametrised it, so it was a dial with one value and a line of arithmetic
+    that could only ever evaluate to zero. Reserving a *second* picture would
+    cost a whole step of every clip -- a fifteenth of a second at CLIP_FPS,
+    and a fifth of a 0.2s clip -- to say something the closing picture already
+    says.
+
     At four seconds this is 235 of 239 frames and no schedule ever came near
     it. At a fifth of a second it is 11 of 12, and it is what stops a 400ms
     hold, or the repeat button's three taps, from running off the end of the
@@ -845,8 +876,7 @@ def input_budget(fps: float, frames: int, clip_fps: int = CLIP_FPS) -> int:
     """
     frames = max(1, int(frames))
     step = capture_step(fps, clip_fps)
-    reserved = max(1, int(MIN_AFTERMATH_FRAMES)) - 1
-    return max(1, (frames // step - reserved) * step - 1)
+    return max(1, (frames // step) * step - 1)
 
 
 # -- How big the posted picture is -------------------------------------------
@@ -950,10 +980,21 @@ def clip_scale(
     ``max_scale``. See the block above for the measurements behind both
     conditions. ``max_scale`` of 1 means "native", which is what the
     screenshot helpers in the tests ask for.
+
+    The frame size and the aspect ratio are trusted as given: positive, and a
+    ratio that means something. :func:`clip_size` is where a geometry read off
+    a core is made sane -- clamped to at least 1x1, and a ratio of zero or
+    less replaced by the frame's own shape -- and it is the only production
+    caller there is, so normalising a second time in here was three lines
+    doing nothing twice. Worse, because clip_size passes the *already
+    normalised* ratio down, this function's own zero-aspect fallback could not
+    be reached from the only path that leads to it. The one place that
+    fallback has to survive is clip_size, where a test pins
+    ``clip_size(160, 144, 0.0) == (320, 288)``.
+
+    ``max_scale`` is still floored at 1 below, because clip_size hands its own
+    through untouched and a ceiling of zero would otherwise mean "no picture".
     """
-    frame_width = max(1, int(frame_width))
-    frame_height = max(1, int(frame_height))
-    aspect = float(aspect) if float(aspect) > 0.0 else frame_width / frame_height
     wanted = max(int(MIN_CLIP_WIDTH), frame_width)
     scale = 1
     while scale < max(1, int(max_scale)):
@@ -976,6 +1017,12 @@ def clip_size(
     :func:`clip_scale`) and the width follows from the aspect ratio the core
     reports, so a Game Boy's square pixels land on exactly 320x288 and a NES
     frame is 4:3-ish rather than tall and narrow.
+
+    This is where a frame size and an aspect ratio are made sane, once, for
+    both halves of the answer: a core that has not finished initialising can
+    report a zero or nonsense geometry, and a ratio of zero or less means
+    "assume square pixels", i.e. the frame's own shape. :func:`clip_scale`
+    trusts what it is handed and is given the normalised values from here.
     """
     frame_width = max(1, int(frame_width))
     frame_height = max(1, int(frame_height))
@@ -1160,6 +1207,34 @@ def picture_hash(image) -> bytes:
     64-bit hosts this runs on and takes a digest size directly. It is not a
     security boundary -- nobody is choosing the frames -- so the choice is
     purely speed and width.
+
+    **Why there are two of these and why they stay two.** :func:`encode_clip`
+    asks the identical question of consecutive pictures and answers it with
+    ``tobytes()`` directly rather than through here, which reads like a
+    duplicated mechanism and is not one: the two have opposite constraints.
+    This digest is *kept* -- a session holds it across the gap between one
+    press and the next, one live session per channel -- so it has to be small,
+    and a full picture is not. The one in encode_clip is thrown away by the
+    end of the loop that built it, so it only has to be cheap, and it already
+    has the bytes in hand for the resize it is deciding about.
+
+    Keying encode_clip on this function was measured rather than reasoned
+    about, on this Raspberry Pi 5, and it is a straight loss. The aspect
+    correction means **every** console's posted size differs from its native
+    one (160x144 -> 320x288, 256x224 -> 293x224; see :func:`clip_size`), so
+    the run detection runs on all of them and never skips the ``tobytes()``
+    -- the hash would be paid 15 times a press at the default clip length and
+    75 times at the ceiling, purely to avoid holding one 69-688 KiB ``bytes``
+    object for the length of one loop. A one second clip of a still screen,
+    best of three:
+
+        Game Boy 15 pictures      12.9ms -> 15.1ms
+        NES      15 pictures      13.7ms -> 16.3ms
+        SNES hi-res, 5s, moving    2.06s -> 2.20s
+
+    So: two mechanisms, deliberately, and this is the one place the shared
+    definition of "the same picture" is written down -- the raw pixels at the
+    core's own resolution, compared byte for byte.
     """
     return hashlib.blake2b(
         image.tobytes(), digest_size=PICTURE_HASH_BYTES
@@ -1270,6 +1345,13 @@ def encode_clip(
     a run costs one ``tobytes()`` per native-sized frame, which is far
     cheaper than the resize it skips.
 
+    That ``tobytes()`` is the same "is this the same picture?" question
+    :func:`picture_hash` answers with a digest, asked here without one on
+    purpose: the key lives and dies inside this loop, so it only has to be
+    cheap, whereas a hash is what something that has to *remember* a picture
+    between presses needs. picture_hash carries the measurements behind
+    keeping both.
+
     A picture whose size is not ``captured.size`` -- every frame of a 1x
     console, and any frame from a mid-clip geometry change -- goes straight
     from its own resolution to the posted one in that single step, never
@@ -1315,7 +1397,7 @@ CLIP_SHRINK_STEPS = (
 
 
 def shrink_clip(
-    captured: CapturedClip, limit: int, current: typing.Optional[bytes] = None
+    captured: CapturedClip, limit: int, current: typing.Optional[bytes]
 ) -> bytes:
     """
     Re-encode a clip until it fits ``limit`` bytes, or give up gracefully.
@@ -1334,6 +1416,12 @@ def shrink_clip(
     synthetic 320x288 pattern: 1.1 KB lossless against 188 KB at quality 80.)
     So every attempt is compared against what the caller already had, and
     nothing bigger is ever handed back.
+
+    Which is why it has no default. It used to default to None, i.e. to the
+    one mode this docstring spends a paragraph arguing against, and a default
+    that contradicts the documented contract is an invitation nobody should
+    be offered -- every caller passes it, and a caller that genuinely has
+    nothing to compare against can still say so by passing None explicitly.
 
     If nothing fits, the **smallest** candidate is returned rather than an
     error: the caller still has to hand Discord something, a clip that is

@@ -117,6 +117,70 @@ async def test_downloading_everything_reports_what_installed_and_what_failed(ret
     assert all(Path(p).is_file() for p in cores.values())
 
 
+@pytest.fixture
+def serve_core_zip(retro, monkeypatch):
+    """Answer the buildbot with whatever bytes a test hands over."""
+
+    def serve(payload):
+        class FakeResponse:
+            status = 200
+
+            async def read(self):
+                return payload
+
+        @contextlib.asynccontextmanager
+        async def fake_guarded_get(url, **kwargs):
+            yield FakeResponse()
+
+        monkeypatch.setattr(retro.netmod, "guarded_get", fake_guarded_get)
+
+    return serve
+
+
+async def test_a_core_over_the_size_cap_is_refused_and_nothing_is_written(
+    retro, serve_core_zip, monkeypatch
+):
+    """The buildbot is trusted. An unbounded decompression still is not.
+
+    This used to be a hand-rolled ``zipfile.ZipFile(io.BytesIO(payload))`` with
+    no cap on it at all, which meant a mirror, a caching proxy or a compromised
+    host answering with a zip bomb got to decompress as much as it liked
+    straight into the bot's memory. It goes through retro/archives.py now, like
+    every other zip the cog opens, so the uncompressed size is checked against
+    the archive's own metadata *and* against the bytes actually produced -- and
+    a refusal costs this one core rather than the process.
+    """
+    retro.patch("MAX_CORE_SIZE", 512, monkeypatch)
+    serve_core_zip(zip_of([("gambatte_libretro.so", b"\0" * 4096)]))
+
+    ok, size, message = await retro.cog._download_core("gambatte")
+    assert not ok and size == 0
+    assert "buildbot archive could not be used" in message, message
+    assert "limit" in message, message
+    assert not (retro.cog._cores_dir() / "gambatte_libretro.so").exists()
+    assert await retro.cog.config.cores() == {}
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        (b"not a zip at all", "not a readable zip archive"),
+        # Readable, but the core is not in it -- the buildbot publishing a
+        # renamed or empty build. archives.py lists what was in there instead,
+        # which the hand-rolled version could not.
+        (b"PK\x03\x04" + b"junk", "could not be used"),
+        (zip_of([("readme.txt", b"no core here")]), "no core this bot can use"),
+    ],
+)
+async def test_a_buildbot_zip_with_no_core_in_it_says_so(
+    retro, serve_core_zip, payload, expected
+):
+    serve_core_zip(payload)
+    ok, size, message = await retro.cog._download_core("gambatte")
+    assert not ok and size == 0
+    assert expected in message, message
+
+
 async def test_re_running_the_download_only_retries_what_is_missing(retro, buildbot):
     ctx = retro.context(retro.channel(8502))
     await retro.cog.config.cores.set({})
@@ -1327,13 +1391,13 @@ async def test_a_missing_console_emulator_says_emulator_rather_than_core(retro):
     await retro.install_cores("gambatte")
     _downloading(retro, running=False)
     nes = retro.sysmod.system_by_key("nes")
-    said = retro.cog._missing_core_message("!", nes, nes.core)
+    said = retro.cog._missing_core_message("!", nes)
     assert "no Nintendo Entertainment System emulator" in said
     assert "`fceumm`" in said, "the name the owner has to type is still there"
     assert "retroset download fceumm" in said
 
     _downloading(retro, running=True)
-    waiting = retro.cog._missing_core_message("!", nes, nes.core)
+    waiting = retro.cog._missing_core_message("!", nes)
     assert "still downloading" in waiting
     assert "retroset download" not in waiting
 
@@ -1610,10 +1674,22 @@ async def test_a_genuinely_unknown_extension_keeps_the_plain_reply(retro):
 
 
 def test_every_refused_extension_can_explain_itself():
-    """The two tables cannot drift apart without this failing."""
+    """The two tables cannot drift apart, because there is only one of them.
+
+    They were two literals and this asserted them equal. Now the set *is*
+    ``frozenset(AMBIGUOUS_REASONS)``, so equality is a tautology and what is
+    worth checking instead is that the derivation is still what systems.py
+    does -- an extension added to the dict shows up in the set on its own, and
+    an extension can no longer be refused with no explanation to give.
+    """
     from retro import systems
 
-    assert set(systems.AMBIGUOUS_REASONS) == set(systems.AMBIGUOUS_EXTENSIONS)
+    assert systems.AMBIGUOUS_EXTENSIONS == frozenset(systems.AMBIGUOUS_REASONS)
+    assert len(systems.AMBIGUOUS_EXTENSIONS) == 11, sorted(systems.AMBIGUOUS_EXTENSIONS)
+    assert all(
+        systems.ambiguous_reason(extension)
+        for extension in systems.AMBIGUOUS_EXTENSIONS
+    )
     for extension, reason in systems.AMBIGUOUS_REASONS.items():
         assert reason.strip(), extension
         assert f"`.{extension}`" in reason, extension
@@ -1688,3 +1764,36 @@ async def test_the_gate_is_released_when_a_resume_finishes(retro):
     )
     assert channel.id not in retro.cog._resuming, "the gate was left closed"
     assert retro.cog.sessions.get(channel.id) is not None, "it should have resumed"
+
+
+async def test_resuming_does_not_hand_the_starter_rights_to_the_clicker(retro):
+    """
+    Resume brings back a game somebody else may have started.
+
+    The starter is what decides who may sleep, reboot or wipe a game (see
+    permissions.may_manage), so the person who clicks **Resume** must not
+    inherit those rights just by clicking. `RetroView.boot` takes `None` as
+    the starter on that path, which means "leave it alone" — it used to take
+    a whole Context purely to read `ctx.author.id`, which is why resume had
+    to hand-roll the boot instead of calling it.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, channel = await retro.posted_game(9440, "someonelse")
+    original_starter = view.starter_id
+    assert original_starter is not None
+
+    await retro.cogmod.Retro.retroend.callback(retro.cog, ctx)
+    retired = next(iter(retro.cog.retired.values()))
+
+    # A *different* person clicks Resume.
+    clicker = types.SimpleNamespace(
+        id=original_starter + 1, display_name="Passerby"
+    )
+    interaction = retro.interaction(view, user=clicker, message=view.message)
+    await retro.cog.resume_retired(retired, interaction)
+
+    resumed = retro.cog.sessions.get(channel.id)
+    assert resumed is not None, "the game should have come back"
+    assert resumed.starter_id == original_starter, (
+        "clicking Resume must not make the clicker the starter"
+    )

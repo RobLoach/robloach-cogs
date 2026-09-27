@@ -147,6 +147,33 @@ BACKUP_SUFFIX = ".bak"
 ROLLBACK_SUFFIX = ".rollback"
 
 
+class SavePaths(typing.NamedTuple):
+    """
+    The four files one channel's progress in one game lives in.
+
+    A plain 4-tuple until now, which read perfectly wherever all four were
+    unpacked at once and badly everywhere else: ``_save_paths(...)[:2]`` meant
+    "the save state and its previous generation" purely by position, and two
+    callers spelled "the state half" as an unpack ending in ``_, _``. Named,
+    those become attribute reads that say which file they mean, and
+    ``DELETE_LABELS``' comment about matching this order stops being the only
+    thing holding the pairing together.
+
+    Still a tuple, deliberately: ``SavesMixin._delete_saves`` zips it against
+    ``DELETE_LABELS`` and two callers unpack all four, and none of them should
+    have to change to gain a name for the halves.
+    """
+
+    #: The save state -- the exact moment the game was left at.
+    state: Path
+    #: The generation before it, kept by :meth:`StorageMixin._write_atomic`.
+    state_backup: Path
+    #: The cartridge's battery save, i.e. what the player saved in-game.
+    sram: Path
+    #: The generation before that one.
+    sram_backup: Path
+
+
 class StorageMixin(MixinMeta):
     """The data directory: paths, reads, atomic writes, and the budget."""
 
@@ -343,13 +370,11 @@ class StorageMixin(MixinMeta):
         """
         return path.with_name(path.name + BACKUP_SUFFIX)
 
-    def _save_paths(
-        self, channel_id: int, slug: str
-    ) -> typing.Tuple[Path, Path, Path, Path]:
-        """``(state, state backup, sram, sram backup)`` for one game."""
+    def _save_paths(self, channel_id: int, slug: str) -> SavePaths:
+        """``(state, state backup, sram, sram backup)``; see :class:`SavePaths`."""
         state = self._state_path(channel_id, slug)
         sram = self._sram_path(channel_id, slug)
-        return state, self._backup_path(state), sram, self._backup_path(sram)
+        return SavePaths(state, self._backup_path(state), sram, self._backup_path(sram))
 
     @staticmethod
     def _slug(name: str) -> str:
@@ -645,6 +670,59 @@ class StorageMixin(MixinMeta):
                 return f"{size:,.1f} {unit}"
         return f"{size / 1024.0:,.1f} GiB"
 
+    def _rom_entries(
+        self,
+        *,
+        prefix: typing.Optional[str] = None,
+        skip: typing.AbstractSet[str] = frozenset(),
+    ) -> typing.List[typing.Tuple[float, str, Path]]:
+        """
+        ``(mtime, name, path)`` for prunable cached ROMs, oldest first.
+
+        Blocking. Both pruners below need the same listing and each used to
+        build its own, which is how their rules drifted apart: only the budget
+        one excluded the ROMs it had been told to keep, and only the budget one
+        checked ``is_file()`` before stat()ing. One listing, so "what counts as
+        a cached ROM a pruner may throw away" is answered once and visibly the
+        same way for both.
+
+        A ``.tmp`` is never a game -- it is what an interrupted
+        :meth:`_write_atomic` leaves behind, and every reader in this cog skips
+        one -- and neither is a directory somebody has put in ``roms/`` by
+        hand.
+
+        Oldest first, because "least recently played wins" is the rule both
+        pruners follow; the count-based one walks the result backwards. The
+        name is in the sort key so two ROMs written in the same filesystem tick
+        (which a coarse mtime makes likely) order predictably rather than by
+        comparing Paths.
+
+        ``prefix`` narrows it to one channel's ROMs. It is only ever built from
+        a channel id, so it holds nothing a glob would treat as a pattern.
+
+        Never raises: a ROM cache that cannot be read is a cache with nothing
+        to prune, and both callers are already on a path where that is the
+        right answer.
+        """
+        entries: typing.List[typing.Tuple[float, str, Path]] = []
+        try:
+            root = self._roms_dir()
+            found = root.iterdir() if prefix is None else root.glob(f"{prefix}*")
+            for path in found:
+                if path.name in skip or path.suffix == ".tmp":
+                    continue
+                try:
+                    if not path.is_file():
+                        continue
+                    entries.append((path.stat().st_mtime, path.name, path))
+                except OSError:
+                    continue
+        except OSError:
+            log.warning("Could not read the ROM cache to prune it.", exc_info=True)
+            return []
+        entries.sort()
+        return entries
+
     def _prune_cached_games(
         self, channel_id: int, keep_slug: str
     ) -> typing.List[str]:
@@ -675,26 +753,13 @@ class StorageMixin(MixinMeta):
         whose cached ROM has gone can only apologise when it is clicked.
         """
         deleted: typing.List[str] = []
-        try:
-            roms = list(self._roms_dir().glob(f"{channel_id}-*"))
-        except OSError:
-            return deleted
-        entries = []
-        for path in roms:
-            # The leftovers of an interrupted _write_atomic are not games.
-            if path.suffix == ".tmp":
-                continue
-            try:
-                entries.append((path.stat().st_mtime, path.name, path))
-            except OSError:
-                continue
-        # Newest first. The name is in the key so two ROMs written in the same
-        # filesystem tick (which happens on a coarse mtime) order predictably
-        # rather than by comparing Paths.
-        entries.sort(reverse=True)
         prefix = f"{channel_id}-"
         seen = 0
-        for _, _, path in entries:
+        # Newest first, which is the order a count cap has to be applied in:
+        # the MAX_CACHED_GAMES_PER_CHANNEL most recently played keep their ROM
+        # and everything behind them falls off. _rom_entries hands them over
+        # oldest first, because the budget's pruner wants them that way round.
+        for _, _, path in reversed(self._rom_entries(prefix=prefix)):
             slug = path.stem[len(prefix):]
             if slug == keep_slug:
                 continue
@@ -841,21 +906,6 @@ class StorageMixin(MixinMeta):
             # be a worse failure than going over the budget.
             return 0
 
-    @staticmethod
-    def _usage_margin(budget: int) -> int:
-        """
-        How much room the cached total is not allowed to decide inside.
-
-        One cached ROM's worth (USAGE_CACHE_MARGIN), so the last decision
-        taken on remembered numbers still leaves a whole download's room
-        before the limit -- except on a budget small enough that a fixed
-        32 MiB would swallow it whole, where a quarter of the budget keeps
-        the same shape at a smaller scale. A tiny budget therefore measures
-        for real nearly every time, which is exactly right: the closer the
-        limit is to the files, the less a remembered number is worth.
-        """
-        return min(USAGE_CACHE_MARGIN, budget // 4)
-
     async def _usage_total(self, incoming: int, budget: int) -> int:
         """
         What the directory holds, measured for real only when it matters.
@@ -867,10 +917,19 @@ class StorageMixin(MixinMeta):
         always made against the real disk.
         """
         total = self._usage_cached_total
+        # How much room the cached total is not allowed to decide inside: one
+        # cached ROM's worth (USAGE_CACHE_MARGIN), so the last decision taken
+        # on remembered numbers still leaves a whole download's room before the
+        # limit -- except on a budget small enough that a fixed 32 MiB would
+        # swallow it whole, where a quarter of the budget keeps the same shape
+        # at a smaller scale. A tiny budget therefore measures for real nearly
+        # every time, which is exactly right: the closer the limit is to the
+        # files, the less a remembered number is worth.
+        margin = min(USAGE_CACHE_MARGIN, budget // 4)
         if (
             total is not None
             and time.monotonic() - self._usage_cached_at < USAGE_CACHE_SECONDS
-            and total + incoming + self._usage_margin(budget) <= budget
+            and total + incoming + margin <= budget
         ):
             return total
         return await asyncio.to_thread(self._measure_usage)
@@ -913,22 +972,7 @@ class StorageMixin(MixinMeta):
         """
         freed = 0
         deleted: typing.List[str] = []
-        try:
-            entries = []
-            for path in self._roms_dir().iterdir():
-                if path.name in keep or path.suffix == ".tmp":
-                    continue
-                try:
-                    if not path.is_file():
-                        continue
-                    entries.append((path.stat().st_mtime, path.name, path))
-                except OSError:
-                    continue
-        except OSError:
-            log.warning("Could not read the ROM cache to prune it.", exc_info=True)
-            return 0, []
-        entries.sort()
-        for _, name, path in entries:
+        for _, name, path in self._rom_entries(skip=keep):
             if freed >= need:
                 break
             try:

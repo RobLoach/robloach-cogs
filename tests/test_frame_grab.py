@@ -62,7 +62,8 @@ def make_driver(pixel_format, rotation=Rotation.NONE, seed=1, pad_pixels=5):
 
 
 def official_image(driver):
-    """What ``_frame_image`` used to build, straight from screenshot()."""
+    """The slow path's picture: what ``RetroEmulator._native_frame_image``
+    falls back to building, straight from libretro.py's own screenshot()."""
     shot = driver.screenshot()
     return Image.frombuffer(
         "RGBA", (shot.width, shot.height), bytes(shot.data), "raw", "RGBA", 0, 1

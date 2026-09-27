@@ -2,9 +2,9 @@
 The shapes that let the cog be assembled from mixins.
 
 `Retro` is one cog class made of several: the storage layer, the cores and
-their options, the `[p]retrosaves` group and the one-off namespace migration
-each live in their own module and are mixed in (see retro/Retro.py). Two
-pieces of scaffolding make that legal:
+their options, the BIOS and firmware files, the `[p]retrosaves` group and the
+one-off namespace migration each live in their own module and are mixed in
+(see retro/Retro.py). Two pieces of scaffolding make that legal:
 
 * :class:`MixinMeta` is what a mixin may assume about the cog it ends up on.
   It is an ABC purely so the annotations have somewhere to live -- nothing
@@ -37,12 +37,8 @@ class MixinMeta(ABC):
     config: Config
     #: channel id -> the RetroView driving that channel's game.
     sessions: typing.Dict[int, typing.Any]
-    #: message id -> the lone Resume button left on a retired message.
-    retired: typing.Dict[int, typing.Any]
     #: Serializes every core operation across all channels.
     emulator_lock: asyncio.Lock
-    #: The per-channel half of the start rate limit.
-    start_buckets: typing.Any
     #: The detached task that fetches missing cores shortly after the cog
     #: loads, or None. Read by CoresMixin._cores_downloading, which is how
     #: "no cores are installed" stops being said while the download the
@@ -89,6 +85,14 @@ class MixinMeta(ABC):
     _safe_send: typing.Callable[..., typing.Awaitable[typing.Any]]
     #: Reply with something long enough to need paging.
     _send_pages: typing.Callable[..., typing.Awaitable[typing.Any]]
+    #: Get (filename, bytes) from a URL or the message's attachment, having
+    #: already said why not if it returns None. The URL half is the one place
+    #: the SSRF guard is applied (Retro._download_bytes), so a mixin that wants
+    #: a file somebody handed a command wants this and never its own fetch.
+    #: Called by BiosMixin for `[p]retroset bios add` -- which used to reach
+    #: straight past it for ``_download_bytes``, undeclared, because the
+    #: contract test did not look at this module.
+    _fetch_upload: typing.Callable[..., typing.Awaitable[typing.Any]]
 
 
 class CompositeMetaClass(commands.CogMeta, ABCMeta):

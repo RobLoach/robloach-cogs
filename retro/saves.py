@@ -22,7 +22,7 @@ from .abc import MixinMeta
 from .emulator import MAX_SRAM_SIZE, EmulatorError, RetroEmulator
 from .RetroView import RetroView, may_manage
 from .storage import BACKUP_SUFFIX, MAX_CACHED_GAMES_PER_CHANNEL, ROLLBACK_SUFFIX
-from .systems import system_by_key, system_for_extension
+from .systems import System, system_by_key, system_for_extension
 
 log = logging.getLogger("red.robloach.retro")
 
@@ -53,6 +53,57 @@ MAX_IMPORT_STATE_SIZE = 16 * 1024 * 1024
 MAX_IMPORT_SRAM_LABEL = f"{MAX_IMPORT_SRAM_SIZE // (1024 * 1024)} MiB"
 MAX_IMPORT_STATE_LABEL = f"{MAX_IMPORT_STATE_SIZE // (1024 * 1024)} MiB"
 
+
+class ImportKind(typing.NamedTuple):
+    """
+    Everything that differs between the two halves an import can bring in.
+
+    :meth:`SavesMixin._read_import` used to work all of this out from
+    ``kind == "sram"`` wherever it needed it: the extensions twice, the
+    classification, the plural noun, the singular noun, and the size ceiling
+    *twice*. The ceiling was the one that cost something -- the two size
+    checks had drifted so far apart that one named both the figure and the
+    kind of save while the other could only manage "past the limit for that
+    kind of save".
+    """
+
+    #: The filename endings that say an attachment is this kind.
+    extensions: typing.Tuple[str, ...]
+    #: How large one of these may be, and the same number spelled for a
+    #: sentence. Never written twice; see the note above MAX_IMPORT_SRAM_LABEL.
+    limit: int
+    limit_label: str
+    #: What to call one of these in a sentence, and two of them.
+    noun: str
+    plural: str
+
+    @property
+    def endings(self) -> str:
+        """The extensions as ``` `.srm`, `.sav` ```, ready for a message."""
+        return "`" + "`, `".join(self.extensions) + "`"
+
+
+# The two halves, keyed by the name the rest of this module calls each one.
+# Insertion order is the order they are offered in a sentence, so the in-game
+# save -- the one that travels between emulators, and the one somebody
+# importing usually means -- comes first.
+IMPORT_KINDS = {
+    "sram": ImportKind(
+        SRAM_EXTENSIONS,
+        MAX_IMPORT_SRAM_SIZE,
+        MAX_IMPORT_SRAM_LABEL,
+        "in-game save",
+        "in-game saves",
+    ),
+    "state": ImportKind(
+        STATE_EXTENSIONS,
+        MAX_IMPORT_STATE_SIZE,
+        MAX_IMPORT_STATE_LABEL,
+        "save state",
+        "save states",
+    ),
+}
+
 # What to assume Discord will accept as an attachment when the server does not
 # say. Every guild is allowed at least this much, so an export sized against
 # it is never rejected for being too large; `discord.Guild.filesize_limit` is
@@ -63,8 +114,8 @@ DEFAULT_UPLOAD_LIMIT = 8 * 1024 * 1024
 # How long `[p]retrosaves delete` waits for someone to press Yes.
 CONFIRM_TIMEOUT = 60.0
 
-# What a delete removes, in the order `StorageMixin._save_paths` hands the
-# four paths back, and what to call each one in a sentence. Named per file
+# What a delete removes, in the order :class:`StorageMixin.SavePaths` lists
+# the four files, and what to call each one in a sentence. Named per file
 # rather than per half, because the reply has to be able to say that three of
 # them went and the fourth did not; see _delete_saves.
 DELETE_LABELS = (
@@ -107,7 +158,7 @@ class SaveInfo(typing.NamedTuple):
     #: slug for a game nothing remembers the name of any more.
     game_name: str
     #: The console, or None when neither a record nor a cached ROM says.
-    system: typing.Optional[typing.Any]
+    system: typing.Optional[System]
     core: str
     #: Bytes and mtime of each half of the save, or None if it is not there.
     state_size: typing.Optional[int]
@@ -161,6 +212,31 @@ class SaveInfo(typing.NamedTuple):
             self.sram_written or 0.0,
             self.state_backup_written or 0.0,
             self.sram_backup_written or 0.0,
+        )
+
+    @property
+    def backup_written(self) -> float:
+        """When the previous generation was written, 0.0 if there is none.
+
+        The newer of the two backups, because they are described to a reader
+        as one thing -- "1 previous generation kept" -- and the honest date for
+        that is the last time any of it changed.
+        """
+        return max(
+            self.state_backup_written or 0.0,
+            self.sram_backup_written or 0.0,
+        )
+
+    @property
+    def total_size(self) -> int:
+        """Every byte this game's progress occupies, previous generations
+        included. The counterpart to :attr:`last_written`, which takes the
+        ``max`` over the same four files' mtimes."""
+        return (
+            (self.state_size or 0)
+            + (self.sram_size or 0)
+            + (self.state_backup_size or 0)
+            + (self.sram_backup_size or 0)
         )
 
     @property
@@ -225,8 +301,10 @@ class SavesMixin(MixinMeta):
     #     wrote itself.
     #   * a live emulator owns the authoritative copy of both saves and writes
     #     them out on its next automatic save, so anything that changes the
-    #     files under one puts it to sleep first. See _pause_for_saves, which
-    #     is the single most important thing in this section.
+    #     files under one puts it to sleep first. See _mutate_saves, which is
+    #     the single most important thing in this section, and
+    #     _pause_for_saves, which is the same rule for the one command that
+    #     has to free a core before it has anything to write.
 
     @staticmethod
     def _when(written: typing.Optional[float]) -> str:
@@ -470,9 +548,7 @@ class SavesMixin(MixinMeta):
         )
         return None
 
-    async def _may_manage_saves(
-        self, ctx: commands.Context, entry: typing.Optional[SaveInfo] = None
-    ) -> bool:
+    async def _may_manage_saves(self, ctx: commands.Context, entry: SaveInfo) -> bool:
         """
         Whether this person may destroy or replace a save.
 
@@ -482,9 +558,7 @@ class SavesMixin(MixinMeta):
         wiping a channel's progress is not.
         """
         return await may_manage(
-            self.bot,
-            getattr(ctx, "author", None),
-            entry.starter_id if entry is not None else None,
+            self.bot, getattr(ctx, "author", None), entry.starter_id
         )
 
     async def _refuse_management(
@@ -497,6 +571,49 @@ class SavesMixin(MixinMeta):
             f"play, look at `{ctx.clean_prefix}retrosaves list`, or export a "
             "copy.",
         )
+
+    async def _manageable(
+        self,
+        ctx: commands.Context,
+        game: str,
+        verb: typing.Optional[str] = None,
+        *,
+        refund: bool = False,
+    ) -> typing.Optional[SaveInfo]:
+        """
+        Find the game a command was given, and check it may be changed.
+
+        The prologue all four management commands opened with, in one place:
+        resolve what was typed into one of this channel's saved games
+        (:meth:`_resolve_save` explains an unknown or ambiguous name itself),
+        then ask whether this person may destroy or replace what it has saved
+        (:meth:`_may_manage_saves`, with :meth:`_refuse_management` doing the
+        explaining). Returns None once something has been said, so every
+        caller is the same two lines.
+
+        ``verb`` finishes the refusal's sentence -- "only ... can *delete its
+        save data*". None skips the permission check altogether, which is what
+        `[p]retrosaves export` wants: exporting changes nothing, so it is open
+        to the whole channel and only the resolve half applies to it.
+
+        ``refund`` hands this invocation's cooldown back on every way out,
+        which is the one thing worth having in a shared helper rather than
+        repeated: an unknown name, an ambiguous one and a refusal all cost the
+        bot nothing and are one correction away from working, and the rule for
+        that is :meth:`_refund_cooldown`. Only `import` and `export` have a
+        cooldown to hand back, which is why the other two leave it off.
+        """
+        entry = await self._resolve_save(ctx, game)
+        if entry is None:
+            if refund:
+                self._refund_cooldown(ctx)
+            return None
+        if verb is not None and not await self._may_manage_saves(ctx, entry):
+            if refund:
+                self._refund_cooldown(ctx)
+            await self._refuse_management(ctx, entry, verb)
+            return None
+        return entry
 
     async def _pause_for_saves(
         self, ctx: commands.Context, entry: SaveInfo, doing: str
@@ -528,6 +645,14 @@ class SavesMixin(MixinMeta):
         would put back the very save the command was asked to destroy or
         replace. It is dropped for a *sleeping* session too, which is why it
         happens before the live check below.
+
+        One caller left, and it is the one that pauses without writing
+        anything afterwards: `[p]retrosaves import` has to free the core
+        *before* a check that boots a core of its own, which takes whole
+        seconds. Everything that goes on to change the files goes through
+        :meth:`_mutate_saves` instead, which does all of this itself in one
+        acquisition of the lock rather than by calling this first -- see there
+        for why one acquisition is strictly better than two.
         """
         view = self.sessions.get(int(getattr(ctx.channel, "id", 0)))
         if view is None or view.slug != entry.slug:
@@ -552,11 +677,12 @@ class SavesMixin(MixinMeta):
         """
         Save a live session and free its core. Hold ``view.lock`` to call.
 
-        The working half of :meth:`_pause_for_saves`, split out so
-        :meth:`_mutate_saves` can run it again *while already holding the
-        lock* just before it touches the files. Checks ``live`` itself,
-        because by the time the lock has been acquired the answer may have
-        changed either way: the press that held it may have been the one
+        The working half of both pausers, split out because the lock around it
+        is the caller's business: :meth:`_pause_for_saves` takes it for this
+        alone, while :meth:`_mutate_saves` holds it across this *and* the write
+        that follows, so nothing can slip in between the two. Checks ``live``
+        itself, because by the time the lock has been acquired the answer may
+        have changed either way: the press that held it may have been the one
         that woke the game up. Returns whether anything was put to sleep.
         """
         view.forget_history()
@@ -595,39 +721,49 @@ class SavesMixin(MixinMeta):
         """
         Change one game's save files while no live core can undo the change.
 
-        :meth:`_pause_for_saves` alone is not quite enough, because pausing
-        and writing are separate awaits and the session's controls stay live
-        in between: any button press in that gap wakes the game *from the
-        old files*, and the woken core's next automatic save then writes
-        those old files straight back over whatever the command changed --
-        silently, which is the worst way for a delete, a rollback or an
-        import to fail. `[p]retrosaves import` has the widest gap (a
-        multi-second core boot validates the incoming save between its pause
-        and its write), but every command that touches the files has one.
+        Pausing and then writing is not enough on its own, because the two are
+        separate awaits and the session's controls stay live in between: any
+        button press in that gap wakes the game *from the old files*, and the
+        woken core's next automatic save then writes those old files straight
+        back over whatever the command changed -- silently, which is the worst
+        way for a delete, a rollback or an import to fail. `[p]retrosaves
+        import` has the widest gap (a multi-second core boot validates the
+        incoming save between its pause and its write), but every command that
+        touches the files has one.
 
-        So the files are only ever touched from in here: pause first, then
-        take the view's own lock -- the same lock every button press holds
-        for the whole of its press -- hibernate again if a press slipped in
-        and woke the game, and run ``mutate`` (blocking, so it goes to a
-        worker thread) before letting the lock go. Nothing can boot from, or
-        save over, the files while it runs. Returns ``(anything was put to
-        sleep, whatever mutate returned)``; whatever mutate raises passes
-        through.
+        So the files are only ever touched from in here, and under a single
+        acquisition of the view's own lock -- the same lock every button press
+        holds for the whole of its press. Hibernate under it (which is what
+        :meth:`_hibernate_for_saves` is split out for) and run ``mutate``
+        (blocking, so it goes to a worker thread) before letting it go.
+        Nothing can boot from, or save over, the files while it runs.
+
+        One acquisition, not two. This used to call :meth:`_pause_for_saves`
+        first and then repeat every step of it here -- the same session lookup,
+        the same slug check, ``cancel_pacing``, the lock, the hibernate -- which
+        made the first pass do nothing the second did not do again, and opened
+        one more of the very gaps described above between them. Returns
+        ``(anything was put to sleep, whatever mutate returned)``; whatever
+        mutate raises passes through.
         """
-        paused = await self._pause_for_saves(ctx, entry, doing)
         view = self.sessions.get(int(getattr(ctx.channel, "id", 0)))
         if view is None or view.slug != entry.slug:
             # Nothing to race with. A session for this game *appearing*
             # mid-thread means somebody started it fresh, and a fresh start
             # boots from whatever files this leaves behind, which is the
             # order every command already promises.
-            return paused, await asyncio.to_thread(mutate)
-        # Same as _pause_for_saves: never wait out a cosmetic delay for the
-        # lock.
+            return False, await asyncio.to_thread(mutate)
+        # Exactly as `[p]retrosleep` and _pause_for_saves do, before reaching
+        # for that lock: a press sitting out the clip on screen holds it, and
+        # no save command should wait on a cosmetic delay. See
+        # RetroView.cancel_pacing.
         view.cancel_pacing()
         async with view.lock:
-            if await self._hibernate_for_saves(view, entry, doing):
-                paused = True
+            # Which also drops the session's undo history, for a sleeping
+            # session as much as a live one -- otherwise one click of Undo
+            # would write the destroyed save straight back. The reasoning is
+            # written out in _pause_for_saves.
+            paused = await self._hibernate_for_saves(view, entry, doing)
             return paused, await asyncio.to_thread(mutate)
 
     async def _confirm(self, ctx: commands.Context, question: str) -> bool:
@@ -646,6 +782,33 @@ class SavesMixin(MixinMeta):
         view.message = message
         await view.wait()
         return bool(view.result)
+
+    @staticmethod
+    def _paused_note(wrote: str, then: str) -> str:
+        """
+        What to add when a command had to stop a running game to do its work.
+
+        Four commands end their reply with this -- `dropstate`, `rollback`,
+        `delete` and `import` -- and all four are saying the same two things:
+        why the game is asleep (the live core held the authoritative copy and
+        the next press would have written it straight back; see
+        :meth:`_pause_for_saves`) and that a press picks it back up. Only what
+        that press *would have written* and what pressing one now *does
+        instead* differ, and four copies of the same twenty words is how three
+        of them had already drifted apart from each other.
+
+        Deliberately not shared with the two other paused sentences in this
+        module, because they describe different events rather than the same one
+        worded differently: a partial delete leaves the save it could not
+        remove in place, so "would have written it back" is not what would have
+        happened, and a pause for a check that then refused the file changed
+        nothing at all.
+        """
+        return (
+            "The game was running, so it was saved and put to sleep first "
+            "\N{EM DASH} otherwise the next button press would have written "
+            f"{wrote} straight back. Press a button on it to {then}."
+        )
 
     @staticmethod
     def _refund_cooldown(ctx: commands.Context) -> None:
@@ -765,7 +928,7 @@ class SavesMixin(MixinMeta):
                 kept.append("battery")
             parts.append(
                 f"1 previous generation kept ({humanize_list(kept)}, "
-                f"{self._when(max(entry.state_backup_written or 0.0, entry.sram_backup_written or 0.0))})"
+                f"{self._when(entry.backup_written)})"
             )
         if not parts:
             parts.append("nothing saved yet")
@@ -841,13 +1004,7 @@ class SavesMixin(MixinMeta):
             )
             return
         saved = sum(1 for entry in entries if entry.has_save)
-        total = sum(
-            (entry.state_size or 0)
-            + (entry.sram_size or 0)
-            + (entry.state_backup_size or 0)
-            + (entry.sram_backup_size or 0)
-            for entry in entries
-        )
+        total = sum(entry.total_size for entry in entries)
         lines = [
             f"**{len(entries)} game(s)** in this channel, {saved} with saved "
             f"progress, {self._humanize_bytes(total)} in total (previous "
@@ -1028,12 +1185,10 @@ class SavesMixin(MixinMeta):
         - `<game>` - A game this channel has played, optionally after `save`, `state` or `both`.
         """
         what, name = self._split_export(game)
-        entry = await self._resolve_save(ctx, name)
+        # No verb: exporting changes nothing, so it is open to the whole
+        # channel and only the resolve-and-refund half of _manageable applies.
+        entry = await self._manageable(ctx, name, refund=True)
         if entry is None:
-            # Nothing was sent and nothing was read: an unknown or ambiguous
-            # name is a typo away from a working command. See
-            # _refund_cooldown.
-            self._refund_cooldown(ctx)
             return
         if not entry.has_save:
             self._refund_cooldown(ctx)
@@ -1182,11 +1337,8 @@ class SavesMixin(MixinMeta):
         **Arguments:**
         - `<game>` - A game this channel has played.
         """
-        entry = await self._resolve_save(ctx, game)
+        entry = await self._manageable(ctx, game, "drop its save state")
         if entry is None:
-            return
-        if not await self._may_manage_saves(ctx, entry):
-            await self._refuse_management(ctx, entry, "drop its save state")
             return
         if not entry.has_state and not entry.has_state_backup:
             await self._safe_send(
@@ -1207,7 +1359,8 @@ class SavesMixin(MixinMeta):
             # command that appears to do nothing: the restore chain would fall
             # straight through to the backup and the game would come back at
             # almost exactly the moment that was just dropped.
-            for path in self._save_paths(ctx.channel.id, entry.slug)[:2]:
+            paths = self._save_paths(ctx.channel.id, entry.slug)
+            for path in (paths.state, paths.state_backup):
                 path.unlink(missing_ok=True)
 
         try:
@@ -1249,12 +1402,7 @@ class SavesMixin(MixinMeta):
                 "beginning."
             )
         if paused:
-            lines.append(
-                "The game was running, so it was saved and put to sleep first "
-                "\N{EM DASH} otherwise the next button press would have "
-                "written the old save state straight back. Press a button on "
-                "it to start it again."
-            )
+            lines.append(self._paused_note("the old save state", "start it again"))
         await self._safe_send(ctx, " ".join(lines))
 
     # No `undo` alias any more. There is an **Undo** button under every game
@@ -1287,11 +1435,8 @@ class SavesMixin(MixinMeta):
         **Arguments:**
         - `<game>` - A game this channel has played.
         """
-        entry = await self._resolve_save(ctx, game)
+        entry = await self._manageable(ctx, game, "roll its save back")
         if entry is None:
-            return
-        if not await self._may_manage_saves(ctx, entry):
-            await self._refuse_management(ctx, entry, "roll its save back")
             return
         if not entry.has_backup:
             await self._safe_send(
@@ -1346,10 +1491,9 @@ class SavesMixin(MixinMeta):
         )
         if paused:
             lines.append(
-                "The game was running, so it was saved and put to sleep first "
-                "\N{EM DASH} otherwise the next button press would have "
-                "written the newer save straight back. Press a button on it to "
-                "carry on from the rolled-back save."
+                self._paused_note(
+                    "the newer save", "carry on from the rolled-back save"
+                )
             )
         await self._safe_send(ctx, " ".join(lines))
 
@@ -1378,10 +1522,10 @@ class SavesMixin(MixinMeta):
         still has -- never a lost generation.
         """
         swapped: typing.List[str] = []
-        state, state_backup, sram, sram_backup = self._save_paths(channel_id, slug)
+        paths = self._save_paths(channel_id, slug)
         for live, backup, label in (
-            (state, state_backup, "save state"),
-            (sram, sram_backup, "in-game save"),
+            (paths.state, paths.state_backup, "save state"),
+            (paths.sram, paths.sram_backup, "in-game save"),
         ):
             if not backup.is_file():
                 continue
@@ -1427,11 +1571,8 @@ class SavesMixin(MixinMeta):
         **Arguments:**
         - `<game>` - A game this channel has played.
         """
-        entry = await self._resolve_save(ctx, game)
+        entry = await self._manageable(ctx, game, "delete its save data")
         if entry is None:
-            return
-        if not await self._may_manage_saves(ctx, entry):
-            await self._refuse_management(ctx, entry, "delete its save data")
             return
         if not entry.has_save:
             await self._safe_send(
@@ -1519,12 +1660,7 @@ class SavesMixin(MixinMeta):
                 "The cached ROM was kept, so it still starts straight away."
             )
         if paused:
-            lines.append(
-                "The game was running, so it was saved and put to sleep first "
-                "\N{EM DASH} otherwise the next button press would have "
-                "written it all straight back. Press a button on it to start "
-                "the game over."
-            )
+            lines.append(self._paused_note("it all", "start the game over"))
         await self._safe_send(ctx, " ".join(lines))
 
     async def _report_partial_delete(
@@ -1613,9 +1749,12 @@ class SavesMixin(MixinMeta):
         removed: typing.List[str] = []
         failed: typing.List[str] = []
         paths = self._save_paths(channel_id, slug)
-        # strict: DELETE_LABELS is _save_paths' tuple spelled out in words, so
-        # a fifth save file added to one and not the other should stop the
-        # delete rather than silently leave the new file behind.
+        # strict: DELETE_LABELS is SavePaths spelled out in words, so a fifth
+        # save file added to one and not the other should stop the delete
+        # rather than silently leave the new file behind. Zipped rather than
+        # named field by field because the point here is "all of them,
+        # whatever they are" -- the one place in this module that really wants
+        # the four as a sequence.
         for path, label in zip(paths, DELETE_LABELS, strict=True):
             facts = self._file_facts(path)
             try:
@@ -1666,16 +1805,13 @@ class SavesMixin(MixinMeta):
         **Arguments:**
         - `<game>` - A game this channel has played.
         """
-        entry = await self._resolve_save(ctx, game)
+        # refund: no attachment has been downloaded yet, so an unknown name and
+        # a refusal both cost nothing worth rationing and both are one retry
+        # away from working. See _refund_cooldown.
+        entry = await self._manageable(
+            ctx, game, "import a save for it", refund=True
+        )
         if entry is None:
-            # No attachment has been downloaded yet, so neither of these cost
-            # anything worth rationing and both are a retry away from
-            # working. See _refund_cooldown.
-            self._refund_cooldown(ctx)
-            return
-        if not await self._may_manage_saves(ctx, entry):
-            self._refund_cooldown(ctx)
-            await self._refuse_management(ctx, entry, "import a save for it")
             return
 
         # _read_import hands the cooldown back itself on the paths that give
@@ -1746,15 +1882,47 @@ class SavesMixin(MixinMeta):
         # Sleep first, so nothing that is written below can be overwritten by
         # a core that is still holding the old save in memory.
         paused = await self._pause_for_saves(ctx, entry, "a save was imported")
-        # Asked here as well as inside the check, because the answer is worth
-        # something on the way *out*: an in-game save that could not be tried
-        # on the cartridge is accepted anyway (see _check_import) and the only
-        # sign it did not fit is the game quietly ignoring it days later.
-        # Whoever imported it deserves to be told which of the two happened.
-        blocker = await self._import_check_blocker(entry)
-        problem = await self._check_import(entry, state, sram, ctx.clean_prefix)
-        if problem is not None:
-            lines = [problem, "Nothing was changed."]
+        # The blocker comes back out of the check rather than being worked out
+        # here as well: it is worth something on the way *out* -- an in-game
+        # save that could not be tried on the cartridge is accepted anyway
+        # (see _check_import) and the only sign it did not fit is the game
+        # quietly ignoring it days later, so whoever imported it deserves to be
+        # told which of the two happened -- but establishing it costs a stat
+        # and a core lookup, and asking twice per import bought nothing but a
+        # second chance to disagree with itself.
+        problem, blocker = await self._check_import(
+            entry, state, sram, ctx.clean_prefix
+        )
+        room, budget_note = (True, "")
+        if problem is None:
+            # The disk budget, which an import used to walk straight past:
+            # _write_import goes to _write_atomic directly, so up to 16 MiB of
+            # save state plus a megabyte of battery save could enter the data
+            # directory unbudgeted, four times a minute per person. Checked
+            # here rather than inside the write for the same reason every other
+            # caller does it out here (`[p]retro` before it caches a ROM,
+            # `[p]retroset bios add` before it stores firmware): making room
+            # may prune and may refuse, both of which are async, while the
+            # write itself runs in a worker thread.
+            #
+            # keep_rom, because pruning to make room must not throw away the
+            # cached ROM of the very game whose save is being imported -- the
+            # saves would survive it, but the game would stop being resumable
+            # as a side effect of importing into it.
+            room, budget_note = await self._make_room(
+                len(state or b"") + len(sram or b""),
+                keep_rom=entry.rom.name if entry.rom is not None else None,
+                prefix=ctx.clean_prefix,
+            )
+            if room and budget_note:
+                # Room was found, by dropping cached ROMs nobody is playing.
+                # Said out loud rather than done quietly; see _make_room.
+                await self._safe_send(ctx, budget_note)
+        if problem is not None or not room:
+            # Either the core refused the file or there is nowhere to put it.
+            # A refusal from _make_room explains itself, so it *is* the
+            # sentence -- there is nothing for this to add but the outcome.
+            lines = [problem or budget_note, "Nothing was changed."]
             if paused:
                 lines.append(
                     "The game was put to sleep to make room for the check; "
@@ -1827,10 +1995,7 @@ class SavesMixin(MixinMeta):
             lines.append(self._unchecked_import_note(entry, blocker, ctx.clean_prefix))
         if paused:
             lines.append(
-                "The game was running, so it was saved and put to sleep first "
-                "\N{EM DASH} otherwise the next button press would have "
-                "written the old save straight back. Press a button on it to "
-                "start it with the imported save."
+                self._paused_note("the old save", "start it with the imported save")
             )
         await self._safe_send(ctx, " ".join(lines))
 
@@ -1847,6 +2012,12 @@ class SavesMixin(MixinMeta):
         that there is at most one of each, that it is not empty, and that it
         is inside the size ceilings. Returns None (having said why) if not.
 
+        Which half an attachment is decides all of that, and IMPORT_KINDS is
+        the one place that knows the difference -- the extensions, the
+        ceilings, and what to call each of them in a sentence. Worked out
+        inline seven times over, it had already cost something: the two size
+        checks below had drifted into two different refusals for one rule.
+
         The cooldown is handed back on every refusal above the download loop
         and kept on every refusal below it, which is the line drawn in
         :meth:`_refund_cooldown`: an attachment Discord reported as 4 MiB was
@@ -1857,13 +2028,14 @@ class SavesMixin(MixinMeta):
         attachments = list(getattr(ctx.message, "attachments", ()) or ())
         if not attachments:
             self._refund_cooldown(ctx)
+            sram_kind, state_kind = IMPORT_KINDS["sram"], IMPORT_KINDS["state"]
             await self._safe_send(
                 ctx,
-                "Attach the save file to your message: an in-game save "
-                f"(`{'`, `'.join(SRAM_EXTENSIONS)}`) and optionally a save "
-                f"state (`{'`, `'.join(STATE_EXTENSIONS)}`). Export one first "
-                f"with `{ctx.clean_prefix}retrosaves export {entry.slug}` to "
-                "see what they look like.",
+                f"Attach the save file to your message: an {sram_kind.noun} "
+                f"({sram_kind.endings}) and optionally a {state_kind.noun} "
+                f"({state_kind.endings}). Export one first with "
+                f"`{ctx.clean_prefix}retrosaves export {entry.slug}` to see "
+                "what they look like.",
             )
             return None
         if len(attachments) > 2:
@@ -1879,43 +2051,43 @@ class SavesMixin(MixinMeta):
         for attachment in attachments:
             name = str(getattr(attachment, "filename", "") or "")
             suffix = Path(name).suffix.lower()
-            if suffix in SRAM_EXTENSIONS:
-                kind = "sram"
-            elif suffix in STATE_EXTENSIONS:
-                kind = "state"
-            else:
+            kind = next(
+                (
+                    key
+                    for key, limits in IMPORT_KINDS.items()
+                    if suffix in limits.extensions
+                ),
+                None,
+            )
+            if kind is None:
                 self._refund_cooldown(ctx)
+                spellings = " and ".join(
+                    f"{limits.plural} end in {limits.endings}"
+                    for limits in IMPORT_KINDS.values()
+                )
                 await self._safe_send(
                     ctx,
-                    f"`{name or 'that file'}` is not a save this cog knows. A "
-                    f"in-game save ends in `{'`, `'.join(SRAM_EXTENSIONS)}` "
-                    f"and a save state in `{'`, `'.join(STATE_EXTENSIONS)}`. "
-                    "Rename the file to match and attach it again.",
+                    f"`{name or 'that file'}` is not a save this cog knows: "
+                    f"{spellings}. Rename the file to match and attach it "
+                    "again.",
                 )
                 return None
             if kind in found:
                 self._refund_cooldown(ctx)
                 await self._safe_send(
                     ctx,
-                    f"Two {'in-game saves' if kind == 'sram' else 'save states'} "
-                    "were attached; attach one of each at most.",
+                    f"Two {IMPORT_KINDS[kind].plural} were attached; attach "
+                    "one of each at most.",
                 )
                 return None
-            limit, label = (
-                (MAX_IMPORT_SRAM_SIZE, MAX_IMPORT_SRAM_LABEL)
-                if kind == "sram"
-                else (MAX_IMPORT_STATE_SIZE, MAX_IMPORT_STATE_LABEL)
-            )
+            # The size Discord reported, before a byte has been fetched. This
+            # is the bandwidth guard: a 20 MiB `.state` is refused without the
+            # bot pulling it, which is the whole reason the ceilings are
+            # checked twice rather than once.
             size = int(getattr(attachment, "size", 0) or 0)
-            if size > limit:
+            if size > IMPORT_KINDS[kind].limit:
                 self._refund_cooldown(ctx)
-                await self._safe_send(
-                    ctx,
-                    f"`{name}` is {self._humanize_bytes(size)}, past the "
-                    f"{label} limit for a "
-                    f"{'in-game save' if kind == 'sram' else 'save state'}. "
-                    "That is not a save for one of these consoles.",
-                )
+                await self._safe_send(ctx, self._too_big(kind, name, size))
                 return None
             found[kind] = (name, attachment)
 
@@ -1932,16 +2104,35 @@ class SavesMixin(MixinMeta):
             if not payload:
                 await self._safe_send(ctx, f"`{name}` is empty.")
                 return None
-            limit = MAX_IMPORT_SRAM_SIZE if kind == "sram" else MAX_IMPORT_STATE_SIZE
-            if len(payload) > limit:
-                await self._safe_send(
-                    ctx,
-                    f"`{name}` is {self._humanize_bytes(len(payload))}, which "
-                    "is past the limit for that kind of save.",
-                )
+            # And again against the bytes that really arrived, because the
+            # size above is Discord's word for it rather than a measurement.
+            # The same refusal, from the same builder: this one used to say
+            # "past the limit for that kind of save" -- no figure, no noun --
+            # having drifted away from the one above it.
+            if len(payload) > IMPORT_KINDS[kind].limit:
+                await self._safe_send(ctx, self._too_big(kind, name, len(payload)))
                 return None
             data[kind] = bytes(payload)
         return data.get("state"), data.get("sram")
+
+    def _too_big(self, kind: str, name: str, size: int) -> str:
+        """
+        Why one attachment is past its ceiling, said the same way both times.
+
+        Both size checks in :meth:`_read_import` come through here: the one
+        against the size Discord reports before anything is fetched, and the
+        one against the bytes that really arrived. They exist for two
+        different reasons (bandwidth, and what lands on disk) but they refuse
+        for one reason, and writing that refusal out twice is exactly how the
+        second copy ended up naming neither the ceiling nor the kind of save
+        it was talking about.
+        """
+        limits = IMPORT_KINDS[kind]
+        return (
+            f"`{name}` is {self._humanize_bytes(size)}, past the "
+            f"{limits.limit_label} limit for {limits.plural}. That is not a "
+            "save for one of these consoles."
+        )
 
     async def _import_check_blocker(self, entry: SaveInfo) -> typing.Optional[str]:
         """
@@ -1951,13 +2142,14 @@ class SavesMixin(MixinMeta):
         emulator the game needs is not installed. Either way there is nothing
         to boot, so there is nothing to offer the file to.
 
-        One answer, two callers with opposite uses for it:
-        :meth:`_check_import` turns it into a refusal for a save state, which
-        is worthless unless a core has actually loaded it, and
-        ``retrosaves_import`` turns it into the caveat on an accepted in-game
-        save, which is merely unproven. They worked it out separately once,
-        which is one edit away from a command that checks nothing and says
-        nothing about it.
+        One answer, used two opposite ways: :meth:`_check_import` turns it into
+        a refusal for a save state, which is worthless unless a core has
+        actually loaded it, and ``retrosaves_import`` turns it into the caveat
+        on an accepted in-game save, which is merely unproven. Both of them
+        used to establish it for themselves, which was two stats and two core
+        lookups per import and one edit away from a command that checks nothing
+        and says nothing about it; the answer is settled here once and handed
+        back out of the check.
         """
         if entry.rom is None or not entry.rom.is_file():
             return "rom"
@@ -2013,7 +2205,7 @@ class SavesMixin(MixinMeta):
         state: typing.Optional[bytes],
         sram: typing.Optional[bytes],
         prefix: str = "",
-    ) -> typing.Optional[str]:
+    ) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
         """
         Try an incoming save on the real core, and say what is wrong with it.
 
@@ -2021,7 +2213,14 @@ class SavesMixin(MixinMeta):
         loadable by exactly one build of one core, and a cartridge's battery
         size is decided by the cartridge. So the game is actually booted, the
         files are actually offered to it, and the core's own refusal is turned
-        into a sentence. Returns None when everything fits.
+        into a sentence.
+
+        Returns ``(what is wrong, why it could not be checked)``. The first is
+        None when everything fits. The second is
+        :meth:`_import_check_blocker`'s answer, handed back because
+        ``retrosaves_import`` needs it for the caveat on an accepted-but-
+        unproven in-game save and used to establish it a second time for
+        itself; see there.
 
         Loading a core is subject to the one-at-a-time rule like everything
         else, so the lock is held and anything still running is hibernated
@@ -2033,15 +2232,17 @@ class SavesMixin(MixinMeta):
         was invoked with (``ctx.clean_prefix``).
         """
         if state is None and sram is None:
-            return None
+            return None, None
         blocker = await self._import_check_blocker(entry)
-        # Looked up again rather than carried out of the blocker, and the gap
-        # between the two closed here: a core that was uninstalled in between
-        # is the "core" blocker by another route, never a None handed to an
-        # emulator.
-        core_path = None if blocker is not None else await self._core_path(entry.core)
-        if blocker is None and core_path is None:
-            blocker = "core"
+        core_path = None
+        if blocker is None:
+            # The core is looked up again rather than carried out of the
+            # blocker, which closes the gap between the two: a core that was
+            # uninstalled in between is the "core" blocker by another route,
+            # never a None handed to an emulator.
+            core_path = await self._core_path(entry.core)
+            if core_path is None:
+                blocker = "core"
         if blocker is not None:
             if state is None:
                 # A battery save is the cartridge's own format and is checked
@@ -2049,7 +2250,7 @@ class SavesMixin(MixinMeta):
                 # costs nothing worse than it being ignored later -- and the
                 # reply says exactly that rather than leaving it to be found
                 # out on the next start. See _unchecked_import_note.
-                return None
+                return None, blocker
             if blocker == "rom":
                 return (
                     f"The cached ROM for **{entry.game_name}** has been "
@@ -2058,12 +2259,12 @@ class SavesMixin(MixinMeta):
                     "refused at boot anyway. Start the game once with "
                     f"`{prefix}retro <name or url>` and import the state "
                     "after that."
-                )
+                ), blocker
             return (
                 f"The emulator core **{entry.game_name}** needs "
                 f"(`{entry.core or 'unknown'}`) is not installed, so a "
                 "save state cannot be checked against it."
-            )
+            ), blocker
 
         emulator = RetroEmulator(
             core_path,
@@ -2093,7 +2294,9 @@ class SavesMixin(MixinMeta):
         # Whatever this check put to sleep is told so now, with the lock given
         # back rather than while it is held; see Retro._flush_refreshes.
         await self._flush_refreshes()
-        return outcome
+        # No blocker: the core really did boot and really was offered the
+        # files, so there is no caveat for the reply to carry.
+        return outcome, None
 
     def _try_import(
         self,
@@ -2159,16 +2362,16 @@ class SavesMixin(MixinMeta):
         for good, and the confirmation in ``retrosaves_import`` says exactly
         that instead of promising a rollback it cannot deliver.
         """
-        state_path, state_backup, sram_path, _ = self._save_paths(channel_id, slug)
+        paths = self._save_paths(channel_id, slug)
         written: typing.List[str] = []
         if sram is not None:
             # keep_backup: whatever was there is still the channel's own
             # progress, and an import is exactly the kind of mistake somebody
             # wants to undo. `[p]retrosaves rollback` brings it back.
-            self._write_atomic(sram_path, sram, True)
+            self._write_atomic(paths.sram, sram, True)
             written.append(f"a {self._humanize_bytes(len(sram))} in-game save")
         if state is not None:
-            self._write_atomic(state_path, state, True)
+            self._write_atomic(paths.state, state, True)
             written.append(f"a {self._humanize_bytes(len(state))} save state")
         elif sram is not None:
             # Both generations of the state go, for the reason in the
@@ -2178,6 +2381,6 @@ class SavesMixin(MixinMeta):
             # ``.state.bak`` exactly as happily as from a live state, so
             # "keeping" the old state there would make this import a silent
             # no-op on the next boot.
-            state_path.unlink(missing_ok=True)
-            state_backup.unlink(missing_ok=True)
+            paths.state.unlink(missing_ok=True)
+            paths.state_backup.unlink(missing_ok=True)
         return written

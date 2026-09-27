@@ -128,8 +128,26 @@ class MigrationMixin(MixinMeta):
         moved = await asyncio.to_thread(self._migrate_data_directory)
         copied = await self._migrate_config() if had_legacy else 0
         # After the copy, not before: the paths that need rewriting are the
-        # ones the copy has just brought across.
-        await self._rewrite_core_paths()
+        # ones the copy has just brought across. And gated on had_legacy like
+        # the copy, which it was not: on an install that never ran under the
+        # old name there is no old directory for any path to be relative to,
+        # so every path raised ValueError and was skipped -- but the
+        # `async with self.config.cores() as cores:` inside writes the group
+        # back when it exits whether or not anything in it changed, and on
+        # Red's JSON driver that is a serialise of the whole settings file,
+        # during cog_load, on every single fresh install for nothing.
+        #
+        # had_legacy rather than `moved`, which looks tighter and is wrong: a
+        # run that was interrupted after moving the cores folder but before
+        # setting the marker has nothing left to move, so `moved` is 0 on the
+        # retry while the stored paths still point into the old folder. That
+        # would strand them there for good. The per-path `is_file()` check
+        # inside is what actually keeps the docstring's promise that a path is
+        # only rewritten once the file is really at the other end of it; this
+        # gate is only about not writing Config when there was never anything
+        # to rewrite.
+        if had_legacy:
+            await self._rewrite_core_paths()
 
         try:
             await self.config.legacy_namespace_migrated.set(True)

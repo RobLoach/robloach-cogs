@@ -997,11 +997,17 @@ def test_the_shim_carries_nothing_private_and_nothing_unused():
 
     # Public clips names nothing imports via the emulator are gone from
     # __all__ too, whether or not emulator.py happens to use them itself.
-    for unused in ("MIN_AFTERMATH_FRAMES", "MIN_CLIP_WIDTH",
+    # (MIN_AFTERMATH_FRAMES was on this list and is not any more: the constant
+    # itself is gone -- it was a dial with one value, whose arithmetic in
+    # input_budget could only ever evaluate to zero -- so asserting it is not
+    # re-exported no longer asserts anything. The prose behind it lives on
+    # input_budget.)
+    for unused in ("MIN_CLIP_WIDTH",
                    "WEBP_METHOD", "WEBP_MINIMIZE_SIZE", "FAST_POINT_TABLES",
                    "clip_scale", "CLIP_FPS", "MAX_CLIP_SCALE", "CapturedClip",
                    "clip_size"):
         assert unused not in E.__all__, f"{unused} is re-exported unused"
+        assert hasattr(C, unused), f"{unused} no longer exists in clips.py"
 
     # ...and every clips name that is still in __all__ is in SHIMMED, so
     # adding one back has to be a deliberate edit to both lists.

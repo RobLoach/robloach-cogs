@@ -64,11 +64,13 @@ making it -- is in RetroView.py, and the two halves meet in
 calls) **needs no core**, and the cog runs it with the emulator lock
 *released*, on an ordinary ``asyncio.to_thread`` worker rather than on the
 core's own thread. That split is the point of ``capture_press`` and
-``run_press`` being two methods rather than one: encoding a clip to WebP costs
+``_encode`` being two methods rather than one: encoding a clip to WebP costs
 more CPU than emulating it does, and doing it under the lock made every press
 in every other channel wait for this channel's Pillow. See ``Retro.run_press``
 for the shape of it -- capture under the lock, take ``view.emulator`` while
-the lock still holds it still, give the lock back, encode.
+the lock still holds it still, give the lock back, encode. (There used to be a
+``SessionMixin.run_press`` that did both in one call, for a caller that never
+existed; see the note where it was.)
 
 Which is also why ``_encode`` takes the emulator it should use as an argument
 instead of reading ``self.emulator``: by the time it runs, another channel is
@@ -237,9 +239,10 @@ class SessionMixin:
         """
         Push the state a press is about to change onto the undo history.
 
-        Called from :meth:`run_press`, i.e. in the worker thread, *before*
-        anything is emulated -- which is the whole contract: what Undo puts
-        back is the machine exactly as it was when the button was clicked.
+        Called from :meth:`capture_press` (and from :meth:`capture_reset`),
+        i.e. in the worker thread, *before* anything is emulated -- which is
+        the whole contract: what Undo puts back is the machine exactly as it
+        was when the button was clicked.
 
         Never raises. A core that cannot serialize (or one that fails to,
         once) must not cost anybody a press: the history simply does not
@@ -497,22 +500,27 @@ class SessionMixin:
         emulator.advance(emulator.frames_for_seconds(BOOT_SECONDS))
         return self._capture(emulator, None)
 
-    def run_press(self, field: typing.Optional[str], repeat: int = 1) -> bytes:
-        """
-        :meth:`capture_press` and encode it, in one call. Worker thread only.
-
-        The convenient form, for a caller with no lock to give back. The cog
-        deliberately does not use it; see :meth:`capture_press`.
-        """
-        return self._encode(self.capture_press(field, repeat))
-
-    def run_undo(self) -> bytes:
-        """:meth:`capture_undo` and encode it; see :meth:`run_press`."""
-        return self._encode(self.capture_undo())
-
-    def run_reset(self) -> bytes:
-        """:meth:`capture_reset` and encode it; see :meth:`run_press`."""
-        return self._encode(self.capture_reset())
+    # There were three more methods here -- `run_press`, `run_undo` and
+    # `run_reset`, each one line of `_encode(capture_something())` -- and
+    # they are gone. They were "the convenient form, for a caller with no lock
+    # to give back", and their own docstrings said the cog deliberately did not
+    # use them. Nothing else did either: every `run_undo` and `run_reset` in
+    # the tree is `Retro.run_undo` / `Retro.run_reset`, which are the cog's own
+    # methods of the same name and are not these.
+    #
+    # The convenience was also the wrong shape to offer. The whole point of
+    # `capture_*` and `_encode` being two calls is that they belong on opposite
+    # sides of the emulator lock (see `_encode` below, and the module docstring
+    # above), so a one-liner that puts them back together is a one-liner whose
+    # only use is to do the expensive half while holding the lock -- i.e. the
+    # thing that was measured, found to make every other channel wait for this
+    # channel's Pillow, and split apart on purpose.
+    #
+    # `Retro.py` writes the real envelope -- wake, capture under the lock, take
+    # the encoder while the lock still holds it still, release, encode, flush,
+    # save -- three times, in `run_press`, `run_undo` and `run_reset`. That is
+    # where a shared helper would actually earn its keep, and it is eight lines
+    # rather than one.
 
     # -- Encoding, with the emulator lock given back ------------------------
 

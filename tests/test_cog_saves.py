@@ -987,12 +987,15 @@ async def test_a_press_during_the_import_check_cannot_undo_the_import(battery):
     real_check = cog._check_import
 
     async def check_and_then_a_press_lands(entry, state, sram, prefix=""):
-        problem = await real_check(entry, state, sram, prefix)
+        # `(what is wrong, why it could not be checked)`, passed straight
+        # through: this stands in for the seconds the real check spends booting
+        # a core, not for its answer.
+        outcome = await real_check(entry, state, sram, prefix)
         # The moment the race lives in: the check is done, the write has not
         # happened, and a player presses a button.
         await cog.run_press(view, "a")
         assert view.live, "the press really did wake the game mid-command"
-        return problem
+        return outcome
 
     cog._check_import = check_and_then_a_press_lands
     incoming = marker_bytes(SRAM_BYTES, seed=99)
@@ -1217,6 +1220,48 @@ async def test_a_stranger_may_not_import_over_someone_elses_save(battery):
     await command(battery, "retrosaves_import")(battery.cog, ctx, game="ucity")
     assert "Only the person who started" in ctx.said()
     assert not battery.cog._sram_path(9272, "ucity").is_file()
+
+
+async def test_an_import_cannot_walk_past_the_disk_budget(battery):
+    """The one way bytes could enter the data directory unbudgeted.
+
+    `_write_import` hands straight to `_write_atomic`, so an import used to add
+    up to 16 MiB of save state plus a megabyte of in-game save with no budget
+    check at all -- four a minute per person, in every channel the bot is in.
+    Every other writer in the cog asks `_make_room` first (`[p]retro` before it
+    caches a ROM, `[p]retroset bios add` before it stores firmware) and this
+    one has to as well.
+    """
+    view, _, channel = await playing(battery, 9294, "ucity")
+    cog = battery.cog
+    await cog.config.disk_budget_mb.set(1)
+    # A one-megabyte budget, filled to the brim with something no pruner is
+    # allowed to touch: the system directory holds firmware, which does not
+    # re-download itself the way a cached ROM does. Written through the cog's
+    # own writer so the running total knows about it -- a file that appeared
+    # behind the budget's back is a different test (see test_leaks.py).
+    cog._write_atomic(cog._system_dir() / "filler.bin", b"x" * (1020 * 1024))
+    incoming = marker_bytes(SRAM_BYTES, seed=13)
+    FakeConfirm.reset(answer=True)
+    ctx = battery.context(
+        channel,
+        author=FakeUser(uid=view.starter_id),
+        attachments=[FakeAttachment(incoming, "ucity.srm")],
+    )
+
+    await command(battery, "retrosaves_import")(cog, ctx, game="ucity")
+
+    said = ctx.said()
+    assert "run out of room" in said, said
+    assert "Nothing was changed" in said, said
+    # The rule the whole budget is built around, and the one an unbudgeted
+    # import was quietly on the wrong side of.
+    assert "No save was deleted to make room" in said, said
+    srm = cog._sram_path(9294, "ucity")
+    assert srm.read_bytes() != incoming, "the refused import was written anyway"
+    # And the game is still the game: its own cached ROM is not what gets
+    # thrown away to find room for its save.
+    assert cog._cached_rom(9294, "ucity") is not None
 
 
 # -- What the cooldown is charged for -----------------------------------------

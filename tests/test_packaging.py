@@ -338,31 +338,37 @@ def test_the_fingerprint_is_of_the_loaded_sources():
 
 def test_the_fingerprint_changes_with_the_code_and_with_a_new_file(tmp_path):
     (tmp_path / "a.py").write_text("x = 1\n")
-    first = V.code_fingerprint(tmp_path)
+    first = V.scan_sources(tmp_path).fingerprint
     (tmp_path / "a.py").write_text("x = 2\n")
-    second = V.code_fingerprint(tmp_path)
+    second = V.scan_sources(tmp_path).fingerprint
     (tmp_path / "b.py").write_text("")
-    third = V.code_fingerprint(tmp_path)
+    third = V.scan_sources(tmp_path).fingerprint
     assert len({first, second, third}) == 3, (first, second, third)
     # A directory with no sources at all has no fingerprint, rather than the
     # hash of nothing (which would look like a real answer).
-    assert V.code_fingerprint(tmp_path / "empty") is None
+    assert V.scan_sources(tmp_path / "empty").fingerprint is None
 
 
 def test_both_source_facts_come_from_one_walk_over_the_files(tmp_path):
     """One glob, one visit per file: the two answers are about the same files.
 
-    They were two passes -- glob, read, hash; glob again, stat -- run back
-    to back at import. Folding them together must not move either answer, so
-    both are checked against the named functions that still exist for
-    callers who only want one of them.
+    They were two passes -- glob, read, hash; glob again, stat -- run back to
+    back at import. Folding them together must not move either answer.
+
+    This used to check both fields against ``code_fingerprint()`` and
+    ``newest_source_time()``, two one-line wrappers that returned one field of
+    this tuple each and survived the fold for callers who might want only one
+    of them. There were none: the module's own constants read the fields off
+    the tuple, and nothing else in the cog called either name -- so the
+    assertions were comparing ``scan_sources(p).fingerprint`` with itself. Both
+    are gone and the fields are checked against what they are supposed to *be*.
     """
     (tmp_path / "a.py").write_text("x = 1\n")
     (tmp_path / "b.py").write_text("y = 2\n")
     (tmp_path / "notes.txt").write_text("not a source file\n")
     scan = V.scan_sources(tmp_path)
-    assert scan.fingerprint == V.code_fingerprint(tmp_path)
-    assert scan.newest == V.newest_source_time(tmp_path)
+    assert scan.fingerprint and len(scan.fingerprint) == V.FINGERPRINT_LENGTH
+    assert not hasattr(V, "code_fingerprint") and not hasattr(V, "newest_source_time")
     assert scan.newest == max(
         (tmp_path / name).stat().st_mtime for name in ("a.py", "b.py")
     )

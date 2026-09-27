@@ -6,8 +6,16 @@ the cog accepts a ``.zip`` wherever it accepts a raw file. There are two ways
 in: :func:`extract` pulls out the single member the caller wants (a ROM), and
 :func:`extract_each` streams a whole archive one member at a time (a BIOS set,
 which is usually several files and sometimes a folder or two of them).
-:func:`extract_all` is the same walk with every member collected into one
-tuple, which is convenient but holds the lot in memory at once.
+
+There was a third, ``extract_all``: the same walk as :func:`extract_each` with
+every member collected into one tuple, plus an ``ExtractedArchive`` type to
+hold them. Convenient, and expensive -- the whole unpacked archive live at once
+on top of the archive it came out of. Once the one caller that unpacks a
+firmware pack learned to write each file as it arrived, nothing in the cog
+wanted that shape, and a second entry point and a second result type kept
+alive for the test file's convenience are two more things that can drift from
+the walk they are supposed to mirror. Both are gone; the tests collect
+:func:`extract_each` into a list themselves, which is all they ever needed.
 
 Nothing here ever calls :meth:`zipfile.ZipFile.extract`: members are read into
 memory and the caller writes them under paths *this module* validated, so an
@@ -31,7 +39,6 @@ __all__ = [
     "NoSupportedMember",
     "Extracted",
     "ExtractedFile",
-    "ExtractedArchive",
     "ArchiveReport",
     "ZIP_MAGIC",
     "MAX_MEMBER_DEPTH",
@@ -40,7 +47,6 @@ __all__ = [
     "safe_member_path",
     "extract",
     "extract_each",
-    "extract_all",
 ]
 
 # The local file header every non-empty zip starts with. An empty archive
@@ -104,7 +110,7 @@ class NoSupportedMember(ArchiveError):
 
 
 class ExtractedFile(typing.NamedTuple):
-    """One file unpacked by :func:`extract_all`."""
+    """One file :func:`extract_each` hands to its sink."""
 
     #: The relative path to write it to, with forward slashes. Every component
     #: has been validated by :func:`safe_member_path`, so joining this onto a
@@ -118,8 +124,11 @@ class ExtractedFile(typing.NamedTuple):
 class ArchiveReport(typing.NamedTuple):
     """What :func:`extract_each` made of an archive, once the bytes are gone.
 
-    Everything :class:`ExtractedArchive` carries except the payloads, which a
-    streaming caller has already written somewhere and must not be holding.
+    Names and numbers only, deliberately: what was taken, what was left behind,
+    what was in there and how much it came to -- but none of the payloads. A
+    streaming caller has already written those somewhere and must not still be
+    holding them, since holding them gives back exactly the memory handing them
+    over one at a time exists to save.
     """
 
     #: The validated relative path of every file handed to the sink, in the
@@ -133,18 +142,6 @@ class ArchiveReport(typing.NamedTuple):
     #: Every file member, sorted, whether it was taken or not.
     members: typing.Tuple[str, ...]
     #: Total uncompressed bytes of everything the sink was given.
-    total_size: int
-
-
-class ExtractedArchive(typing.NamedTuple):
-    """Everything usable :func:`extract_all` found in one archive."""
-
-    files: typing.Tuple[ExtractedFile, ...]
-    #: As :attr:`ArchiveReport.skipped`.
-    skipped: typing.Tuple[str, ...]
-    #: Every file member, sorted, whether it was taken or not.
-    members: typing.Tuple[str, ...]
-    #: Total uncompressed bytes of ``files``.
     total_size: int
 
 
@@ -163,9 +160,11 @@ class Extracted(typing.NamedTuple):
     # Whether ``name`` is the member the caller asked for by name rather than
     # the alphabetical first. False when no ``prefer`` was given *and* when
     # one was given but matched nothing, so a caller that asked for a
-    # particular file can tell the user it was not in there. Defaulted so
-    # anything that builds an Extracted positionally still does.
-    preferred: bool = False
+    # particular file can tell the user it was not in there. Not defaulted:
+    # :func:`extract` is the only thing that builds an Extracted and it passes
+    # all five fields positionally, so a default would only ever hide a field
+    # someone forgot to fill in.
+    preferred: bool
 
 
 def is_zip(data: bytes) -> bool:
@@ -320,6 +319,29 @@ def _list_files(
     return files, tuple(info.filename for info in files)
 
 
+def _nothing_usable(what: str, names: typing.Sequence[str]) -> NoSupportedMember:
+    """
+    The refusal for a readable zip that held nothing the caller can use.
+
+    Both ways into this module reject an archive for this reason and have to say
+    so in the same words: somebody who tries a zip as a ROM and then as a BIOS
+    pack should not be told two different stories about the same file. The
+    sentence was character-identical at both sites, differing only in
+    indentation, which is precisely the state a message quietly drifts out of --
+    the same argument that put the index-read error and the empty-archive
+    sentence in :func:`_list_files`, applied to the last message the two shared.
+
+    Returned rather than raised, so both call sites keep their own ``raise`` and
+    still read as the refusals they are where they stand; a helper that raised
+    would also leave every caller's control flow a mystery to a type checker.
+    """
+    return NoSupportedMember(
+        f"the zip contains no {what} this bot can use. It contains: "
+        f"{describe_members(names)}.",
+        names,
+    )
+
+
 def _read_member(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
@@ -453,11 +475,7 @@ def extract(
 
         candidates = tuple(info.filename for info in files if accept(info.filename))
         if not candidates:
-            raise NoSupportedMember(
-                f"the zip contains no {what} this bot can use. It contains: "
-                f"{describe_members(names)}.",
-                names,
-            )
+            raise _nothing_usable(what, names)
 
         wanted = _preferred(candidates, prefer) if prefer else None
         chosen_name = wanted if wanted is not None else candidates[0]
@@ -496,13 +514,14 @@ def extract_each(
     """
     Unpack every usable member of ``data``, one at a time, into ``sink``.
 
-    The same walk as :func:`extract_all` -- same caps, same skip rules, same
-    order -- except that each file is handed to ``sink`` the moment it is
-    decompressed and then dropped, so only one member's bytes are ever live.
-    That is the difference between a peak of the archive plus every file in it
-    (a maximal firmware pack is over a hundred megabytes) and the archive plus
-    the largest single file, which matters on the small VPSes these bots live
-    on.
+    Each file is handed to ``sink`` the moment it is decompressed and then
+    dropped, so only one member's bytes are ever live. That is the difference
+    between a peak of the archive plus every file in it (a maximal firmware pack
+    is over a hundred megabytes) and the archive plus the largest single file,
+    which matters on the small VPSes these bots live on. Collecting the lot into
+    one tuple is of course still possible for anyone who wants it -- a sink of
+    ``files.append`` -- but that is the caller's memory to spend, and no caller
+    in the cog spends it.
 
     ``sink`` is called once per accepted file, in sorted order, with an
     :class:`ExtractedFile`; it is expected to write the bytes somewhere and
@@ -610,42 +629,5 @@ def extract_each(
             del payload
 
     if not taken:
-        raise NoSupportedMember(
-            f"the zip contains no {what} this bot can use. It contains: "
-            f"{describe_members(names)}.",
-            names,
-        )
+        raise _nothing_usable(what, names)
     return ArchiveReport(tuple(taken), tuple(skipped), names, total)
-
-
-def extract_all(
-    data: bytes,
-    *,
-    max_total_size: int,
-    max_file_size: int,
-    max_files: int,
-    what: str = "file",
-) -> ExtractedArchive:
-    """
-    :func:`extract_each` with every file collected into one tuple.
-
-    The convenient shape, and the expensive one: the whole unpacked archive is
-    live at once, on top of the archive it came out of. Fine for a couple of
-    files or a test; a caller unpacking a firmware pack that may be a hundred
-    megabytes should use :func:`extract_each` and write each file as it
-    arrives. Every cap, skip rule and error is that function's -- this only
-    keeps what it is handed.
-
-    :raises ArchiveError: if the archive cannot be read or busts a cap.
-    :raises NoSupportedMember: if nothing inside could be used.
-    """
-    files: typing.List[ExtractedFile] = []
-    report = extract_each(
-        data,
-        sink=files.append,
-        max_total_size=max_total_size,
-        max_file_size=max_file_size,
-        max_files=max_files,
-        what=what,
-    )
-    return ExtractedArchive(tuple(files), report.skipped, report.members, report.total_size)

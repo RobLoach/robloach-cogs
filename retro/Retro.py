@@ -105,6 +105,7 @@ from .RetroView import (
     press_plan,
     presser_name,
     restore_into,
+    whisper,
 )
 from .saves import (
     CONFIRM_TIMEOUT,
@@ -131,6 +132,7 @@ from .storage import (
 from .systems import (
     CORES,
     SYSTEMS,
+    System,
     ambiguous_reason,
     core_filename,
     core_name_from_filename,
@@ -463,7 +465,10 @@ class Retro(
                         "where you left off.",
                     )
                 else:
-                    self._hibernate_now(view)
+                    # release=False: the sleep half only, on this thread. The
+                    # view is closed and handed back a few lines down, for
+                    # every session in the loop alike.
+                    self._discard_session_now(view, release=False)
             except asyncio.CancelledError as error:
                 cancelled = error
                 log.warning(
@@ -473,7 +478,7 @@ class Retro(
                 # Whatever this one still held has already been freed by
                 # _hibernate_locked's finally, but the write may not have
                 # happened; there is nothing left to save if it has.
-                self._hibernate_now(view)
+                self._discard_session_now(view, release=False)
             except Exception:
                 log.exception("Failed to hibernate a Libretro session on unload.")
             # The buttons stay enabled on the message so the game can be
@@ -483,10 +488,8 @@ class Retro(
             view.closed = True
             self._release_view(view)
         self.sessions.clear()
-        for retired in self.retired.values():
-            retired.alive = False
-            self._release_view(retired)
-        self.retired.clear()
+        for message_id in list(self.retired):
+            self._discard_retired(message_id)
         # Every core has been freed by the loop above, so the emulator thread
         # has nothing left to do and no core can outlive it. Not waited on:
         # this runs on the event loop, and an unload must not block on a
@@ -742,19 +745,50 @@ class Retro(
                 len(self.retired),
             )
 
+    def _discard_retired(
+        self, message_id: int
+    ) -> typing.Optional[RetiredView]:
+        """
+        Take one message's Resume button out of service. Returns what it took.
+
+        The one implementation of "this Resume button is finished with", for
+        the same reason :meth:`_discard_session_now` is the one implementation
+        of it for the session half: the three statements below were written
+        out six times -- the unload, arming a replacement, trimming the oldest
+        record out of a channel's store, and the three forget paths -- and the
+        *order* of them is a rule rather than a preference.
+
+        ``alive = False`` first, so a click that is already in flight is
+        answered rather than acted on (see RetiredView). ``_release_view``
+        second, and crucially **before any replacement view is registered for
+        the same message**: ``remove_view`` unconditionally drops that message
+        id from discord.py's synced-view table, so releasing the old view
+        after registering the new one takes the new one's entry with it. See
+        _release_view, and _arm_retired, which is the caller that order was
+        written for.
+
+        Returns the view, or None when the message had no Resume button --
+        which every caller but :meth:`_arm_retired` ignores, because "there
+        was nothing to take out of service" and "it has been taken out of
+        service" want the same thing done next.
+        """
+        view = self.retired.pop(int(message_id), None)
+        if view is None:
+            return None
+        view.alive = False
+        self._release_view(view)
+        return view
+
     def _arm_retired(self, record: dict) -> typing.Optional[RetiredView]:
         """Give one retired message a working Resume button."""
         message_id = record.get("message_id")
         if not message_id:
             return None
         message_id = int(message_id)
-        existing = self.retired.pop(message_id, None)
-        if existing is not None:
-            existing.alive = False
-            # Before the new one is registered, or remove_view would take
-            # the new view's entry out of discord.py's table with the old
-            # one's; see _release_view.
-            self._release_view(existing)
+        # Before the new one is registered, or remove_view would take the new
+        # view's entry out of discord.py's table with the old one's; see
+        # _discard_retired, which is where that ordering rule lives.
+        self._discard_retired(message_id)
         view = RetiredView(self, record)
         self.retired[message_id] = view
         try:
@@ -798,10 +832,7 @@ class Retro(
                         ),
                     )
                     dropped = retired.pop(oldest)
-                    stale = self.retired.pop(int(oldest), None)
-                    if stale is not None:
-                        stale.alive = False
-                        self._release_view(stale)
+                    self._discard_retired(int(oldest))
                     log.debug(
                         "Forgot the Resume button for %s in channel %s.",
                         (dropped or {}).get("game_name"),
@@ -815,10 +846,7 @@ class Retro(
 
     async def _forget_retired(self, channel_id: int, message_id: int) -> None:
         """Drop one retired record, on the way to putting it back in service."""
-        view = self.retired.pop(int(message_id), None)
-        if view is not None:
-            view.alive = False
-            self._release_view(view)
+        self._discard_retired(message_id)
         try:
             async with self.config.channel_from_id(int(channel_id)).retired() as retired:
                 retired.pop(str(int(message_id)), None)
@@ -848,10 +876,7 @@ class Retro(
                 "Could not tidy the retired Retro records for channel %s.", channel_id
             )
         for message_id in stale:
-            view = self.retired.pop(message_id, None)
-            if view is not None:
-                view.alive = False
-                self._release_view(view)
+            self._discard_retired(message_id)
 
     # -- Forgetting a channel -----------------------------------------------
     #
@@ -940,7 +965,7 @@ class Retro(
         view = self.sessions.pop(int(channel_id), None)
         if view is None:
             return
-        self._discard_session_now(view, getattr(view, "emulator", None), save=True)
+        self._discard_session_now(view)
 
     def _forget_session_view(self, channel_id: int, view: RetroView) -> bool:
         """
@@ -964,11 +989,8 @@ class Retro(
     def _drop_retired_views(self, channel_id: int) -> None:
         """Take every Resume button of one channel out of service."""
         for message_id, view in list(self.retired.items()):
-            if int(getattr(view, "channel_id", 0) or 0) != int(channel_id):
-                continue
-            self.retired.pop(message_id, None)
-            view.alive = False
-            self._release_view(view)
+            if int(getattr(view, "channel_id", 0) or 0) == int(channel_id):
+                self._discard_retired(message_id)
 
     async def _forget_channel(self, channel_id: int, why: str) -> None:
         """
@@ -1254,63 +1276,102 @@ class Retro(
         except Exception:
             log.exception("Could not free a libretro core.")
 
+    # -- Writing the state and freeing the core ------------------------------
+    #
+    # One pair of methods, sync and async, behind every way this cog finishes
+    # with a loaded core. There were four: two "discard" (which also handed
+    # the view back to discord.py) and two "hibernate" (which left the
+    # controls live so the next press could wake the game), each in a sync and
+    # an async flavour. Their bodies differed in nothing but the two axes
+    # below, and the comments on those four copies record what keeping them
+    # apart cost: one of them forgot the ``try`` that frees the core when the
+    # write raises, which spent the one emulator slot for the life of the
+    # process.
+    #
+    # ``save`` -- whether the progress is worth writing. A start or a resume
+    # that *failed* passes False: nothing worth keeping was emulated, and
+    # writing the state of a boot that did not work would put it over a good
+    # save. Everything else passes True; losing a session's pointer is never
+    # meant to cost the channel its progress.
+    #
+    # ``release`` -- whether the view is finished with. False is a *sleep*:
+    # the message keeps working buttons and the next press wakes the game up
+    # again, so it must not be marked closed or handed back. True is the end
+    # of this view's life.
+    #
+    # The order inside them is a rule, not a preference:
+    #
+    #   1. stop pacing, so a press sitting out a clip's playing time is not
+    #      waited on for a purely cosmetic delay (see cancel_pacing);
+    #   2. take the core off the view, *before* the write rather than after
+    #      it, so there is no window in which the view still advertises a core
+    #      that is being torn down -- this is what _hibernate_locked already
+    #      does, and the async flavour of it awaits twice, so the window was
+    #      real;
+    #   3. write the state, then free the core: after ``stop()`` there is
+    #      nothing left to read;
+    #   4. mark the view closed before handing it back, because
+    #      ``_release_view`` is what stops discord.py routing clicks to it.
+    #
+    # ``emulator`` is still a parameter, and it is not redundant: the
+    # failed-boot paths hold a core the view never took (``view.emulator`` is
+    # assigned only once the boot has come back, so a boot that raised or was
+    # cancelled leaves the local holding the only reference). Reading the
+    # attribute alone there would leak exactly the slot all of this exists to
+    # protect. It defaults to "whatever the view has", which is what every
+    # other caller means.
+
     def _discard_session_now(
         self,
         view: RetroView,
-        emulator: typing.Optional[RetroEmulator],
+        emulator: typing.Optional[RetroEmulator] = None,
         *,
-        save: bool,
+        save: bool = True,
+        release: bool = True,
     ) -> None:
         """
-        Free a session's core and retire its view, without awaiting anything.
+        Write a session's progress and free its core, without awaiting.
 
-        The one implementation of "this session is over", for the paths that
-        cannot await: a cancelled task cannot rely on the next ``await``
-        coming back, and a core left loaded is not merely memory -- only one
-        may be live at a time (MAX_LIVE_EMULATORS), so leaking one stops the
-        cog working until the bot restarts.
+        For the paths that cannot await: a cancelled task cannot rely on the
+        next ``await`` coming back, and a core left loaded is not merely
+        memory -- only one may be live at a time (MAX_LIVE_EMULATORS), so
+        leaking one stops the cog working until the bot restarts.
 
-        The order is the order every path needs: the state is written (if it
-        is worth writing) *before* the core is freed, because after
-        ``stop()`` there is nothing left to read; the view is marked closed
-        before it is handed back, because ``_release_view`` is what stops
-        discord.py routing clicks to it.
-
-        ``save`` is the one thing the callers genuinely differ on. A start or
-        a resume that *failed* passes False: nothing worth keeping was
-        emulated, and writing the state of a boot that did not work would put
-        it over a good save. Everything else passes True -- losing a
-        session's pointer is never meant to cost the channel its progress.
-
-        This sequence used to be written out five times with small
-        variations, and the comments on those copies record what that cost:
-        one of them forgot the ``try`` that frees the core when the write
-        raises, which spent the one emulator slot for the life of the
-        process.
+        Never raises, and safe on a session that is already asleep -- which
+        is the common case by the time a teardown reaches it.
         """
+        if emulator is None:
+            emulator = getattr(view, "emulator", None)
+        view.cancel_pacing()
+        view.emulator = None
         if emulator is not None:
             if save:
                 self._write_state_now(view, emulator)
             self._free_emulator(emulator)
-        view.emulator = None
-        view.closed = True
-        self._release_view(view)
+        if release:
+            view.closed = True
+            self._release_view(view)
 
     async def _discard_session(
         self,
         view: RetroView,
-        emulator: typing.Optional[RetroEmulator],
+        emulator: typing.Optional[RetroEmulator] = None,
         *,
-        save: bool,
+        save: bool = True,
+        release: bool = True,
     ) -> None:
         """
         :meth:`_discard_session_now` for a path that can still await.
 
         Same order, same rules; the write and the core unload go to a worker
-        thread rather than blocking the event loop. Never raises: every
-        caller is already handling a failure of its own, and a session that
-        could not be tidied up perfectly must still end with its core freed.
+        thread rather than blocking the event loop. Never raises: every caller
+        is already handling a failure of its own, and a session that could not
+        be tidied up perfectly must still end with its core freed.
         """
+        if emulator is None:
+            emulator = getattr(view, "emulator", None)
+        view.cancel_pacing()
+        view.emulator = None
         if emulator is not None:
             if save:
                 try:
@@ -1323,51 +1384,27 @@ class Retro(
                 await self.run_in_emulator_thread(emulator.stop)
             except Exception:
                 log.exception("Could not stop a discarded session's emulator.")
-        view.emulator = None
-        view.closed = True
-        self._release_view(view)
+        if release:
+            view.closed = True
+            self._release_view(view)
 
     async def _force_hibernate(self, view: RetroView) -> None:
         """
         Save the game and free the core, whatever state the view is in.
 
-        The belt and braces behind every ``await self.hibernate(...)`` that
-        is wrapped in a ``try``: a stale view, or a message the bot can no
-        longer edit, must not leave a libretro core loaded. Only one may be
-        (MAX_LIVE_EMULATORS), so a core leaked here is not merely memory --
-        it is the cog not working again until the bot restarts.
+        The belt and braces behind every ``await self.hibernate(...)`` that is
+        wrapped in a ``try``: a stale view, or a message the bot can no longer
+        edit, must not leave a libretro core loaded. Only one may be
+        (MAX_LIVE_EMULATORS), so a core leaked here is not merely memory -- it
+        is the cog not working again until the bot restarts.
 
-        The order is the one everything else uses: the state is written
-        *before* the core is freed, because after ``stop()`` there is nothing
-        left to read. Never raises, and safe on a session that is already
-        asleep.
+        A name rather than a body, and it keeps its own name because it is
+        part of the mixin contract: it is declared in retro/abc.py and called
+        from retro/saves.py, where `[p]retrosaves` frees the core before it
+        touches a save on disk. Never raises, and safe on a session that is
+        already asleep.
         """
-        view.cancel_pacing()
-        emulator, view.emulator = getattr(view, "emulator", None), None
-        if emulator is None:
-            return
-        await self._write_state(view, emulator)
-        await self.run_in_emulator_thread(emulator.stop)
-
-    def _hibernate_now(self, view: RetroView) -> None:
-        """
-        Put one session to sleep without awaiting anything. Never raises.
-
-        The two halves of :meth:`_hibernate_locked` that cannot be skipped --
-        write the progress, then free the core -- done on the calling thread,
-        for a teardown that has already been cancelled once and therefore
-        cannot rely on an ``await`` coming back. The lock is deliberately not
-        taken, for the same reason: acquiring it is an await.
-
-        Safe on a session that is already asleep, which is the common case
-        by the time this is reached.
-        """
-        view.cancel_pacing()
-        emulator, view.emulator = getattr(view, "emulator", None), None
-        if emulator is None:
-            return
-        self._write_state_now(view, emulator)
-        self._free_emulator(emulator)
+        await self._discard_session(view, release=False)
 
     async def _save_record(self, view: RetroView) -> None:
         """Write the session record. Never raises: it is on every save path."""
@@ -1497,6 +1534,74 @@ class Retro(
                     exc_info=True,
                 )
 
+    def _press_landed(self, view: RetroView) -> bool:
+        """
+        Count one press, and say whether this is the one that autosaves.
+
+        The count and the decision are one fact, which is why they are one
+        call: a press that is counted but not considered for the autosave
+        cadence, or considered twice, drifts the cadence silently. Must run
+        under :attr:`emulator_lock`, because the snapshot it authorises is
+        taken from the core.
+        """
+        view.press_count += 1
+        return view.press_count % SAVE_STATE_EVERY_PRESSES == 0
+
+    async def _emulate_clip(
+        self,
+        view: RetroView,
+        capture: typing.Callable[[], typing.Any],
+        *,
+        snapshot: typing.Callable[[], bool],
+    ) -> typing.Tuple[bytes, typing.Any]:
+        """
+        Drive the core once and encode the clip. Returns ``(clip, progress)``.
+
+        The whole of what the one emulator lock is held across, and the whole
+        of what happens once it is given back -- written once rather than
+        three times. `run_press`, `run_undo` and `run_reset` each used to
+        spell this out, which meant three chances to get the order wrong in
+        the code where getting it wrong costs the process its only core slot.
+
+        Under the lock, in this order and no other:
+
+        * **wake the session** if it is asleep, which may evict another
+          channel's game (and queue the edit that tells them so);
+        * **capture** -- the caller's own core call, the only part that
+          differs between the three;
+        * **touch**, so the idle sweep sees this as activity even if the
+          encode below takes a moment;
+        * **snapshot the progress**, if the caller wants it. Reading the
+          machine state out of a core is sub-millisecond; *writing* it is
+          fsync'd disk, which is why only the read is in here;
+        * **take the emulator**, because an eviction in another channel clears
+          ``view.emulator`` the instant the lock is free, and the encode below
+          runs after that. See ``SessionMixin._encode``.
+
+        Then, with the lock given back: encode (the most expensive step of a
+        press, and it touches no core, so holding the lock across it made
+        every other channel wait for this one's WebP), and flush the edits the
+        eviction put off.
+
+        ``snapshot`` is a callable rather than a bool because a press decides
+        it *under the lock*, from a counter it bumps itself; see
+        :meth:`_press_landed`.
+        """
+        limit = view.upload_limit()
+        async with self.emulator_lock:
+            await self._wake_locked(view)
+            frames = await self.run_in_emulator_thread(capture)
+            view.touch()
+            progress = (
+                await self.run_in_emulator_thread(self._capture_progress, view)
+                if snapshot()
+                else None
+            )
+            encoder = view.emulator
+        clip = await asyncio.to_thread(view._encode, frames, limit, encoder)
+        await self._flush_refreshes()
+        return clip, progress
+
     async def run_press(
         self, view: RetroView, field: typing.Optional[str], repeat: int = 1
     ) -> bytes:
@@ -1514,32 +1619,11 @@ class Retro(
         lock made every third press in one channel delay presses in all the
         others -- and its own clip, which is the one somebody is waiting for.
         """
-        # Read before the lock: it is a cached attribute on the guild, and
-        # the encode that uses it happens in a worker thread.
-        limit = view.upload_limit()
-        async with self.emulator_lock:
-            await self._wake_locked(view)
-            frames = await self.run_in_emulator_thread(
-                view.capture_press, field, repeat
-            )
-            view.touch()
-            view.press_count += 1
-            autosave = view.press_count % SAVE_STATE_EVERY_PRESSES == 0
-            progress = (
-                await self.run_in_emulator_thread(self._capture_progress, view)
-                if autosave
-                else None
-            )
-            # Taken while the lock still holds it still: an eviction in
-            # another channel clears view.emulator, and the encode below runs
-            # after the lock is given back. See SessionMixin._encode in retro/session.py.
-            encoder = view.emulator
-        # Out of the lock. Encoding the clip is the most expensive step of a
-        # press and touches no core (see SessionMixin._encode), so it happens
-        # here: while this channel's WebP is being written, the next channel
-        # is already emulating.
-        clip = await asyncio.to_thread(view._encode, frames, limit, encoder)
-        await self._flush_refreshes()
+        clip, progress = await self._emulate_clip(
+            view,
+            functools.partial(view.capture_press, field, repeat),
+            snapshot=lambda: self._press_landed(view),
+        )
         if progress is not None:
             await self._write_captured(view, progress)
             await self._save_record(view)
@@ -1567,18 +1651,9 @@ class Retro(
         nothing to undo, or if the core will not take the state back. Called
         by the view from the Undo button.
         """
-        async with self.emulator_lock:
-            await self._wake_locked(view)
-            frames = await self.run_in_emulator_thread(view.capture_undo)
-            view.touch()
-            # Captured here, written below: see run_press, which explains why
-            # neither the encode nor the disk belongs under the lock.
-            progress = await self.run_in_emulator_thread(self._capture_progress, view)
-            encoder = view.emulator
-        clip = await asyncio.to_thread(
-            view._encode, frames, view.upload_limit(), encoder
+        clip, progress = await self._emulate_clip(
+            view, view.capture_undo, snapshot=lambda: True
         )
-        await self._flush_refreshes()
         await self._write_captured(view, progress)
         await self._save_record(view)
         return clip
@@ -1603,21 +1678,15 @@ class Retro(
         saved (it is only the session's bookkeeping) but the ``.state`` file
         is left holding the moment before the reset until the game saves
         again of its own accord -- the next autosave, or its next sleep. See
-        ``SessionMixin.run_reset`` (retro/session.py) and the command's own help.
+        ``SessionMixin.capture_reset`` (retro/session.py) and the command's own help.
 
         Raises EmulatorError if the session cannot be woken or the core will
         not reset. Called by `[p]retroreboot` and nothing else: there is no
         Reset button.
         """
-        async with self.emulator_lock:
-            await self._wake_locked(view)
-            frames = await self.run_in_emulator_thread(view.capture_reset)
-            view.touch()
-            encoder = view.emulator
-        clip = await asyncio.to_thread(
-            view._encode, frames, view.upload_limit(), encoder
+        clip, _ = await self._emulate_clip(
+            view, view.capture_reset, snapshot=lambda: False
         )
-        await self._flush_refreshes()
         await self._save_record(view)
         return clip
 
@@ -1632,6 +1701,77 @@ class Retro(
         async with self.emulator_lock:
             await self._hibernate_locked(view, reason)
         await self._flush_refreshes()
+
+    @staticmethod
+    def _replaced_notice(new_name: str, old_name: str) -> str:
+        """
+        What the outgoing game's message says when another one takes over.
+
+        One sentence, said by every path that replaces a channel's game: a
+        `[p]retro <something else>`, and a Resume click on a different game in
+        the same channel. It was written out three times with three different
+        line-wraps, which is how a change to the wording came to mean finding
+        all three.
+
+        It has to name *both* games. The message it goes on is the old game's,
+        which is now several posts up the channel and shows a still of a game
+        that is no longer running, so "this was saved" on its own reads as
+        being about whatever is on screen now.
+        """
+        return (
+            f"Replaced by **{new_name}**. **{old_name}** was saved "
+            "\N{EM DASH} press Resume to come back to it."
+        )
+
+    def _take_channel(
+        self, channel_id: int, view: RetroView
+    ) -> typing.Optional[RetroView]:
+        """
+        Install this view as the channel's session; return what it displaced.
+
+        **Called with the emulator lock held, and with the core already
+        attached to the view.** That is the invariant, and it is the whole
+        reason this is one named thing rather than three lines written out in
+        both of the paths that start a game:
+
+        ``self.sessions`` is the only place :meth:`_evict_locked` looks, so a
+        live core that is not reachable from it can never be freed -- and with
+        MAX_LIVE_EMULATORS at 1 the next game to start loads a second core into
+        a process that is only ever allowed one. The handover therefore happens
+        under the lock, with the core in place, and before anything that can
+        await. It used to happen after the lock had been given back and after
+        the outgoing game had been retired (which re-takes the lock and edits a
+        message), which left exactly that window: a press in another channel
+        arriving in it takes the lock, finds nothing live to evict, and boots.
+
+        Never returns ``view`` itself. The caller wants "what do I have to
+        retire?", and retiring the session that is being installed would free
+        the core that has just been attached to it. It can genuinely happen:
+        interactions go through no ``max_concurrency``, so a Resume click on
+        this very message can have taken the lock first and installed it.
+        """
+        channel_id = int(channel_id)
+        previous = self.sessions.get(channel_id)
+        self.sessions[channel_id] = view
+        return previous if previous is not view else None
+
+    async def _retire_inert(self, view: RetroView, reason: str) -> None:
+        """
+        Leave a session's controls dead with a line on them, and give them up.
+
+        The bail-out half of :meth:`_retire`, for the two cases where there is
+        nothing to put a Resume button *on*. Both used to be written out, and
+        character-identically, which made the second look like a different case
+        than it is.
+
+        ``_release_view`` goes last on purpose. ``refresh`` edits the message,
+        and an edit that carries a view re-registers it with discord.py, so
+        releasing before the edit would be undone by it -- and this view is
+        finished with either way.
+        """
+        view.retire()
+        await view.refresh(reason)
+        self._release_view(view)
 
     async def _retire(self, view: RetroView, reason: str) -> None:
         """
@@ -1652,11 +1792,7 @@ class Retro(
         if message is None:
             # No message to put a button on, so there is nothing to resume
             # from; leave the view inert and say nothing more about it.
-            # refresh() has nothing to edit either, so releasing the view
-            # here cannot be undone by a later edit re-registering it.
-            view.retire()
-            await view.refresh(reason)
-            self._release_view(view)
+            await self._retire_inert(view, reason)
             return
         # Hand these controls back to discord.py *before* the Resume button
         # takes the message over; see _release_view for why the order
@@ -1665,12 +1801,11 @@ class Retro(
         retired = self._arm_retired(record)
         if retired is None:
             # The record carries no message id, so there is nothing to put a
-            # Resume button on. refresh() edits the message it does have,
-            # which re-registers this view with discord.py, so release it
-            # again afterwards rather than before.
-            view.retire()
-            await view.refresh(reason)
-            self._release_view(view)
+            # Resume button on either. Probably unreachable -- it needs
+            # view.message set with view.message_id unset, and no path produces
+            # that -- but the shape above is what makes it safe to keep rather
+            # than a case to reason about.
+            await self._retire_inert(view, reason)
             return
         await self._remember_retired(record)
         try:
@@ -1720,7 +1855,7 @@ class Retro(
         game_name = record.get("game_name") or "that game"
 
         if channel_id in self._resuming:
-            await self._whisper_interaction(
+            await whisper(
                 interaction,
                 f"**{game_name}** is already starting \N{HORIZONTAL ELLIPSIS} "
                 "give it a moment.",
@@ -1728,7 +1863,7 @@ class Retro(
             return
         delay = self._channel_start_delay(channel_id)
         if delay:
-            await self._whisper_interaction(
+            await whisper(
                 interaction,
                 "This channel has started a lot of games in the last minute. "
                 f"Try again in {delay:.0f}s \N{EM DASH} the game already on "
@@ -1766,7 +1901,7 @@ class Retro(
             # There is no ctx.clean_prefix on a button click, and Red only
             # substitutes `[p]` in a docstring, so the prefix is asked for.
             prefix = await self._prefix_for(getattr(interaction, "guild", None))
-            await self._whisper_interaction(
+            await whisper(
                 interaction,
                 f"The cached ROM for **{game_name}** has been cleaned up, so "
                 "this button cannot start it. Start it again with "
@@ -1778,7 +1913,7 @@ class Retro(
         core = record.get("core") or ""
         core_path = await self._core_path(core)
         if core_path is None:
-            await self._whisper_interaction(
+            await whisper(
                 interaction,
                 f"The emulator **{game_name}** needs is not installed any "
                 f"more (`{core}`, the libretro emulator for that console), so "
@@ -1819,26 +1954,23 @@ class Retro(
             async with self.emulator_lock:
                 # One core at a time, here as everywhere else.
                 await self._evict_locked(exclude=view)
-                clip = await self.run_in_emulator_thread(view._boot, emulator, progress)
-                # The new session becomes the channel's *inside the lock*,
-                # with its core already attached, and before anything that
-                # can await. This used to happen after the lock had been
-                # released and after _retire (which re-takes the lock and
-                # edits a message), which left a window where a live core
-                # belonged to no session in self.sessions: a press in another
-                # channel arriving in it takes the lock, finds nothing live
-                # to evict, and loads a second core into a process that is
-                # only ever allowed one (MAX_LIVE_EMULATORS).
-                #
+                # `None` as the starter: this game may have been started by
+                # somebody else, and the starter is what decides who may
+                # sleep, reboot or wipe it. See RetroView.boot.
+                clip = await view.boot(
+                    None,
+                    emulator,
+                    progress,
+                    on_booted=lambda booted: self._settle_boot(
+                        booted, progress, notice
+                    ),
+                )
                 # Whatever this replaces is remembered rather than retired
                 # here, because retiring it awaits; _evict_locked has already
                 # saved it and freed its core, so the only thing left to do
                 # to it is cosmetic and can wait for the lock to be free.
-                previous = self.sessions.get(channel_id)
-                if previous is view:
-                    previous = None
-                view.emulator = emulator
-                self.sessions[channel_id] = view
+                # See _take_channel for why the handover is here at all.
+                previous = self._take_channel(channel_id, view)
         except asyncio.CancelledError:
             # A reload or shutdown landing on the boot. Nothing is awaited
             # from here (see _free_emulator) and there is nothing to report
@@ -1871,31 +2003,25 @@ class Retro(
         # would retire it, and gets a Resume button of its own.
         if previous is not None:
             await self._retire(
-                previous,
-                f"Replaced by **{game_name}**. **{previous.game_name}** was "
-                "saved \N{EM DASH} press Resume to come back to it.",
+                previous, self._replaced_notice(game_name, previous.game_name)
             )
 
-        # Same reason as RetroView.start(): with a core in hand the repeat
-        # button's label can be written from its real frame rate, and this is
-        # the last chance before the message goes back out.
-        view._update_repeat_label()
-        view.touch()
-        self._settle_boot(view, progress, notice)
+        # The repeat button's label, the activity stamp and the restore
+        # notice were all settled by view.boot() above -- it is the one place
+        # that knows what booting a session consists of. This method used to
+        # repeat all three by hand, sixty lines apart from each other, because
+        # boot() wanted a Context and a Resume click has an Interaction.
         await self._forget_retired(channel_id, message_id)
         await self._forget_retired_slug(channel_id, view.slug)
-        try:
-            view.message = await interaction.edit_original_response(
-                content=view._content(),
-                attachments=[view._clip_file(clip)],
-                view=view,
-            )
-        except discord.HTTPException as error:
-            log.exception(
-                "Discord rejected the resumed Retro message in channel %s.",
-                channel_id,
-            )
-            await self._whisper_interaction(interaction, self._http_error_message(error))
+        # Through the view's one edit path rather than by hand. Doing it here
+        # dropped two things every other clip-carrying edit does: NO_PINGS,
+        # without which a game named "@everyone" notifies the channel, and
+        # note_posted, without which the first press after a resume paces
+        # against nothing and has no picture to trim its opening against.
+        if not await view._edit(
+            interaction, view._content, clip, what="put the resumed game back"
+        ):
+            await whisper(interaction, self._http_error_message(None))
         # Whatever happened to the message, the session is real and this
         # message now drives it, so route its clicks here from now on.
         self._register_view(view)
@@ -1951,20 +2077,6 @@ class Retro(
             if not prefix.startswith("<@"):
                 return prefix
         return prefixes[0] if prefixes else ""
-
-    @staticmethod
-    async def _whisper_interaction(interaction, message: str) -> None:
-        """Tell only the person who clicked, whether or not we have replied."""
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(message, ephemeral=True)
-                return
-        except Exception:
-            log.debug("Could not answer an interaction directly.", exc_info=True)
-        try:
-            await interaction.followup.send(message, ephemeral=True)
-        except Exception:
-            log.debug("Could not deliver an interaction notice.", exc_info=True)
 
     async def _hibernate_locked(
         self, view: RetroView, reason: typing.Optional[str] = None
@@ -2140,7 +2252,7 @@ class Retro(
     def _settle_boot(
         self,
         view: RetroView,
-        progress: typing.Optional[Progress],
+        progress: Progress,
         notice: typing.Optional[str],
     ) -> None:
         """
@@ -2149,6 +2261,14 @@ class Retro(
         Runs after every :func:`restore_into`, whichever path called it -- a
         fresh start, a Resume click, or waking a hibernated session -- so the
         consequences of a restore are decided in one place too.
+
+        ``progress`` is what :meth:`_saved_progress` just handed back, which
+        every caller has and none of them can be missing: this has to know
+        whether there *was* a state to load in order to tell "nothing to
+        restore" from "the restore failed". It used to be optional, with an
+        empty :class:`Progress` standing in -- which would have said "nothing
+        to restore" for a game whose save state had just been rejected, and so
+        left the broken file on disk to be retried on every press.
 
         ``notice`` is what to say when the restore worked, which is the one
         thing the paths differ on: starting a game says where it picked up
@@ -2166,7 +2286,6 @@ class Retro(
         the generation that worked exactly where it is -- it is the newest
         good copy the channel has, and the next boot finds it in the same way.
         """
-        progress = progress if progress is not None else Progress()
         outcome = getattr(view, "boot_outcome", "fresh")
         state_path, state_backup, _, _ = self._save_paths(view.channel_id, view.slug)
         if outcome == "backup-state":
@@ -2227,17 +2346,40 @@ class Retro(
         Each one is saved before its core is freed, and its own message is
         edited to say it went to sleep. Returns the sessions that were
         evicted so the caller can mention them.
+
+        **A live session in the excluded view's own channel is the exception**,
+        and it is not really an eviction at all: that game is being *replaced*
+        by the one booting, not paused for somewhere else. Its core still has
+        to go -- only one may be loaded -- but it is neither told "another
+        channel started playing" (it is the same channel) nor handed back to
+        the caller to name in a "paused that first" courtesy line. What it is
+        owed instead is the Resume button and the "Replaced by X" sentence that
+        :meth:`_retire` gives it once the boot has come back, which is a better
+        answer and would only be overwritten by this one. ``None`` rather than
+        an empty string, so the message is not edited twice: see
+        :meth:`_queue_refresh` for the three states, and note that
+        _flush_refreshes runs *before* the retire, so anything written here
+        would be visible as a flicker.
         """
         evicted: typing.List[RetroView] = []
+        replacing = int(getattr(exclude, "channel_id", 0) or 0)
         for view in list(self.sessions.values()):
             if not view.live or view is exclude:
                 continue
+            same_channel = bool(replacing) and (
+                int(getattr(view, "channel_id", 0) or 0) == replacing
+            )
             await self._hibernate_locked(
                 view,
-                "Another channel started playing, so this game was saved and "
-                "went to sleep. Press a button to continue.",
+                None
+                if same_channel
+                else (
+                    "Another channel started playing, so this game was saved "
+                    "and went to sleep. Press a button to continue."
+                ),
             )
-            evicted.append(view)
+            if not same_channel:
+                evicted.append(view)
         return evicted
 
     def _eviction_notice(
@@ -2275,10 +2417,19 @@ class Retro(
         """
         Both halves of a game's progress to disk, in order. Never raises.
 
-        The one implementation of the ordering and the backup rules, shared by
-        the two ways of asking for it: :meth:`_write_state` runs it in a
-        worker thread and :meth:`_write_state_now` runs it on the calling
-        thread because it cannot await. It used to be written out twice.
+        Read the core, then write what came out: the two halves of a press's
+        autosave (:meth:`_capture_progress` and :meth:`_write_captured_now`)
+        run back to back, which is what a teardown path wants -- it has no
+        lock to give back between them, so there is nothing to gain by keeping
+        them apart.
+
+        This used to be a third implementation of the write rules, and the
+        duplication was exact: the same reads, the same falsy-SRAM skip, the
+        same ``OSError``/``Exception`` split, the same SRAM-first order, the
+        same return value. The only difference was that it interleaved read
+        and write per half rather than doing both reads and then both writes,
+        and nothing anywhere observes that -- a core read is sub-millisecond
+        and the two files are independent.
 
         Both halves, because they are different things: the save state is the
         exact moment and is only ever loadable by the same build of the same
@@ -2289,20 +2440,13 @@ class Retro(
         first, so the channel always has the generation before this one to
         fall back to; see BACKUP_SUFFIX and `[p]retrosaves rollback`.
 
-        Blocking, so an async caller runs it in a thread. The return value is
-        whether the *state* was written; a cartridge with no battery is the
-        normal case and is not a failure.
+        Blocking, so an async caller runs it in a thread. Shared by the two
+        ways of asking for it: :meth:`_write_state` runs it in a worker thread
+        and :meth:`_write_state_now` runs it on the calling thread because it
+        cannot await. The return value is whether the *state* was written; a
+        cartridge with no battery is the normal case and is not a failure.
         """
-        self._write_sram_now(view, emulator)
-        try:
-            data = emulator.save_state()
-            self._write_atomic(self._state_path(view.channel_id, view.slug), data, True)
-        except Exception:
-            log.warning(
-                "Could not write the save state for %s.", view.slug, exc_info=True
-            )
-            return False
-        return True
+        return self._write_captured_now(view, *self._capture_progress(view, emulator))
 
     def _capture_progress(
         self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
@@ -2319,8 +2463,13 @@ class Retro(
         The companion to :meth:`_write_captured`, and the split between them
         is what keeps the disk off the lock: this half is sub-millisecond
         (see the measurements above UNDO_COMPRESSION_LEVEL in retro/session.py), the other half
-        is fsync'd disk. :meth:`_write_progress` still does both at once for
+        is fsync'd disk. :meth:`_write_progress` calls the two back to back for
         the teardown paths, which have no lock to give back.
+
+        ``emulator`` defaults to the view's own, which is what a press means.
+        :meth:`_write_progress` passes one explicitly, because the teardown
+        paths it serves have already taken the core off the view -- and, on a
+        failed boot, may be holding a core the view never took at all.
         """
         emulator = emulator if emulator is not None else view.emulator
         if emulator is None or not emulator.started:
@@ -2369,7 +2518,21 @@ class Retro(
         state: typing.Optional[bytes],
         sram: typing.Optional[bytes],
     ) -> bool:
-        """The blocking half of :meth:`_write_captured`. Never raises."""
+        """
+        The blocking half of :meth:`_write_captured`. Never raises.
+
+        A falsy ``sram`` writes nothing at all rather than writing an empty
+        file: a cartridge with no battery -- most NES and Game Boy puzzle
+        games, every test ROM -- is the ordinary case and not an error, so it
+        is not logged, and an empty ``.srm`` left on disk is something the
+        resume path would then try to restore from.
+
+        The two failures are caught differently on purpose. A battery save
+        that cannot be written is reported and the state is still written
+        afterwards, because they are separate files and the state is the thing
+        the next press needs; a state that cannot be written is the return
+        value going False.
+        """
         if sram:
             try:
                 self._write_atomic(
@@ -2394,36 +2557,6 @@ class Retro(
             return False
         return True
 
-    def _write_sram_now(self, view: RetroView, emulator: RetroEmulator) -> bool:
-        """
-        Write the cartridge's battery save next to the save state. Never raises.
-
-        Returns False, and writes nothing at all, for a cartridge that has no
-        battery -- most NES and Game Boy puzzle games, every test ROM. That is
-        the ordinary case, not an error, so it is not logged and never leaves
-        an empty ``.srm`` behind for the resume path to trip over.
-
-        Blocking; see :meth:`_write_progress`, which is its only caller here,
-        and :meth:`_write_sram` for the awaitable form.
-        """
-        try:
-            data = emulator.save_sram()
-        except Exception:
-            log.warning(
-                "Could not read the battery save for %s.", view.slug, exc_info=True
-            )
-            return False
-        if not data:
-            return False
-        try:
-            self._write_atomic(self._sram_path(view.channel_id, view.slug), data, True)
-        except OSError:
-            log.warning(
-                "Could not write the battery save for %s.", view.slug, exc_info=True
-            )
-            return False
-        return True
-
     async def _write_state(
         self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
     ) -> bool:
@@ -2438,9 +2571,7 @@ class Retro(
             return False
         return await asyncio.to_thread(self._write_progress, view, emulator)
 
-    def _write_state_now(
-        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
-    ) -> bool:
+    def _write_state_now(self, view: RetroView, emulator: RetroEmulator) -> bool:
         """
         The same writes as :meth:`_write_state`, without awaiting anything.
 
@@ -2450,20 +2581,15 @@ class Retro(
         this runs :meth:`_write_progress` on the calling thread. It is a few
         milliseconds of blocking on a path that is already tearing down, and
         it is why the shared piece is synchronous rather than a coroutine.
+
+        The emulator is required here, unlike on :meth:`_write_state`: every
+        caller is a teardown that has already taken the core off the view (see
+        _discard_session_now), so a ``view.emulator`` fallback would read the
+        None it just wrote and silently save nothing.
         """
-        emulator = emulator if emulator is not None else view.emulator
         if emulator is None or not emulator.started:
             return False
         return self._write_progress(view, emulator)
-
-    async def _write_sram(
-        self, view: RetroView, emulator: typing.Optional[RetroEmulator] = None
-    ) -> bool:
-        """The battery save on its own, off the event loop. Never raises."""
-        emulator = emulator if emulator is not None else view.emulator
-        if emulator is None or not emulator.started:
-            return False
-        return await asyncio.to_thread(self._write_sram_now, view, emulator)
 
     async def _hibernation_loop(self) -> None:
         """Put sessions to sleep once they have been idle for long enough."""
@@ -2709,7 +2835,7 @@ class Retro(
             return False
 
     async def _download_bytes(
-        self, url: str, max_size: int, size_label: str, what: str = "file"
+        self, url: str, max_size: int, size_label: str, what: str
     ) -> typing.Tuple[str, bytes]:
         """
         Fetch a URL into memory, capped at ``max_size``.
@@ -2719,6 +2845,11 @@ class Retro(
         a scheme that is not http(s), resolves the hostname and refuses any
         address that is not a public one, connects to the address it just
         checked, and re-checks every redirect hop. See retro/net.py.
+
+        ``what`` is the noun every one of the messages below is built around
+        ("ROM", "BIOS file", "core"), so it is required rather than defaulted
+        to "file": every caller names its own, and a default nobody uses is a
+        wording the messages could silently fall back to.
 
         Returns (filename, data). Raises DownloadError with a message written
         for the person who gave us the URL -- and a *single* message, shared
@@ -2809,38 +2940,61 @@ class Retro(
             raise DownloadError(too_big)
         return filename, data
 
-    async def _fetch_rom(
-        self, ctx: commands.Context, url: typing.Optional[str]
+    async def _fetch_upload(
+        self,
+        ctx: commands.Context,
+        url: typing.Optional[str],
+        max_size: int,
+        size_label: str,
+        what: str,
     ) -> typing.Optional[typing.Tuple[str, bytes]]:
         """
-        Return (filename, data) from the URL or attachment, or None on error.
+        Get (filename, data) from a URL or the message's attachment.
 
-        A URL wins over an attachment, because it is the one the caller named
-        explicitly (a preset resolves to a URL before we get here).
+        The one implementation of "a file somebody handed this command",
+        shared by `[p]retro` (a ROM) and `[p]retroset bios add` (a firmware
+        file or a zip of them). The two were written out separately and were
+        near-identical: the same guarded download, the same DownloadError
+        reply, the same size check, the same ``attachment.read()``, and the
+        same *"The attached file could not be downloaded"* sentence in both.
+
+        **A URL wins over an attachment**, because it is the one the caller
+        named explicitly -- a preset resolves to a URL before either caller
+        gets here -- and because guessing between the two when both are
+        present would be a silent choice.
+
+        The size check on the attachment exists even though ``_download_bytes``
+        has its own: an attachment is never downloaded through that, and
+        Discord has already told us how big it is, so it can be refused
+        without reading it. The sentence is deliberately the same one the URL
+        path uses for the same limit.
+
+        Returns None having already said what went wrong -- or **silently**,
+        when there was neither a URL nor an attachment, because what to say
+        about that is the one thing the two callers genuinely differ on:
+        `[p]retro` with nothing at all is a request for help rather than a
+        mistake, and `[p]retroset bios add` shows its usage.
         """
         if url:
             try:
-                filename, data = await self._download_bytes(
-                    url, MAX_ROM_SIZE, MAX_ROM_SIZE_LABEL, "ROM"
-                )
+                return await self._download_bytes(url, max_size, size_label, what)
             except DownloadError as error:
                 await self._safe_send(ctx, str(error))
                 return None
-            return filename or "rom.gb", data
 
         if ctx.message.attachments:
             attachment = ctx.message.attachments[0]
-            if attachment.size > MAX_ROM_SIZE:
+            if attachment.size > max_size:
                 await self._safe_send(
-                    ctx,
-                    f"That file is bigger than the {MAX_ROM_SIZE_LABEL} limit "
-                    "for ROMs.",
+                    ctx, f"That {what} is bigger than the {size_label} limit."
                 )
                 return None
             try:
                 return attachment.filename, await attachment.read()
             except discord.HTTPException as error:
-                log.warning("Could not read a Retro ROM attachment.", exc_info=True)
+                log.warning(
+                    "Could not read a Retro %s attachment.", what, exc_info=True
+                )
                 await self._safe_send(
                     ctx, f"The attached file could not be downloaded: {error}"
                 )
@@ -2848,12 +3002,38 @@ class Retro(
 
         return None
 
+    async def _fetch_rom(
+        self, ctx: commands.Context, url: typing.Optional[str]
+    ) -> typing.Optional[typing.Tuple[str, bytes]]:
+        """
+        Return (filename, data) for a ROM, or None on error.
+
+        :meth:`_fetch_upload` with this command's limits, plus the one thing
+        that is specific to a ROM: a name to fall back on. A redirect chain can
+        end somewhere with no filename in the path, no Content-Disposition and
+        nothing else to go on, and the *extension* is what picks the console
+        (see _identify_rom) -- so a nameless download is called a Game Boy ROM,
+        which is the commonest of these and produces a refusal somebody can act
+        on rather than a crash.
+
+        Says nothing when there was no URL and no attachment: a bare
+        `[p]retro` never reaches here, and a caller that does has already
+        decided what to say.
+        """
+        fetched = await self._fetch_upload(
+            ctx, url, MAX_ROM_SIZE, MAX_ROM_SIZE_LABEL, "ROM"
+        )
+        if fetched is None:
+            return None
+        filename, data = fetched
+        return filename or "rom.gb", data
+
     async def _extract_rom(
         self,
         ctx: commands.Context,
         filename: str,
         data: bytes,
-        prefer: typing.Optional[str] = None,
+        prefer: typing.Optional[str],
     ) -> typing.Optional[typing.Tuple[str, bytes]]:
         """
         Pull a playable ROM out of a zip, or explain why we can't.
@@ -2861,7 +3041,9 @@ class Retro(
         The member is read into memory and handed back under its own name;
         nothing is ever unpacked using the paths stored in the archive.
 
-        ``prefer`` is the name the caller typed, if they typed one:
+        ``prefer`` is the name the caller typed, if they typed one -- required
+        rather than defaulted, because ``None`` is a real answer here ("they
+        typed nothing") and the one caller always knows which it has:
         `[p]retro sonic` with a multi-game zip attached takes `Sonic.md` out
         of it rather than whatever sorts first. It is matched on the
         basename, with or without the extension, and a name that matches
@@ -2895,7 +3077,7 @@ class Retro(
             await self._safe_send(ctx, f"`{filename}` could not be unpacked.")
             return None
 
-        if len(found.candidates) > 1 and getattr(found, "preferred", False):
+        if len(found.candidates) > 1 and found.preferred:
             # They named one and it was there, so say which was taken and
             # leave it at that: nothing went wrong and nothing needs doing.
             log.debug("Extracted the requested %s from %s.", found.name, filename)
@@ -2991,7 +3173,18 @@ class Retro(
         await self._repost_session(ctx, view)
 
     async def _repost_session(self, ctx: commands.Context, view: RetroView) -> None:
-        """Wake a session up and post a new message for it."""
+        """
+        Wake a session up and post a new message for it.
+
+        Through :meth:`RetroView.post`, which is the same call a fresh start
+        makes, rather than the four ``ctx.send`` keyword arguments and the
+        ``message_id`` assignment written out again. The copy was missing one
+        line -- ``note_posted(posted_playback())`` -- and it was the one that is
+        not cosmetic: without it the clip this posts is not registered as
+        playing, so the reposted session's first press is paced against nothing
+        and cuts its own clip off partway, and the still it leaves behind is
+        not there for the opening-trim to work from. See note_posted.
+        """
         async with ctx.typing():
             try:
                 clip = await self.run_press(view, None)
@@ -3000,12 +3193,7 @@ class Retro(
                 return
         view.touch()
         try:
-            view.message = await ctx.send(
-                view._content(),
-                file=view._clip_file(clip),
-                view=view,
-                reference=ctx.message.to_reference(fail_if_not_exists=False),
-            )
+            await view.post(ctx, clip)
         except discord.HTTPException as error:
             # The game is fine; the new message is not. Put it back to sleep
             # so a core is not left running for a message nobody can see.
@@ -3019,7 +3207,7 @@ class Retro(
                 log.exception("Could not hibernate after a failed repost.")
             await self._safe_send(ctx, self._http_error_message(error))
             return
-        view.message_id = view.message.id
+        # `post` has already set message_id from the message it sent.
         await self._save_record(view)
 
     async def _abandon_session(
@@ -3103,6 +3291,120 @@ class Retro(
             log.debug("Could not check the Retro channel cooldown.", exc_info=True)
             return 0.0
 
+    # -- Working out what to start -------------------------------------------
+    #
+    # Two steps of `[p]retro` that are each a ladder of "say something and
+    # return None", which is the same contract _fetch_rom and _extract_rom
+    # already use, and the reason they are worth having out of the command: the
+    # command body is then the *order* of the decisions rather than all of
+    # them at once.
+
+    async def _resolve_source(
+        self, ctx: commands.Context, game: typing.Optional[str]
+    ) -> typing.Optional[typing.Tuple[typing.Optional[str], str]]:
+        """
+        Turn what somebody typed into ``(url to fetch, what to call it)``.
+
+        ``url`` is None when the ROM is coming from the message's attachment.
+        ``source`` is what gets stored on the session and compared against on
+        the next `[p]retro`, so it is the *request* rather than the file: a
+        preset's key, the URL as typed, or the word "attachment".
+
+        The order of the ladder is the whole content of it:
+
+        * a saved game by name wins, because that is the cheap, curated answer
+          and the one `[p]retro list` advertises;
+        * then an explicit URL;
+        * then a name *with a ROM attached*, which is somebody telling us what
+          the file they just handed over is called. Answering "there's no saved
+          game called that" while holding the game is the least useful thing
+          this command could do, so the attachment wins and the text becomes
+          the game's name. It comes last of the three because a preset or a URL
+          names a ROM explicitly and a caption cannot outrank one;
+        * and a name that is none of those is a typo, and nothing is fetched.
+
+        Returns None having already said why. Bare `[p]retro` with an
+        attachment and no name never reaches the ladder at all -- there is
+        nothing to resolve -- and comes straight back as the attachment.
+        """
+        if game is None:
+            return None, "attachment"
+        presets = await self.config.games()
+        preset = presets.get(self._slug(game))
+        if preset:
+            return preset, self._slug(game)
+        if game.lower().startswith(("http://", "https://")):
+            return game, game
+        if ctx.message.attachments:
+            return None, "attachment"
+        self._forgive_cooldown(ctx)
+        # `[p]retro list` rather than `[p]retroset game list`: the whole
+        # `retroset` group is owner-only, so the old advice sent every player
+        # to a command they cannot run.
+        await ctx.send(
+            f"There's no saved game called `{game}`. Pass a ROM URL, "
+            "attach a ROM, or run "
+            f"`{ctx.clean_prefix}retro list` to see what this bot has."
+        )
+        return None
+
+    async def _identify_rom(
+        self, ctx: commands.Context, filename: str, data: bytes
+    ) -> typing.Optional[typing.Tuple[str, System]]:
+        """
+        Decide which console these bytes are for, or say why there is none.
+
+        Returns ``(the name it will be stored under, the system)``. Everything
+        here is about the file rather than about the request, and runs after
+        the fetch and after a zip has been opened, because until then there is
+        nothing to look at.
+
+        There is deliberately **no "is that core installed?" check** here any
+        more. `_start_session` asks ``_core_path``, which is the superset of
+        what this could ask -- the config entry, then the exact filename on
+        disk, then a scan of the cores directory -- so a dictionary read here
+        was a strictly weaker copy of an authoritative check a moment later,
+        and the only thing having both bought was a second place for
+        `_missing_core_message` to be worded.
+        """
+        filename = self._sanitize_filename(filename)
+        system = system_for_extension(Path(filename).suffix)
+        if system is None:
+            suffix = Path(filename).suffix
+            # Some extensions are not merely unknown -- they are deliberately
+            # refused, and this cog knows exactly why (see
+            # AMBIGUOUS_EXTENSIONS in retro/systems.py). `.bin` is the one
+            # that matters: it is the commonest ROM extension in the wild and
+            # the reply used to be "isn't a console this bot knows", which is
+            # true, useless, and hides the fact that renaming the file to
+            # `.md` would have worked.
+            refused = ambiguous_reason(suffix)
+            lines = [
+                refused
+                if refused
+                else f"`{suffix or filename}` isn't a console this bot knows.",
+                "",
+                "Supported file types:",
+            ]
+            lines.extend(self._supported_lines())
+            for page in pagify("\n".join(lines)):
+                await ctx.send(page)
+            return None
+
+        # Catch obviously-broken content before handing it to the core. The
+        # most common failure is a URL that serves an HTML page (for example
+        # a GitHub "blob" page) instead of the ROM file itself.
+        if data[:64].lstrip()[:1] == b"<":
+            await ctx.send(
+                "That looks like a web page, not a ROM. If you used a URL, "
+                "make sure it is a direct download link to the file."
+            )
+            return None
+        if len(data) < MIN_ROM_SIZE:
+            await ctx.send("That file is too small to be a ROM.")
+            return None
+        return filename, system
+
     # -- Commands -----------------------------------------------------------
 
     @commands.max_concurrency(1, commands.BucketType.channel)
@@ -3184,44 +3486,27 @@ class Retro(
             await self._no_rom_help(ctx)
             return
 
-        url: typing.Optional[str] = None
-        source = "attachment"
-        if game is not None:
-            presets = await self.config.games()
-            preset = presets.get(self._slug(game))
-            if preset:
-                url, source = preset, self._slug(game)
-            elif game.lower().startswith(("http://", "https://")):
-                url, source = game, game
-            elif ctx.message.attachments:
-                # A name *and* a ROM attached. The name is not a saved game,
-                # so the obvious reading is the one people actually mean:
-                # they have attached the ROM and typed what it is called.
-                # Answering "there's no saved game called that" while holding
-                # the game they just handed over is the least helpful thing
-                # this command could do with it, so the attachment wins and
-                # the text becomes the game's name.
-                #
-                # The preset and URL branches above still come first: those
-                # name a ROM explicitly, and a caption cannot outrank one.
-                url, source = None, "attachment"
-            else:
-                self._forgive_cooldown(ctx)
-                # `[p]retro list` rather than `[p]retroset game list`: the
-                # whole `retroset` group is owner-only, so the old advice sent
-                # every player to a command they cannot run.
-                await ctx.send(
-                    f"There's no saved game called `{game}`. Pass a ROM URL, "
-                    "attach a ROM, or run "
-                    f"`{ctx.clean_prefix}retro list` to see what this bot has."
-                )
-                return
-            # Asking for the game that is already going here resumes it
-            # rather than downloading the ROM all over again.
-            if existing is not None and existing.source.lower() == source.lower():
-                self._forgive_cooldown(ctx)
-                await self._resume_session(ctx, existing)
-                return
+        resolved = await self._resolve_source(ctx, game)
+        if resolved is None:
+            return
+        url, source = resolved
+        # Asking for the game that is already going here resumes it rather than
+        # downloading the ROM all over again. This is the one rung of the ladder
+        # that stays in the command, because it is the only one that needs to
+        # know what the channel is already playing.
+        #
+        # Only when they *named* something, which is what makes it a request
+        # for a particular game. A bare `[p]retro` with a ROM attached names
+        # nothing and resolves to "attachment" as well, and somebody who has
+        # just uploaded a file means to start that file.
+        if (
+            game is not None
+            and existing is not None
+            and existing.source.lower() == source.lower()
+        ):
+            self._forgive_cooldown(ctx)
+            await self._resume_session(ctx, existing)
+            return
 
         # Past this point a ROM really is going to be fetched and written, so
         # this is where the channel's share of the rate limit and the bot's
@@ -3277,47 +3562,10 @@ class Retro(
                     return
                 filename, data = unpacked
 
-        filename = self._sanitize_filename(filename)
-        system = system_for_extension(Path(filename).suffix)
-        if system is None:
-            suffix = Path(filename).suffix
-            # Some extensions are not merely unknown -- they are deliberately
-            # refused, and this cog knows exactly why (see
-            # AMBIGUOUS_EXTENSIONS in retro/systems.py). `.bin` is the one
-            # that matters: it is the commonest ROM extension in the wild and
-            # the reply used to be "isn't a console this bot knows", which is
-            # true, useless, and hides the fact that renaming the file to
-            # `.md` would have worked.
-            refused = ambiguous_reason(suffix)
-            lines = [
-                refused
-                if refused
-                else f"`{suffix or filename}` isn't a console this bot knows.",
-                "",
-                "Supported file types:",
-            ]
-            lines.extend(self._supported_lines())
-            for page in pagify("\n".join(lines)):
-                await ctx.send(page)
+        identified = await self._identify_rom(ctx, filename, data)
+        if identified is None:
             return
-        if system.core not in installed:
-            await ctx.send(
-                self._missing_core_message(ctx.clean_prefix, system, system.core)
-            )
-            return
-
-        # Catch obviously-broken content before handing it to the core. The
-        # most common failure is a URL that serves an HTML page (for example
-        # a GitHub "blob" page) instead of the ROM file itself.
-        if data[:64].lstrip()[:1] == b"<":
-            await ctx.send(
-                "That looks like a web page, not a ROM. If you used a URL, "
-                "make sure it is a direct download link to the file."
-            )
-            return
-        if len(data) < MIN_ROM_SIZE:
-            await ctx.send("That file is too small to be a ROM.")
-            return
+        filename, system = identified
 
         game_name = Path(filename).stem
         slug = self._slug(game_name)
@@ -3327,19 +3575,14 @@ class Retro(
             await self._resume_session(ctx, existing)
             return
 
-        # A different game: bank the current one's progress and switch. Its
-        # ROM and save state stay cached, so it can be started again later.
-        if existing is not None:
-            await self._retire(
-                existing,
-                f"Replaced by **{game_name}**. **{existing.game_name}** was "
-                "saved \N{EM DASH} press Resume to come back to it.",
-            )
-            # Only if it is still the one that was retired: _retire awaits
-            # message edits, and a Resume click landing during them installs
-            # a live session an unconditional pop would make unreachable.
-            self._forget_session_view(ctx.channel.id, existing)
-
+        # A different game, and the outgoing one is deliberately **not**
+        # retired here. It is retired by _start_session, after the boot has
+        # come back, from the one site that does it -- which is the policy the
+        # resume path already documents: booted before anything is taken away
+        # from the channel, so a core that will not come up costs nothing.
+        # Retiring first meant a start that failed afterwards (a missing core,
+        # a full disk, an EmulatorError) had already replaced the channel's
+        # game with a Resume button for no reason.
         await self._start_session(ctx, game_name, slug, filename, data, source, system)
 
     async def _start_session(
@@ -3355,11 +3598,24 @@ class Retro(
         """Cache the ROM, boot it, and post the controls."""
         extension = Path(filename).suffix.lower() or f".{system.extensions[0]}"
         rom_filename = f"{ctx.channel.id}-{slug}{extension}"
+        # First, before a byte is written or pruned: there is no point spending
+        # somebody else's cached ROM to make room for a game that cannot be
+        # booted. _core_path is the authoritative answer -- the config entry,
+        # then the exact filename on disk, then a scan of the cores directory
+        # -- and it used to be asked only after the disk work, with a weaker
+        # dictionary read in `[p]retro` standing in for it beforehand. One
+        # check, and it is this one.
+        core_path = await self._core_path(system.core)
+        if core_path is None:
+            await self._safe_send(
+                ctx, self._missing_core_message(ctx.clean_prefix, system)
+            )
+            return
         # The real size is only known now, so this is the check that counts:
-        # the one in `[p]retro` refuses a download when the disk is already
-        # full, and this one refuses to write what came back. Pruning here
-        # excludes this game's own ROM, which may already be on disk from the
-        # last time the channel played it.
+        # `[p]retro` deliberately does not ask beforehand (see the note where
+        # the pre-flight check used to be), and this one refuses to write what
+        # came back. Pruning here excludes this game's own ROM, which may
+        # already be on disk from the last time the channel played it.
         room, note = await self._make_room(
             len(data), keep_rom=rom_filename, prefix=ctx.clean_prefix
         )
@@ -3388,13 +3644,6 @@ class Retro(
             await asyncio.to_thread(self._prune_cached_games, ctx.channel.id, slug)
         )
 
-        core_path = await self._core_path(system.core)
-        if core_path is None:
-            await self._safe_send(
-                ctx, self._missing_core_message(ctx.clean_prefix, system, system.core)
-            )
-            return
-
         view = RetroView(
             self,
             game_name=game_name,
@@ -3408,7 +3657,9 @@ class Retro(
             clip_seconds=await self.config.clip_seconds(),
             hold_ms=await self.config.hold_ms(),
         )
-        self.sessions[ctx.channel.id] = view
+        # Deliberately not installed as the channel's session yet: that happens
+        # under the emulator lock, with a core attached, and it is what makes
+        # the outgoing game come out of _take_channel below. See _take_channel.
 
         # This channel may well have played this game before -- five minutes
         # ago or a month and six games ago -- in which case its progress is
@@ -3436,7 +3687,7 @@ class Retro(
                     evicted = await self._evict_locked(exclude=view)
                     notice = self._eviction_notice(ctx, evicted)
                     clip = await view.boot(
-                        ctx,
+                        ctx.author.id,
                         emulator,
                         progress,
                         on_booted=lambda booted: self._settle_boot(
@@ -3445,19 +3696,9 @@ class Retro(
                     )
                     # The channel changes hands *inside the lock*, with the
                     # core already attached, and before anything that can
-                    # await -- exactly as resume_retired does, and for the
-                    # same reason it was made to. This used to happen before
-                    # the boot and outside the lock, which left a window
-                    # where a Resume click in this channel (interactions go
-                    # through no max_concurrency) could take the lock first,
-                    # install its own session, and have this one overwrite
-                    # the dictionary entry afterwards -- a live core reachable
-                    # from nothing, which is the state MAX_LIVE_EMULATORS
-                    # exists to make impossible.
-                    previous = self.sessions.get(ctx.channel.id)
-                    if previous is view:
-                        previous = None
-                    self.sessions[ctx.channel.id] = view
+                    # await -- exactly as resume_retired does. See
+                    # _take_channel, which is where that rule is written down.
+                    previous = self._take_channel(ctx.channel.id, view)
             # The lock is free from here: the core is up and belongs to this
             # session, and everything below is Discord.
             await self._flush_refreshes()
@@ -3466,14 +3707,15 @@ class Retro(
                 # still start.
                 await self._safe_send(ctx, notice)
             if previous is not None:
-                # Something got in between the checks at the top of `[p]retro`
-                # and the lock. It has already been saved and had its core
-                # freed by the eviction above, so all that is left is to give
-                # its message a Resume button.
+                # Whatever this channel was playing, retired now that the new
+                # game is really up -- the ordinary case for `[p]retro <another
+                # game>`, and the one place it happens. The eviction above has
+                # already saved it and freed its core (quietly, because a game
+                # being *replaced* is not being evicted for another channel;
+                # see _evict_locked), so all that is left is to give its
+                # message a Resume button.
                 await self._retire(
-                    previous,
-                    f"Replaced by **{game_name}**. **{previous.game_name}** "
-                    "was saved \N{EM DASH} press Resume to come back to it.",
+                    previous, self._replaced_notice(game_name, previous.game_name)
                 )
             async with ctx.typing():
                 await view.post(ctx, clip)
@@ -3539,6 +3781,72 @@ class Retro(
         """
         await self._no_rom_help(ctx)
 
+    async def _managed_session(
+        self, ctx: commands.Context, what: str
+    ) -> typing.Optional[RetroView]:
+        """
+        This channel's game, if the person asking may do that to it.
+
+        The ten-line preamble `[p]retrosleep`, `[p]retroend` and
+        `[p]retroreboot` all opened with, in one place: there has to be a game,
+        and stopping or rebooting somebody else's is for whoever started it,
+        moderators (Manage Messages) and the bot owner. Only the verb varied,
+        which is what ``what`` is -- and one of the three said its refusal with
+        a bare ``ctx.send``, so a channel where the bot had lost Send Messages
+        turned a polite "you cannot do that" into a traceback.
+
+        The same shape retro/saves.py already uses for the same rule
+        (``_may_manage_saves`` plus ``_refuse_management``): look it up, say
+        why not, hand back ``None``. The "no game" line is `[p]retroreboot`'s,
+        which was the only one of the three to say how to start one.
+
+        Returns the session, or None having already replied.
+        """
+        view = self.sessions.get(ctx.channel.id)
+        if view is None:
+            await self._safe_send(
+                ctx,
+                "No game is running in this channel. Start one with "
+                f"`{ctx.clean_prefix}retro <name or url>`.",
+            )
+            return None
+        if not await view.can_stop(ctx.author):
+            await self._safe_send(
+                ctx,
+                "Only the person who started the game, moderators, or the bot "
+                f"owner can {what}.",
+            )
+            return None
+        return view
+
+    @staticmethod
+    def _by_whom(user) -> str:
+        """
+        ``" by Somebody"``, or nothing at all when there is no name to use.
+
+        The named-vs-impersonal split, for the three sentences the commands
+        write themselves: "Put to sleep by X", "Finished by X", "has been
+        rebooted by X" all have to read properly when :func:`presser_name`
+        cannot name the author -- a webhook, a member who has asked to be
+        forgotten (see red_delete_data_for_user), a name that sanitises down to
+        nothing.
+
+        The name is sanitised, which is doing two jobs. Two of these sentences
+        go on the game's own message, where a nickname full of markdown would
+        otherwise reformat the line around it; the third is a plain channel
+        message rather than an edit, where escaping is the only thing between a
+        nickname of "@everyone" and a notification. See
+        :func:`RetroView.presser_name`.
+
+        retro/text.py solves the same problem for the lines a *press* writes
+        (:func:`text.action_note`, which picks between a named and an
+        impersonal wording). This is the smaller half of it and belongs beside
+        that eventually; it is here because these three callers are the only
+        ones and they are all in this file.
+        """
+        who = presser_name(user)
+        return f" by {who}" if who else ""
+
     @commands.guild_only()
     @commands.command(name="retrosleep", aliases=["retrostop", "retropause"])
     async def retrosleep(self, ctx: commands.Context) -> None:
@@ -3560,20 +3868,9 @@ class Retro(
         **Examples:**
         - `[p]retrosleep`
         """
-        view = self.sessions.get(ctx.channel.id)
+        view = await self._managed_session(ctx, "do that")
         if view is None:
-            await ctx.send("No game is running in this channel.")
             return
-        if not await view.can_stop(ctx.author):
-            await ctx.send(
-                "Only the person who started the game, moderators, or the "
-                "bot owner can do that."
-            )
-            return
-        # Sanitised, exactly as the press line's name is: this sentence goes
-        # on the game's message, where a nickname full of markdown would
-        # otherwise reformat it. See RetroView.presser_name.
-        who = presser_name(ctx.author)
         # Before the lock, not after it: a press that is holding its edit
         # back to let the clip on screen play through is holding this very
         # lock, and sleeping the game must not queue up behind a cosmetic
@@ -3583,7 +3880,7 @@ class Retro(
             async with view.lock:
                 await self.hibernate(
                     view,
-                    f"Put to sleep{' by ' + who if who else ''}. Press a "
+                    f"Put to sleep{self._by_whom(ctx.author)}. Press a "
                     "button to pick up where you left off.",
                 )
         except Exception:
@@ -3599,10 +3896,11 @@ class Retro(
         # promises: draining would wake the game straight back up, and the
         # next line the session writes says how many went.
         view.forget_queue()
-        await ctx.send(
+        await self._safe_send(
+            ctx,
             "The game has been saved and put to sleep. Press any button on "
             f"it to carry on, or `{ctx.clean_prefix}retroend` to finish with "
-            "it altogether."
+            "it altogether.",
         )
 
     @commands.guild_only()
@@ -3628,24 +3926,15 @@ class Retro(
         **Examples:**
         - `[p]retroend`
         """
-        view = self.sessions.get(ctx.channel.id)
+        view = await self._managed_session(ctx, "do that")
         if view is None:
-            await self._safe_send(ctx, "No game is running in this channel.")
             return
-        if not await view.can_stop(ctx.author):
-            await self._safe_send(
-                ctx,
-                "Only the person who started the game, moderators, or the "
-                "bot owner can do that.",
-            )
-            return
-        who = presser_name(ctx.author)
         # The same path a channel switching games takes: saved, core freed,
         # record kept, and the message left with a Resume button. Doing it
         # any other way would mean a second way to retire a session.
         await self._retire(
             view,
-            f"Finished{' by ' + who if who else ''} \N{EM DASH} "
+            f"Finished{self._by_whom(ctx.author)} \N{EM DASH} "
             f"**{view.game_name}** was saved. Press Resume to come back to it.",
         )
         # See _forget_session_view: `_retire` awaits, so the channel may not
@@ -3695,20 +3984,8 @@ class Retro(
         **Examples:**
         - `[p]retroreboot`
         """
-        view = self.sessions.get(ctx.channel.id)
+        view = await self._managed_session(ctx, "reboot it")
         if view is None:
-            await self._safe_send(
-                ctx,
-                "No game is running in this channel. Start one with "
-                f"`{ctx.clean_prefix}retro <name or url>`.",
-            )
-            return
-        if not await view.can_stop(ctx.author):
-            await self._safe_send(
-                ctx,
-                "Only the person who started the game, moderators, or the "
-                "bot owner can reboot it.",
-            )
             return
         # The view's own lock, exactly as `[p]retrosleep` takes it, so a press
         # that is already being emulated finishes before the machine is
@@ -3758,14 +4035,9 @@ class Retro(
         # says who did what -- one edit, like a press, and named the same way
         # a press is even though this is a command rather than a button.
         await view.show_clip(clip, view.reset_note(ctx.author))
-        # Sanitised for the same reason the line on the message is, and for
-        # one more: this is a plain channel message rather than an edit, so
-        # escaping the name is the only thing between a nickname of
-        # "@everyone" and a notification. See RetroView.presser_name.
-        who = presser_name(ctx.author)
         await self._safe_send(
             ctx,
-            f"**{view.game_name}** has been rebooted{' by ' + who if who else ''} "
+            f"**{view.game_name}** has been rebooted{self._by_whom(ctx.author)} "
             "\N{EM DASH} it is back at its title screen. Its in-game save is "
             "untouched, and nothing on disk has been overwritten: press "
             "**Undo** on the game to step straight back to the moment before "
@@ -4337,7 +4609,7 @@ class Retro(
             await self._install_bios_archive(ctx, source, data, name)
             return
 
-        await self._install_bios_file(ctx, source, data, name)
+        await self._install_bios_file(ctx, source, data, name, url)
 
     @retroset_bios.command(name="list")
     async def retroset_bios_list(self, ctx: commands.Context) -> None:
@@ -4641,6 +4913,86 @@ class Retro(
         """
         await self._safe_send(ctx, version.describe(ctx.clean_prefix))
 
+    @staticmethod
+    def _field(embed: discord.Embed, name: str, value: typing.Any) -> None:
+        """
+        Add one embed field, truncated to what Discord will take.
+
+        Discord refuses a field value over 1024 characters *and* refuses an
+        empty one, and it refuses the **whole message** for either -- so one
+        field that has grown past the limit (the installed cores, the saved
+        games, a long storage report) loses the entire settings embed. Twelve
+        fields used to be written out with three different answers to that:
+        seven hand-written ``[:1024]`` slices, one of them slicing an
+        already-sliced value, and five fields with no protection at all.
+
+        The zero-width space is for the empty case, because "" is the one
+        value Discord will not accept and there is nothing sensible to
+        substitute; a caller with something to say says it.
+
+        Every field here is ``inline=False``: this is a settings listing read
+        top to bottom, not a dashboard.
+        """
+        embed.add_field(name=name, value=str(value)[:1024] or "\N{ZERO WIDTH SPACE}", inline=False)
+
+    def _cores_field(
+        self, prefix: str, installed: typing.Dict[str, Path]
+    ) -> str:
+        """Which emulators are installed, and where they were found."""
+        cores_dir = self._cores_dir()
+        if not installed:
+            body = (
+                f"None installed. Run `{prefix}retroset download` to get them, "
+                f"or drop them into `{cores_dir}` yourself."
+            )
+        else:
+            entries = []
+            for name in sorted(CORES):
+                if name not in installed:
+                    continue
+                path = installed[name]
+                # Say so when a core is being used from outside the folder the
+                # cog manages, since that one is not something `[p]retroset
+                # download` will ever replace.
+                elsewhere = (
+                    "" if path.parent == cores_dir else f" (from `{path.parent}`)"
+                )
+                entries.append(
+                    f"\N{WHITE HEAVY CHECK MARK} `{name}` - {CORES[name]}{elsewhere}"
+                )
+            missing = len(CORES) - len(installed)
+            if missing > 0:
+                entries.append(
+                    f"{missing} more available from `{prefix}retroset download`."
+                )
+            body = "\n".join(entries)
+        return f"`{cores_dir}`\n{body}"
+
+    async def _core_options_field(self, prefix: str) -> str:
+        """Which of the cores' own settings the owner has changed."""
+        overrides = await self.config.core_options()
+        known = await self.config.core_option_definitions()
+        changed = {name: values for name, values in overrides.items() if values}
+        if changed:
+            entries = [
+                f"- `{key}` = `{changed[name][key]}`"
+                for name in sorted(changed)
+                for key in sorted(changed[name])
+            ]
+            total = sum(len(values) for values in changed.values())
+            value = (
+                f"{total} option(s) changed on {len(changed)} core(s):\n"
+                + "\n".join(entries)
+            )
+        else:
+            value = (
+                "Every core is running on its own defaults. Change one with "
+                f"`{prefix}retroset coreoptions <core> <key> <value>`."
+            )
+        if known:
+            value += f"\nOption definitions are known for {len(known)} core(s)."
+        return value
+
     @retroset.command(name="settings")
     @commands.bot_has_permissions(embed_links=True)
     async def retroset_settings(self, ctx: commands.Context) -> None:
@@ -4651,7 +5003,6 @@ class Retro(
         - `[p]retroset settings`
         """
         installed = await self._installed_cores()
-        cores_dir = self._cores_dir()
         embed = discord.Embed(
             title="Retro Settings",
             colour=await ctx.embed_colour(),
@@ -4663,81 +5014,31 @@ class Retro(
         build = [version.summary()]
         if version.FINGERPRINT:
             build.append(f"loaded code `{version.FINGERPRINT}`")
-        embed.add_field(
-            name="Build",
-            value=(
-                " \N{EM DASH} ".join(build)
-                + f"\n`{ctx.clean_prefix}retroset version` for the details."
-            )[:1024],
-            inline=False,
+        self._field(
+            embed,
+            "Build",
+            " \N{EM DASH} ".join(build)
+            + f"\n`{ctx.clean_prefix}retroset version` for the details.",
         )
-
-        if not installed:
-            cores_value = (
-                f"None installed. Run `{ctx.clean_prefix}retroset download` "
-                f"to get them, or drop them into `{cores_dir}` yourself."
-            )
-        else:
-            entries = []
-            for name in sorted(CORES):
-                if name not in installed:
-                    continue
-                path = installed[name]
-                # Say so when a core is being used from outside the folder the
-                # cog manages, since that one is not something `[p]retroset
-                # download` will ever replace.
-                elsewhere = "" if path.parent == cores_dir else f" (from `{path.parent}`)"
-                entries.append(
-                    f"\N{WHITE HEAVY CHECK MARK} `{name}` - {CORES[name]}{elsewhere}"
-                )
-            missing = len(CORES) - len(installed)
-            if missing > 0:
-                entries.append(
-                    f"{missing} more available from "
-                    f"`{ctx.clean_prefix}retroset download`."
-                )
-            cores_value = "\n".join(entries)[:1024]
-        embed.add_field(
-            name=f"Cores ({len(installed)}/{len(CORES)} installed)",
-            value=f"`{cores_dir}`\n{cores_value}"[:1024],
-            inline=False,
+        self._field(
+            embed,
+            f"Cores ({len(installed)}/{len(CORES)} installed)",
+            self._cores_field(ctx.clean_prefix, installed),
         )
-
-        overrides = await self.config.core_options()
-        known = await self.config.core_option_definitions()
-        changed = {name: values for name, values in overrides.items() if values}
-        if changed:
-            entries = []
-            for name in sorted(changed):
-                for key in sorted(changed[name]):
-                    entries.append(f"- `{key}` = `{changed[name][key]}`")
-            total = sum(len(values) for values in changed.values())
-            options_value = (
-                f"{total} option(s) changed on {len(changed)} core(s):\n"
-                + "\n".join(entries)
-            )
-        else:
-            options_value = (
-                "Every core is running on its own defaults. Change one with "
-                f"`{ctx.clean_prefix}retroset coreoptions <core> <key> <value>`."
-            )
-        if known:
-            options_value += (
-                f"\nOption definitions are known for {len(known)} core(s)."
-            )
-        embed.add_field(name="Core options", value=options_value[:1024], inline=False)
-
+        self._field(
+            embed,
+            "Core options",
+            await self._core_options_field(ctx.clean_prefix),
+        )
         auto = await self.config.auto_download_cores()
-        embed.add_field(
-            name="Automatic core downloads",
-            value=(
-                ("**On** \N{EM DASH} missing cores are fetched in the "
-                 "background when the cog loads."
-                 if auto else
-                 "**Off** \N{EM DASH} install cores with "
-                 f"`{ctx.clean_prefix}retroset download`.")
-            ),
-            inline=False,
+        self._field(
+            embed,
+            "Automatic core downloads",
+            "**On** \N{EM DASH} missing cores are fetched in the background "
+            "when the cog loads."
+            if auto
+            else "**Off** \N{EM DASH} install cores with "
+            f"`{ctx.clean_prefix}retroset download`.",
         )
 
         bios = self._bios_files()
@@ -4749,45 +5050,46 @@ class Retro(
                 "No BIOS files installed. Every core above works without one; "
                 f"add your own with `{ctx.clean_prefix}retroset bios add`."
             )
-        embed.add_field(
-            name="System directory (BIOS)",
-            value=f"`{self._system_dir()}`\n{bios_value}"[:1024],
-            inline=False,
+        self._field(
+            embed,
+            "System directory (BIOS)",
+            f"`{self._system_dir()}`\n{bios_value}",
         )
 
         timeout_minutes = await self.config.session_timeout_minutes()
-        embed.add_field(
-            name="Sleep after",
-            value=(
-                f"{timeout_minutes} minutes without input. Sleeping games are "
-                "saved and wake up on the next button press."
-            ),
-            inline=False,
+        self._field(
+            embed,
+            "Sleep after",
+            f"{timeout_minutes} minutes without input. Sleeping games are "
+            "saved and wake up on the next button press.",
         )
         clip_seconds = clamp_clip_seconds(await self.config.clip_seconds())
-        embed.add_field(
-            name="Clip length",
-            value=(
-                f"{describe_seconds(clip_seconds)} of play per button press "
-                f"({format_seconds(MIN_CLIP_SECONDS)}-"
-                f"{format_seconds(MAX_CLIP_SECONDS)}, fractions allowed)."
-            ),
-            inline=False,
+        self._field(
+            embed,
+            "Clip length",
+            f"{describe_seconds(clip_seconds)} of play per button press "
+            f"({format_seconds(MIN_CLIP_SECONDS)}-"
+            f"{format_seconds(MAX_CLIP_SECONDS)}, fractions allowed).",
         )
         hold_ms = await self.config.hold_ms()
         fit = self._describe_press_fit(clip_seconds, hold_ms)
-        embed.add_field(
-            name="Button hold",
-            value=f"{hold_ms}ms per press, directions included{'. ' + fit if fit else ''}",
-            inline=False,
+        self._field(
+            embed,
+            "Button hold",
+            f"{hold_ms}ms per press, directions included"
+            f"{'. ' + fit if fit else ''}",
         )
         games = await self.config.games()
         if not games:
             games_value = "None saved"
         else:
             names = ", ".join(f"`{name}`" for name in sorted(games))
+            # The one field that is deliberately *not* truncated but replaced.
+            # A list of preset names cut off mid-name reads as a name, so a
+            # `[p]retro` of it fails and the count is the honest answer -- and
+            # `[p]retroset game list` pages the whole thing properly.
             games_value = names if len(names) <= 1000 else f"{len(games)} saved"
-        embed.add_field(name="Saved games", value=games_value, inline=False)
+        self._field(embed, "Saved games", games_value)
         awake = sum(1 for view in self.sessions.values() if view.live)
         batteries = sum(
             1
@@ -4803,27 +5105,21 @@ class Retro(
                 f"\n{batteries} have an in-game save on disk, which "
                 "survives an emulator update even when the save state does not."
             )
-        embed.add_field(name="Sessions", value=sessions_value, inline=False)
-        embed.add_field(
-            name="Storage",
-            value=(await self._usage_report(ctx))[:1024],
-            inline=False,
-        )
-        embed.add_field(
-            name="ROM URLs",
-            value=(
-                (
-                    "\N{WARNING SIGN}\N{VARIATION SELECTOR-16} **Private and "
-                    "loopback addresses are allowed.** Anybody who can run "
-                    f"`{ctx.clean_prefix}retro` can make the bot fetch from "
-                    "inside this network."
-                    if await self._allow_private_urls()
-                    else "Only public addresses are fetched; a URL that "
-                    "resolves to a loopback, private, link-local or reserved "
-                    "address is refused, redirects included."
-                )
-                + f"\n`{ctx.clean_prefix}retroset allowprivateurls`"
-            )[:1024],
-            inline=False,
+        self._field(embed, "Sessions", sessions_value)
+        self._field(embed, "Storage", await self._usage_report(ctx))
+        self._field(
+            embed,
+            "ROM URLs",
+            (
+                "\N{WARNING SIGN}\N{VARIATION SELECTOR-16} **Private and "
+                "loopback addresses are allowed.** Anybody who can run "
+                f"`{ctx.clean_prefix}retro` can make the bot fetch from inside "
+                "this network."
+                if await self._allow_private_urls()
+                else "Only public addresses are fetched; a URL that resolves "
+                "to a loopback, private, link-local or reserved address is "
+                "refused, redirects included."
+            )
+            + f"\n`{ctx.clean_prefix}retroset allowprivateurls`",
         )
         await self._safe_send(ctx, embed=embed)

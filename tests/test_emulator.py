@@ -1435,7 +1435,14 @@ def test_one_clip_carries_on_from_the_last_with_no_frames_lost(emu, image, gamba
     reference = []
     for _ in range(frames + step):
         emulator.advance(1)
-        reference.append(emulator._frame_image(size).tobytes())
+        # The posted picture, built the way screenshot() builds it: the native
+        # frame resized once with NEAREST. This was `_frame_image(size)`, whose
+        # `size` argument had this line as its only caller anywhere -- a
+        # parameter on production code kept alive by one test, which is what
+        # spelling it out here retires.
+        reference.append(
+            emulator._native_frame_image().resize(size, image.NEAREST).tobytes()
+        )
 
     assert first[-1].tobytes() == reference[frames - 1], (
         "the first clip does not end on its own last emulated frame"
@@ -1721,6 +1728,57 @@ def test_the_audio_buffer_is_drained_between_clips(emu, gambatte, ucity):
     emulator._audio_buffer = None
     emulator.advance(120)
     assert len(emulator._session.audio.buffer) > 100_000, "the control never grew"
+
+
+def test_a_bulk_advance_never_piles_up_more_than_one_frame_of_audio(
+    emu, gambatte, ucity
+):
+    """The drain is per *frame*, not per advance() call.
+
+    It used to sit in advance()'s ``finally``, which binds to the try and not
+    to the loop, so one advance(180) -- which is what a three second boot is,
+    on every game start and every reboot -- accumulated the whole three
+    seconds of samples before anything emptied them.
+
+    Measured the same way as the control in the test above: same 120 frames,
+    and the peak this asserts is read from inside the drain itself, just
+    before the buffer is emptied, because that is the only place the true high
+    water mark is visible from.
+    """
+    emulator = emu(gambatte, ucity)
+    buffer = emulator._audio_buffer
+    assert buffer is not None, "the audio buffer was not found"
+
+    peaks = []
+    original = type(emulator)._drain_audio
+
+    def spy(self):
+        peaks.append(len(buffer))
+        return original(self)
+
+    type(emulator)._drain_audio = spy
+    try:
+        emulator.advance(120)
+    finally:
+        type(emulator)._drain_audio = original
+
+    # 120 drains from the loop plus the one in the `finally`, which is there
+    # so that a frame that raised -- and advance(0), which runs none -- still
+    # leaves the console tidy.
+    assert len(peaks) == 121, len(peaks)
+    peak = max(peaks)
+
+    # The control: the same 120 frames with the drain switched off, which is
+    # what the whole call used to leave behind before this ran once at the end.
+    emulator._audio_buffer = None
+    emulator.advance(120)
+    undrained = len(emulator._session.audio.buffer)
+    assert undrained > 100_000, "the control never grew"
+
+    # One emulated frame at 44.1 kHz stereo is ~1,470 samples against the
+    # ~176,400 two seconds of them come to, so the two numbers are two orders
+    # of magnitude apart and a per-call drain could not pass this.
+    assert peak * 50 < undrained, (peak, undrained)
 
 
 def test_nothing_a_core_logs_reaches_the_bot_s_log(emu, gambatte, ucity):

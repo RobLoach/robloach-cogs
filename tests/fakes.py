@@ -189,12 +189,12 @@ class FakeEmulator:
         self.resets += 1
         self.advance(1)
 
-    def record(self, frames=None, *, scale=2, fps=15, presses=None):
+    def record(self, frames, *, fps=15, presses=None):
         return self.encode_captured(
-            self.record_frames(frames, scale=scale, fps=fps, presses=presses)
+            self.record_frames(frames, fps=fps, presses=presses)
         )
 
-    def record_frames(self, frames=None, *, scale=2, fps=15, presses=None):
+    def record_frames(self, frames, *, fps=15, presses=None):
         """The capture half, as the real emulator splits it.
 
         The real one hands back frames for the caller to encode, so that the

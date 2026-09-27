@@ -12,7 +12,8 @@ thread-local state misbehaves the moment they do.
 
 Supports both the SessionBuilder API of libretro.py <= 0.6.x (the newest
 release available on Python 3.11, which Red-DiscordBot requires) and the
-Session constructor API of libretro.py >= 0.7.
+Session constructor API of libretro.py >= 0.7. The whole of that difference
+lives in :func:`_make_session`.
 
 The clip arithmetic, the animation encoder and the fast frame grab live next
 door in retro/clips.py, which needs no libretro at all. The names of theirs
@@ -260,13 +261,30 @@ def probe_core_options(core_path, options=None) -> typing.Dict[str, dict]:
     with process-global state).
     """
     try:
-        from libretro import ArrayAudioDriver, ArrayVideoDriver, Core, JoypadState
+        from libretro import ArrayAudioDriver, Core, JoypadState
         from libretro.drivers.environment.composite import CompositeEnvironmentDriver
         from libretro.drivers.input.iterable import IterableInputDriver
         from libretro.drivers.options.dict import DictOptionDriver
     except Exception as exc:
         raise EmulatorError(
             f"This libretro.py cannot be asked for a core's options: {exc}"
+        ) from exc
+
+    # The *tolerant* video driver, the same one start() uses, and for a
+    # sharper reason here. _make_video_driver exists because several cores
+    # (snes9x, nestopia, quicknes) change their geometry while they are still
+    # initialising, which on libretro.py 0.6.x makes the geometry setter
+    # dereference a None _system_av_info and dump a ctypes traceback to
+    # stderr. Initialising is the *only* thing this function does, so it is
+    # the purest form of that case -- and it was the one path still building a
+    # raw ArrayVideoDriver, so probing snes9x's options printed a traceback
+    # that starting a snes9x game does not. Wrapped for the same reason
+    # start() wraps it: everything this function raises is an EmulatorError.
+    try:
+        video = _make_video_driver()
+    except Exception as exc:
+        raise EmulatorError(
+            f"This libretro.py is not one the cog can drive: {exc}"
         ) from exc
 
     core_path = Path(core_path).resolve()
@@ -284,7 +302,7 @@ def probe_core_options(core_path, options=None) -> typing.Dict[str, dict]:
     )
     drivers = {
         "audio": ArrayAudioDriver(),
-        "video": ArrayVideoDriver(),
+        "video": video,
         "input": IterableInputDriver(_input_generator),
         "options": option_driver,
         "log": _make_log_driver(),
@@ -316,8 +334,13 @@ def probe_core_options(core_path, options=None) -> typing.Dict[str, dict]:
         initialised = True
         core.init()
         return describe_definitions(option_driver.definitions)
-    except EmulatorError:
-        raise
+    # No `except EmulatorError: raise` ahead of the catch-all, unlike
+    # save_state()/load_state(), where that clause is load-bearing because the
+    # body raises EmulatorError itself and would otherwise re-wrap its own
+    # sentences. Nothing in this try can produce one: Core, set_environment
+    # and init are libretro.py's, describe_definitions and _text raise nothing
+    # at all, and this function's own two EmulatorError raises are above the
+    # try. The clause could only ever have been dead.
     except Exception as exc:
         log.warning("Could not read the options of the core %s", core_path, exc_info=True)
         raise EmulatorError(f"The core's options could not be read: {exc}") from exc
@@ -370,10 +393,11 @@ class RetroEmulator:
         emulator.advance(120)
         emulator.press("start", hold_frames=12, release_frames=40)
         png_bytes = emulator.screenshot()
-        clip_bytes = emulator.record(presses=[("a", 0, 12)])
+        frames = emulator.clip_frames(CLIP_SECONDS)
+        clip_bytes = emulator.record(frames, presses=[("a", 0, 12)])
         # ...or in two halves, so the encode -- which needs no core -- can
         # run outside whatever lock serializes access to this object:
-        captured = emulator.record_frames(presses=[("a", 0, 12)])
+        captured = emulator.record_frames(frames, presses=[("a", 0, 12)])
         clip_bytes = encode_clip(captured)
         state = emulator.save_state()
         sram = emulator.save_sram()   # None if the cart has no battery
@@ -455,59 +479,17 @@ class RetroEmulator:
             while True:
                 yield self._current_joypad()
 
-        encoded_options = _encode_options(self.options)
         try:
-            builder_defaults = getattr(libretro, "defaults", None)
-            if builder_defaults is not None:
-                # libretro.py <= 0.6.x: SessionBuilder API.
-                builder = (
-                    builder_defaults(str(self.core_path))
-                    .with_content(str(self.rom_path))
-                    .with_input(input_generator)
-                    .with_video(video)
-                )
-                if path_driver is not None and hasattr(builder, "with_paths"):
-                    # Overrides the TempDirPathDriver that defaults() installs,
-                    # whose system directory is a throwaway temp folder.
-                    builder = builder.with_paths(path_driver)
-                if log_driver is not None and hasattr(builder, "with_log"):
-                    builder = builder.with_log(log_driver)
-                if encoded_options and hasattr(builder, "with_options"):
-                    # Seeds a DictOptionDriver with these values, which it
-                    # keeps when the core registers its own definitions. An
-                    # unknown key, or a value the core does not offer, is
-                    # ignored and the core sees its own default instead -- so
-                    # a setting left over from an older build of a core can
-                    # never stop a game from starting.
-                    builder = builder.with_options(encoded_options)
-                session = builder.build()
-            else:
-                # libretro.py >= 0.7: Session constructor API.
-                kwargs = {"input": input_generator, "video": video}
-                if path_driver is not None:
-                    kwargs["path"] = path_driver
-                if log_driver is not None:
-                    kwargs["log"] = log_driver
-                if encoded_options:
-                    kwargs["options"] = encoded_options
-                try:
-                    session = libretro.Session(
-                        str(self.core_path), str(self.rom_path), **kwargs
-                    )
-                except TypeError:
-                    # A libretro.py whose Session takes no options= argument.
-                    # The game matters more than the setting, so start it
-                    # anyway and say why the setting did nothing.
-                    if "options" not in kwargs:
-                        raise
-                    log.warning(
-                        "This libretro.py does not accept core options at "
-                        "startup, so %s of them were ignored.",
-                        len(kwargs.pop("options")),
-                    )
-                    session = libretro.Session(
-                        str(self.core_path), str(self.rom_path), **kwargs
-                    )
+            session = _make_session(
+                libretro,
+                self.core_path,
+                self.rom_path,
+                video=video,
+                path_driver=path_driver,
+                log_driver=log_driver,
+                options=_encode_options(self.options),
+                input_generator=input_generator,
+            )
             session.__enter__()
         except Exception as exc:
             self._log_start_failure(exc)
@@ -784,11 +766,28 @@ class RetroEmulator:
         try:
             for _ in range(max(0, frames)):
                 self._session.run()
+                # Every frame, so the audio libretro.py hoards never outgrows
+                # one frame's worth; see _drain_audio().
+                #
+                # Inside the loop, not in the `finally` below, which is where
+                # this lived and which binds to the *try* -- one drain per
+                # advance() call however many frames it ran. The bulk callers
+                # are real and routine: a three second boot is advance(~180)
+                # (BOOT_SECONDS in retro/timing.py, used by retro/session.py
+                # and retro/restore.py), which at 44.1 kHz stereo is ~530 KiB
+                # of array("h") piled up before anything empties it, on every
+                # game start and every reboot. Draining per frame makes the
+                # peak what the comment above and _drain_audio's own docstring
+                # have always claimed it was: one frame's worth, ~2.9 KiB.
+                self._drain_audio()
         except Exception as exc:
             raise EmulatorError(f"The core crashed while running: {exc}") from exc
         finally:
-            # Every frame, so the audio libretro.py hoards never outgrows one
-            # frame's worth; see _drain_audio().
+            # And once more, for the two cases the loop cannot cover: a frame
+            # that raised may still have handed samples over before it did, and
+            # advance(0) runs no frames at all but is still a caller asking for
+            # the console to be left tidy. On the ordinary path this is one
+            # attribute read and a `del` on an already-empty buffer.
             self._drain_audio()
 
     def reset(self) -> None:
@@ -1094,39 +1093,42 @@ class RetroEmulator:
             ).convert("RGB")
         return image
 
-    def _frame_image(self, size=None, *, scale: int = MAX_CLIP_SCALE):
+    def screenshot(self, scale: int = MAX_CLIP_SCALE) -> bytes:
         """
-        Grab the current screen at the size it would be posted at.
+        Return the current screen as PNG bytes, at the size it would be posted.
 
         :meth:`_native_frame_image` plus the NEAREST resize -- nearest so the
-        picture stays crisp pixel art rather than a blurry upscale. ``size``
-        pins the output to an exact size instead of asking
-        :meth:`output_size`. Recordings used to pass it for the
-        mid-clip-geometry-change case; they now keep native frames and leave
-        the resize to :func:`encode_clip`, so what is left on this method is
-        the single-picture traffic: :meth:`screenshot`, and the tests that
-        compare a clip's pictures against the screen.
-        """
-        Image = _pillow()
-        image = self._native_frame_image()
-        if size is None:
-            size = self.output_size(scale=scale)
-        if tuple(size) != image.size:
-            image = image.resize(tuple(size), Image.NEAREST)
-        return image
+        picture stays crisp pixel art rather than a blurry upscale.
 
-    def screenshot(self, scale: int = MAX_CLIP_SCALE) -> bytes:
-        """Return the current screen as PNG bytes."""
+        This used to go through a ``_frame_image(size=None, *, scale)`` in
+        between, which recordings passed an explicit ``size`` to for the
+        mid-clip-geometry-change case. They now keep native frames and leave
+        every resize to :func:`encode_clip`, which left ``size`` with exactly
+        one caller in the whole repository -- a test -- so the method was a
+        parameter kept alive by its own test and one line of body besides.
+        A test that wants a frame at a pinned size can say
+        ``_native_frame_image().resize(size, Image.NEAREST)``, which is what
+        this line is.
+
+        ``_pillow()`` is reached for inside the branch rather than above it.
+        It was called twice per grab: once here and once immediately again
+        inside :meth:`_native_frame_image`, when the only thing the outer call
+        was ever needed for was the ``Image.NEAREST`` in a resize that a 1x
+        console never performs at all.
+        """
         self._require_started()
+        image = self._native_frame_image()
+        size = self.output_size(scale=scale)
+        if size != image.size:
+            image = image.resize(size, _pillow().NEAREST)
         buffer = io.BytesIO()
-        self._frame_image(scale=scale).save(buffer, format="PNG")
+        image.save(buffer, format="PNG")
         return buffer.getvalue()
 
     def record(
         self,
-        frames: "int | None" = None,
+        frames: int,
         *,
-        scale: int = MAX_CLIP_SCALE,
         fps: int = CLIP_FPS,
         presses: "typing.Iterable | None" = None,
     ) -> bytes:
@@ -1139,11 +1141,11 @@ class RetroEmulator:
         the second). This stays as the convenient form, but the encode is the
         most expensive CPU step of a button press and needs no core at all,
         so a caller that serializes emulator access behind a lock should call
-        the halves itself and hold the lock only for the capture.
+        the halves itself and hold the lock only for the capture. Which is
+        every production caller there is: nothing in retro/ calls this any
+        more, only the tests that drive a real core.
         """
-        return encode_clip(
-            self.record_frames(frames, scale=scale, fps=fps, presses=presses)
-        )
+        return encode_clip(self.record_frames(frames, fps=fps, presses=presses))
 
     @staticmethod
     def encode_captured(captured) -> bytes:
@@ -1161,9 +1163,8 @@ class RetroEmulator:
 
     def record_frames(
         self,
-        frames: "int | None" = None,
+        frames: int,
         *,
-        scale: int = MAX_CLIP_SCALE,
         fps: int = CLIP_FPS,
         presses: "typing.Iterable | None" = None,
     ) -> CapturedClip:
@@ -1175,6 +1176,21 @@ class RetroEmulator:
         their durations, and the size the clip posts at -- that
         :func:`encode_clip` turns into the final bytes without touching the
         emulator again.
+
+        ``frames`` is required, on both halves. It used to default to None and
+        fall back to ``self.clip_frames(CLIP_SECONDS)``, which no caller ever
+        took -- a clip length is a per-guild setting, so the caller has already
+        had to read and clamp it (see ``clamp_clip_seconds``) before it gets
+        this far, and a default of "one second" here was a second answer to
+        that question in a place with no business having one.
+
+        There is no ``scale`` either. It was a ceiling handed straight to
+        :meth:`output_size`, and nothing in retro/ or tests/ ever passed
+        anything but the default: the one production call is
+        ``emulator.record_frames(self.clip_frames(emulator), presses=...)``.
+        A non-default scale is still reachable where it is actually wanted, on
+        :meth:`screenshot` and :meth:`output_size`, which is where the native
+        screenshots the test suite hashes come from.
 
         ``presses`` is a sequence of ``(button, start_frame, hold_frames)``
         triples, scheduled against the frames *of this window*, so the clip
@@ -1229,8 +1245,6 @@ class RetroEmulator:
         """
         self._require_started()
         core_fps = self.fps
-        if frames is None:
-            frames = self.clip_frames(CLIP_SECONDS)
         frames = max(1, int(frames))
 
         # frame index -> buttons that go down / come up on that frame, keyed
@@ -1302,7 +1316,7 @@ class RetroEmulator:
                 duration = plan.get(index)
                 if duration is not None:
                     if size is None:
-                        size = self.output_size(scale=scale)
+                        size = self.output_size()
                     images.append(self._native_frame_image())
                     durations.append(duration)
         finally:
@@ -1398,3 +1412,87 @@ def _make_video_driver():
             ArrayVideoDriver.geometry.fset(self, value)
 
     return _TolerantArrayVideoDriver()
+
+
+def _make_session(
+    libretro,
+    core_path,
+    rom_path,
+    *,
+    video,
+    path_driver,
+    log_driver,
+    options,
+    input_generator,
+):
+    """
+    A libretro.py session for this core and ROM, on whichever API is installed.
+
+    The one place the 0.6-vs-0.7 difference lives, which is why it is a named
+    function and not a block in the middle of :meth:`RetroEmulator.start`.
+    That method has six jobs -- validate the ROM, import libretro.py, build
+    the drivers, build the session, classify whatever went wrong and assign the
+    result -- and this is the only one of them with a second implementation of
+    itself inside it. Having it here means "which libretro.py are we talking
+    to?" is answerable in one place rather than by reading a hundred-line
+    method to find out.
+
+    Returns the session *unentered*. ``__enter__`` is the caller's, on purpose:
+    it is where the core actually loads the content, so it is the call that
+    produces the "Failed to load game" that start() translates into a sentence
+    for the player, and it belongs in the same try as the rest of that
+    classification rather than being hidden in here.
+
+    ``options`` is the output of :func:`_encode_options`, i.e. already
+    ``{bytes: bytes}``; an empty mapping means "say nothing about options".
+
+    **Both branches are load-bearing and neither may be deleted.** 0.6.x is
+    the newest release available on Python 3.11, which Red-DiscordBot requires
+    and which CI runs a leg of.
+    """
+    builder_defaults = getattr(libretro, "defaults", None)
+    if builder_defaults is not None:
+        # libretro.py <= 0.6.x: SessionBuilder API.
+        builder = (
+            builder_defaults(str(core_path))
+            .with_content(str(rom_path))
+            .with_input(input_generator)
+            .with_video(video)
+        )
+        if path_driver is not None and hasattr(builder, "with_paths"):
+            # Overrides the TempDirPathDriver that defaults() installs,
+            # whose system directory is a throwaway temp folder.
+            builder = builder.with_paths(path_driver)
+        if log_driver is not None and hasattr(builder, "with_log"):
+            builder = builder.with_log(log_driver)
+        if options and hasattr(builder, "with_options"):
+            # Seeds a DictOptionDriver with these values, which it keeps when
+            # the core registers its own definitions. An unknown key, or a
+            # value the core does not offer, is ignored and the core sees its
+            # own default instead -- so a setting left over from an older build
+            # of a core can never stop a game from starting.
+            builder = builder.with_options(options)
+        return builder.build()
+
+    # libretro.py >= 0.7: Session constructor API.
+    kwargs = {"input": input_generator, "video": video}
+    if path_driver is not None:
+        kwargs["path"] = path_driver
+    if log_driver is not None:
+        kwargs["log"] = log_driver
+    if options:
+        kwargs["options"] = options
+    try:
+        return libretro.Session(str(core_path), str(rom_path), **kwargs)
+    except TypeError:
+        # A libretro.py whose Session takes no options= argument. The game
+        # matters more than the setting, so start it anyway and say why the
+        # setting did nothing.
+        if "options" not in kwargs:
+            raise
+        log.warning(
+            "This libretro.py does not accept core options at startup, so %s "
+            "of them were ignored.",
+            len(kwargs.pop("options")),
+        )
+        return libretro.Session(str(core_path), str(rom_path), **kwargs)

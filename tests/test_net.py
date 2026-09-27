@@ -93,9 +93,11 @@ def test_a_url_worth_no_lookup_is_refused_outright(url):
 
 @pytest.mark.parametrize("url", ["http://example.com/rom.gb", "https://example.com/rom.zip"])
 def test_an_ordinary_public_url_passes_the_scheme_check(url):
-    scheme, host = net.check_scheme(url)
-    assert scheme in {"http", "https"}
-    assert host == "example.com"
+    # The host is all that comes back. The scheme is still validated -- the
+    # refusals above are the proof of that, and they are the only thing anybody
+    # ever did with it -- but it used to be returned as well, to two callers
+    # that both discarded it.
+    assert net.check_scheme(url) == "example.com"
 
 
 @pytest.mark.parametrize(

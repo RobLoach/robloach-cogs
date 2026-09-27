@@ -100,7 +100,9 @@ async def test_a_corrupt_save_state_still_restores_the_battery_save(retro):
     ctx = retro.context(channel)
     view = await retro.start_game(ctx, "batterycorrupt")
     view.emulator.sram[:] = b"\x5a" * 8192
-    await retro.cog._write_sram(view)
+    # The battery save on its own, deliberately without the state, so the
+    # state written on the next line is the only one on disk and is rubbish.
+    await retro.cog._write_captured(view, (None, b"\x5a" * 8192))
     retro.cog._state_path(channel.id, view.slug).write_bytes(b"RUBBISH")
     retro.cog.sessions.pop(channel.id)
 
@@ -119,7 +121,9 @@ async def test_only_a_battery_save_starts_the_game_with_it_in_place(retro):
     ctx = retro.context(channel)
     view = await retro.start_game(ctx, "batteryonly")
     view.emulator.sram[:] = b"\x77" * 8192
-    await retro.cog._write_sram(view)
+    # The battery save on its own: no state is written, and the line below
+    # makes sure there is none from anywhere else either.
+    await retro.cog._write_captured(view, (None, b"\x77" * 8192))
     retro.cog._state_path(channel.id, view.slug).unlink(missing_ok=True)
     retro.cog.sessions.pop(channel.id)
 

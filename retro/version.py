@@ -57,8 +57,6 @@ __all__ = [
     "read_version",
     "git_checkout",
     "scan_sources",
-    "code_fingerprint",
-    "newest_source_time",
     "describe",
     "summary",
 ]
@@ -216,6 +214,15 @@ def scan_sources(directory: typing.Optional[Path] = None) -> Sources:
     entirely, because a partial hash would be a confident wrong answer; a
     file that cannot be *stat*ed only drops out of the newest-mtime
     calculation, which is a decoration either way.
+
+    Called once, at import, which is what makes :data:`FINGERPRINT` a hash of
+    the code that is *running* rather than of whatever is on disk now -- see
+    this module's own docstring. There were two one-line wrappers beside this
+    (``code_fingerprint`` and ``newest_source_time``) that returned one field
+    of the result each, from the days when they were two separate walks. Once
+    the walk was folded into one, nothing in the cog called either of them --
+    the constants below read the fields straight off the tuple -- so they were
+    twenty lines and two exported names standing in for an attribute access.
     """
     directory = PACKAGE_DIR if directory is None else Path(directory)
     try:
@@ -247,27 +254,6 @@ def scan_sources(directory: typing.Optional[Path] = None) -> Sources:
         digest.hexdigest()[:FINGERPRINT_LENGTH] if readable else None,
         max(times) if times else None,
     )
-
-
-def code_fingerprint(
-    directory: typing.Optional[Path] = None,
-) -> typing.Optional[str]:
-    """
-    A short hash of every ``.py`` in this package, or None.
-
-    Called once, at import, which is what makes it a fingerprint of the code
-    that is *running* rather than of whatever is on disk now -- see this
-    module's own docstring. Kept as its own name because that is the fact
-    people ask for; :func:`scan_sources` does the work.
-    """
-    return scan_sources(directory).fingerprint
-
-
-def newest_source_time(
-    directory: typing.Optional[Path] = None,
-) -> typing.Optional[float]:
-    """When the most recently changed file in this package was written."""
-    return scan_sources(directory).newest
 
 
 #: The declared version, from info.json.

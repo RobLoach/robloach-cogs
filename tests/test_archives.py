@@ -323,27 +323,39 @@ def test_sizes_are_reported_in_units_a_person_reads(size, expected):
 # What `[p]retroset bios add` does with a firmware set: several files, often
 # with a folder per console, all of which have to land under the system
 # directory and none of which may land anywhere else.
+#
+# These used to run against `extract_all`, the collecting entry point the module
+# shipped beside `extract_each`. It was deleted for having no caller but this
+# file, so the tests that care about the *rules* of the walk -- which members are
+# taken, which are skipped and why -- collect the stream into a list themselves
+# and read the answers off that. The tests that care about the streaming itself
+# are in the next section.
 
 ALL_LIMITS = dict(max_total_size=MAX, max_file_size=MAX, max_files=100)
 
 
-def test_extract_all_returns_every_file_in_sorted_order():
-    data = zipped([("b.bin", b"bb"), ("a.bin", b"aa"), ("dc/boot.bin", b"cc")])
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["a.bin", "b.bin", "dc/boot.bin"]
-    assert [f.data for f in found.files] == [b"aa", b"bb", b"cc"]
-    assert found.total_size == 6
-    assert found.skipped == ()
+def collected(data, **limits):
+    """Run `extract_each` into a list, for tests that want the whole archive.
+
+    A sink of `list.append`: the shape a caller writes when it does not mind
+    holding everything at once, and exactly what the module's own `extract_all`
+    was before it was deleted. Cheap in a test, where the whole archive is a few
+    dozen bytes; the cog writes each file to disk as it arrives instead, and the
+    next section measures the difference.
+    """
+    files = []
+    report = A.extract_each(data, sink=files.append, **(limits or ALL_LIMITS))
+    return files, report
 
 
-def test_extract_all_keeps_folders_but_normalises_separators():
+def test_extract_each_keeps_folders_but_normalises_separators():
     data = zipped([("np2kai\\FONT.ROM", b"x" * 8)])
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["np2kai/FONT.ROM"]
-    assert found.files[0].member == "np2kai\\FONT.ROM"
+    files, _ = collected(data)
+    assert [f.path for f in files] == ["np2kai/FONT.ROM"]
+    assert files[0].member == "np2kai\\FONT.ROM"
 
 
-def test_extract_all_drops_archive_junk():
+def test_extract_each_drops_archive_junk():
     data = zipped(
         [
             ("real.bin", b"x" * 8),
@@ -355,12 +367,12 @@ def test_extract_all_drops_archive_junk():
             ("folder/.hidden/deep.bin", b"junk"),
         ]
     )
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["real.bin"]
+    files, report = collected(data)
+    assert [f.path for f in files] == ["real.bin"]
     # Junk is dropped rather than reported: nobody meant to install it. The
     # backslashed and nested __MACOSX members matter here -- an unsafe *name*
     # would be skipped and counted, junk must not be.
-    assert found.skipped == ()
+    assert report.skipped == ()
 
 
 @pytest.mark.parametrize(
@@ -390,11 +402,11 @@ def test_extract_all_drops_archive_junk():
         "dotted./inside.bin",
     ],
 )
-def test_extract_all_refuses_an_unsafe_member(member):
+def test_extract_each_refuses_an_unsafe_member(member):
     data = zipped([(member, b"x" * 8), ("good.bin", b"y" * 8)])
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["good.bin"]
-    assert found.skipped == (member,)
+    files, report = collected(data)
+    assert [f.path for f in files] == ["good.bin"]
+    assert report.skipped == (member,)
 
 
 @pytest.mark.parametrize(
@@ -448,7 +460,7 @@ def test_safe_member_path_never_escapes_a_directory():
 
 
 @pytest.mark.parametrize("mode", [0o120777, 0o020666, 0o060660, 0o010666, 0o140777])
-def test_extract_all_refuses_anything_that_is_not_a_regular_file(mode):
+def test_extract_each_refuses_anything_that_is_not_a_regular_file(mode):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as archive:
         info = zipfile.ZipInfo("link.bin")
@@ -456,9 +468,9 @@ def test_extract_all_refuses_anything_that_is_not_a_regular_file(mode):
         info.external_attr = mode << 16
         archive.writestr(info, "/etc/passwd")
         archive.writestr("real.bin", b"x" * 8)
-    found = A.extract_all(buf.getvalue(), **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["real.bin"]
-    assert found.skipped == ("link.bin",)
+    files, report = collected(buf.getvalue())
+    assert [f.path for f in files] == ["real.bin"]
+    assert report.skipped == ("link.bin",)
 
 
 def test_a_non_unix_archive_mode_is_not_read_as_one():
@@ -470,25 +482,25 @@ def test_a_non_unix_archive_mode_is_not_read_as_one():
         info.create_system = 0
         info.external_attr = 0o120777 << 16
         archive.writestr(info, b"x" * 8)
-    found = A.extract_all(buf.getvalue(), **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["dos.bin"]
+    files, _ = collected(buf.getvalue())
+    assert [f.path for f in files] == ["dos.bin"]
 
 
-def test_extract_all_refuses_too_many_files():
+def test_extract_each_refuses_too_many_files():
     data = zipped([(f"f{i}.bin", b"x") for i in range(20)])
     with pytest.raises(A.ArchiveError) as caught:
-        A.extract_all(data, max_total_size=MAX, max_file_size=MAX, max_files=5)
+        collected(data, max_total_size=MAX, max_file_size=MAX, max_files=5)
     assert "more than the 5" in str(caught.value)
 
 
-def test_extract_all_refuses_a_bomb_before_decompressing_it():
+def test_extract_each_refuses_a_bomb_before_decompressing_it():
     data = zipped([("bomb.bin", b"\x00" * (1024 * 1024))])
     with pytest.raises(A.ArchiveError) as caught:
-        A.extract_all(data, max_total_size=1024, max_file_size=MAX, max_files=10)
+        collected(data, max_total_size=1024, max_file_size=MAX, max_files=10)
     assert "unpacks to" in str(caught.value)
 
 
-def test_extract_all_enforces_the_total_against_the_real_bytes(monkeypatch):
+def test_extract_each_enforces_the_total_against_the_real_bytes(monkeypatch):
     # ZipInfo.file_size is attacker-controlled metadata, so the metadata check
     # is only a first pass; the running total of bytes actually produced is
     # what really enforces the cap.
@@ -506,106 +518,93 @@ def test_extract_all_enforces_the_total_against_the_real_bytes(monkeypatch):
     # first) by the CRC that the lie also invalidates. Either way nothing that
     # lied about its size is handed back.
     with pytest.raises(A.ArchiveError):
-        A.extract_all(data, max_total_size=4096, max_file_size=MAX, max_files=10)
+        collected(data, max_total_size=4096, max_file_size=MAX, max_files=10)
 
 
-def test_extract_all_skips_a_single_member_over_the_per_file_cap():
-    data = zipped([("big.bin", b"x" * 4096), ("small.bin", b"y" * 8)])
-    found = A.extract_all(data, max_total_size=MAX, max_file_size=1024, max_files=10)
-    assert [f.path for f in found.files] == ["small.bin"]
-    assert found.skipped == ("big.bin",)
-
-
-def test_extract_all_skips_a_case_insensitive_duplicate():
+def test_extract_each_skips_a_case_insensitive_duplicate():
     # Both names are individually safe, but on the case-insensitive disks of
     # Windows/macOS hosts the second write would clobber the first. Sorted
     # order means the uppercase one is always the survivor.
     data = zipped([("BIOS.bin", b"first"), ("bios.bin", b"second")])
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["BIOS.bin"]
-    assert found.files[0].data == b"first"
-    assert len(found.skipped) == 1
-    assert found.skipped[0].startswith("bios.bin ")
-    assert "case" in found.skipped[0]
+    files, report = collected(data)
+    assert [f.path for f in files] == ["BIOS.bin"]
+    assert files[0].data == b"first"
+    assert len(report.skipped) == 1
+    assert report.skipped[0].startswith("bios.bin ")
+    assert "case" in report.skipped[0]
 
 
-def test_extract_all_spots_a_case_collision_in_a_folder_name():
+def test_extract_each_spots_a_case_collision_in_a_folder_name():
     data = zipped(
         [("DC/boot.bin", b"upper"), ("dc/boot.bin", b"lower"), ("dc/extra.bin", b"ok")]
     )
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["DC/boot.bin", "dc/extra.bin"]
-    assert len(found.skipped) == 1
-    assert found.skipped[0].startswith("dc/boot.bin ")
+    files, report = collected(data)
+    assert [f.path for f in files] == ["DC/boot.bin", "dc/extra.bin"]
+    assert len(report.skipped) == 1
+    assert report.skipped[0].startswith("dc/boot.bin ")
 
 
 def test_a_case_variant_of_a_member_that_was_not_taken_is_still_taken():
     # Only *accepted* members claim a name: the empty BIOS.bin is skipped for
     # being empty, so bios.bin collides with nothing and is kept.
     data = zipped([("BIOS.bin", b""), ("bios.bin", b"real")])
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["bios.bin"]
-    assert found.skipped == ("BIOS.bin",)
+    files, report = collected(data)
+    assert [f.path for f in files] == ["bios.bin"]
+    assert report.skipped == ("BIOS.bin",)
 
 
-def test_extract_all_skips_an_empty_member():
+def test_extract_each_skips_an_empty_member():
     data = zipped([("empty.bin", b""), ("real.bin", b"x" * 8)])
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert [f.path for f in found.files] == ["real.bin"]
-    assert found.skipped == ("empty.bin",)
+    files, report = collected(data)
+    assert [f.path for f in files] == ["real.bin"]
+    assert report.skipped == ("empty.bin",)
 
 
-def test_extract_all_refuses_an_encrypted_member():
+def test_extract_each_refuses_an_encrypted_member():
     data = bytearray(zipped([("secret.bin", b"x" * 8)]))
     data[data.find(b"PK\x03\x04") + 6] |= 0x01
     data[data.find(b"PK\x01\x02") + 8] |= 0x01
     with pytest.raises(A.ArchiveError, match="password-protected"):
-        A.extract_all(bytes(data), **ALL_LIMITS)
+        collected(bytes(data))
 
 
-def test_extract_all_raises_when_nothing_is_usable():
+def test_extract_each_raises_when_nothing_is_usable():
     data = zipped([("../nope.bin", b"x" * 8)])
     with pytest.raises(A.NoSupportedMember) as caught:
-        A.extract_all(data, what="BIOS file", **ALL_LIMITS)
+        collected(data, what="BIOS file", **ALL_LIMITS)
     assert "no BIOS file this bot can use" in str(caught.value)
 
 
-def test_extract_all_raises_on_an_empty_archive():
+def test_extract_each_raises_on_an_empty_archive():
     with pytest.raises(A.NoSupportedMember):
-        A.extract_all(zipped([]), **ALL_LIMITS)
+        collected(zipped([]))
 
 
-def test_extract_all_raises_on_something_that_is_not_a_zip():
+def test_extract_each_raises_on_something_that_is_not_a_zip():
     with pytest.raises(A.ArchiveError):
-        A.extract_all(b"this is not a zip at all", **ALL_LIMITS)
+        collected(b"this is not a zip at all")
 
 
 def test_the_password_sentence_counts_the_files_it_is_asking_for():
     # One sentence, one plural knob: `extract` is after a single file and
-    # `extract_all` after a set, and both ask the uploader to unzip it.
+    # `extract_each` after a set, and both ask the uploader to unzip it.
     data = bytearray(zipped([("secret.gb", ROM)]))
     data[data.find(b"PK\x03\x04") + 6] |= 0x01
     data[data.find(b"PK\x01\x02") + 8] |= 0x01
     with pytest.raises(A.ArchiveError) as one:
         extract(bytes(data))
     with pytest.raises(A.ArchiveError) as many:
-        A.extract_all(bytes(data), **ALL_LIMITS)
+        collected(bytes(data))
     assert str(one.value).endswith("Unzip it yourself and upload the file inside.")
     assert str(many.value).endswith("Unzip it yourself and upload the files inside.")
 
 
 # -- Unpacking without holding the whole archive ------------------------------
 #
-# `extract_each` is the same walk as `extract_all` -- same caps, same skips,
-# same order -- handing each file over as it is decompressed so that a
-# hundred-megabyte firmware pack never sits in memory in one piece.
-
-
-def collected(data, **limits):
-    """Run `extract_each` into a list, the way `extract_all` does."""
-    files = []
-    report = A.extract_each(data, sink=files.append, **(limits or ALL_LIMITS))
-    return files, report
+# The section above reads the walk's answers off a list; these are about the
+# handing-over itself -- one file at a time, in order, dropped as soon as the
+# sink has had it, which is what keeps a hundred-megabyte firmware pack from
+# ever sitting in memory in one piece.
 
 
 def test_extract_each_hands_over_every_file_in_sorted_order():
@@ -643,9 +642,14 @@ def test_extract_each_sees_one_file_at_a_time():
     assert seen == [(0, "a.bin", 8), (1, "b.bin", 16), (2, "c.bin", 32)]
 
 
-def test_extract_each_matches_extract_all_on_an_awkward_archive():
-    # One archive with every skip rule in it at once, unpacked both ways: the
-    # convenient shape must be exactly the streaming one, collected.
+def test_one_awkward_archive_exercises_every_skip_rule_at_once(tmp_path):
+    # This used to unpack the same archive both ways and assert the two agreed,
+    # back when `extract_all` was a second entry point that could drift from
+    # this one. There is only one walk now, so there is nothing to compare --
+    # but the archive itself is worth keeping: every skip rule in the module
+    # firing in a single pass, which is how a real firmware pack goes wrong.
+    # Written through a sink that writes to disk rather than `collected`, so the
+    # rules are checked against the report the cog actually reads.
     data = zipped(
         [
             ("BIOS.bin", b"first"),
@@ -656,18 +660,40 @@ def test_extract_each_matches_extract_all_on_an_awkward_archive():
             ("dc/boot.bin", b"z" * 8),
         ]
     )
-    files, report = collected(data)
-    found = A.extract_all(data, **ALL_LIMITS)
-    assert found.files == tuple(files)
-    assert found.skipped == report.skipped
-    assert found.members == report.members
-    assert found.total_size == report.total_size
-    assert report.paths == tuple(f.path for f in found.files)
+    written = []
+
+    def sink(extracted):
+        path = tmp_path / extracted.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(extracted.data)
+        written.append(extracted.path)
+
+    report = A.extract_each(data, sink=sink, **ALL_LIMITS)
+    assert written == ["BIOS.bin", "dc/boot.bin"]
+    assert report.paths == ("BIOS.bin", "dc/boot.bin")
+    assert (tmp_path / "BIOS.bin").read_bytes() == b"first"
+    assert (tmp_path / "dc/boot.bin").read_bytes() == b"z" * 8
+    # Skips are reported in the order they were met, which is sorted member
+    # order: the unsafe name and the empty member counted plainly, the case
+    # collision saying what it collided with, and the junk not mentioned at all.
+    assert len(report.skipped) == 3
+    assert report.skipped[0] == "../escape.bin"
+    assert report.skipped[1].startswith("bios.bin (differs from `BIOS.bin`")
+    assert report.skipped[2] == "empty.bin"
+    assert "__MACOSX/._junk.bin" not in report.members
+    assert report.total_size == len(b"first") + 8
 
 
-def test_extract_each_peaks_far_below_extract_all(tmp_path):
+def test_extract_each_peaks_far_below_holding_every_member(tmp_path):
     # The whole point of item 15, measured: eight megabytes of firmware, one
     # megabyte at a time. The sink here writes and forgets, as the cog's does.
+    #
+    # The baseline used to be `extract_all`, the collecting entry point that
+    # lived beside this one. With that gone the test builds the baseline itself,
+    # which is all `extract_all` ever was -- a sink of `list.append`. Measuring
+    # against a list rather than against a sibling function is if anything the
+    # better test: what is being priced is the caller's choice to hold on, not
+    # one library function against another.
     data = zipped([(f"f{i}.bin", bytes(1024 * 1024)) for i in range(8)])
     limits = dict(max_total_size=MAX, max_file_size=2 * 1024 * 1024, max_files=10)
 
@@ -677,8 +703,9 @@ def test_extract_each_peaks_far_below_extract_all(tmp_path):
     tracemalloc.stop()
 
     tracemalloc.start()
-    held = A.extract_all(data, **limits)
-    assert held.total_size == 8 * 1024 * 1024
+    held, report = collected(data, **limits)
+    assert report.total_size == 8 * 1024 * 1024
+    assert len(held) == 8
     at_once = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
 

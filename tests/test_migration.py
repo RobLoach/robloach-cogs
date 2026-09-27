@@ -153,6 +153,44 @@ async def test_a_fresh_install_migrates_nothing_and_says_nothing(retro):
     assert not retro.legacy_data.exists(), "and no empty old folder was conjured"
 
 
+async def test_a_fresh_install_does_not_write_the_core_paths_back(retro, monkeypatch):
+    """The path rewrite is gated on there having been an old namespace at all.
+
+    ``_rewrite_core_paths`` opens ``config.cores()`` as a context manager, and
+    Red writes a group back when that context exits whether or not anything in
+    it changed -- on the default (JSON) driver that is a serialise of the whole
+    settings file. It used to run on every load of every install, gated on
+    nothing, while ``_migrate_config`` beside it was gated on ``had_legacy``:
+    on an install that never ran under the old name every stored path raised
+    ValueError against a legacy directory that never existed, so the loop did
+    precisely nothing and the write happened anyway, inside ``cog_load``.
+    """
+    from . import fakes
+
+    cog, _ = retro.make_cog(fresh_config=True)
+    assert not retro.legacy_data.exists()
+    # Something to rewrite, so the test cannot pass merely because `cores` was
+    # empty: this path is outside the old folder, which is the ordinary case.
+    await cog.config.cores.set({"mgba": "/opt/retroarch/mgba_libretro.so"})
+
+    groups = []
+    original = fakes.FakeValue.__aexit__
+
+    async def counted(self, *exc):
+        groups.append(self.key)
+        return await original(self, *exc)
+
+    monkeypatch.setattr(fakes.FakeValue, "__aexit__", counted)
+
+    await cog._migrate_legacy_namespace()
+
+    assert "cores" not in groups, groups
+    assert await cog.config.cores() == {"mgba": "/opt/retroarch/mgba_libretro.so"}
+    # ...and the install that *did* run under the old name still gets the
+    # rewrite, which is the half that would be silent data loss to drop; see
+    # test_the_stored_core_paths_are_repointed_at_the_new_folder above.
+
+
 async def test_the_config_store_file_is_never_moved_as_if_it_were_data(retro):
     # Red's default (JSON) driver keeps a cog's settings in settings.json
     # *inside* its data directory, so the data folder and the Config namespace

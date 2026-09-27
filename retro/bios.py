@@ -28,13 +28,11 @@ import logging
 import typing
 from pathlib import Path
 
-import discord
 from redbot.core import commands
 from redbot.core.utils.chat_formatting import pagify
 
 from . import archives
 from .abc import MixinMeta
-from .net import DownloadError
 
 log = logging.getLogger("red.robloach.retro")
 
@@ -72,35 +70,35 @@ class BiosMixin(MixinMeta):
         name: typing.Optional[str],
         url: typing.Optional[str],
     ) -> typing.Optional[typing.Tuple[str, bytes]]:
-        """(source name, bytes) from the URL or attachment, or None on error."""
-        if url:
-            try:
-                return await self._download_bytes(
-                    url,
-                    MAX_BIOS_ARCHIVE_SIZE,
-                    MAX_BIOS_ARCHIVE_SIZE_LABEL,
-                    "BIOS file",
-                )
-            except DownloadError as error:
-                await self._safe_send(ctx, str(error))
-                return None
-        if ctx.message.attachments:
-            attachment = ctx.message.attachments[0]
-            if attachment.size > MAX_BIOS_ARCHIVE_SIZE:
-                await self._safe_send(
-                    ctx,
-                    "That file is bigger than the "
-                    f"{MAX_BIOS_ARCHIVE_SIZE_LABEL} limit.",
-                )
-                return None
-            try:
-                return attachment.filename, await attachment.read()
-            except discord.HTTPException as error:
-                log.warning("Could not read a Retro BIOS attachment.", exc_info=True)
-                await self._safe_send(
-                    ctx, f"The attached file could not be downloaded: {error}"
-                )
-                return None
+        """
+        (source name, bytes) from the URL or attachment, or None on error.
+
+        :meth:`Retro._fetch_upload` with this command's limits, plus the one
+        thing that is specific to firmware: there is nothing helpful to do with
+        a `[p]retroset bios add` that carries neither a file nor a URL, so it
+        gets the usage line. (`[p]retro` in the same position shows the whole
+        "what can I start?" listing instead, which is why the shared half says
+        nothing at all.)
+
+        The archive cap is the limit used for both a bare file and a zip,
+        because which of the two this is cannot be known before it has been
+        fetched; a single file is held to MAX_BIOS_SIZE afterwards, by
+        :meth:`_install_bios_file`.
+        """
+        fetched = await self._fetch_upload(
+            ctx,
+            url,
+            MAX_BIOS_ARCHIVE_SIZE,
+            MAX_BIOS_ARCHIVE_SIZE_LABEL,
+            "BIOS file",
+        )
+        if fetched is not None:
+            return fetched
+        if url or ctx.message.attachments:
+            # Something was offered and refused, and the shared half has
+            # already said why. Adding the usage line here would read as
+            # though the file had not arrived at all.
+            return None
         await self._safe_send(
             ctx,
             "Attach the BIOS file (or a `.zip` of them) to your message, or "
@@ -115,6 +113,7 @@ class BiosMixin(MixinMeta):
         source: str,
         data: bytes,
         name: typing.Optional[str],
+        url: typing.Optional[str],
     ) -> None:
         """
         Store one firmware file in the system directory under a usable name.
@@ -123,22 +122,38 @@ class BiosMixin(MixinMeta):
         ``StorageMixin._bios_name``): a core asks for an exact filename, so a
         name that cannot be stored truthfully is refused with an explanation
         instead of being mangled into one the core will never look for.
+
+        ``url`` is only read to word the retry hint in that refusal, and it is
+        the honest thing to ask: the hint has to be the command *they* should
+        type again, which ends in ``<url>`` if they passed one and does not if
+        they attached the file. It used to be conditioned on ``source`` -- the
+        fetched file's *name* -- which is truthy on essentially every path that
+        reaches here, and empty in precisely the one case where the ``<url>``
+        is wanted (a URL download that yielded no filename at all). Compare
+        :meth:`_fetch_bios`, which words the same hint off ``name``.
+
+        Every reply goes through ``_safe_send``, as every other reply in this
+        module does. Five of them were bare ``ctx.send``, so a channel where
+        the bot had lost Send Messages turned "that name will not do" into a
+        traceback while its neighbours answered quietly.
         """
         name = name or self._bios_name(Path(str(source)).name)
         if name is None:
-            await ctx.send(
+            await self._safe_send(
+                ctx,
                 f"`{Path(str(source)).name}` is not a usable filename. Say "
                 "what the core should see it as: `"
                 f"{ctx.clean_prefix}retroset bios add <filename>"
-                f"{' <url>' if source else ''}`."
+                f"{' <url>' if url else ''}`.",
             )
             return
         if not data:
-            await ctx.send("That file is empty.")
+            await self._safe_send(ctx, "That file is empty.")
             return
         if len(data) > MAX_BIOS_SIZE:
-            await ctx.send(
-                f"That BIOS file is bigger than the {MAX_BIOS_SIZE_LABEL} limit."
+            await self._safe_send(
+                ctx,
+                f"That BIOS file is bigger than the {MAX_BIOS_SIZE_LABEL} limit.",
             )
             return
         room, note = await self._make_room(len(data), prefix=ctx.clean_prefix)
@@ -152,13 +167,14 @@ class BiosMixin(MixinMeta):
             await asyncio.to_thread(self._write_atomic, target, data)
         except OSError as error:
             log.warning("Could not write the BIOS file %s", target, exc_info=True)
-            await ctx.send(f"The file could not be saved: {error}")
+            await self._safe_send(ctx, f"The file could not be saved: {error}")
             return
         log.info("Installed the BIOS file %s (%s bytes).", name, len(data))
-        await ctx.send(
+        await self._safe_send(
+            ctx,
             f"Stored `{name}` ({len(data):,} bytes) in the system directory. "
             f"Cores will find it from now on. See "
-            f"`{ctx.clean_prefix}retroset bios list`."
+            f"`{ctx.clean_prefix}retroset bios list`.",
         )
 
     async def _install_bios_archive(

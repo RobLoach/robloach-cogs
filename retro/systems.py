@@ -460,11 +460,8 @@ class System(typing.NamedTuple):
 # disc track as a Mega Drive game and showing them the result. Genesis ROMs
 # should be named ".md" instead, which is what the unsupported-extension
 # reply tells people.
-AMBIGUOUS_EXTENSIONS = frozenset(
-    {"bin", "cue", "iso", "chd", "toc", "m3u", "ccd", "img", "fds", "bs", "st"}
-)
-
-#: Why each of those is refused, in a sentence the person who uploaded it can
+#
+#: Why each of them is refused, in a sentence the person who uploaded it can
 #: act on -- and, where there is one, what to do instead.
 #:
 #: The reasoning was written out at length above and then only ever existed
@@ -509,6 +506,21 @@ for _disc in ("cue", "iso", "chd", "toc", "m3u", "ccd", "img"):
         "cartridge machines, and disc systems need both the disc and a "
         "console BIOS, so none of them is supported."
     )
+
+#: The same eleven extensions again, as the set the "do we claim this?"
+#: question is asked against.
+#:
+#: Derived from the dict rather than written out beside it, because it is not a
+#: second fact: an extension is refused *because* there is a reason to refuse
+#: it, and the reason is the thing worth maintaining. Both used to be literals,
+#: and the drift they invited ran in the dangerous direction -- add an
+#: extension to the frozenset alone and it is refused with no explanation,
+#: because ambiguous_reason() answers None and the caller falls back to the
+#: generic "not a console this bot knows" reply that AMBIGUOUS_REASONS exists
+#: to replace. That is silent, and it is exactly the case somebody would be
+#: adding an entry to fix. Defined *after* the disc-format loop above for the
+#: obvious reason: before it, seven of the eleven are not in the dict yet.
+AMBIGUOUS_EXTENSIONS = frozenset(AMBIGUOUS_REASONS)
 
 
 def ambiguous_reason(extension: str) -> typing.Optional[str]:

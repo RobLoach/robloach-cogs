@@ -832,6 +832,65 @@ def test_a_hidden_repeat_button_is_still_registered_for_routing(retro, system):
     assert view.is_persistent()
 
 
+@pytest.mark.parametrize("branch", ["empty undo", "stale repeat", "replaced game"])
+async def test_a_private_answer_discord_refuses_still_acknowledges_the_click(
+    retro, branch
+):
+    """The one thing that must not happen is the click going unanswered.
+
+    Three branches of this view say something privately and do nothing else --
+    Undo with an empty history, a click on a repeat button that is no longer
+    drawn, and any click on a controller whose game has been replaced -- and
+    all three are answering a click that Discord will show its own red "This
+    interaction failed" on if nothing acknowledges it within three seconds. So
+    an ephemeral Discord refuses has to fall back to a plain defer.
+
+    Two of the three had that fallback and were each carrying their own copy of
+    it; Undo's empty-history branch did not have one at all, which is the
+    branch the whole "leave Undo enabled even with nothing to undo" decision
+    exists to serve. It is now `RetroView.ephemeral`'s, once, which is why this
+    can be one parametrized test rather than a rule three branches remember
+    separately.
+    """
+    view = viewmod.RetroView(
+        retro.cog,
+        game_name="Test",
+        slug="test",
+        rom_filename="test.gb",
+        channel_id=1,
+        # Short enough that the repeat button has nothing to do and is hidden,
+        # which is the state a stale click on it arrives in.
+        clip_seconds=0.2,
+    )
+    interaction = retro.interaction(view)
+
+    async def refuse(*args, **kwargs):
+        raise discord.HTTPException(
+            types.SimpleNamespace(status=400, reason="Bad Request"),
+            {"code": 50035, "message": "Invalid Form Body"},
+        )
+
+    interaction.response.send_message = refuse
+
+    if branch == "empty undo":
+        assert not view.history, "which is the whole case"
+        await view._undo(interaction)
+    elif branch == "stale repeat":
+        assert view._repeat_button().hidden
+        await view._repeat_button().callback(interaction)
+    else:
+        view.retire()
+        await view._press(interaction, "a")
+
+    # Nothing was said, because Discord would not take it -- but the click was
+    # acknowledged, so nobody is looking at "This interaction failed".
+    assert interaction.kinds() == ["response.defer"], interaction.log
+    # ...and the session's own message was never touched, which is the other
+    # half of every one of these three branches: an edit re-renders the message
+    # and rewinds the clip playing on it for the whole channel.
+    assert view.message is None
+
+
 async def test_a_click_on_a_hidden_repeat_button_is_answered_privately(retro, system):
     """A stale click costs one ephemeral line and no edit of the message.
 
@@ -1194,6 +1253,15 @@ MOVED = {
 #: is what every caller and half the test suite writes, and it has to keep
 #: resolving to the one function `SessionMixin` declares rather than to a
 #: second copy somebody left behind on the view.
+#:
+#: `run_press`, `run_undo` and `run_reset` were in this list and are not any
+#: more, because they no longer exist. Each was one line of
+#: `_encode(capture_something())`, none of them had a caller in the cog (every
+#: `run_undo`/`run_reset` in the tree is `Retro`'s own method of that name),
+#: and their entries here were the only thing keeping them alive -- a test of
+#: the *move* outliving the thing it moved. The two places in this file that
+#: called `view.run_press` now write the capture and the encode out, which is
+#: what `Retro.run_press` really does with the emulator lock in between.
 MOVED_METHODS = [
     "_boot",
     "_capture",
@@ -1209,9 +1277,6 @@ MOVED_METHODS = [
     "forget_history",
     "history_bytes",
     "remember_state",
-    "run_press",
-    "run_reset",
-    "run_undo",
 ]
 
 

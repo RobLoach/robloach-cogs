@@ -174,9 +174,9 @@ def address_refusal(address: typing.Union[str, ipaddress._BaseAddress]) -> typin
     return None
 
 
-def check_scheme(url: str) -> typing.Tuple[str, str]:
+def check_scheme(url: str) -> str:
     """
-    ``(scheme, host)`` for a URL worth resolving, or raise :class:`BlockedURL`.
+    The hostname of a URL worth resolving, or raise :class:`BlockedURL`.
 
     Everything here is decided from the text of the URL: the scheme, that
     there is a hostname at all, and -- when the host is written as a literal
@@ -186,6 +186,14 @@ def check_scheme(url: str) -> typing.Tuple[str, str]:
     recognises a literal address and skips the resolver entirely for it, so a
     guard that lived only in the resolver would let ``http://127.0.0.1/``
     straight through.
+
+    This used to return ``(scheme, host)``, and neither caller wanted the
+    scheme: :func:`guarded_get` throws the whole tuple away and keeps the URL
+    it already had, and :func:`refuse_reason` unpacks it into ``_``. The
+    scheme is *validated* here, which is the part that matters and is
+    unchanged -- it was only ever also handed back, which invited a caller to
+    believe it was the thing to act on. The name still reads as an assertion
+    that happens to yield the one value a caller needs next.
     """
     text = str(url).strip()
     parts = urlsplit(text)
@@ -204,11 +212,11 @@ def check_scheme(url: str) -> typing.Tuple[str, str]:
     try:
         literal = ipaddress.ip_address(host)
     except ValueError:
-        return scheme, host
+        return host
     reason = address_refusal(literal)
     if reason is not None:
         raise BlockedURL(f"{host} is {reason}")
-    return scheme, host
+    return host
 
 
 class GuardedResolver(aiohttp.abc.AbstractResolver):
@@ -386,6 +394,11 @@ async def guarded_get(
                 return
             response.release()
             if hop >= max_redirects:
+                # Only ever true on the last iteration, which would exit the
+                # loop and reach the same raise anyway -- so this is not what
+                # enforces the bound. It is here to keep the log honest: the
+                # line below says a redirect is being *followed*, and on the
+                # last hop it is not.
                 break
             log.debug("Following redirect %s -> %s", current, target)
             current = target
@@ -408,7 +421,7 @@ async def refuse_reason(
     resolve right now may resolve later, and the fetch will check it again.
     """
     try:
-        _, host = check_scheme(url)
+        host = check_scheme(url)
     except BlockedURL as error:
         return str(error)
     guard = GuardedResolver(inner=resolver, allow_private=allow_private)

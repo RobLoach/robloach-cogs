@@ -486,6 +486,9 @@ def test_no_module_level_container_is_keyed_by_user_input():
             "one entry per AMBIGUOUS_EXTENSIONS member, asserted equal to it"
         ),
         ("retro.saves", "EXPORT_CHOICES"): "literal",
+        # The two halves of a save -- the in-game save and the save state --
+        # and there is no third kind for anything to add.
+        ("retro.saves", "IMPORT_KINDS"): "two literal ImportKinds",
         ("retro.Retro", "DEFAULT_GLOBALS"): "the Config schema",
         ("retro.Retro", "DEFAULT_CHANNEL"): "the Config schema",
     }

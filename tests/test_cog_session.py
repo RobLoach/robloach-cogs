@@ -128,7 +128,7 @@ async def test_retroset_cliplength_says_what_a_short_clip_does_to_a_press(retro)
 
 
 async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro):
-    """Changing the clip length re-draws the row on the next press.
+    """Changing the clip length re-draws the row, and the press after agrees.
 
     Both ways round, which is the whole point of the button being hidden
     rather than greyed out: at 0.2s only one tap fits, so the x3 button goes
@@ -138,6 +138,12 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
     Off the *message*: the button object stays in the view either way, so a
     click on a message Discord has not re-rendered still reaches a callback
     that answers it. See RetroView.to_components.
+
+    The line that says where the button went now rides on the command's own
+    redraw rather than on the next press, and that is the right way round: the
+    edit that stops drawing the button is the edit that should explain it. It
+    used to arrive a press later because `refresh` did not redraw at all -- see
+    the test below this one, which is about nothing else.
     """
     await retro.install_cores("gambatte")
     view, ctx, _ = await retro.posted_game(8054, "relength")
@@ -148,24 +154,27 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
 
     await cliplength(retro.cog, ctx, 0.2)
     assert view.clip_seconds == 0.2
-    # The next press redraws the controls, and the repeat button -- which can
-    # now do no more than the console's own A button -- is gone from them.
-    vanishing = retro.interaction(view, message=view.message)
-    await view._press(vanishing, "a")
+    # The command's redraw has already taken the repeat button -- which can now
+    # do no more than the console's own A button -- off the message, with no
+    # press anywhere near it.
     assert view.repeat_taps == 1
     assert retro.drawn(view, "repeat") is None
     assert retro.control(view, "repeat").hidden, "hidden, not removed"
-    # ...and that press says where it went, once. A control that silently
-    # disappears reads as removed just as surely as a greyed-out one does,
-    # which is exactly how the greyed-out version was reported. It rides on
-    # the edit the press was making anyway, so it costs no extra edit.
-    said = vanishing.log[-1][1]["content"]
-    assert vanishing.kinds() == ["response.defer", "edit_original_response"]
+    # ...and says where it went, once. A control that silently disappears reads
+    # as removed just as surely as a greyed-out one does, which is exactly how
+    # the greyed-out version was reported. It rides on the edit the command was
+    # making anyway, so it costs no extra edit.
+    said = view.message.edits[-1]["content"]
     assert "**A x3** button is hidden" in said, said
     assert "cliplength" in said
+    vanishing = retro.interaction(view, message=view.message)
+    await view._press(vanishing, "a")
+    assert vanishing.kinds() == ["response.defer", "edit_original_response"]
+    assert "hidden" not in vanishing.log[-1][1]["content"], "said once"
+    assert retro.drawn(view, "repeat") is None, "and the press agrees with it"
     again = retro.interaction(view, message=view.message)
     await view._press(again, "a")
-    assert "hidden" not in again.log[-1][1]["content"], "said once"
+    assert "hidden" not in again.log[-1][1]["content"], "still once"
     assert view.clip_frames(view.emulator) == 12
     # Wait and Undo have not moved, because the row still reserves space for
     # all three controls whether or not the third is drawn.
@@ -173,12 +182,74 @@ async def test_retroset_cliplength_reaches_live_sessions_and_their_buttons(retro
 
     coming_back = retro.interaction(view, message=view.message)
     await cliplength(retro.cog, ctx, 4)
-    await view._press(coming_back, "a")
     back = retro.drawn(view, "repeat")
     assert back is not None and back["label"] == "A x3" and not back["disabled"]
     # Coming back says nothing: the button is right there saying what it does.
+    assert "hidden" not in view.message.edits[-1]["content"]
+    await view._press(coming_back, "a")
     assert "hidden" not in coming_back.log[-1][1]["content"]
     assert retro.drawn_row(view) == ["Start", "Select", "Wait", "A x3", "Undo"]
+
+
+async def test_a_cliplength_change_redraws_the_row_with_no_press_at_all(retro):
+    """The payload `refresh()` sends is the row it is *now*.
+
+    Which `[p]retroset cliplength` is the entire reason for: a repeat button
+    still drawn on a message Discord has not re-rendered routes a click to a
+    custom_id the payload no longer carries, and discord.py's
+    `ViewStore.dispatch_view` drops that click without acknowledging it -- so
+    three seconds later the *player* is shown Discord's own red "This
+    interaction failed". Editing every live game's message is what closes that
+    window now rather than whenever somebody next presses something, and it
+    only closes it if the edit carries the new row.
+
+    It did not. `refresh` was the one edit path that sent `view=self` without
+    ever redrawing: `_RepeatButton.hidden` and `.label` were written in the
+    constructor and by `_update_repeat_label`, nothing called
+    `_update_repeat_label` on this path, and `to_components()` filters on that
+    stale `hidden` -- so the payload carried the *previous* clip length's
+    visibility and label, and two comments in Retro.py claimed otherwise. The
+    redraw-on-the-next-press path had a test and this one did not, which is how
+    it lasted. See RetroView._edit, which is where there stopped being four
+    edit paths for one of them to be the odd one out.
+
+    Read off the payload at the moment it goes out, rather than off the view
+    afterwards, because "what did this edit put on the message" is the whole
+    question being asked.
+    """
+    await retro.install_cores("gambatte")
+    view, ctx, _ = await retro.posted_game(8055, "redrawnow")
+    cliplength = retro.cogmod.Retro.retroset_cliplength.callback
+    repeat = f"{retro.viewmod.CUSTOM_ID_PREFIX}:repeat"
+    sent = []
+    real_edit = view.message.edit
+
+    async def watched_edit(**kwargs):
+        # `to_components()` is asked *here*, with the edit in flight, so what is
+        # recorded is the payload Discord is being handed.
+        sent.append(
+            [
+                button.get("custom_id")
+                for row in kwargs["view"].to_components()
+                for button in row["components"]
+            ]
+        )
+        return await real_edit(**kwargs)
+
+    view.message.edit = watched_edit
+    assert repeat in [
+        b.get("custom_id") for row in view.to_components() for b in row["components"]
+    ], "it starts on the message at the default clip length"
+
+    await cliplength(retro.cog, ctx, 0.2)
+
+    assert sent, "the command edited the live game's message at all"
+    assert repeat not in sent[-1], sent[-1]
+    assert not view.press_count, "and nobody pressed anything to make it happen"
+    # Both ways round, on the same one edit per change.
+    await cliplength(retro.cog, ctx, 4)
+    assert repeat in sent[-1], sent[-1]
+    assert not view.press_count
 
 
 async def test_can_stop_is_kept_for_retrosleep_reboot_and_end(retro):
@@ -428,14 +499,19 @@ async def test_a_schedule_never_outlasts_a_short_clip(retro, held):
             assert max(t[1] + t[2] for t in taps) <= budget, (seconds, repeat, taps)
             # ...and the emulator is handed a schedule it does not have to
             # clamp, which is what used to shove a tap onto the last frame.
-            view.run_press("a", repeat)
+            # Capture then encode, spelled out, because that is what a real
+            # press is: `Retro.run_press` does exactly these two calls with the
+            # emulator lock released in between. There was a one-line
+            # `view.run_press` that did both and it is gone -- see
+            # MOVED_METHODS.
+            view._encode(view.capture_press("a", repeat))
             assert emulator.last_presses == taps
 
 
 async def test_a_press_reaches_the_emulator_as_a_webp_clip_schedule(retro, held):
     view, _, _ = held
     emulator = view.emulator
-    clip = view.run_press("a")
+    clip = view._encode(view.capture_press("a"))
     assert emulator.last_presses == view._schedule(emulator, "a", 1)
     # Animated WebP is the only format a clip is ever encoded in; see
     # CLIP_EXTENSION in retro/clips.py for why GIF is not worth having back.
@@ -651,7 +727,9 @@ async def test_a_press_no_longer_greys_the_controls_out(retro):
     cannot both be had: any component response that shows something either
     edits this message (the rewind) or posts a second one (an ephemeral
     notice, removed earlier for being spam). The controls therefore stay
-    enabled throughout, and _set_disabled(True) is left for retirement only.
+    enabled throughout, and greying them out is `_disable()`, which only
+    `retire()` calls -- it used to be `_set_disabled(True)`, with a `False`
+    half that put back children nothing disables any more.
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9006, "nogrey")
@@ -1095,7 +1173,13 @@ async def test_an_entry_queued_before_a_discard_is_not_run_after_it(retro):
 
     # The discard happens, and the entry is then put back by hand -- which is
     # what an append racing the clear looks like from the drain's side.
-    assert view.forget_queue() == 1
+    #
+    # How many went is read off `queue_dropped`, which is the documented way to
+    # ask and the only one now: `forget_queue` used to return the count as
+    # well, and this line was the one reader of a second answer to a question
+    # the attribute already answers (see forget_queue).
+    view.forget_queue()
+    assert view.queue_dropped == 1
     view.queue.append(stale)
     assert stale.epoch != view._queue_epoch
 
@@ -1507,9 +1591,18 @@ async def test_a_long_clip_drains_in_its_clips_rather_than_the_old_cap(retro):
     await fill_the_queue(retro, view, viewmod.MAX_QUEUED_PRESSES)
 
     assert len(retro.pace_waits) == viewmod.MAX_QUEUED_PRESSES + 1
+    # Bounded rather than an equality, for the same reason as the test above:
+    # each delay is the time *left* on the clip it replaces, so it is short by
+    # however long that entry actually spent emulating and encoding -- real
+    # work, on a box that may be running the rest of this suite at the same
+    # time. An `approx(playback, abs=0.2)` here failed intermittently under
+    # load. What the test is for is that the pacing follows the *clip* and not
+    # a flat cap, and every one of these bounds says so: half of a four second
+    # clip is still 2s, which the old 1.25s cap could never have produced.
     for delay in retro.pace_waits:
-        assert delay == pytest.approx(playback, abs=0.2), retro.pace_waits
+        assert delay <= playback, retro.pace_waits
         assert delay > 1.25, "the old cap would have truncated every one"
+        assert delay >= playback / 2, retro.pace_waits
     assert not view.queue and not view._draining
 
 

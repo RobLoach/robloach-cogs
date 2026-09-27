@@ -1,7 +1,7 @@
 """The cog is several modules and one class, and the fakes reach all of them.
 
 `Retro` was one 6,000 line module and is now a cog class assembled from
-mixins (retro/storage.py, retro/cores.py, retro/saves.py,
+mixins (retro/storage.py, retro/cores.py, retro/bios.py, retro/saves.py,
 retro/migration.py; see retro/abc.py for the scaffolding). Two things about
 that are load-bearing enough to be asserted rather than assumed:
 
@@ -83,7 +83,12 @@ def test_mixinmeta_declares_everything_the_mixins_reach_for(retro):
     cog_owned = set(vars(RetroClass)) | set(vars(retro.cog))
 
     undeclared = {}
-    for name in ("storage", "cores", "saves", "migration"):
+    # Every mixin module, and "every" is the point: the list stopped at four
+    # for as long as `BiosMixin` existed, so retro/bios.py was never held to
+    # the contract at all -- and it was reaching straight past `_fetch_upload`
+    # for `Retro._download_bytes`, undeclared, exactly the thing this test is
+    # for. A mixin added to retro/ belongs here.
+    for name in ("storage", "cores", "saves", "migration", "bios"):
         source = (REPO_ROOT / "retro" / f"{name}.py").read_text()
         for attribute in sorted(set(re.findall(r"self\.([_a-zA-Z]\w*)", source))):
             if attribute in declared or attribute not in cog_owned:
@@ -92,14 +97,16 @@ def test_mixinmeta_declares_everything_the_mixins_reach_for(retro):
     assert not undeclared, (
         f"these come from the cog class but are not in MixinMeta: {sorted(undeclared)}"
     )
-    # ...and it is not vacuous: the five things on the cog itself that the
-    # mixins really do call are in there.
+    # ...and it is not vacuous: the things on the cog itself that the mixins
+    # really do call are in there.
     assert {
         "hibernate",
         "_force_hibernate",
         "_evict_locked",
         "_safe_send",
         "_send_pages",
+        # retro/bios.py's one, which is what adding "bios" above found.
+        "_fetch_upload",
     } <= declared
 
 
@@ -386,7 +393,12 @@ async def test_the_fake_emulator_is_the_one_the_saves_module_boots(retro):
 
     # _check_import lives in retro/saves.py and builds an emulator of its
     # own; the real one would try to dlopen a 14-byte fake core.
-    assert await retro.cog._check_import(entry, None, b"\x00" * 8) is not None
+    #
+    # Unpacked rather than compared to None: it returns `(problem, blocker)`
+    # now, and a tuple is never None -- so `is not None` passed whatever it
+    # did, which is the one thing an assertion must not do.
+    problem, _ = await retro.cog._check_import(entry, None, b"\x00" * 8, "!")
+    assert problem is not None, "a fake core should not have validated a save"
     assert len(FakeEmulator.instances) > before, "saves.py booted the real thing"
 
 
