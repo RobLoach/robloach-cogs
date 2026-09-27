@@ -52,6 +52,24 @@ class Command:
     def __get__(self, obj, objtype=None):
         return self
 
+    def autocomplete(self, name):
+        """Register a completion for one argument, and keep the function.
+
+        The real one attaches the callback to the command's app-command form
+        so Discord can call it while somebody types. There is no app command
+        here, and the tests call these callbacks directly (exactly as they
+        call a command's), so this only has to leave the function alone and
+        not raise. What it is *for* is that `retro/Retro.py` applies it at
+        import time: without it, importing the cog against these stubs fails
+        outright, which is how CI caught a hybrid command that had only ever
+        been run against the real Red.
+        """
+
+        def decorator(func):
+            return func
+
+        return decorator
+
 
 class Group(Command):
     def command(self, name=None, **kwargs):
@@ -75,6 +93,27 @@ def command(name=None, **kwargs):
 
 
 def group(name=None, **kwargs):
+    def decorator(func):
+        return Group(getattr(func, "callback", func), name=name)
+
+    return decorator
+
+
+# A hybrid is a prefix command *and* a slash command. Everything that makes it
+# the second -- the app command, its options, `fallback`, `with_app_command`,
+# the autocompletes -- is Discord's business and none of it is reachable from a
+# test that calls a callback directly. So these are the plain versions, which
+# is enough for the cog to import and for `Retro.retro.callback(...)` to work.
+# The slash surface itself cannot be faked usefully and is asserted against the
+# real Red instead, in tests/test_mixins.py (marked `redbot`).
+def hybrid_command(name=None, **kwargs):
+    def decorator(func):
+        return Command(getattr(func, "callback", func), name=name)
+
+    return decorator
+
+
+def hybrid_group(name=None, **kwargs):
     def decorator(func):
         return Group(getattr(func, "callback", func), name=name)
 

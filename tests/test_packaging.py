@@ -629,3 +629,60 @@ def test_the_floor_is_high_enough_for_the_calls_that_are_not_syntax():
                     f"{source.name} uses {marker} (Python "
                     f"{needs[0]}.{needs[1]}+) but the floor is {floor}"
                 )
+
+
+# -- The stub has to keep up with the cog ------------------------------------
+#
+# `tests/stubs/redbot` stands in for Red when it is not installed, which is how
+# CI runs the fast suite and how a bare checkout works at all. That makes it a
+# second contract, and one that is invisible to anybody who *does* have Red
+# installed: `@commands.hybrid_group` was added to the cog, every local run
+# passed against the real Red, and CI failed to import the cog at all because
+# the stub had no such attribute. Same shape as MixinMeta's contract test --
+# a requirement only visible as an attribute access two files away.
+
+
+def _stub_names() -> set:
+    """Every name `tests/stubs/redbot/core/commands.py` defines.
+
+    Read off the parsed source rather than imported, deliberately: when the
+    real Red *is* installed, importing `redbot.core.commands` gets Red's, and
+    this test would then check the stub by looking at something else entirely
+    -- passing for precisely the person who cannot see the problem.
+    """
+    stub = REPO_ROOT / "tests" / "stubs" / "redbot" / "core" / "commands.py"
+    names = set()
+    for node in ast.parse(stub.read_text()).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(
+                    child.id for child in ast.walk(target) if isinstance(child, ast.Name)
+                )
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names)
+    return names
+
+
+def test_the_red_stub_has_everything_the_cog_uses():
+    used = {}
+    for path in sorted((REPO_ROOT / "retro").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            # `commands.<name>`, which is the only way this cog touches Red's
+            # command layer -- it never does `from redbot.core.commands import`.
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "commands"
+            ):
+                used.setdefault(node.attr, set()).add(path.name)
+    assert used, "nothing was found, so this test is asserting nothing"
+    missing = {name: sorted(where) for name, where in used.items() if name not in _stub_names()}
+    assert not missing, f"tests/stubs/redbot/core/commands.py is missing: {missing}"
+
+
+def test_the_stub_check_would_notice_something_missing():
+    """And it is not vacuous: a name nobody defines is reported."""
+    assert "hybrid_group" in _stub_names()
+    assert "no_such_attribute_anywhere" not in _stub_names()
