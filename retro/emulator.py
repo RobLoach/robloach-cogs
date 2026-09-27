@@ -280,7 +280,7 @@ def probe_core_options(core_path, options=None) -> typing.Dict[str, dict]:
     # raw ArrayVideoDriver, so probing snes9x's options printed a traceback
     # that starting a snes9x game does not. Wrapped for the same reason
     # start() wraps it: everything this function raises is an EmulatorError.
-    video = _video_driver_or_error()
+    video = video_driver_or_error()
 
     core_path = Path(core_path).resolve()
     if not core_path.is_file():
@@ -461,7 +461,7 @@ class RetroEmulator:
             ) from exc
 
         self._joypad_state_cls = JoypadState
-        video = _video_driver_or_error()
+        video = video_driver_or_error()
         path_driver = self._make_path_driver(libretro)
         log_driver = _make_log_driver()
 
@@ -1376,7 +1376,7 @@ def _make_log_driver():
         return None
 
 
-def _video_driver_or_error():
+def video_driver_or_error():
     """
     :func:`_make_video_driver`, with a libretro.py it cannot drive translated.
 
@@ -1385,6 +1385,10 @@ def _video_driver_or_error():
     raise has to be an EmulatorError. They each wrapped it themselves, in the
     same five lines with the same sentence, which is two places for the
     wording to drift and two places to forget the wrap.
+
+    Public because `[p]retrodiagnose` calls it on its own, as the one
+    end-to-end check that needs no core, no ROM and no disk: if this raises,
+    every press in every channel is going to fail the same way.
     """
     try:
         return _make_video_driver()

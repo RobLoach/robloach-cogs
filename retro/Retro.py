@@ -30,8 +30,10 @@ this one, so `retro.Retro.<NAME>` keeps meaning what it always did.
 import asyncio
 import concurrent.futures
 import functools
+import importlib.metadata
 import io
 import logging
+import platform
 import re
 import time
 import types
@@ -82,6 +84,8 @@ from .emulator import (
     describe_seconds,
     format_seconds,
     playback_seconds,
+    probe_core_options,
+    video_driver_or_error,
 )
 from .migration import (
     CONFIG_IDENTIFIER,
@@ -4095,6 +4099,182 @@ class Retro(
             "the reboot, or carry on playing and the reboot becomes the save "
             "a few presses from now.",
         )
+
+    # -- Diagnostics --------------------------------------------------------
+    #
+    # `[p]retroset settings` says what the cog is *configured* to do. This says
+    # what it can actually do right now, which is a different question and the
+    # one a bug report needs answered: a core file that is present but will not
+    # dlopen, a libretro.py this build cannot drive, a Pillow that is missing,
+    # a data directory over budget all look fine in the settings listing.
+    #
+    # Plain text rather than an embed, for the reason `[p]retroset version`
+    # gives: it needs no extra permission and can be pasted as it stands.
+
+    async def _runtime_lines(self, prefix: str) -> typing.List[str]:
+        """What this Python can actually do: the libraries and the video path.
+
+        Both libraries are reported by *distribution* version rather than by
+        asking the module, because that is the number a bug report needs and
+        neither package reliably carries a ``__version__``. A missing one is
+        said plainly instead of raising: the cog cannot have got this far
+        without libretro.py, but Pillow is only reached when a clip is encoded,
+        so "installed" and "working" really are separate questions here.
+        """
+        lines = [
+            f"- Python `{platform.python_version()}` on `{platform.platform(terse=True)}`",
+        ]
+        for label, dist in (("libretro.py", "libretro.py"), ("Pillow", "pillow")):
+            try:
+                lines.append(f"- {label} `{importlib.metadata.version(dist)}`")
+            except Exception:
+                lines.append(
+                    f"- {label} \N{CROSS MARK} not installed \N{EM DASH} "
+                    f"`{prefix}pipinstall {dist}`, or reinstall the cog's "
+                    "requirements"
+                )
+        # The one cheap end-to-end check there is: no core, no ROM, no disk.
+        # It is also the exact failure video_driver_or_error exists for, and
+        # the one that turns every single press into the same error.
+        try:
+            await self.run_in_emulator_thread(video_driver_or_error)
+            lines.append("- Video driver \N{WHITE HEAVY CHECK MARK} this libretro.py can be driven")
+        except Exception as exc:
+            lines.append(f"- Video driver \N{CROSS MARK} {exc}")
+        return lines
+
+    async def _core_health_lines(self, prefix: str, deep: bool) -> typing.List[str]:
+        """Which emulators are installed, and (on request) whether they load.
+
+        Without ``deep`` this reports what is known for free: the file is
+        there, how big it is, and whether the cog has ever read that core's
+        own options -- which it can only have done by loading it, so it is
+        evidence of a working core rather than merely a present one.
+
+        With ``deep`` every core is actually loaded, ROM-lessly, on the
+        emulator thread. That is the only thing that proves a core will run,
+        and it is opt-in because it means dlopening every installed core one
+        after another and is far too slow to do on every invocation.
+        """
+        installed = await self._installed_cores()
+        if not installed:
+            return [
+                f"- None installed. `{prefix}retroset download` fetches them.",
+            ]
+        known = await self.config.core_option_definitions()
+        lines = []
+        for name in sorted(installed):
+            path = installed[name]
+            try:
+                size = self._humanize_bytes(path.stat().st_size)
+            except OSError:
+                size = "unreadable"
+            note = "options known" if known.get(name) else "never loaded yet"
+            if deep:
+                try:
+                    options = await self.run_in_emulator_thread(
+                        probe_core_options, path, None
+                    )
+                    note = f"loads, {len(options)} option(s)"
+                    mark = "\N{WHITE HEAVY CHECK MARK}"
+                except Exception as exc:
+                    # The whole point of `deep`: a core that is present and
+                    # broken is indistinguishable from a working one until
+                    # something tries to load it.
+                    note = f"will not load \N{EM DASH} {exc}"
+                    mark = "\N{CROSS MARK}"
+            else:
+                mark = "\N{WHITE HEAVY CHECK MARK}"
+            lines.append(f"- {mark} `{name}` ({size}, {note})")
+        missing = len(CORES) - len(installed)
+        if missing > 0:
+            lines.append(f"- {missing} more available from `{prefix}retroset download`.")
+        return lines
+
+    def _session_lines(self) -> typing.List[str]:
+        """How many games are live, and how many are holding a core.
+
+        The second number is the one worth having: MAX_LIVE_EMULATORS is 1, so
+        anything other than "0 or 1 hold a core" means the eviction that keeps
+        it to one has stopped working, and that is not visible from anywhere
+        else the owner can look.
+        """
+        sessions = list(self.sessions.values())
+        if not sessions:
+            return ["- No games are running."]
+        loaded = [view for view in sessions if getattr(view, "emulator", None) is not None]
+        lines = [
+            f"- {len(sessions)} session(s), {len(loaded)} holding a core "
+            f"(the cap is {MAX_LIVE_EMULATORS}).",
+        ]
+        for view in sessions[:10]:
+            queued = len(getattr(view, "queue", ()) or ())
+            state = "awake" if getattr(view, "emulator", None) is not None else "asleep"
+            lines.append(
+                f"  - `{view.slug}` in channel {view.channel_id}: {state}"
+                + (f", {queued} press(es) queued" if queued else "")
+            )
+        if len(sessions) > 10:
+            lines.append(f"  - ...and {len(sessions) - 10} more.")
+        return lines
+
+    @commands.command(name="retrodiagnose", aliases=["retrodiag"])
+    @commands.is_owner()
+    async def retrodiagnose(
+        self, ctx: commands.Context, deep: typing.Optional[bool] = False
+    ) -> None:
+        """
+        Check what this install can actually do, for a bug report.
+
+        `[p]retroset settings` lists what is configured. This says what works:
+        the libraries that are really installed, whether this libretro.py can
+        be driven, which cores are there, what the data directory is using
+        against its budget, and what is running right now.
+
+        Pass `true` to load every installed core as well. That is the only
+        check that proves a core will actually run, and it is off by default
+        because it dlopens each one in turn and takes a few seconds.
+
+        **Examples:**
+        - `[p]retrodiagnose`
+        - `[p]retrodiagnose true` (also load every core)
+        """
+        prefix = ctx.clean_prefix
+        sections = [
+            ("Build", [f"- {version.summary()}"] + (
+                [f"- loaded code `{version.FINGERPRINT}`"] if version.FINGERPRINT else []
+            )),
+            ("Runtime", await self._runtime_lines(prefix)),
+            ("Cores", await self._core_health_lines(prefix, bool(deep))),
+        ]
+
+        bios = self._bios_files()
+        sections.append((
+            "BIOS",
+            [f"- `{self._system_dir()}`"]
+            + (
+                [f"- {len(bios)} file(s), {self._humanize_bytes(sum(s for _, s in bios))}"]
+                if bios
+                else ["- None installed. Every shipped core works without one."]
+            ),
+        ))
+        sections.append(("Storage", [await self._usage_report(ctx)]))
+        sections.append(("Sessions", self._session_lines()))
+
+        auto = await self.config.auto_download_cores()
+        attempted = await self.config.auto_download_attempted_at()
+        downloads = [
+            f"- Automatic downloads are **{'on' if auto else 'off'}**.",
+            f"- Last attempt: {version.stamp(attempted) if attempted else 'never'}.",
+        ]
+        if self._cores_downloading():
+            downloads.append("- A download is running right now.")
+        sections.append(("Core downloads", downloads))
+
+        body = "\n".join(
+            f"**{title}**\n" + "\n".join(lines) for title, lines in sections
+        )
+        await self._send_pages(ctx, body)
 
     @commands.group()
     @commands.is_owner()

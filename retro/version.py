@@ -275,7 +275,13 @@ SOURCE_TIME: typing.Optional[float] = _SOURCES.newest
 LOADED_AT: float = time.time()
 
 
-def _stamp(when: typing.Optional[float]) -> str:
+def stamp(when: typing.Optional[float]) -> str:
+    """A timestamp a human can read, or "unknown".
+
+    Public because `[p]retrodiagnose` reports when the core download last ran
+    and has to spell the time the same way this module does; it was private
+    until it had a second caller.
+    """
     if not when:
         return "unknown"
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
@@ -315,8 +321,8 @@ def describe(prefix: str = "") -> str:
     elif COMMIT:
         lines.append(f"**Checkout** `{COMMIT[:12]}` (detached HEAD)")
     if FINGERPRINT:
-        lines.append(f"**Loaded code** `{FINGERPRINT}`, newest file {_stamp(SOURCE_TIME)}")
-    lines.append(f"**Loaded at** {_stamp(LOADED_AT)}")
+        lines.append(f"**Loaded code** `{FINGERPRINT}`, newest file {stamp(SOURCE_TIME)}")
+    lines.append(f"**Loaded at** {stamp(LOADED_AT)}")
     lines.append(
         "The version is what `info.json` declares; the fingerprint is a hash "
         "of the `.py` files as they were **when the cog was loaded**, so it "

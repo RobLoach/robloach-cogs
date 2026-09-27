@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import io
 import os
+import platform
 import time
 import types
 import zipfile
@@ -1797,3 +1798,115 @@ async def test_resuming_does_not_hand_the_starter_rights_to_the_clicker(retro):
     assert resumed.starter_id == original_starter, (
         "clicking Resume must not make the clicker the starter"
     )
+
+
+# -- `[p]retrodiagnose`: what this install can actually do ---------------------
+#
+# Deliberately not asserted against a particular verdict for libretro.py, Pillow
+# or the video driver: whether those are installed is a property of the machine
+# running the suite, not of the cog (see tests/conftest.py, which skips the
+# emulator suite for exactly that reason). What is asserted is that every
+# section is reported and that a missing library is *said* rather than raised --
+# the whole value of the command is that it still answers on a broken install.
+
+
+async def test_retrodiagnose_reports_every_section(retro):
+    ctx = retro.context(retro.channel(9301))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
+
+    said = ctx.said()
+    for heading in ("Build", "Runtime", "Cores", "BIOS", "Storage", "Sessions"):
+        assert f"**{heading}**" in said, (heading, said)
+    assert "[p]" not in said, said
+    # Python is the one runtime fact that cannot be missing.
+    assert platform.python_version() in said, said
+
+
+async def test_retrodiagnose_says_when_no_cores_are_installed(retro):
+    ctx = retro.context(retro.channel(9302))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
+
+    said = ctx.said()
+    assert "None installed" in said, said
+    assert f"{ctx.clean_prefix}retroset download" in said, said
+
+
+async def test_retrodiagnose_names_each_installed_core(retro):
+    await retro.install_cores("gambatte", "fceumm")
+    ctx = retro.context(retro.channel(9303))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
+
+    said = ctx.said()
+    assert "`gambatte`" in said and "`fceumm`" in said, said
+    # Never loaded, so it must not claim the core is known to work.
+    assert "never loaded yet" in said, said
+
+
+async def test_retrodiagnose_calls_a_core_working_once_its_options_are_known(retro):
+    await retro.install_cores("gambatte")
+    await retro.cog.config.core_option_definitions.set(
+        {"gambatte": {"gambatte_gb_colorization": {"default": "auto"}}}
+    )
+    ctx = retro.context(retro.channel(9304))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
+
+    said = ctx.said()
+    assert "options known" in said, said
+    assert "never loaded yet" not in said, said
+
+
+async def test_a_deep_retrodiagnose_reports_a_core_that_will_not_load(retro, monkeypatch):
+    """The reason `deep` exists: a present-but-broken core looks fine without it."""
+    await retro.install_cores("gambatte")
+
+    def explode(path, options=None):
+        raise RuntimeError("undefined symbol: retro_run")
+
+    monkeypatch.setattr(retro.cogmod, "probe_core_options", explode)
+    ctx = retro.context(retro.channel(9305))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx, True)
+
+    said = ctx.said()
+    assert "will not load" in said, said
+    assert "undefined symbol: retro_run" in said, said
+
+
+async def test_a_deep_retrodiagnose_reports_a_core_that_loads(retro, monkeypatch):
+    await retro.install_cores("gambatte")
+    monkeypatch.setattr(
+        retro.cogmod, "probe_core_options", lambda path, options=None: {"a": {}, "b": {}}
+    )
+    ctx = retro.context(retro.channel(9306))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx, True)
+
+    said = ctx.said()
+    assert "loads, 2 option(s)" in said, said
+
+
+async def test_retrodiagnose_counts_the_sessions_and_the_cores_they_hold(retro):
+    """The one number nothing else the owner can look at would show."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9307, "diagnosed")
+    ctx = retro.context(retro.channel(9308))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
+
+    said = ctx.said()
+    assert "1 session(s)" in said, said
+    assert f"the cap is {retro.cogmod.MAX_LIVE_EMULATORS}" in said, said
+    assert f"`{view.slug}`" in said, said
+    assert str(channel.id) in said, said
+
+
+async def test_retrodiagnose_says_no_games_are_running_when_none_are(retro):
+    ctx = retro.context(retro.channel(9309))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
+
+    assert "No games are running." in ctx.said()

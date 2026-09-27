@@ -93,6 +93,7 @@ can start it by name:
 - `[p]retroset hold <milliseconds>` (owner) sets how long a button is held when someone presses it. The default is 160. It is a ceiling: a clip too short to show the button coming back up holds it for less.
 - `[p]retroset settings` (owner) shows the current configuration, including the build that is loaded, the system directory and any BIOS files in it.
 - `[p]retroset version` (owner) answers **“am I running the new code?”** — the declared version, the commit it was installed from, and a fingerprint of the source that was actually loaded. See [Which build is this?](#which-build-is-this).
+- `[p]retrodiagnose [true]` (owner, aliased `retrodiag`) answers **“does this install actually work?”** — the libraries that are really present, whether this libretro.py can be driven, which cores are installed, what storage is using against its budget, and what is running right now. Pass `true` to load every core as well. See [Is it working?](#is-it-working).
 
 ## Attaching a ROM
 
@@ -1342,6 +1343,44 @@ Three separate facts, because only together are they honest:
 Nothing here can fail a command: every piece of it degrades to "not shown"
 rather than raising, and `retro/version.py` imports nothing but the standard
 library so it works on the most broken install there is.
+
+## Is it working?
+
+`[p]retroset settings` says what the cog is **configured** to do.
+`[p]retrodiagnose` says what it can **actually do right now**, which is a
+different question and the one a bug report needs answered — a core file that
+is present but will not load, a libretro.py this build cannot drive, a missing
+Pillow and a data directory over budget all look perfectly fine in the
+settings listing.
+
+```
+[p]retrodiagnose
+```
+
+reports, as plain text you can paste straight into an issue:
+
+* **Build** — the same first line `[p]retroset version` gives.
+* **Runtime** — the Python and platform, the *installed* versions of
+  libretro.py and Pillow, and whether a video driver can be made at all. That
+  last one is the cheapest end-to-end check there is (no core, no ROM, no
+  disk), and if it fails then every press in every channel fails the same way.
+* **Cores** — each installed core, its size, and whether the cog has ever read
+  that core's own options. It can only have done that by loading it, so it is
+  evidence of a *working* core rather than merely a present file.
+* **BIOS**, **Storage** (what the data directory uses against its budget) and
+  **Sessions** — how many games are live and how many hold a core. That last
+  number matters: the cap is one, so anything else means the eviction that
+  keeps it to one has stopped working, and nothing else the owner can look at
+  would show it.
+* **Core downloads** — on or off, and when the last attempt ran.
+
+```
+[p]retrodiagnose true
+```
+
+additionally **loads every installed core**, ROM-lessly, one after another. It
+is the only check that proves a core will really run, and it is opt-in for that
+reason: it dlopens each core in turn and takes a few seconds.
 
 ## Permissions
 
