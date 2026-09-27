@@ -16,6 +16,23 @@ and a 160ms hold. The defaults are now 1.6s and 80ms (see
 the numbers below are left exactly as measured rather than rescaled, because
 what they were taken to show is the comparison between the columns.
 
+## Contents
+
+- [The seam between two clips](#the-seam-between-two-clips) — the pre-roll, the opening picture, and two attempts that were reversed
+- [Clip size and format](#clip-size-and-format) — per-console sizes, and why WebP
+- [Pacing: one clip at a time](#pacing-one-clip-at-a-time) — and the 1.25s cap that was itself a stutter
+- [The press queue](#the-press-queue) — the four rules, and what each is for
+- [Undo](#undo) — the compression measurements, and the history on disk
+- [The ×3 button](#the-3-button) — hidden rather than greyed out
+- [The controller's shape](#the-controllers-shape) — component budgets per console
+- [Rebooting, and one edit per press](#rebooting-and-one-edit-per-press)
+- [Starting a game from the dropdown](#starting-a-game-from-the-dropdown)
+- [Slash commands and autocomplete](#slash-commands-and-autocomplete)
+- [Reporting which build is loaded](#reporting-which-build-is-loaded)
+- [What the cog forgets, and what it never does](#what-the-cog-forgets-and-what-it-never-does)
+- [Naming: dropstate, reboot, and the aliases that went](#naming-dropstate-reboot-and-the-aliases-that-went)
+- [The RetroCog → Retro rename](#the-retrocog--retro-rename)
+
 ## The seam between two clips
 
 Both halves have been got wrong, and the history is worth keeping because

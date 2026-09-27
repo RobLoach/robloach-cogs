@@ -571,9 +571,14 @@ def test_every_command_that_names_a_save_uses_one_of_the_two_words():
 # oldest bot that can install this. `min_python_version` is what Downloader
 # checks before installing (see its downloader.py: `if cog.min_python_version >
 # sys.version_info`), and without it the default is (3, 5, 1) -- so a cog that
-# quietly needs 3.10 installs happily onto a 3.9 bot and fails at runtime. It
-# did: `zip(..., strict=True)` in clips.capture_plan is on the press path, so
-# every single button press would have raised TypeError there.
+# quietly needs a newer Python installs happily onto an older bot and fails at
+# runtime. It did: `zip(..., strict=True)` in clips.capture_plan is on the
+# press path, so every single button press would have raised TypeError there.
+#
+# The floor is 3.11 rather than the 3.10 that call implies, and libretro.py is
+# why: it needs `>=3.12` from 0.8.0 onwards, so the newest release a Red bot
+# (`<3.12`) can install is 0.6.0, which needs 3.11. On 3.10 the newest
+# installable libretro.py is 0.1.6, which does not import at all.
 
 
 def test_info_json_declares_the_python_floor():
@@ -588,8 +593,8 @@ def test_the_linter_and_info_json_agree_on_the_python_floor():
     """Two files naming the same floor, so neither can be raised alone.
 
     Read with a regex rather than a TOML parser on purpose: ``tomllib`` is
-    itself 3.11+, and a test about the 3.10 floor that cannot run on 3.10 would
-    be its own small joke.
+    itself 3.11+, and a test about the Python floor that could not run at the
+    floor would be its own small joke.
     """
     pyproject = (REPO_ROOT / "pyproject.toml").read_text()
     found = re.search(r'^target-version\s*=\s*"(py\d+)"', pyproject, re.MULTILINE)

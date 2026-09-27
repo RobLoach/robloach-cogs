@@ -37,12 +37,20 @@ markers = [
 [tool.ruff]
 line-length = 100
 extend-exclude = ["tests/stubs"]
-# The oldest Python the cog runs on, which is NOT the oldest Red runs on: Red
-# allows 3.8.1+, and the cog uses `zip(..., strict=True)` (3.10) on the press
-# path. retro/info.json's `min_python_version` is what actually stops an older
-# bot installing it; this is the same floor for the linter, and
+# The oldest Python the cog runs on, which is NOT the oldest Red runs on.
+# Red allows 3.8.1+, but the floor here is set by libretro.py rather than by
+# this cog's own code: libretro.py needs `>=3.12` from 0.8.0 onwards, so the
+# newest release a Red bot can install is 0.6.0, and 0.6.0 needs 3.11. Below
+# that there is no working libretro.py at all -- the newest declaring
+# `>=3.10` is 0.1.6, which has PEP 695 syntax in it and does not import.
+#
+# (The cog's own code needs 3.10, for `zip(..., strict=True)` on the press
+# path. That is the lower of the two bounds and is no longer the binding one.)
+#
+# retro/info.json's `min_python_version` is what actually stops an older bot
+# installing it; this is the same floor for the linter, and
 # tests/test_packaging.py holds the two to each other.
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 # E/W pycodestyle, F pyflakes, I import order, UP pyupgrade, B bugbear.

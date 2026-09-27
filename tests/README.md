@@ -21,6 +21,20 @@ run everything between them.
 no `libretro.py`, no `discord.py` -- **skips** with a reason rather than
 failing.
 
+## Contents
+
+- [The three halves](#the-three-halves)
+- [The cog is several modules and one class](#the-cog-is-several-modules-and-one-class)
+- [What a button press is allowed to do to the message](#what-a-button-press-is-allowed-to-do-to-the-message)
+- [Pacing: a clip is not replaced before it has been watched](#pacing-a-clip-is-not-replaced-before-it-has-been-watched)
+- [What the message says](#what-the-message-says)
+- [What the controls are allowed to look like](#what-the-controls-are-allowed-to-look-like)
+- [Clip timing and the seam](#clip-timing-and-the-seam)
+- [What the cog holds on to](#what-the-cog-holds-on-to)
+- [Where the clip on a message is](#where-the-clip-on-a-message-is)
+- [Getting the cores and ROMs](#getting-the-cores-and-roms)
+- [Adding a test](#adding-a-test)
+
 ## The three halves
 
 | | what it covers | needs |
@@ -222,6 +236,8 @@ to measure) and the identity between that arithmetic and the bytes is asserted
 against a real core in `test_emulator.py` -- the durations in the WebP's ANMF
 chunks add up to exactly what the cog paced against.
 
+## What the message says
+
 **The line above the clip starts with the game**, so almost every content
 assertion goes through `fakes.RetroEnv.line(view, text)` rather than comparing
 a bare sentence. That helper *spells the format out* instead of reading it
@@ -279,6 +295,8 @@ change the shape of the message -- markdown, backticks, start-of-line
 markdown, masked links, mass mentions, zero-width characters, newlines and a
 200 character name.
 
+## What the controls are allowed to look like
+
 **No control is allowed to be greyed out any more**, so
 `fakes.CONDITIONAL_CONTROLS` is an empty tuple. Both entries it used to have
 went for the same reason -- a present, dead, unexplained control reads as
@@ -335,6 +353,8 @@ plays a whole clip as a 17ms flash. `test_cog_session.py` pins the session
 half -- who remembers the still (a 16 byte hash, never the pixels), that only
 a *successful* edit promotes it, what the pacing gate then waits for, and
 every teardown path that has to forget it.
+
+## Clip timing and the seam
 
 **A clip starts exactly one emulated frame after the last one ended.** A
 picture is taken *after* an emulated frame, so the last picture of a clip is

@@ -25,10 +25,13 @@ through the last eight presses. Anyone in the channel can play.
 [p]load retro
 ```
 
-Needs Python 3.10 or newer (Red itself allows 3.8.1+; this cog does not).
+Needs **Python 3.11** — the only version a Red bot can run this on. Red is
+`>=3.8.1,<3.12`, and libretro.py needs `>=3.12` from 0.8.0, so 0.6.0 is the
+newest a real install can have and it needs 3.11.
 
-**[Read the Retro manual →](retro)** for how to use it, or
-**[docs/DESIGN.md](docs/DESIGN.md)** for why it works the way it does.
+**[Read the Retro manual →](retro)** for how to use it,
+**[docs/DESIGN.md](docs/DESIGN.md)** for why it works the way it does, or
+**[CHANGELOG.md](CHANGELOG.md)** for what changed.
 
 ## Development
 
