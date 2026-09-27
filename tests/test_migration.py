@@ -11,6 +11,8 @@ These tests are the proof that they come across, and that doing so is safe to
 interrupt, safe to repeat, and safe to fail.
 """
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("discord", reason="the cog tests need discord.py")
@@ -484,6 +486,128 @@ async def test_a_read_only_data_folder_does_not_break_the_load(retro, pre_rename
     # Nothing moved, nothing was destroyed, and the cog is up.
     assert (retro.legacy_data / "roms" / "8000-ucity.gbc").is_file()
     assert "could not move" in caplog.text.lower()
+    # And the migration is not over: see the partial-move tests below.
+    assert await cog.config.legacy_namespace_migrated() is False
+
+
+# -- A partial move is not a finished one -------------------------------------
+#
+# The marker makes this write-once code, so recording a migration that only
+# half happened strands the other half under a namespace nothing reads any
+# more -- permanently, with one log warning as the only trace. Moving is
+# deliberately per-entry and forgiving (one core file held open by another
+# process must not stop the saves coming across), which is exactly what makes
+# the gate on the marker load-bearing. See migration.MoveResult.
+
+
+async def test_one_entry_that_will_not_move_does_not_end_the_migration(retro, caplog):
+    """The regression: `states` is locked, so the migration stays unfinished.
+
+    Everything movable still moves -- that is the point of going entry by
+    entry -- but the run does not get to call itself done while somebody's save
+    states are still sitting in the old folder.
+    """
+    import shutil
+
+    furnish(retro.legacy_data)
+    cog, _ = retro.make_cog(fresh_config=True)
+    original = shutil.move
+
+    def refuse_states(source, target):
+        if Path(source).name == "states":
+            raise PermissionError(13, "Permission denied", str(source))
+        return original(source, target)
+
+    shutil.move = refuse_states
+    try:
+        await cog._migrate_legacy_namespace()
+    finally:
+        shutil.move = original
+
+    # The movable entries are across...
+    assert (retro.data / "roms" / "8000-ucity.gbc").read_bytes() == ROM_BYTES
+    assert (retro.data / "cores" / "gambatte_libretro.so").is_file()
+    # ...the locked one is untouched where it was, not half-copied...
+    assert (retro.legacy_data / "states" / "8000-ucity.state").read_bytes() == b"STATE:1234"
+    assert (retro.legacy_data / "states" / "8000-ucity.srm").read_bytes() == b"\xff" * 512
+    # ...and the migration has NOT been recorded, so it runs again.
+    assert await cog.config.legacy_namespace_migrated() is False
+    assert "left" in caplog.text.lower()
+
+
+async def test_the_next_load_picks_up_what_was_left_behind(retro):
+    """And because it runs again, the save states arrive in the end.
+
+    The whole reason a partial move may be left unmarked: every step of this is
+    safe to repeat, so the retry costs a directory listing and rescues the
+    entry whose lock has since gone away.
+    """
+    import shutil
+
+    furnish(retro.legacy_data)
+    cog, _ = retro.make_cog(fresh_config=True)
+    original = shutil.move
+
+    def refuse_states(source, target):
+        if Path(source).name == "states":
+            raise PermissionError(13, "Permission denied", str(source))
+        return original(source, target)
+
+    shutil.move = refuse_states
+    try:
+        await cog._migrate_legacy_namespace()
+    finally:
+        shutil.move = original
+
+    # Second load, nothing locked any more.
+    await cog._migrate_legacy_namespace()
+
+    assert (retro.data / "states" / "8000-ucity.state").read_bytes() == b"STATE:1234"
+    assert (retro.data / "states" / "8000-ucity.srm").read_bytes() == b"\xff" * 512
+    assert not retro.legacy_data.exists()
+    assert await cog.config.legacy_namespace_migrated() is True
+
+
+async def test_an_entry_the_new_folder_already_had_is_finished_not_retried(retro):
+    """A deliberate leave-behind must not hold the marker open forever.
+
+    `cores` existing at both ends is a question that has been *answered* --
+    the new copy wins -- so it is not an unfinished move. Counting it as one
+    would mean the migration never records itself and logs the same warning on
+    every load the bot ever does.
+    """
+    furnish(retro.legacy_data)
+    (retro.data / "cores").mkdir(parents=True, exist_ok=True)
+    (retro.data / "cores" / "gambatte_libretro.so").write_bytes(b"\x7fELF newer")
+    cog, _ = retro.make_cog(fresh_config=True)
+
+    await cog._migrate_legacy_namespace()
+
+    assert (retro.legacy_data / "cores").is_dir(), "the old copy is kept on purpose"
+    assert await cog.config.legacy_namespace_migrated() is True
+
+
+async def test_an_old_folder_that_cannot_be_listed_is_not_finished(retro, caplog):
+    """If its contents cannot be read, there is no basis for calling it done."""
+    furnish(retro.legacy_data)
+    cog, _ = retro.make_cog(fresh_config=True)
+    legacy = retro.legacy_data.resolve()
+    original = Path.iterdir
+
+    def refuse(self):
+        if self.resolve() == legacy:
+            raise PermissionError(13, "Permission denied", str(self))
+        return original(self)
+
+    Path.iterdir = refuse
+    try:
+        await cog._migrate_legacy_namespace()
+    finally:
+        Path.iterdir = original
+
+    assert (retro.legacy_data / "roms" / "8000-ucity.gbc").is_file()
+    assert await cog.config.legacy_namespace_migrated() is False
+    assert "could not read the old" in caplog.text.lower()
 
 
 async def test_an_unreadable_legacy_config_does_not_break_the_load(retro):

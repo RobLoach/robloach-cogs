@@ -10,6 +10,7 @@ again, which is exactly why it lives on its own.
 import asyncio
 import logging
 import shutil
+import typing
 from pathlib import Path
 
 from redbot.core import Config
@@ -50,6 +51,43 @@ CONFIG_IDENTIFIER = 114+111+98+108+111+97+99+104+45+99+111+103+115+47+112+121+98
 # through a Config handle instead, which is the only way that also works for
 # the Postgres driver, where no such file exists.
 CONFIG_STORE_FILENAME = "settings.json"
+
+
+class MoveResult(typing.NamedTuple):
+    """What one attempt at moving the old data directory actually achieved.
+
+    Two numbers rather than one, because the caller has to tell "there is
+    nothing left to do" apart from "something could not be done". Moving works
+    entry by entry and a single entry can fail on its own -- a core file held
+    open by another process, one subfolder with the wrong permissions, a disk
+    that went read-only mid-run -- and :meth:`_migrate_data_directory` logs
+    that and carries on with the rest, which is right: one unmovable file
+    should not stop the saves from coming across.
+
+    What would be wrong is then recording the migration as done. The marker
+    makes this write-once code (see :meth:`_migrate_legacy_namespace`), so an
+    entry left behind by a failure would be left behind *for good*, under a
+    namespace nothing reads any more, with one warning in a log nobody is
+    watching as the only trace. If that entry is `saves`, somebody's save
+    games have silently stopped existing as far as the cog is concerned.
+
+    So `stranded` counts what a *failure* left behind, and the marker waits
+    until it is zero. Everything here is safe to run again -- the per-entry
+    `target.exists()` check, the config copy refusing a non-empty namespace,
+    the per-path `is_file()` check in :meth:`_rewrite_core_paths` -- so
+    retrying on the next load costs a directory listing and can only help.
+
+    Deliberate leave-behinds are not counted. An entry that already exists in
+    the new location is a question that has been *answered* (the new one wins),
+    and the old settings file is copied rather than moved on purpose; retrying
+    those would strand the marker forever and log the same warning on every
+    single load.
+    """
+
+    #: Top-level entries moved across.
+    moved: int
+    #: Entries a failure left in the old folder. Non-zero means "not finished".
+    stranded: int
 
 
 class MigrationMixin(MixinMeta):
@@ -125,7 +163,7 @@ class MigrationMixin(MixinMeta):
         except OSError:
             had_legacy = False
 
-        moved = await asyncio.to_thread(self._migrate_data_directory)
+        moved, stranded = await asyncio.to_thread(self._migrate_data_directory)
         copied = await self._migrate_config() if had_legacy else 0
         # After the copy, not before: the paths that need rewriting are the
         # ones the copy has just brought across. And gated on had_legacy like
@@ -149,13 +187,27 @@ class MigrationMixin(MixinMeta):
         if had_legacy:
             await self._rewrite_core_paths()
 
-        try:
-            await self.config.legacy_namespace_migrated.set(True)
-        except Exception:
-            # Harmless: the migration is idempotent. Moving runs out of things
-            # to move, and the config copy refuses to run once the new
-            # namespace has anything in it.
-            log.exception("Could not record that the Retro migration ran.")
+        if stranded:
+            # Not finished, so not marked finished: this runs again on the next
+            # load and has another go at whatever was left. See MoveResult for
+            # why a partial move must not be allowed to end the migration, and
+            # why running it again is safe. The warning naming the folder has
+            # already gone out, from whichever branch did the leaving.
+            log.warning(
+                "The move out of the old %s namespace left %s entry/entries "
+                "behind, so it has not been recorded as done and will run "
+                "again the next time the cog loads.",
+                LEGACY_COG_NAME,
+                stranded,
+            )
+        else:
+            try:
+                await self.config.legacy_namespace_migrated.set(True)
+            except Exception:
+                # Harmless: the migration is idempotent. Moving runs out of
+                # things to move, and the config copy refuses to run once the
+                # new namespace has anything in it.
+                log.exception("Could not record that the Retro migration ran.")
         if moved or copied:
             log.info(
                 "Migrated the Retro cog out of its old %s namespace: %s file(s) "
@@ -165,25 +217,34 @@ class MigrationMixin(MixinMeta):
                 copied,
             )
 
-    def _migrate_data_directory(self) -> int:
+    def _migrate_data_directory(self) -> "MoveResult":
         """
         Move the old data directory's contents into the new one. Blocking.
 
-        Returns how many top-level entries were moved. Works entry by entry
-        rather than moving the directory whole, which is what makes it safe to
-        run again after an interrupted attempt, and lets an entry that already
-        exists in the new location win instead of being clobbered.
+        Works entry by entry rather than moving the directory whole, which is
+        what makes it safe to run again after an interrupted attempt, and lets
+        an entry that already exists in the new location win instead of being
+        clobbered.
+
+        Returns a :class:`MoveResult`: how many top-level entries were moved,
+        and whether anything was left behind by a *failure*. See that class for
+        why the second number exists and what the caller does with it.
         """
         try:
             new_dir = cog_data_path(self)
             old_dir = self._legacy_data_dir()
         except Exception:
             log.exception("Could not work out where the Retro data folders are.")
-            return 0
+            # Nothing was even attempted, and nothing is known about whether
+            # there was anything to attempt, so this is not "finished": a run
+            # that cannot find the folders must not be the run that decides the
+            # migration is over.
+            return MoveResult(0, stranded=1)
         if not old_dir.is_dir() or old_dir.resolve() == new_dir.resolve():
-            return 0
+            return MoveResult(0, stranded=0)
 
         moved = 0
+        stranded = 0
         kept = []
         try:
             entries = sorted(old_dir.iterdir())
@@ -194,7 +255,9 @@ class MigrationMixin(MixinMeta):
                 old_dir,
                 exc_info=True,
             )
-            return 0
+            # The folder is there (is_dir() just said so) and its contents
+            # could not be listed, so there may be anything in it. Unfinished.
+            return MoveResult(0, stranded=1)
         for entry in entries:
             if entry.name == CONFIG_STORE_FILENAME:
                 # Not a file of ours: it is the JSON driver's copy of the old
@@ -213,9 +276,11 @@ class MigrationMixin(MixinMeta):
                 shutil.move(str(entry), str(target))
                 moved += 1
             except (OSError, shutil.Error):
+                stranded += 1
                 log.warning(
                     "Could not move %s into the Retro data folder; it has "
-                    "been left where it is.",
+                    "been left where it is and will be tried again next time "
+                    "the cog loads.",
                     entry,
                     exc_info=True,
                 )
@@ -240,7 +305,7 @@ class MigrationMixin(MixinMeta):
                     "backup copy of the old settings and can be deleted.",
                     old_dir,
                 )
-        return moved
+        return MoveResult(moved, stranded)
 
     async def _rewrite_core_paths(self) -> None:
         """
