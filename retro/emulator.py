@@ -280,12 +280,7 @@ def probe_core_options(core_path, options=None) -> typing.Dict[str, dict]:
     # raw ArrayVideoDriver, so probing snes9x's options printed a traceback
     # that starting a snes9x game does not. Wrapped for the same reason
     # start() wraps it: everything this function raises is an EmulatorError.
-    try:
-        video = _make_video_driver()
-    except Exception as exc:
-        raise EmulatorError(
-            f"This libretro.py is not one the cog can drive: {exc}"
-        ) from exc
+    video = _video_driver_or_error()
 
     core_path = Path(core_path).resolve()
     if not core_path.is_file():
@@ -466,12 +461,7 @@ class RetroEmulator:
             ) from exc
 
         self._joypad_state_cls = JoypadState
-        try:
-            video = _make_video_driver()
-        except Exception as exc:
-            raise EmulatorError(
-                f"This libretro.py is not one the cog can drive: {exc}"
-            ) from exc
+        video = _video_driver_or_error()
         path_driver = self._make_path_driver(libretro)
         log_driver = _make_log_driver()
 
@@ -1384,6 +1374,24 @@ def _make_log_driver():
     except Exception:
         log.debug("Could not build the core log driver.", exc_info=True)
         return None
+
+
+def _video_driver_or_error():
+    """
+    :func:`_make_video_driver`, with a libretro.py it cannot drive translated.
+
+    Both callers -- :func:`probe_core_options` and
+    :meth:`RetroEmulator.start` -- want exactly this, because everything they
+    raise has to be an EmulatorError. They each wrapped it themselves, in the
+    same five lines with the same sentence, which is two places for the
+    wording to drift and two places to forget the wrap.
+    """
+    try:
+        return _make_video_driver()
+    except Exception as exc:
+        raise EmulatorError(
+            f"This libretro.py is not one the cog can drive: {exc}"
+        ) from exc
 
 
 def _make_video_driver():

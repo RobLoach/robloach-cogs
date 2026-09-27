@@ -81,6 +81,15 @@ class MixinMeta(ABC):
     #: held. Called by anything that takes that lock and lets it go again --
     #: _evict_locked records an edit per session it puts to sleep.
     _flush_refreshes: typing.Callable[..., typing.Awaitable[None]]
+    #: Hand this invocation's cooldown back, because it cost nothing. Red
+    #: charges a cooldown the moment a command is invoked, which is before
+    #: every mistake somebody makes on the way to a working invocation, so
+    #: every path that gives up before it has actually fetched or written
+    #: anything refunds the slot. Called by SavesMixin for the
+    #: `[p]retrosaves` limits; retro/saves.py kept a line-for-line twin of it
+    #: rather than reach for something undeclared, which is what this
+    #: declaration is for.
+    _forgive_cooldown: typing.Callable[..., None]
     #: Reply to a command without letting a missing permission raise.
     _safe_send: typing.Callable[..., typing.Awaitable[typing.Any]]
     #: Reply with something long enough to need paging.

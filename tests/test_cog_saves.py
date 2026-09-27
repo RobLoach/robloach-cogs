@@ -1280,7 +1280,7 @@ def charged(ctx):
     These tests call the command callbacks directly, so Red's real cooldown
     never runs and there is nothing to spend. What is asserted is the only
     half the cog controls: whether it asks for the slot back. See
-    ``SavesMixin._refund_cooldown``.
+    ``Retro._forgive_cooldown``.
     """
     import types
 

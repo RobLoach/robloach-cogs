@@ -1321,6 +1321,35 @@ class Retro(
     # protect. It defaults to "whatever the view has", which is what every
     # other caller means.
 
+    def _detach_session(
+        self, view: RetroView, emulator: typing.Optional[RetroEmulator]
+    ) -> typing.Optional[RetroEmulator]:
+        """
+        Take a session's core out of its view, and hand it back to be freed.
+
+        The three statements both discard paths open with, and the reason they
+        are a named step rather than three lines copied twice: the *order* is
+        the whole of what makes a teardown safe, and it is not obvious.
+
+        Pacing is cancelled first, because a press sitting out a clip's
+        playing time is holding the view's lock and everything below would
+        queue behind a purely cosmetic wait. Then ``view.emulator`` is
+        cleared **before** anything is written or freed, so that from here on
+        the returned local is the only reference to the core: nothing else can
+        find it, start it, or free it twice.
+
+        ``emulator`` may be given explicitly, and usually is. It is not
+        redundant: ``view.emulator`` is only assigned once a boot has
+        *succeeded*, so on a cancelled or failed start the caller's local is
+        the sole reference to a core that is nonetheless loaded. Reading the
+        attribute alone would leak the one MAX_LIVE_EMULATORS slot on exactly
+        the paths this code exists for.
+        """
+        emulator = emulator if emulator is not None else getattr(view, "emulator", None)
+        view.cancel_pacing()
+        view.emulator = None
+        return emulator
+
     def _discard_session_now(
         self,
         view: RetroView,
@@ -1340,10 +1369,7 @@ class Retro(
         Never raises, and safe on a session that is already asleep -- which
         is the common case by the time a teardown reaches it.
         """
-        if emulator is None:
-            emulator = getattr(view, "emulator", None)
-        view.cancel_pacing()
-        view.emulator = None
+        emulator = self._detach_session(view, emulator)
         if emulator is not None:
             if save:
                 self._write_state_now(view, emulator)
@@ -1368,10 +1394,7 @@ class Retro(
         is already handling a failure of its own, and a session that could not
         be tidied up perfectly must still end with its core freed.
         """
-        if emulator is None:
-            emulator = getattr(view, "emulator", None)
-        view.cancel_pacing()
-        view.emulator = None
+        emulator = self._detach_session(view, emulator)
         if emulator is not None:
             if save:
                 try:
@@ -1818,6 +1841,30 @@ class Retro(
                 exc_info=True,
             )
 
+    async def _new_emulator(
+        self, core_path: Path, rom_path: Path, core: str
+    ) -> RetroEmulator:
+        """
+        Build a core for a game, with this bot's directory and this core's
+        options.
+
+        Every emulator the cog makes is made here: the three paths that boot
+        one -- a fresh start, a Resume click and waking a hibernated session --
+        each spelled out the same four arguments, so the owner's saved
+        overrides and the system directory were three places that had to agree
+        rather than one. A core booted without its options is a core running on
+        defaults the owner thought they had changed.
+
+        Not started: the caller does that in the emulator thread, under the
+        lock, because loading a ROM is the slow part.
+        """
+        return RetroEmulator(
+            core_path,
+            rom_path,
+            system_dir=self._system_dir(),
+            options=await self._core_options(core),
+        )
+
     async def resume_retired(self, retired: RetiredView, interaction) -> None:
         """
         Start a retired message's game again, in its own channel.
@@ -1940,12 +1987,7 @@ class Retro(
         view.message = getattr(interaction, "message", None)
 
         progress, notice = await self._saved_progress(channel_id, view.slug)
-        emulator = RetroEmulator(
-            core_path,
-            rom_path,
-            system_dir=self._system_dir(),
-            options=await self._core_options(view.core),
-        )
+        emulator = await self._new_emulator(core_path, rom_path, view.core)
         # Booted *before* anything is taken away from the channel, so a core
         # that will not come up costs nothing: whatever was playing is merely
         # hibernated (which its own buttons undo) rather than retired.
@@ -2155,12 +2197,7 @@ class Retro(
         # narrating, so only a *failed* restore says anything.
         progress, _ = await self._saved_progress(view.channel_id, view.slug)
 
-        emulator = RetroEmulator(
-            core_path,
-            rom_path,
-            system_dir=self._system_dir(),
-            options=await self._core_options(view.core),
-        )
+        emulator = await self._new_emulator(core_path, rom_path, view.core)
 
         # Three ways out, and the core has to be accounted for in all of
         # them: handed to the view, freed in a thread after an ordinary
@@ -3247,10 +3284,29 @@ class Retro(
         """
         Hand a command's cooldown back: this invocation cost nothing.
 
-        Bare `[p]retro` to bring the channel's game back, asking for the game
-        that is already running, and a name that is not a saved game all take
-        this path. Charging for them is what turns a rate limit that only bites
-        on abuse into one that makes the cog annoying.
+        Red charges a cooldown the moment a command is invoked, which is
+        before every mistake somebody makes on the way to a working
+        invocation. Bare `[p]retro` to bring the channel's game back, asking
+        for the game that is already running, and a name that is not a saved
+        game all take this path. So do the ways `[p]retrosaves import` and
+        `[p]retrosaves export` are got wrong -- a forgotten attachment, a
+        `.zip` where a `.srm` should be, a file over the size ceiling, a name
+        that matched two games. Every one of those is a correction away from
+        working, and charging for the correction is exactly how somebody
+        trying to fix their own typo locks themselves out for a minute in the
+        middle of a conversation. Each path that gives up before it has
+        actually fetched a ROM, downloaded an attachment or read a file off
+        disk hands the slot back, and the limits go on protecting the only
+        things that cost anything.
+
+        Declared in retro/abc.py, because SavesMixin calls it: this used to be
+        two line-for-line copies, one here and one in retro/saves.py, on the
+        reasoning that two guarded lines were not worth widening MixinMeta
+        for. One declaration is cheaper than one copy.
+
+        Guarded because none of it is guaranteed: a command with no cooldown,
+        or a context assembled by something other than Red, must not turn a
+        polite refusal into a traceback.
         """
         command = getattr(ctx, "command", None)
         reset = getattr(command, "reset_cooldown", None)
@@ -3669,12 +3725,7 @@ class Retro(
         # battery save, then the beginning.
         progress, restored_notice = await self._saved_progress(ctx.channel.id, slug)
 
-        emulator = RetroEmulator(
-            core_path,
-            rom_path,
-            system_dir=self._system_dir(),
-            options=await self._core_options(system.core),
-        )
+        emulator = await self._new_emulator(core_path, rom_path, system.core)
         previous: typing.Optional[RetroView] = None
         try:
             async with ctx.typing():

@@ -600,17 +600,17 @@ class SavesMixin(MixinMeta):
         which is the one thing worth having in a shared helper rather than
         repeated: an unknown name, an ambiguous one and a refusal all cost the
         bot nothing and are one correction away from working, and the rule for
-        that is :meth:`_refund_cooldown`. Only `import` and `export` have a
+        that is :meth:`_forgive_cooldown`. Only `import` and `export` have a
         cooldown to hand back, which is why the other two leave it off.
         """
         entry = await self._resolve_save(ctx, game)
         if entry is None:
             if refund:
-                self._refund_cooldown(ctx)
+                self._forgive_cooldown(ctx)
             return None
         if verb is not None and not await self._may_manage_saves(ctx, entry):
             if refund:
-                self._refund_cooldown(ctx)
+                self._forgive_cooldown(ctx)
             await self._refuse_management(ctx, entry, verb)
             return None
         return entry
@@ -809,45 +809,6 @@ class SavesMixin(MixinMeta):
             "\N{EM DASH} otherwise the next button press would have written "
             f"{wrote} straight back. Press a button on it to {then}."
         )
-
-    @staticmethod
-    def _refund_cooldown(ctx: commands.Context) -> None:
-        """
-        Hand this invocation's cooldown back: it cost nothing.
-
-        `[p]retrosaves import` and `[p]retrosaves export` are limited to
-        SAVE_COOLDOWN_RATE a minute because each one moves a file and an
-        import boots a core on top of that. Red charges that the moment the
-        command is invoked, which is before every mistake somebody makes on
-        the way to a working one: a forgotten attachment, a `.zip` where a
-        `.srm` should be, a file over the size ceiling, a name that matched
-        two games. Every one of those is a correction away from working, and
-        charging for the correction is exactly how somebody trying to fix
-        their own typo locks themselves out for a minute in the middle of a
-        conversation. So each path that gives up *before* an attachment has
-        been downloaded or a file has been read off disk hands the slot back,
-        and the limit goes on protecting the only things that cost anything.
-
-        `Retro._forgive_cooldown` does the identical thing for `[p]retro`,
-        and this is deliberately a twin of it rather than a call to it:
-        retro/abc.py's MixinMeta is the whole contract of what a mixin may
-        reach for on the assembled cog and `_forgive_cooldown` is not in it,
-        so calling it would be reaching for something nobody wrote down (a
-        test holds the contract to that -- see tests/test_mixins.py). Two
-        guarded lines are not worth widening the contract for.
-
-        Guarded because none of it is guaranteed: a command with no cooldown,
-        or a context assembled by something other than Red, must not turn a
-        polite refusal into a traceback.
-        """
-        command = getattr(ctx, "command", None)
-        reset = getattr(command, "reset_cooldown", None)
-        if reset is None:
-            return
-        try:
-            reset(ctx)
-        except Exception:
-            log.debug("Could not hand back a Retro save cooldown.", exc_info=True)
 
     def _upload_limit(self, ctx: commands.Context) -> int:
         """How large an attachment this server will accept."""
@@ -1191,7 +1152,7 @@ class SavesMixin(MixinMeta):
         if entry is None:
             return
         if not entry.has_save:
-            self._refund_cooldown(ctx)
+            self._forgive_cooldown(ctx)
             await self._safe_send(
                 ctx,
                 f"**{entry.game_name}** has nothing saved yet, so there is "
@@ -1269,7 +1230,7 @@ class SavesMixin(MixinMeta):
         if not files:
             # Nothing was uploaded and no file was opened, so this invocation
             # cost the bot nothing worth rationing.
-            self._refund_cooldown(ctx)
+            self._forgive_cooldown(ctx)
             if what == "sram" and entry.has_state:
                 # Reachable only from an explicit `export save <game>` now
                 # that the default falls through, and worth saying even
@@ -1807,7 +1768,7 @@ class SavesMixin(MixinMeta):
         """
         # refund: no attachment has been downloaded yet, so an unknown name and
         # a refusal both cost nothing worth rationing and both are one retry
-        # away from working. See _refund_cooldown.
+        # away from working. See _forgive_cooldown.
         entry = await self._manageable(
             ctx, game, "import a save for it", refund=True
         )
@@ -2020,14 +1981,14 @@ class SavesMixin(MixinMeta):
 
         The cooldown is handed back on every refusal above the download loop
         and kept on every refusal below it, which is the line drawn in
-        :meth:`_refund_cooldown`: an attachment Discord reported as 4 MiB was
+        :meth:`_forgive_cooldown`: an attachment Discord reported as 4 MiB was
         never fetched, so the retry that renames the file should not have to
         wait a minute, while bytes that really were pulled were really paid
         for.
         """
         attachments = list(getattr(ctx.message, "attachments", ()) or ())
         if not attachments:
-            self._refund_cooldown(ctx)
+            self._forgive_cooldown(ctx)
             sram_kind, state_kind = IMPORT_KINDS["sram"], IMPORT_KINDS["state"]
             await self._safe_send(
                 ctx,
@@ -2039,7 +2000,7 @@ class SavesMixin(MixinMeta):
             )
             return None
         if len(attachments) > 2:
-            self._refund_cooldown(ctx)
+            self._forgive_cooldown(ctx)
             await self._safe_send(
                 ctx,
                 "Attach at most two files: one in-game save and one save "
@@ -2060,7 +2021,7 @@ class SavesMixin(MixinMeta):
                 None,
             )
             if kind is None:
-                self._refund_cooldown(ctx)
+                self._forgive_cooldown(ctx)
                 spellings = " and ".join(
                     f"{limits.plural} end in {limits.endings}"
                     for limits in IMPORT_KINDS.values()
@@ -2073,7 +2034,7 @@ class SavesMixin(MixinMeta):
                 )
                 return None
             if kind in found:
-                self._refund_cooldown(ctx)
+                self._forgive_cooldown(ctx)
                 await self._safe_send(
                     ctx,
                     f"Two {IMPORT_KINDS[kind].plural} were attached; attach "
@@ -2086,7 +2047,7 @@ class SavesMixin(MixinMeta):
             # checked twice rather than once.
             size = int(getattr(attachment, "size", 0) or 0)
             if size > IMPORT_KINDS[kind].limit:
-                self._refund_cooldown(ctx)
+                self._forgive_cooldown(ctx)
                 await self._safe_send(ctx, self._too_big(kind, name, size))
                 return None
             found[kind] = (name, attachment)
