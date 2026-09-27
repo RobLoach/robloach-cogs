@@ -1,6 +1,6 @@
 # robloach-cogs
 
-Experimental Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot).
+Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot).
 
 ## Cogs
 
@@ -11,10 +11,12 @@ Experimental Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-Disco
 ## Installation
 
 ```
-[p]repo add robloach-cogs https://github.com/robloach/robloach-cogs
-[p]cog install robloach-cogs <list of cogs>
-[p]load <list of cogs>
+[p]repo add robloach-cogs https://github.com/RobLoach/robloach-cogs
+[p]cog install robloach-cogs retro
+[p]load retro
 ```
+
+Needs Python 3.10 or newer (Red itself allows 3.8.1+; this cog does not).
 
 ## Development
 

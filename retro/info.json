@@ -31,6 +31,11 @@
         "genesis"
     ],
     "min_bot_version": "3.5.3",
+    "min_python_version": [
+        3,
+        10,
+        0
+    ],
     "license": "GPL-3.0-or-later",
     "end_user_data_statement": "This cog stores the Discord channel and message ID of each game, the ID of the member who started it, the name of the game being played, and a copy of the ROM together with its emulator save state and the game's own in-game save, so a game can be resumed later. The same details are kept for the few most recent games a channel has moved on from, so their Resume buttons keep working. Those records are deleted by the cog itself once they can no longer resume anything: when the channel or thread is deleted, when the bot leaves the server, or when the cached ROM they name is cleaned up. Deleting a record removes the member ID in it; the game's save state and in-game save are kept, because they belong to the channel rather than to any member. The clip on a game's message is an attachment on that message and is not stored anywhere else; the server display name of whoever last pressed a button appears in that message's text, as plain text that cannot notify anyone, and is not stored anywhere either; the save states the Undo button steps back through are stored beside that game's save state and are deleted with it. Members with the Manage Messages permission, whoever started a game, and the bot owner can export a copy of a game's saves into the channel, replace them with an uploaded file, or delete them. Nothing is shared with anyone automatically. Cached ROMs, save states and in-game saves are pruned automatically as a channel plays other games."
 }

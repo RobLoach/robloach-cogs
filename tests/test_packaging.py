@@ -560,3 +560,72 @@ def test_every_command_that_names_a_save_uses_one_of_the_two_words():
         if "save state" in doc or "in-game save" in doc
     ]
     assert len(talkers) >= 5, talkers
+
+
+# -- The Python floor --------------------------------------------------------
+#
+# Red itself allows Python 3.8.1+, so "it runs here" says nothing about the
+# oldest bot that can install this. `min_python_version` is what Downloader
+# checks before installing (see its downloader.py: `if cog.min_python_version >
+# sys.version_info`), and without it the default is (3, 5, 1) -- so a cog that
+# quietly needs 3.10 installs happily onto a 3.9 bot and fails at runtime. It
+# did: `zip(..., strict=True)` in clips.capture_plan is on the press path, so
+# every single button press would have raised TypeError there.
+
+
+def test_info_json_declares_the_python_floor():
+    version = COG_INFO.get("min_python_version")
+    assert version is not None, "Downloader would default this to (3, 5, 1)"
+    # Downloader wants a list of exactly three ints and warns for anything else.
+    assert isinstance(version, list) and len(version) == 3, version
+    assert all(isinstance(part, int) for part in version), version
+
+
+def test_the_linter_and_info_json_agree_on_the_python_floor():
+    """Two files naming the same floor, so neither can be raised alone.
+
+    Read with a regex rather than a TOML parser on purpose: ``tomllib`` is
+    itself 3.11+, and a test about the 3.10 floor that cannot run on 3.10 would
+    be its own small joke.
+    """
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+    found = re.search(r'^target-version\s*=\s*"(py\d+)"', pyproject, re.MULTILINE)
+    assert found, "ruff's target-version is not set in pyproject.toml"
+    major, minor, _ = COG_INFO["min_python_version"]
+    assert found.group(1) == f"py{major}{minor}", (
+        found.group(1),
+        COG_INFO["min_python_version"],
+    )
+
+
+def test_every_source_file_parses_at_the_declared_floor():
+    """Catches *syntax* newer than the floor; see below for what it cannot."""
+    major, minor, _ = COG_INFO["min_python_version"]
+    for path in sorted((REPO_ROOT / "retro").glob("*.py")):
+        try:
+            ast.parse(path.read_text(), feature_version=(major, minor))
+        except SyntaxError as error:  # pragma: no cover - only on a regression
+            raise AssertionError(
+                f"{path.name} needs newer than {major}.{minor}: {error.msg} "
+                f"(line {error.lineno})"
+            ) from error
+
+
+def test_the_floor_is_high_enough_for_the_calls_that_are_not_syntax():
+    """The half `ast` cannot answer, which is the half that actually bit.
+
+    `zip(a, b, strict=True)` parses fine on 3.9 and raises TypeError there, so
+    no amount of parsing finds it. These are the version-gated *calls* the cog
+    uses; a new one added below its floor has to be added here too, which is
+    the only way this stays honest.
+    """
+    gated = {"strict=True": (3, 10)}  # zip(..., strict=True)
+    floor = tuple(COG_INFO["min_python_version"][:2])
+    for source in (REPO_ROOT / "retro").glob("*.py"):
+        text = source.read_text()
+        for marker, needs in gated.items():
+            if marker in text:
+                assert floor >= needs, (
+                    f"{source.name} uses {marker} (Python "
+                    f"{needs[0]}.{needs[1]}+) but the floor is {floor}"
+                )
