@@ -1,10 +1,12 @@
 {
-    "name" : "robloach-cogs",
-    "short" : "Cogs by RobLoach",
-    "author" : ["RobLoach"],
-    "description" : "Cogs for Red-DiscordBot by RobLoach. Currently: Retro, which plays retro console games in channels, emulated with libretro.",
-    "install_msg" : "The *robloach-cogs* repository has been installed.\n- `[p]repo list robloach-cogs` to list of available cogs\n- `[p]cog install robloach-cogs retro` to install the retro cog",
-    "tags" : [
+    "name": "robloach-cogs",
+    "short": "Cogs by RobLoach",
+    "author": [
+        "RobLoach"
+    ],
+    "description": "Cogs for Red-DiscordBot by RobLoach. Currently: Retro, which plays retro console games in a channel.",
+    "install_msg": "Installed. `[p]cog install robloach-cogs retro` to add the Retro cog.",
+    "tags": [
         "games"
     ]
 }

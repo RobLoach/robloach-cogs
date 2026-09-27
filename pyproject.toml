@@ -6,6 +6,13 @@
 # ["libretro.py", "pillow"]. The development tools live in
 # requirements-dev.txt and are used by CI and by people hacking on the cog.
 
+# The cog needs 3.11: Red is `<3.12` and libretro.py needs `>=3.12` from
+# 0.8.0, so 0.6.0 is the newest a Red bot can install and it needs 3.11.
+# retro/info.json's `min_python_version` is what enforces it on install.
+[project]
+name = "robloach-cogs"
+requires-python = ">=3.11"
+
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]

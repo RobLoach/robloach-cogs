@@ -2,11 +2,11 @@
     "author": [
         "Rob Loach"
     ],
-    "install_msg": "Retro installed. Load it with `[p]load retro`, then attach a ROM to `[p]retro` and play, or run `[p]retro list` to see what this bot can start. The console emulators download themselves in the background on the first load, so give them a minute. Upgrading? See the README.",
+    "install_msg": "Retro installed. Load it with `[p]load retro`, then attach a ROM to `[p]retro` and play. The emulators download in the background on first load, so give them a minute.",
     "name": "Retro",
     "version": "1.3.0",
     "short": "Play retro console games in Discord",
-    "description": "Play retro console games together in Discord, emulated with libretro.\n\nStart a game by name, URL, or an attached ROM or .zip and control it with buttons under the screen. Every press posts an animated clip of the next second and a half of play. Nine consoles, from the NES to the Game Boy Advance, each with its own controller layout, picked from the file extension.\n\nGames save automatically and resume where they left off, even after the bot restarts. Undo steps back through the last eight presses.",
+    "description": "Play retro console games together in Discord, emulated with libretro.\n\nStart a game by name, URL or an attached ROM and control it with buttons under the screen. Every press posts a clip of the next second and a half of play. Nine consoles, from the NES to the Game Boy Advance. Games save themselves and resume where they left off; Undo steps back eight presses.",
     "required_cogs": {},
     "requirements": [
         "libretro.py",
@@ -37,5 +37,5 @@
         0
     ],
     "license": "GPL-3.0-or-later",
-    "end_user_data_statement": "This cog stores the Discord channel and message ID of each game, the ID of the member who started it, the name of the game being played, and a copy of the ROM together with its emulator save state and the game's own in-game save, so a game can be resumed later. The same details are kept for the few most recent games a channel has moved on from, so their Resume buttons keep working. Those records are deleted by the cog itself once they can no longer resume anything: when the channel or thread is deleted, when the bot leaves the server, or when the cached ROM they name is cleaned up. Deleting a record removes the member ID in it; the game's save state and in-game save are kept, because they belong to the channel rather than to any member. The clip on a game's message is an attachment on that message and is not stored anywhere else; the server display name of whoever last pressed a button appears in that message's text, as plain text that cannot notify anyone, and is not stored anywhere either; the save states the Undo button steps back through are stored beside that game's save state and are deleted with it. Members with the Manage Messages permission, whoever started a game, and the bot owner can export a copy of a game's saves into the channel, replace them with an uploaded file, or delete them. Nothing is shared with anyone automatically. Cached ROMs, save states and in-game saves are pruned automatically as a channel plays other games."
+    "end_user_data_statement": "This cog stores, per channel: the channel and message ID of each game, the name of the game, the ID of the member who started it, and a copy of the ROM with its save state and in-game save. The member ID is the only personal data, and it goes when the record does. Records are deleted automatically once they can no longer resume anything -- when the channel is deleted, the bot leaves the server, or the cached ROM is cleaned up. Saves are kept until somebody deletes them with `[p]retrosaves delete`, which the game's starter, anyone with Manage Messages, and the bot owner can do. The clip is an attachment on the game's message and is stored nowhere else; the presser's display name appears in that message as plain text and is not stored. Nothing is shared with anyone."
 }
