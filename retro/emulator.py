@@ -423,6 +423,24 @@ class RetroEmulator:
         self.system_dir = Path(system_dir) if system_dir is not None else None
         self._pressed: frozenset = frozenset()
         self._session = None
+        self._joypad_state_cls = None
+        self._forget_session()
+
+    def _forget_session(self) -> None:
+        """Put the fields that describe a loaded core back to "nothing loaded".
+
+        These five are set together by :meth:`start` and there is no state in
+        which some of them are current and the rest are not, so they are
+        cleared together too -- here, by ``__init__`` for an emulator that has
+        never started and by :meth:`stop` for one that has finished. Written
+        out in both places until now, which is exactly how a sixth field gets
+        added to ``start`` and forgotten in one of the two resets.
+
+        ``_session`` is deliberately not among them: :meth:`stop` has to take
+        it *and* exit it, which is a different operation from clearing a
+        field, and doing it here would hide the one failure in this module
+        that must not be quiet.
+        """
         self._video = None
         self._path_driver = None
         self._audio_buffer = None
@@ -430,7 +448,6 @@ class RetroEmulator:
         #: emulated frame, so it says so once a session rather than sixty
         #: times a second; see _drain_audio.
         self._audio_drain_failed = False
-        self._joypad_state_cls = None
         self.started = False
 
     # -- Lifecycle ----------------------------------------------------------
@@ -650,11 +667,7 @@ class RetroEmulator:
         swallowed.
         """
         session, self._session = self._session, None
-        self._video = None
-        self._path_driver = None
-        self._audio_buffer = None
-        self._audio_drain_failed = False
-        self.started = False
+        self._forget_session()
         if session is not None:
             try:
                 session.__exit__(None, None, None)
