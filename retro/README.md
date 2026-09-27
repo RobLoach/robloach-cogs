@@ -453,46 +453,46 @@ you.
 
 **Playing** — anyone in the channel:
 
-| Command | Aliases | What it does |
-| --- | --- | --- |
-| `[p]retro [name\|url]` | | Starts a game from a saved name, a URL, or an attached ROM or `.zip`. With no arguments, brings back the channel's game or lists what can be started. Also `/retro play`. |
-| `[p]retro list` | `games`, `consoles` | The saved games, and the consoles this bot can play right now. |
-| `[p]retrosaves [game]` | `saves` | What this channel has saved, or one game in detail. |
-| `[p]retrosaves list` | | The listing on its own. |
-| `[p]retrosaves info <game>` | | One game in detail, including what starting it now would do. |
-| `[p]retrosaves export <game>` | | Posts the in-game save as a file. `export state` or `export both` sends the save state too. |
+| Command | What it does |
+| --- | --- |
+| `[p]retro [name\|url]` | Starts a game from a saved name, a URL, or an attached ROM or `.zip`. With no arguments, brings back the channel's game or lists what can be started. Also `/retro play`. |
+| `[p]retro list` | The saved games, and the consoles this bot can play right now. |
+| `[p]retrosaves [game]` | What this channel has saved, or one game in detail. |
+| `[p]retrosaves list` | The listing on its own. |
+| `[p]retrosaves info <game>` | One game in detail, including what starting it now would do. |
+| `[p]retrosaves export <game>` | Posts the in-game save as a file. `export state` or `export both` sends the save state too. |
 
 **The channel's game** — whoever started it, anyone with **Manage Messages**, or the bot owner:
 
-| Command | Aliases | What it does |
-| --- | --- | --- |
-| `[p]retrosleep` | `retrostop`, `retropause` | Saves the game and puts it to sleep. The controls keep working. |
-| `[p]retroend` | `retroretire` | Finishes with the game: saved, emulator freed, controller replaced by a single **▶️ Resume**. Nothing is deleted. |
-| `[p]retroreboot` | `retroreset` | Reboots the running game, as if you flipped its power switch. Nothing on disk is deleted, and it is an undo point. |
-| `[p]retrosaves import <game>` | | Installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real core first. |
-| `[p]retrosaves dropstate <game>` | `reset`, `restart` | Deletes the save state, so the game restarts from the last in-game save. |
-| `[p]retrosaves rollback <game>` | | Goes back to the previous save-state generation. |
-| `[p]retrosaves delete <game>` | | Wipes both halves of a game's save, after asking. |
+| Command | What it does |
+| --- | --- |
+| `[p]retrosleep` | Saves the game and puts it to sleep. The controls keep working. |
+| `[p]retroend` | Finishes with the game: saved, emulator freed, controller replaced by a single **▶️ Resume**. Nothing is deleted. |
+| `[p]retroreboot` | Reboots the running game, as if you flipped its power switch. Nothing on disk is deleted, and it is an undo point. |
+| `[p]retrosaves import <game>` | Installs an attached `.srm`/`.sav` (and optionally a `.state`), checked against the real core first. |
+| `[p]retrosaves dropstate <game>` | Deletes the save state, so the game restarts from the last in-game save. |
+| `[p]retrosaves rollback <game>` | Goes back to the previous save-state generation. |
+| `[p]retrosaves delete <game>` | Wipes both halves of a game's save, after asking. |
 
 **Owner only** — cores, games and settings:
 
-| Command | Aliases | What it does |
-| --- | --- | --- |
-| `[p]retroset download [core]` | | Downloads every supported core for your platform from the buildbot, or refreshes one. |
-| `[p]retroset autodownload [true\|false]` | | Whether missing cores are fetched when the cog loads. On by default. |
-| `[p]retroset game add <name> <url>` | | Saves a game so anyone can start it by name. |
-| `[p]retroset game remove <name>` | | Forgets one. |
-| `[p]retroset game list` | | Lists them. `[p]retro list` is the version players can run. |
-| `[p]retroset coreoptions [core] [key] [value]` | `coreopts` | Reads and changes a core's own settings. Also `/retroset coreoptions`, which autocompletes all three arguments. |
-| `[p]retroset bios add\|list\|remove` | `firmware` | BIOS files for cores that need one. See [BIOS files](#bios-files). |
-| `[p]retroset cliplength <seconds>` | `clip` | How much play each clip shows. Default 1.6. |
-| `[p]retroset hold <milliseconds>` | | How long a button is held. Default 80. |
-| `[p]retroset timeout <minutes>` | | How long a game idles before it sleeps. Default 10. |
-| `[p]retroset diskbudget [megabytes]` | `disk`, `budget` | Caps what the cog may use on disk; with no argument, reports what is using it. |
-| `[p]retroset allowprivateurls [true\|false]` | `allowprivate` | Lets ROM URLs point inside your own network. Off, and best left off. |
-| `[p]retroset settings` | | The current configuration. |
-| `[p]retroset version` | | Answers **"am I running the new code?"** |
-| `[p]retrodiagnose [true]` | `retrodiag` | Answers **"does this install actually work?"** |
+| Command | What it does |
+| --- | --- |
+| `[p]retroset download [core]` | Downloads every supported core for your platform from the buildbot, or refreshes one. |
+| `[p]retroset autodownload [true\|false]` | Whether missing cores are fetched when the cog loads. On by default. |
+| `[p]retroset game add <name> <url>` | Saves a game so anyone can start it by name. |
+| `[p]retroset game remove <name>` | Forgets one. |
+| `[p]retroset game list` | Lists them. `[p]retro list` is the version players can run. |
+| `[p]retroset coreoptions [core] [key] [value]` | Reads and changes a core's own settings. Also `/retroset coreoptions`, which autocompletes all three arguments. |
+| `[p]retroset bios add\|list\|remove` | BIOS files for cores that need one. See [BIOS files](#bios-files). |
+| `[p]retroset cliplength <seconds>` | How much play each clip shows. Default 1.6. |
+| `[p]retroset hold <milliseconds>` | How long a button is held. Default 80. |
+| `[p]retroset timeout <minutes>` | How long a game idles before it sleeps. Default 10. |
+| `[p]retroset diskbudget [megabytes]` | Caps what the cog may use on disk; with no argument, reports what is using it. |
+| `[p]retroset allowprivateurls [true\|false]` | Lets ROM URLs point inside your own network. Off, and best left off. |
+| `[p]retroset settings` | The current configuration. |
+| `[p]retroset version` | Answers **"am I running the new code?"** |
+| `[p]retrodiagnose [true]` | Answers **"does this install actually work?"** |
 
 ## Troubleshooting
 
