@@ -2600,13 +2600,15 @@ class RetroView(SessionMixin, discord.ui.View):
             # clicked Undo on a message with nothing to undo -- the case this
             # whole "leave the button enabled" decision exists for -- was shown
             # "This interaction failed" instead of the explanation.
+            # Says what to do and stops. It used to explain the history depth
+            # and that a restart empties it, which is true, is the reason this
+            # branch exists, and is none of the player's business: what they
+            # can act on is that a press makes Undo work and the game has not
+            # moved. The rest was this file describing itself.
             await ephemeral(
                 interaction,
-                "There is nothing to undo here yet: Undo steps back "
-                f"through the last {UNDO_DEPTH} presses, and that history "
-                "is kept in memory only, so a bot restart empties it. "
-                "Press any button and Undo works again from there. The "
-                "game itself is exactly where you left it.",
+                "Nothing to undo here yet \N{EM DASH} press any button and "
+                "Undo works from there. The game is exactly where you left it.",
             )
             return
         async with self.lock:

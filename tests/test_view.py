@@ -1493,4 +1493,8 @@ async def test_a_stale_click_really_reaches_the_view_through_discord_s_own_store
             break
 
     assert interaction.kinds() == ["response.send_message"], interaction.log
-    assert "hidden while clips are this short" in interaction.log[-1][1]["content"]
+    # What the answer has to carry, rather than how it happens to be worded:
+    # that the repeat button is gone, and which button to press instead.
+    said = interaction.log[-1][1]["content"]
+    assert "repeat button is hidden" in said, said
+    assert f"**{system.label_for(system.confirm)}**" in said, said

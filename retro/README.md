@@ -1076,10 +1076,14 @@ broken". (Exactly the same mistake the greyed-out **×3** button made, which
 was reported as the feature having been removed.) Clicking it with nothing to
 undo now costs one private reply and **no edit of the message at all**:
 
-> There is nothing to undo here yet: Undo steps back through the last 8
-> presses, and that history is kept in memory only, so a bot restart empties
-> it. Press any button and Undo works again from there. The game itself is
-> exactly where you left it. A game going to *sleep* is different: the session object
+> Nothing to undo here yet — press any button and Undo works from there. The
+> game is exactly where you left it.
+
+It says what to do and stops there. The depth, and the fact that a restart is
+what emptied the history, are the reasons this branch exists and are of no use
+to somebody who just wants their button back.
+
+A game going to *sleep* is different: the session object
 survives, and a save state can be loaded into any instance of the same core
 build, so Undo still reaches back across a sleep — waking the game restores
 the moment it fell asleep at, and the undo steps back from there. If a core
@@ -1260,8 +1264,8 @@ corrects it either way without restarting anything.
 removed just as surely as a greyed-out one does, so the press on which it
 vanishes carries one line — on an edit that was happening anyway:
 
-> The **A x3** button is hidden while clips are this short: only one tap fits,
-> which is what **A** already does. A longer `cliplength` brings it back.
+> The **A x3** button is hidden while clips are this short — only one tap
+> fits. A longer `cliplength` brings it back.
 
 Coming back says nothing: the button is right there saying what it does.
 

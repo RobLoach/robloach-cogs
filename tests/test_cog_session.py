@@ -2432,11 +2432,16 @@ async def test_an_undo_with_nothing_to_undo_says_so_and_touches_nothing(retro):
     snap = interaction.log[0][1]
     assert snap["ephemeral"] is True
     said = snap["content"] or ""
-    assert "nothing to undo" in said
-    assert "memory only" in said and "restart" in said
-    # Shorter than it was: it used to be five clauses. Two sentences and the
-    # reason first.
-    assert said.count(".") <= 4, said
+    assert "nothing to undo" in said.lower()
+    # Only what the player can act on: press something and Undo works, and the
+    # game has not moved underneath them. It used to go on to explain that the
+    # history is memory-only and that a restart empties it -- true, the reason
+    # this branch exists at all, and nothing anybody reading it can do
+    # anything with.
+    assert "press any button" in said.lower(), said
+    assert "where you left it" in said.lower(), said
+    assert "memory" not in said.lower() and "restart" not in said.lower(), said
+    assert said.count(".") <= 2, said
     assert not view.message.edits, "the message itself was never touched"
 
 

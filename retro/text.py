@@ -31,10 +31,12 @@ import discord
 #: just as surely as a greyed-out one does -- that is precisely how the
 #: greyed-out version was reported -- so the moment it goes is the moment to
 #: say why, and where it went. It rides on an edit that was happening anyway.
+#: Kept to the why and the fix. The clause explaining that one tap is "what
+#: {button} already does" was spelling out what the button beside it plainly
+#: is.
 REPEAT_GONE_NOTE = (
-    "The **{button} x3** button is hidden while clips are this short: only "
-    "one tap fits, which is what **{button}** already does. A longer "
-    "`cliplength` brings it back."
+    "The **{button} x3** button is hidden while clips are this short \N{EM DASH} "
+    "only one tap fits. A longer `cliplength` brings it back."
 )
 
 #: Said privately to whoever clicks a repeat button that is not drawn any
@@ -54,12 +56,14 @@ REPEAT_GONE_NOTE = (
 #: was last drawn, and the view no longer knows which -- an interaction
 #: carries the custom_id and not the label. Naming the count would therefore
 #: be a guess, and one that contradicts what they are looking at.
+#: Trimmed to the answer. "This message has not been redrawn yet" is a fact
+#: about Discord's rendering that nobody clicking a button can do anything
+#: with, and it was the first thing they read; what they need is which button
+#: to press instead, so that is what is left.
 REPEAT_STALE_NOTE = (
-    "The repeat button is hidden while clips are this short, and this "
-    "message has not been redrawn yet \N{EM DASH} only one tap fits at this "
-    "`cliplength`, which is what **{button}** already does. Press "
-    "**{button}**, or ask for a longer `cliplength` to bring the repeat "
-    "button back."
+    "The repeat button is hidden at this `cliplength` \N{EM DASH} only one tap "
+    "fits. Press **{button}** instead, or ask for a longer `cliplength` to "
+    "bring it back."
 )
 
 
