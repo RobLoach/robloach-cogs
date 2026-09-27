@@ -1,9 +1,19 @@
 root = true
 
-[*.py]
-indent_style = space
-indent_size = 4
+# Everything: the three that are never wrong. `insert_final_newline` used to be
+# declared for *.py alone, which is how README.md ended up as the one tracked
+# file without one.
+[*]
 charset = utf-8
 end_of_line = lf
 insert_final_newline = true
+
+[*.py]
+indent_style = space
+indent_size = 4
 trim_trailing_whitespace = true
+
+# Not markdown: two trailing spaces are a hard line break in it, so trimming
+# them silently changes how a file renders.
+[*.md]
+trim_trailing_whitespace = false

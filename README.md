@@ -34,4 +34,6 @@ without them. See [tests/README.md](tests/README.md).
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Copyright (C) 2025-2026 Rob Loach.
+
+GPL-3.0-or-later. See [LICENSE](LICENSE) for the full text.
