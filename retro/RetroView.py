@@ -2004,6 +2004,20 @@ class RetroView(SessionMixin, discord.ui.View):
         try:
             self.message = await edit(**kwargs)
         except discord.HTTPException as error:
+            # An interaction has a second route to the very same message, and
+            # it is worth taking: `edit_original_response` goes through the
+            # interaction's token, which is dead the moment the acknowledgement
+            # did not land -- a `defer()` that missed Discord's three second
+            # window answers 10062 Unknown interaction, and then every edit
+            # through that token answers 10015 Unknown Webhook. Editing the
+            # message directly uses the bot's own token and the message's id,
+            # so it is unaffected by any of that. Without this the press was
+            # emulated, the save was written, and the clip was simply dropped:
+            # the game had moved and the channel was still looking at the
+            # previous picture, which is indistinguishable from the cog losing
+            # the press.
+            if await self._edit_without_interaction(target, kwargs, clip, error, what):
+                return self._edited(clip)
             # The game itself is fine -- the message may simply have been
             # deleted, or the bot may have lost the channel, or Discord may
             # have refused the component payload. The HTTP status and Discord's
@@ -2027,12 +2041,75 @@ class RetroView(SessionMixin, discord.ui.View):
             if self.notice is None:
                 self.notice = notice
             return False
+        return self._edited(clip)
+
+    def _edited(self, clip: typing.Optional[bytes]) -> bool:
+        """Book-keeping for an edit that landed, by whichever of the two routes.
+
+        Shared so the fallback in :meth:`_edit_without_interaction` cannot
+        arrive at a *visually* identical edit that skipped this: a clip somebody
+        can see is one to pace the next edit against and one whose still the
+        next clip's opening is compared to, however it got there.
+        """
         if clip is not None:
             # This clip is now the one playing, so it is the one the next edit
             # is paced against, and the still it leaves is what the next clip's
             # opening is compared against. After the edit, not before: what is
             # being timed is the picture on somebody's screen. See note_posted.
             self.note_posted(self.posted_playback())
+        return True
+
+    async def _edit_without_interaction(
+        self,
+        target: typing.Any,
+        kwargs: typing.Dict[str, typing.Any],
+        clip: typing.Optional[bytes],
+        error: discord.HTTPException,
+        what: str,
+    ) -> bool:
+        """
+        Make the same edit again, against the message instead of the click.
+
+        The second route in :meth:`_edit`. Only ever tried when the first
+        attempt went through an interaction, because otherwise it *is* the
+        first attempt: a message edit that failed will not succeed by being
+        repeated identically.
+
+        **The attachment has to be rebuilt.** A ``discord.File`` wraps a
+        stream, and the attempt that just failed has already read it -- so
+        re-sending the same object uploads an empty file or raises. The clip is
+        passed as bytes for exactly that reason and a fresh file is made here.
+        That is the whole of why this takes ``clip`` as well as ``kwargs``.
+
+        Never raises, and never logs above debug: the caller's warning is the
+        one worth reading, and this is an attempt to avoid needing it.
+        """
+        if getattr(target, "edit_original_response", None) is None:
+            return False
+        message = await self.resolve_message()
+        if message is None:
+            return False
+        retry = dict(kwargs)
+        if clip is not None:
+            retry["attachments"] = [self._clip_file(clip)]
+        try:
+            self.message = await message.edit(**retry)
+        except discord.HTTPException:
+            log.debug(
+                "The fallback edit for %s in channel %s failed too.",
+                what,
+                self.channel_id,
+                exc_info=True,
+            )
+            return False
+        log.info(
+            "Could not %s through the click in channel %s (HTTP %s, code %s), "
+            "so it was edited onto the message directly instead.",
+            what,
+            self.channel_id,
+            getattr(error, "status", "?"),
+            getattr(error, "code", "?"),
+        )
         return True
 
     async def refresh(self, note: typing.Optional[str] = None) -> None:

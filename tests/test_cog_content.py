@@ -1120,13 +1120,77 @@ async def test_safe_send_falls_back_to_plain_text_and_then_gives_up(retro):
     assert await retro.cog._safe_send(ctx, "x") is None
 
 
-async def test_an_edit_discord_refuses_mid_press_leaves_the_controls_usable(retro):
+# -- When the click's token is dead ------------------------------------------
+#
+# A `defer()` that misses Discord's three second window answers 10062 Unknown
+# interaction, and from then on every edit through that token answers 10015
+# Unknown Webhook. Seen in production. Both were caught and logged, and the
+# press was then simply lost: it had been emulated and saved, but the channel
+# was still looking at the previous clip -- indistinguishable from the cog
+# dropping the press. The message itself is reachable by another route, so
+# RetroView._edit takes it.
+
+
+async def test_an_edit_the_click_refuses_still_lands_on_the_message(retro):
+    """The fallback: the clip goes on, and nobody has to be apologised to."""
     await retro.install_cores("gambatte")
     view, _, channel = await retro.posted_game(9603, "editfail")
     interaction = retro.interaction(view, message=view.message)
     interaction.fail_edits = True
+    before = len(view.message.edits)
 
     await view._press(interaction, "a")
+
+    # The message was edited directly instead...
+    assert len(view.message.edits) == before + 1, view.message.edits
+    # ...with the clip really on it, and not an already-read file (see
+    # _edit_without_interaction: a discord.File is a stream and the failed
+    # attempt consumed the first one).
+    attachments = view.message.edits[-1]["attachments"]
+    assert len(attachments) == 1
+    assert attachments[0].fp.read(), "the fallback re-sent an emptied file"
+    # ...so there is nothing to whisper about.
+    assert "followup.send" not in interaction.kinds(), interaction.kinds()
+    assert not any(getattr(c, "disabled", False) for c in retro.playable(view))
+    assert retro.cog.sessions.get(channel.id) is view
+
+
+async def test_a_rescued_edit_still_arms_the_pacing_and_the_still(retro):
+    """It has to be the same edit in every way that matters, not just visually.
+
+    A clip that reached somebody's screen by the second route is still the clip
+    being paced against and still the picture the next clip's opening is
+    compared against. Going down the fallback and skipping note_posted would
+    reintroduce both stutters that pacing and the trim exist to fix.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9604, "pacedfallback")
+    view.forget_pacing()
+    interaction = retro.interaction(view, message=view.message)
+    interaction.fail_edits = True
+
+    await view._press(interaction, "a")
+
+    assert view.posted_playback() > 0.0
+    assert view._posted_playback > 0.0, "the pacing gate was never armed"
+    # The remembered still cannot be asserted here: FakeEmulator hands over
+    # finished bytes rather than pictures, so SessionMixin._encode leaves
+    # `_encoded` as None by design and there is no hash to keep. What this can
+    # show is that the rescued edit went through note_posted at all, which is
+    # the one call both of those facts come from.
+    assert view._posted_at is not None
+
+
+async def test_both_edit_routes_failing_still_tells_the_presser(retro):
+    """And when neither route works, the old behaviour is what is left."""
+    await retro.install_cores("gambatte")
+    view, _, channel = await retro.posted_game(9605, "bothfail")
+    interaction = retro.interaction(view, message=view.message)
+    interaction.fail_edits = True
+    view.message.fail_edits = True
+
+    await view._press(interaction, "a")
+
     assert "followup.send" in interaction.kinds()
     whispers = [
         str(data.get("content", ""))
@@ -1139,6 +1203,32 @@ async def test_an_edit_discord_refuses_mid_press_leaves_the_controls_usable(retr
     assert not any("HTTP" in text for text in whispers), whispers
     assert not any(getattr(c, "disabled", False) for c in retro.playable(view))
     assert retro.cog.sessions.get(channel.id) is view
+
+
+async def test_a_command_edit_that_fails_is_not_retried_identically(retro):
+    """The fallback is only a *second* route, never a second go at the first.
+
+    `[p]retroreboot` edits the message directly, so there is nothing else to
+    try; repeating it would double the work and the log line for nothing.
+    """
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9606, "commandfail")
+    view.message.fail_edits = True
+    attempts = []
+    real = type(view.message).edit
+
+    async def counting(self, **kwargs):
+        attempts.append(kwargs)
+        return await real(self, **kwargs)
+
+    type(view.message).edit = counting
+    try:
+        landed = await view.show_clip(b"clip-bytes", "a note")
+    finally:
+        type(view.message).edit = real
+
+    assert landed is False
+    assert len(attempts) == 1, attempts
 
 
 @pytest.mark.parametrize(

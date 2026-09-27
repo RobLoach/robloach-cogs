@@ -483,12 +483,22 @@ class FakeMessage:
         self.attachments = []
         self.edits = []
         self.kwargs = kwargs
+        #: Set to make every edit raise, the way a deleted message or a lost
+        #: permission does. The interaction has its own flag; this is the other
+        #: route to the same message, which RetroView._edit falls back to when
+        #: the click's token is dead. See _edit_without_interaction.
+        self.fail_edits = False
 
     @property
     def jump_url(self):
         return f"https://discord.test/{self.id}"
 
     async def edit(self, **kwargs):
+        if self.fail_edits:
+            raise discord.HTTPException(
+                types.SimpleNamespace(status=404, reason="Not Found"),
+                {"code": 10008, "message": "Unknown Message"},
+            )
         self.edits.append(kwargs)
         return self
 
