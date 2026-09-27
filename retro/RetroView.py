@@ -54,6 +54,7 @@ to say there were two of them and name ``restore_into`` as the one
 
 import asyncio
 import collections
+import copy
 import io
 import logging
 import re
@@ -580,6 +581,118 @@ class _UndoButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await self.view._undo(interaction)
+
+
+# Discord shows at most 25 options in a select menu and refuses the whole
+# message for a longer list. Separate from MAX_AUTOCOMPLETE_CHOICES in
+# retro/Retro.py even though both are 25: they are two different Discord limits
+# that happen to agree, and tying them together would mean one of them silently
+# changing if the other ever moved.
+MAX_SELECT_OPTIONS = 25
+
+#: How long a game picker stays clickable. It is a helper attached to a "what
+#: can I start?" reply rather than a control on a game, so it is deliberately
+#: *not* persistent: a picker that survived a restart would be a dropdown, a
+#: week later, in a channel that has played three other things since, and
+#: clicking it would replace whatever is playing now.
+PICKER_TIMEOUT_SECONDS = 180.0
+
+
+class _GameSelect(discord.ui.Select):
+    """The dropdown of saved games on a "what can I start?" reply."""
+
+    def __init__(self, games: typing.Sequence[str]) -> None:
+        super().__init__(
+            placeholder="Pick a game to start\N{HORIZONTAL ELLIPSIS}",
+            min_values=1,
+            max_values=1,
+            options=[
+                # The label is the name and so is the value: these are the
+                # names `[p]retro <name>` takes, and the whole point is that
+                # picking one is the same thing as typing one.
+                discord.SelectOption(label=name[:100], value=name[:100])
+                for name in games[:MAX_SELECT_OPTIONS]
+            ],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.view.start(interaction, self.values[0])
+
+
+class GamePickerView(discord.ui.View):
+    """
+    A dropdown of the games this bot has saved, under the reply that lists them.
+
+    The library used to be a sentence of names in the middle of a wall of help
+    text, and starting one meant reading a name, then typing it. This is the
+    same list as something to click.
+
+    **Starting the game re-runs the real command.** The select does not call
+    any part of the start path itself: it copies the message it is attached to,
+    puts `<prefix>retro <name>` in it as the person who clicked, and hands that
+    to Red to invoke. So there is exactly one way a game is ever started by
+    name, with the same checks, the same two cooldowns and the same
+    ``max_concurrency`` -- and all of them charged to whoever clicked rather
+    than to whoever ran the command this dropdown is attached to, which matters
+    because those are very often different people.
+
+    That last part is why this is not simply a wrapper around the command's
+    body: a component click goes through none of a command's gates on its own
+    (the same problem :meth:`Retro.resume_retired` documents), and re-invoking
+    is what gets every one of them back without a second copy of them here.
+    """
+
+    def __init__(self, cog: commands.Cog, games: typing.Sequence[str]) -> None:
+        super().__init__(timeout=PICKER_TIMEOUT_SECONDS)
+        self.cog: commands.Cog = cog
+        self.message: typing.Optional[discord.Message] = None
+        self.add_item(_GameSelect(games))
+
+    async def start(self, interaction: discord.Interaction, name: str) -> None:
+        """Run `[p]retro <name>` for whoever picked it."""
+        source = getattr(interaction, "message", None)
+        if source is None:
+            # Nothing to copy a context out of, which should not happen for a
+            # component click. Say so rather than failing silently.
+            await whisper(
+                interaction,
+                f"Pick it with `retro {name}` \N{EM DASH} this dropdown could "
+                "not start it from here.",
+            )
+            return
+        # Acknowledged first: invoking the command does its own talking (and
+        # may spend seconds fetching a ROM), and an unacknowledged interaction
+        # shows "This interaction failed" after three of them.
+        await defer(interaction)
+        bot = self.cog.bot
+        try:
+            message = copy.copy(source)
+            message.author = interaction.user
+            prefixes = await bot.get_prefix(message)
+            prefix = prefixes[0] if isinstance(prefixes, (list, tuple)) else prefixes
+            message.content = f"{prefix}retro {name}"
+            ctx = await bot.get_context(message)
+            await bot.invoke(ctx)
+        except Exception:
+            log.exception("Could not start %s from the game picker.", name)
+            await whisper(
+                interaction,
+                f"That did not start. Try `retro {name}` instead.",
+            )
+
+    async def on_timeout(self) -> None:
+        """Grey the dropdown out, so it does not look clickable for ever."""
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except Exception:
+            # The message may well be gone, and a timeout tidying up after
+            # itself is not worth a log line at anything above debug.
+            log.debug("Could not disable a finished game picker.", exc_info=True)
 
 
 class _ResumeButton(discord.ui.Button):

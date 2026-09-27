@@ -553,6 +553,12 @@ class FakeBot:
         #: hold several, and with ``--mentionable`` the bot's mention comes
         #: first; a test that cares sets this.
         self.prefixes = ["!"]
+        #: The cog on this bot, so invoke() can dispatch to it. Set by RetroEnv
+        #: once the cog exists, which is after this.
+        self.cog = None
+        #: Every context get_context() built, and every one invoke() ran.
+        self.contexts = []
+        self.invoked = []
 
     async def is_owner(self, user):
         return user.id == 1
@@ -560,6 +566,45 @@ class FakeBot:
     async def get_valid_prefixes(self, guild=None):
         """Red's own helper: the prefixes that work, DMs if guild is None."""
         return list(self.prefixes)
+
+    # -- Running a command on somebody's behalf.
+    #
+    # The game picker does not reimplement any of the start path: it copies the
+    # message it is attached to, writes `<prefix>retro <name>` into it as the
+    # person who clicked, and asks the bot to invoke that (see
+    # RetroView.GamePickerView). These three are what that needs, and they
+    # record what they were given so a test can assert on the *invocation* --
+    # which is the picker's whole job -- as well as on the game that results.
+
+    async def get_prefix(self, message=None):
+        return list(self.prefixes)
+
+    async def get_context(self, message):
+        """A context for a message, the way Red builds one to invoke."""
+        ctx = FakeContext(message.channel, author=getattr(message, "author", None))
+        #: What the picker wrote into the message it copied.
+        ctx.content = getattr(message, "content", "")
+        self.contexts.append(ctx)
+        return ctx
+
+    async def invoke(self, ctx):
+        """Dispatch a context built by :meth:`get_context`.
+
+        Only ``<prefix>retro <name>`` is understood, because that is the only
+        thing anything in this cog asks the bot to invoke. Anything else raises
+        rather than being quietly ignored, so a picker that started sending a
+        different command could not pass by doing nothing.
+        """
+        self.invoked.append(ctx)
+        prefix = self.prefixes[0]
+        expected = f"{prefix}retro "
+        if not ctx.content.startswith(expected):
+            raise AssertionError(f"the fake bot cannot invoke {ctx.content!r}")
+        game = ctx.content[len(expected):]
+        if self.cog is None:
+            raise AssertionError("no cog is attached to this fake bot")
+        command = type(self.cog).retro
+        await command.callback(self.cog, ctx, game=game)
 
     def is_ready(self):
         return self.ready
@@ -818,7 +863,10 @@ class FakeInteraction:
         self.view = view
         self.user = user or FakeUser()
         self.message = message
-        self.channel_id = view.channel_id
+        # Not every view is a game's controls: GamePickerView is attached to a
+        # help reply and works off the message it was clicked on, so it has no
+        # channel of its own to name.
+        self.channel_id = getattr(view, "channel_id", None)
         # discord.Interaction carries the guild it was raised in, which is
         # what a reply needs to look the bot's prefix up with; see
         # Retro._prefix_for.
@@ -1183,7 +1231,10 @@ class RetroEnv:
         if fresh_config:
             self.configs.forget("Retro")
         bot = FakeBot()
-        return self.cogmod.Retro(bot), bot
+        cog = self.cogmod.Retro(bot)
+        # So FakeBot.invoke() can dispatch, the way Red's bot reaches its cogs.
+        bot.cog = cog
+        return cog, bot
 
     def legacy_store(self):
         """The Config store the cog had when its class was called RetroCog."""

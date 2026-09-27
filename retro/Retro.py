@@ -104,6 +104,7 @@ from .RetroView import (
     MIN_REPEAT_TAPS,
     REPEAT_TAPS,
     SAVE_STATE_EVERY_PRESSES,
+    GamePickerView,
     Progress,
     RetiredView,
     RetroView,
@@ -3253,7 +3254,8 @@ class Retro(
             lines.append("")
             lines.append(
                 f"You can also start a saved game by name: {names} "
-                f"\N{EM DASH} `{ctx.clean_prefix}retro {sorted(presets)[0]}`."
+                f"\N{EM DASH} `{ctx.clean_prefix}retro {sorted(presets)[0]}`, "
+                "or pick one from the menu below."
             )
         else:
             lines.append("")
@@ -3285,8 +3287,21 @@ class Retro(
             "Only use ROMs you have the rights to. There are hundreds of free "
             f"homebrew games for these consoles at <{HOMEBREW_URL}>."
         )
-        for page in pagify("\n".join(lines)):
-            await self._safe_send(ctx, page)
+        # The dropdown rides on the *last* page, so it sits at the bottom of the
+        # reply rather than in the middle of it. Only when there is something to
+        # put in it: an empty select is a message Discord refuses outright, and
+        # the "no games saved yet" line above is the answer in that case.
+        pages = list(pagify("\n".join(lines)))
+        picker = GamePickerView(self, sorted(presets)) if presets else None
+        for index, page in enumerate(pages):
+            last = index == len(pages) - 1
+            sent = await self._safe_send(
+                ctx, page, view=picker if (last and picker is not None) else None
+            )
+            if last and picker is not None:
+                # So the timeout can grey it out. A send that was refused
+                # returns None, and then there is nothing to tidy up.
+                picker.message = sent
 
     async def _resume_session(self, ctx: commands.Context, view: RetroView) -> None:
         """Point the channel at its existing session instead of starting over."""

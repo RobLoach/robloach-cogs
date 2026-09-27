@@ -22,7 +22,14 @@ pytest.importorskip("discord", reason="the cog tests need discord.py")
 import aiohttp  # noqa: E402
 import discord  # noqa: E402
 
-from .fakes import NES_BYTES, ROM_BYTES, FakeAttachment, FakeEmulator, zip_of  # noqa: E402
+from .fakes import (  # noqa: E402
+    NES_BYTES,
+    ROM_BYTES,
+    FakeAttachment,
+    FakeEmulator,
+    FakeUser,
+    zip_of,
+)
 
 
 def http_error(status=400, code=50035, message="Invalid Form Body"):
@@ -2112,3 +2119,135 @@ async def test_a_value_autocomplete_for_an_unknown_key_offers_only_reset(retro):
         core="gambatte",
         key="not_a_real_key",
     ) == [("reset", "reset")]
+
+
+# -- The game picker: the library as something to click -----------------------
+#
+# The names used to be a sentence in the middle of a wall of help text, and
+# starting one meant reading a name and then typing it. The dropdown is the same
+# list, and picking from it re-runs the real command rather than reimplementing
+# any of the start path -- see RetroView.GamePickerView.
+
+
+def picker_of(ctx):
+    """The GamePickerView attached to the last message this context sent.
+
+    Read off the messages rather than off ``ctx.sent``, which records the
+    content of a send that had one and only falls back to the keywords.
+    """
+    for message in reversed(list(ctx.channel.messages.values())):
+        view = (getattr(message, "kwargs", None) or {}).get("view")
+        if view is not None:
+            return view
+    return None
+
+
+async def test_the_help_reply_carries_a_dropdown_of_the_saved_games(retro):
+    await retro.install_cores("gambatte")
+    await retro.cog.config.games.set({"ucity": "u", "libbet": "l"})
+    ctx = retro.context(retro.channel(9320))
+
+    await retro.cog._no_rom_help(ctx)
+
+    picker = picker_of(ctx)
+    assert picker is not None, ctx.sent
+    options = picker.children[0].options
+    assert [option.value for option in options] == ["libbet", "ucity"]
+    assert "pick one from the menu below" in " ".join(
+        s for s in ctx.sent if isinstance(s, str)
+    )
+
+
+async def test_a_bot_with_no_saved_games_gets_no_empty_dropdown(retro):
+    """Discord refuses a select with no options, taking the whole reply with it."""
+    await retro.install_cores("gambatte")
+    ctx = retro.context(retro.channel(9321))
+
+    await retro.cog._no_rom_help(ctx)
+
+    assert picker_of(ctx) is None
+    assert "no games saved by name yet" in " ".join(
+        s for s in ctx.sent if isinstance(s, str)
+    )
+
+
+async def test_no_more_games_are_offered_than_a_select_will_hold(retro):
+    await retro.install_cores("gambatte")
+    await retro.cog.config.games.set({f"game{n:03d}": "u" for n in range(40)})
+    ctx = retro.context(retro.channel(9322))
+
+    await retro.cog._no_rom_help(ctx)
+
+    options = picker_of(ctx).children[0].options
+    assert len(options) == retro.viewmod.MAX_SELECT_OPTIONS
+
+
+async def test_picking_a_game_runs_the_real_command_as_whoever_clicked(retro):
+    """The whole design: one start path, charged to the person who clicked it."""
+    await retro.install_cores("gambatte")
+    retro.serve("chosen.gbc", ROM_BYTES)
+    await retro.cog.config.games.set({"chosen": "https://example.com/chosen.gbc"})
+    channel = retro.channel(9323)
+    ctx = retro.context(channel)
+    await retro.cog._no_rom_help(ctx)
+    picker = picker_of(ctx)
+
+    clicker = FakeUser(uid=4242, name="Passerby")
+    interaction = retro.interaction(picker, user=clicker, message=picker.message)
+    await picker.start(interaction, "chosen")
+
+    # It built an invocation rather than starting the game itself...
+    assert retro.bot.invoked, "the command was never invoked"
+    invoked = retro.bot.invoked[-1]
+    assert invoked.content == "!retro chosen"
+    assert invoked.author is clicker, "the cooldowns must be the clicker's"
+    # ...and the game really started in the channel.
+    started = retro.cog.sessions.get(channel.id)
+    assert started is not None and started.slug == "chosen"
+
+
+async def test_a_picker_with_nothing_to_copy_says_what_to_type(retro):
+    await retro.install_cores("gambatte")
+    await retro.cog.config.games.set({"ucity": "u"})
+    picker = retro.viewmod.GamePickerView(retro.cog, ["ucity"])
+    interaction = retro.interaction(picker, message=None)
+
+    await picker.start(interaction, "ucity")
+
+    assert not retro.bot.invoked
+    said = (interaction.log[-1][1].get("content") or "").lower()
+    assert "retro ucity" in said
+
+
+async def test_a_start_that_explodes_is_reported_not_swallowed(retro, monkeypatch):
+    await retro.install_cores("gambatte")
+    await retro.cog.config.games.set({"ucity": "u"})
+    ctx = retro.context(retro.channel(9324))
+    await retro.cog._no_rom_help(ctx)
+    picker = picker_of(ctx)
+
+    async def explode(context):
+        raise RuntimeError("the bot fell over")
+
+    monkeypatch.setattr(retro.bot, "invoke", explode)
+    interaction = retro.interaction(picker, message=picker.message)
+
+    await picker.start(interaction, "ucity")  # must not raise
+
+    said = " ".join(
+        str(entry[1].get("content") or "") for entry in interaction.log
+    ).lower()
+    assert "did not start" in said
+
+
+async def test_a_timed_out_picker_greys_itself_out(retro):
+    await retro.install_cores("gambatte")
+    await retro.cog.config.games.set({"ucity": "u"})
+    ctx = retro.context(retro.channel(9325))
+    await retro.cog._no_rom_help(ctx)
+    picker = picker_of(ctx)
+
+    await picker.on_timeout()
+
+    assert all(child.disabled for child in picker.children)
+    assert picker.message.edits, "the dropdown still looks clickable"

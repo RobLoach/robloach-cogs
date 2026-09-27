@@ -70,7 +70,7 @@ can start it by name:
 
 ## Commands
 
-- `[p]retro [name|url]` starts a game from a saved name, a URL, or a ROM attached to the message. `.zip` files are unpacked for you. With no arguments it brings back the game already going in the channel.
+- `[p]retro [name|url]` starts a game from a saved name, a URL, or a ROM attached to the message. `.zip` files are unpacked for you. With no arguments it brings back the game already going in the channel — and in a channel with nothing running, it lists what can be started with a **dropdown to pick from**. Also a slash command: `/retro play game:` autocompletes over the saved games, which is how you find out what this bot has without running a second command first. See [Slash commands](#slash-commands).
 - `[p]retro list` (aliased `games`/`consoles`) shows the games this bot has saved by name and the consoles it can play right now. **Anyone can run it**, which is the point: `[p]retroset game list` says part of the same thing and the whole `[p]retroset` group is owner-only, so players used to be pointed at a command they could not run.
 - `[p]retrosleep` (aliased `retrostop`, `retropause`) saves the game and puts it to sleep. The controls keep working — pressing any button wakes it up again. Queued presses are dropped.
 - `[p]retroend` (aliased `retroretire`) finishes with the channel's game: it is saved, the emulator is freed, and the whole controller is replaced by a single **▶️ Resume** button. Nothing is deleted. This is the one thing the cog could not do before — `[p]retrostop` only ever paused.
@@ -84,7 +84,7 @@ can start it by name:
 - `[p]retroset download` (owner) downloads every supported core for your platform from the [libretro buildbot](https://buildbot.libretro.com). `[p]retroset download <core>` fetches or refreshes just one.
 - `[p]retroset autodownload [true|false]` (owner) controls whether missing cores are fetched automatically when the cog loads. On by default.
 - `[p]retroset game add <name> <url>`, `[p]retroset game remove <name>` and `[p]retroset game list` (owner) manage the games anyone can start by name.
-- `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below.
+- `[p]retroset coreoptions [core] [key] [value]` (owner, aliased `coreopts`) reads and changes a core's own settings. See below. Also a slash command, and the only one in the `[p]retroset` group that is: `/retroset coreoptions` autocompletes the core, its option keys **and** the values that option will accept, which are libretro's own names and not things anybody remembers.
 - `[p]retroset bios add`, `[p]retroset bios list` and `[p]retroset bios remove` (owner) manage BIOS files for cores that need one. See below.
 - `[p]retroset diskbudget [megabytes]` (owner, aliased `disk`/`budget`) caps what the whole cog may use on disk, and with no argument reports what is using it. The default is 1024 MiB; `0` is no limit. **No save is ever deleted to make room** — cached ROMs are, oldest first. A download or save that fails part way through cleans its own half-written file up, and any left behind by a process that was killed outright are swept when the cog next loads, so a failed write cannot quietly eat the allowance.
 - `[p]retroset allowprivateurls [true|false]` (owner) lets ROM URLs point inside your own network. Off, and best left off: see [ROM URLs](#rom-urls).
@@ -531,6 +531,30 @@ completely fresh" — would be one button press away from coming back.
 like playing. `dropstate`, `delete` and `import` are limited to the person who
 started the game, anybody with **Manage Messages**, and the bot owner — the
 same three who may `[p]retrosleep` someone else's game.
+
+## Starting one from the list
+
+`[p]retro list`, and a bare `[p]retro` in a channel with nothing running, both
+show what this bot can start: the games it has saved by name, and the consoles
+it can play right now. The saved games come with a **dropdown to pick from**, so
+starting one is a click rather than reading a name and then typing it.
+
+Picking from it **re-runs the ordinary command**. The dropdown copies the message
+it is attached to, writes `[p]retro <name>` into it as the person who clicked,
+and asks Red to invoke that. So there is exactly one way a game is ever started
+by name, with the same checks, the same two cooldowns and the same
+`max_concurrency` — and all of them charged to **whoever clicked**, which matters
+because that is very often not whoever ran the command. A component click goes
+through none of a command's gates on its own (the same problem the **Resume**
+button has, and it solves it the same way), and re-invoking is what gets every
+one of them back without a second copy of the start path existing to drift.
+
+It is deliberately **not** a persistent view: it stops working after three
+minutes and greys itself out. A picker that survived a restart would be a
+dropdown, a week later, in a channel that has played three other things since —
+and clicking it would replace whatever is playing now. A bot with no saved games
+gets no dropdown at all, because Discord refuses a select with no options and
+would take the whole reply down with it.
 
 ## Playing
 
@@ -1374,6 +1398,45 @@ Three separate facts, because only together are they honest:
 Nothing here can fail a command: every piece of it degrades to "not shown"
 rather than raising, and `retro/version.py` imports nothing but the standard
 library so it works on the most broken install there is.
+
+## Slash commands
+
+Two of the cog's commands are **hybrids** — the same command reachable both as
+`[p]retro` and as `/retro`. Only two, and the reason is autocomplete: it does
+not exist for prefix commands, and these are the two places where not knowing
+what to type is the actual problem.
+
+**`/retro play game:`** autocompletes over the games this bot has saved. That
+is the whole point — `[p]retro <name>` needs the name up front, and the only way
+to learn one was to run `[p]retro list` first. The match is on any part of a
+name and is case-insensitive, because these names are whatever the owner called
+them and the memorable part of `pokemon-red-1996` is in the middle of it.
+
+It is `/retro play` rather than `/retro` because **Discord does not let a group
+be invoked, only its subcommands**. `[p]retro` is a group (it has `[p]retro
+list`), so without a fallback subcommand there would be no slash way to start a
+game at all — `/retro` would offer nothing but `/retro list`. The prefix form is
+untouched: `[p]retro ucity` and `[p]retro <url>` still work exactly as they did.
+
+**`/retroset coreoptions`** autocompletes all three of its arguments: the
+installed cores, that core's option keys, and the values the option will accept
+(with the core's own default marked, and `reset`). libretro options are very
+nearly all enumerations and the core declares them, so this is the one place a
+completion can offer the whole correct set rather than a guess at it.
+
+Every one of these answers from what the cog already knows — the installed
+cores, and the option definitions cached in Config. Never from a probe: a probe
+dlopens a core on the one emulator thread whatever is being played is using, and
+Discord allows an autocomplete about three seconds. So a core whose options have
+never been read offers nothing, and the command's own reply is what explains
+that. None of them can fail loudly either: an autocomplete that raises shows an
+empty box with no clue why, so a Config that will not answer degrades to no
+suggestions and everything can still be typed by hand.
+
+The rest of `[p]retroset` is deliberately **prefix-only**
+(`with_app_command=False`). The whole group is owner-only, and publishing a
+dozen slash commands that only one person in the server can run would put them
+in everybody's slash menu for nothing.
 
 ## Is it working?
 
