@@ -8,6 +8,11 @@ Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot).
 | --- | --- |
 | [Retro](retro) | Play retro console games in Discord |
 
+<img src="assets/screenshot.png" alt="A Game Boy game running in a Discord channel: a clip of µCity's title screen, a line reading &quot;ucity · RobLoach reset the game.&quot;, and a row of controller buttons underneath — a d-pad, B and A, Start, Select, Wait, A x3 and Undo." width="492">
+
+Every press posts a clip of the next second of play and redraws the controls,
+on one message, with one edit. See [the Retro README](retro) for the rest.
+
 ## Installation
 
 ```
