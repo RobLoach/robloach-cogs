@@ -12,7 +12,13 @@ import logging
 
 import pytest
 
-from retro import metrics as M
+from .loader import load_standalone
+
+# Loaded standalone, not `from retro import metrics`: retro/__init__.py imports
+# Red, which imports discord.py, and the buildbot CI job installs neither. The
+# module itself needs nothing but the standard library, so it is one of the
+# few that can be tested with no dependencies at all -- see tests/README.md.
+M = load_standalone("retro_metrics_standalone", "metrics.py")
 
 
 def test_one_recording_is_its_own_mean_and_worst():
