@@ -2,11 +2,11 @@
     "author": [
         "Rob Loach"
     ],
-    "install_msg": "Retro installed. Load it with `[p]load retro`, then attach a ROM to `[p]retro` and play. The emulators download in the background on first load, so give them a minute.",
+    "install_msg": "Retro installed. Load it with `[p]load retro`, then attach a ROM to `[p]retro` and play.",
     "name": "Retro",
     "version": "1.3.0",
     "short": "Play retro console games in Discord",
-    "description": "Play retro console games together in Discord, emulated with libretro.\n\nStart a game by name, URL or an attached ROM and control it with buttons under the screen. Every press posts a clip of the next second and a half of play. Nine consoles, from the NES to the Game Boy Advance. Games save themselves and resume where they left off; Undo steps back eight presses.",
+    "description": "Play retro console games together in Discord, emulated with libretro, from the NES to the Game Boy Advance.\n\nStart a game by name, URL or an attached ROM and control it with buttons under the screen. Every press posts a clip of the next few seconds of play. Games save themselves and resume where they left off.",
     "required_cogs": {},
     "requirements": [
         "libretro.py",
