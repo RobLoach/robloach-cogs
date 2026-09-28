@@ -21,6 +21,7 @@ measured, because what they show is the comparison between the columns.
 - [Rebooting](#rebooting)
 - [The dropdown, and slash commands](#the-dropdown-and-slash-commands)
 - [Reporting which build is loaded](#reporting-which-build-is-loaded)
+- [Measuring a press](#measuring-a-press)
 - [What the cog forgets](#what-the-cog-forgets)
 - [Naming](#naming)
 - [The RetroCog → Retro rename](#the-retrocog--retro-rename)
@@ -375,6 +376,38 @@ honest:
 
 Nothing here can fail a command: every piece degrades to "not shown", and
 `version.py` imports nothing but the standard library.
+
+## Measuring a press
+
+Three questions kept being answered by hand: how long a press takes, which part
+is expensive, and whether the event loop is keeping up. The third is the one
+production actually needed — a click Discord sent more than three seconds ago
+answers `10062 Unknown interaction`, and every edit through that token then
+answers `10015`, so the clip is lost. Telling a slow bot from a slow network
+needs the bot measured.
+
+`retro/metrics.py` keeps **count, total and worst per name** — four floats,
+whatever the traffic. No history: a ring buffer would answer nicer questions
+and grow with use, and nothing here is worth a megabyte of a bot's memory.
+Nothing is persisted, because the question is "is this bot healthy *now*".
+
+Three names, and the split is the point — a single "the press took 900ms"
+cannot tell them apart, and which one is large is the whole diagnosis:
+
+- **core wait** — somebody else's press, since there is one core;
+- **emulate** — this press's own core time;
+- **encode** — the expensive step, which needs no core and so runs with the
+  lock already handed back.
+
+**Event loop lag** is one coroutine sleeping a known time and seeing how long
+that really took. Anything above zero is the loop busy elsewhere. A sample past
+three seconds is logged at warning, because a click arriving in a stall that
+long is one the player sees fail.
+
+Every call site is on the press path, so none of it can raise: a metric that
+can fail a press is worse than no metric. The timer records a block that threw,
+too — a press that took four seconds and *then* failed is exactly the one worth
+knowing about.
 
 ## What the cog forgets
 

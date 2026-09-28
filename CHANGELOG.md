@@ -23,6 +23,9 @@ Upgrading: `[p]repo update robloach-cogs`, `[p]cog update retro`,
   `/retroset coreoptions` autocompletes the core, its keys and its values.
 - **A dropdown of saved games** on `[p]retro list`. Picking one re-runs the
   ordinary command, so checks and cooldowns land on whoever clicked.
+- **Timings in `[p]retrodiagnose`** — where presses spend their time, and how
+  late the event loop is waking up. The second answers "is it the bot or the
+  network?" when clicks fail.
 - **Undo survives a restart** — the history is kept on disk, read lazily, and
   wiped with the progress it describes.
 

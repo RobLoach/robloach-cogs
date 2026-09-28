@@ -88,6 +88,7 @@ from .emulator import (
     probe_core_options,
     video_driver_or_error,
 )
+from .metrics import Metrics, describe_timings
 from .migration import (
     CONFIG_IDENTIFIER,
     CONFIG_STORE_FILENAME,
@@ -415,6 +416,11 @@ class Retro(
         self._resuming: typing.Set[int] = set()
         self._idle_task: typing.Optional[asyncio.Task] = None
         self._download_task: typing.Optional[asyncio.Task] = None
+        # Where a press spends its time, and how late the event loop is
+        # waking up. Read by `[p]retrodiagnose`; see retro/metrics.py for why
+        # the second one is worth a task of its own.
+        self.metrics = Metrics()
+        self._lag_task: typing.Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
         # First, before anything reads a setting or touches the data folder:
@@ -452,9 +458,10 @@ class Retro(
         # the libretro buildbot, and a download that fails must not stop the
         # cog coming up. _auto_download_loop() swallows everything.
         self._download_task = asyncio.create_task(self._auto_download_loop())
+        self._lag_task = asyncio.create_task(self.metrics.sample_lag())
 
     async def cog_unload(self) -> None:
-        for attribute in ("_idle_task", "_download_task"):
+        for attribute in ("_idle_task", "_download_task", "_lag_task"):
             task = getattr(self, attribute, None)
             setattr(self, attribute, None)
             if task is not None:
@@ -1623,17 +1630,28 @@ class Retro(
         :meth:`_press_landed`.
         """
         limit = view.upload_limit()
-        async with self.emulator_lock:
-            await self._wake_locked(view)
-            frames = await self.run_in_emulator_thread(capture)
-            view.touch()
-            progress = (
-                await self.run_in_emulator_thread(self._capture_progress, view)
-                if snapshot()
-                else None
-            )
-            encoder = view.emulator
-        clip = await asyncio.to_thread(view._encode, frames, limit, encoder)
+        # Three separately useful numbers, and the split is the point: waiting
+        # for the one core is somebody else's press, driving it is this one's,
+        # and encoding is the expensive step that needs no core at all. A
+        # single "press took 900ms" cannot tell those apart, and which of them
+        # is large is the whole diagnosis. See retro/metrics.py.
+        with self.metrics.timing("core wait"):
+            await self.emulator_lock.acquire()
+        try:
+            with self.metrics.timing("emulate"):
+                await self._wake_locked(view)
+                frames = await self.run_in_emulator_thread(capture)
+                view.touch()
+                progress = (
+                    await self.run_in_emulator_thread(self._capture_progress, view)
+                    if snapshot()
+                    else None
+                )
+                encoder = view.emulator
+        finally:
+            self.emulator_lock.release()
+        with self.metrics.timing("encode"):
+            clip = await asyncio.to_thread(view._encode, frames, limit, encoder)
         await self._flush_refreshes()
         return clip, progress
 
@@ -4416,6 +4434,10 @@ class Retro(
         ))
         sections.append(("Storage", [await self._usage_report(ctx)]))
         sections.append(("Sessions", self._session_lines()))
+        # Where presses spend their time, and whether the loop is keeping up.
+        # The lag line is the one worth reading first on a bot that is
+        # dropping clicks: see retro/metrics.py.
+        sections.append(("Timing", describe_timings(self.metrics)))
 
         auto = await self.config.auto_download_cores()
         attempted = await self.config.auto_download_attempted_at()

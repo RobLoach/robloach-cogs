@@ -331,6 +331,12 @@ Pillow, whether a video driver can be made, each core, storage against its
 budget, and what is running. Plain text, for pasting into an issue.
 `[p]retrodiagnose true` loads every core as well.
 
+**Timing.** `[p]retrodiagnose` ends with where presses spend their time —
+waiting for the one core, driving it, and encoding — plus **event loop lag**:
+how late the bot is waking up. That last one is the first line to read if
+clicks are failing, because Discord gives three seconds to acknowledge one and
+a bot stalled past that cannot.
+
 **`[p]retroset version`** — the declared version, the commit, and a fingerprint
 of the code that was actually loaded. `git pull` without `[p]reload retro` does
 not change the fingerprint, which is exactly the situation worth proving.

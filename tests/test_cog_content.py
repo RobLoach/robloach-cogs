@@ -2341,3 +2341,61 @@ async def test_a_timed_out_picker_greys_itself_out(retro):
 
     assert all(child.disabled for child in picker.children)
     assert picker.message.edits, "the dropdown still looks clickable"
+
+
+# -- Timings: where a press really spends its time ----------------------------
+#
+# The numbers come from the press path itself rather than from a test harness,
+# so these drive a real press and read what it recorded. See retro/metrics.py
+# for why the three are kept apart.
+
+
+async def test_a_press_records_the_three_things_it_spends_time_on(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9330, "timed")
+    # Measured across the press alone. Booting a game does not go through
+    # _emulate_clip -- RetroView.boot has its own path -- so what is already
+    # recorded here is not assumed either way.
+    names = ("core wait", "emulate", "encode")
+    before = {name: retro.cog.metrics.stat(name).count for name in names}
+
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    for name in names:
+        assert retro.cog.metrics.stat(name).count > before[name], name
+
+
+async def test_a_press_that_fails_is_still_timed(retro, monkeypatch):
+    """A slow press that then failed is exactly the one worth knowing about."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9331, "timedfail")
+    before = retro.cog.metrics.stat("emulate").count
+
+    async def explode(*args, **kwargs):
+        raise retro.emumod.EmulatorError("the core fell over")
+
+    monkeypatch.setattr(retro.cog, "run_in_emulator_thread", explode)
+    await view._press(retro.interaction(view, message=view.message), "a")
+
+    assert retro.cog.metrics.stat("emulate").count > before
+
+
+async def test_retrodiagnose_reports_the_timings(retro):
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9332, "diagtimed")
+    await view._press(retro.interaction(view, message=view.message), "a")
+    ctx = retro.context(retro.channel(9333))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
+
+    said = ctx.said()
+    assert "**Timing**" in said, said
+    assert "encode" in said and "emulate" in said, said
+
+
+async def test_retrodiagnose_on_an_idle_bot_says_nothing_was_pressed(retro):
+    ctx = retro.context(retro.channel(9334))
+
+    await retro.cogmod.Retro.retrodiagnose.callback(retro.cog, ctx)
+
+    assert "Nothing has been pressed since the cog loaded." in ctx.said()
