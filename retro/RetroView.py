@@ -307,9 +307,15 @@ DEFAULT_TIMEOUT_MINUTES = 10
 #   It multiplies with the clip length, which is the part worth watching:
 #   every edit now waits out the whole clip it replaces (see
 #   MAX_PACE_SECONDS in retro/timing.py), so a full drain takes about
-#   MAX_QUEUED_PRESSES * cliplength -- five seconds at the default, and
+#   MAX_QUEUED_PRESSES * cliplength -- eight seconds at the 1.6s default, and
 #   twenty-five at the five second ceiling. Both numbers in that product are
 #   the owner's own settings.
+#
+#   Five was chosen against a *one second* clip, where a full queue was five
+#   seconds. The default is 1.6s now, so the same depth is eight -- and the
+#   depth is still a flat five rather than "whatever fits in about five
+#   seconds", which is the trade worth revisiting if anyone reports the tail
+#   of a run landing too late to recognise.
 # * **first come, first served, whoever it is.** There is deliberately no
 #   per-person limit any more. There used to be one -- one waiting press
 #   each -- on the theory that it made a roomful of people take turns
