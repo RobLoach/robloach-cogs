@@ -34,23 +34,21 @@ Why it works the way it does: [docs/DESIGN.md](../docs/DESIGN.md).
 
 ## Getting started
 
+Ensure you're on Python 3.11+.
+
 ```
 [p]repo add robloach-cogs https://github.com/RobLoach/robloach-cogs
 [p]cog install robloach-cogs retro
 [p]load retro
 ```
 
-Needs Python 3.11. Nothing to configure: the seven cores (4.5 MiB) download in
-the background on first load. `[p]retroset download` does it now,
-`[p]retroset settings` shows where they went.
-
-Then play. [µCity](https://github.com/AntonioND/ucity) is a good first game:
+The libretro cores are downloaded in the background. Once downloaded, you can then play a game. In this example, we're play [µCity](https://github.com/AntonioND/ucity):
 
 ```
 [p]retro https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc
 ```
 
-Save it so anyone can start it by name:
+You are also able to save games by name so that they're easy to launch:
 
 ```
 [p]retroset game add ucity https://github.com/AntonioND/ucity/releases/download/v1.3/ucity.gbc
@@ -60,8 +58,8 @@ Save it so anyone can start it by name:
 ## Starting a game
 
 ```
-[p]retro ucity            a game saved by name
 [p]retro <url>            a direct link to a ROM
+[p]retro ucity            a game saved by name
 [p]retro                  with a ROM or .zip attached
 [p]retro                  nothing running: lists what you can start
 ```
@@ -77,8 +75,6 @@ is unpacked using paths from the archive.
 
 ## Consoles
 
-Chosen from the file extension. Every core here is BIOS-free.
-
 | Console | Core | Extensions |
 | --- | --- | --- |
 | Game Boy / Color | `gambatte` | `.gb` `.gbc` `.dmg` |
@@ -91,63 +87,9 @@ Chosen from the file extension. Every core here is BIOS-free.
 | PC Engine / TurboGrafx-16 | `mednafen_pce_fast` | `.pce` |
 | Neo Geo Pocket | `mednafen_ngp` | `.ngp` `.ngc` `.ngpc` `.npc` |
 
-**`.bin` is refused.** It says nothing about which console a ROM is for — Atari
-cartridges, Mega Drive ROMs, CD tracks and BIOS dumps are all `.bin`. Rename a
+Since systems are detected by file extension, **`.bin` is refused.** Rename a
 Genesis ROM to `.md`. CD images (`.cue`, `.iso`, `.chd`) and BIOS-dependent
-formats (`.fds`, `.bs`, `.st`) are not supported; each says so when you try it.
-
-Each console shows its own button names — the Genesis **A B C**, the Master
-System **1**, **2** and **Pause**, the PC Engine **I**–**VI** and **Run**.
-
-## The controller
-
-Laid out like the console's own pad. A Game Boy, where `·` is a spacer:
-
-```
-·  ⬆️
-⬅️  ⬇️  ➡️   B  A
-Start  Select  ⏳ Wait   A ×3   ↩️ Undo
-```
-
-Bigger consoles grow into the same shape — the GBA puts **L**/**R** on top, the
-SNES adds **Y X / B A**, the Genesis and PC Engine keep their six-button cluster.
-
-- **⏳ Wait** — one clip's worth of time with no input.
-- **↩️ Undo** — steps back one press, eight deep. Kept on disk, so it survives a
-  restart and a sleep. Updating a core empties it.
-- **A ×3** — taps the confirm button several times in one clip. Labelled with
-  the real tap count, and **hidden rather than greyed out** when only one fits:
-
-| Clip length | Taps | Button |
-| --- | --- | --- |
-| 0.2s (floor) – 0.25s | 1 | not shown |
-| 0.26s – 0.45s | 2 | `A ×2` |
-| 0.46s – 5s (ceiling) | 3 | `A ×3` |
-
-There is no Stop or Reset button. Sleeping, rebooting and ending a game are
-commands, because each is destructive to everybody's game.
-
-### What a press does
-
-Records the next **1.6 seconds** (`[p]retroset cliplength`) and posts it as an
-animated WebP that plays once. The button is held **80ms**
-(`[p]retroset hold`). Between presses the console is frozen, so a game left
-overnight is where you left it.
-
-The message carries the clip and one line:
-
-> **µCity** · Rob pressed A. *Queued: ⬅️*
-
-Names are plain text and can never notify anyone.
-
-**Presses queue rather than drop**, five deep, first come first served — one
-person may hold every slot. Every waiting press is shown. The queue is thrown
-away by anything that moves the game elsewhere (sleep, reboot, undo, an idle
-timeout, another channel taking the emulator), and the message says how many
-went.
-
-**A clip is never replaced before it has finished playing.** A press that
-arrives when nothing is playing is still instant.
+formats (`.fds`, `.bs`, `.st`) are not supported.
 
 ## Saving and sleeping
 
@@ -188,7 +130,7 @@ Records are dropped when the cached ROM is pruned, the channel is deleted, or
 the bot leaves the server. **The saves are kept either way** — starting the
 game again re-downloads the ROM and picks the save straight back up.
 
-## Managing saves
+## Saves
 
 ```
 [p]retrosaves                          this channel's saved games
@@ -255,9 +197,9 @@ Reading a core's options can mean loading it, so a running game is slept first.
 Results are remembered. Some cores (FCEUmm) declare nothing until a ROM is
 loaded; theirs become listable once somebody plays one.
 
-## BIOS files
+## BIOS and System files
 
-Every core above is BIOS-free — most people never need this.
+Every core above is BIOS-free, so most sytems won't require this.
 
 ```
 [p]retroset bios add                     (with a file or .zip attached)
@@ -270,10 +212,6 @@ Every core above is BIOS-free — most people never need this.
 A `.zip` installs everything in it, keeping its folder layout — cores disagree
 about whether firmware sits at the top or in a subfolder, and this satisfies
 both. `<filename>` renames a single file to the exact name a core looks for.
-
-Archive paths are validated, never rewritten: absolute paths, `..`, deep
-nesting, dotfiles, symlinks and device nodes are refused. Capped at 64 MiB, 250
-files, 16 MiB each.
 
 **This cog ships no firmware and downloads none.** BIOS images are copyrighted;
 supplying one you may use is up to you.
@@ -382,24 +320,19 @@ prefer `[p]retroset game add` with the guard left on.
 
 ## Upgrading
 
+To update the Retro cog, use...
+
 ```
 [p]repo update robloach-cogs
 [p]cog update retro
 [p]reload retro
 ```
 
-All three, in that order. `[p]cog update` compares against what the repo was
-last fetched at, not GitHub, so without the first it has nothing to install —
-and **without the reload the bot is still running the old code**. Check with
-`[p]retroset version`.
-
 Settings, cores, cached ROMs, saves, BIOS files and live sessions all survive.
-Games that were playing come back on their next button press.
-
-See [CHANGELOG.md](../CHANGELOG.md) for what changed.
 
 ## Credits
 
+- [RobLoach](https://robloach.net)
 - [libretro.py](https://github.com/JesseTG/libretro.py) by Jesse Talavera
 - [libretro](https://www.libretro.com/) and the RetroArch buildbot
 - The Gambatte, mGBA, FCEUmm, Snes9x, Genesis Plus GX and Mednafen core teams

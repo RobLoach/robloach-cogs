@@ -8,24 +8,6 @@ Measurements are on a Raspberry Pi 5, **at the defaults of the time** (mostly a
 1s clip and a 160ms hold; they are now 1.6s and 80ms). They are left as
 measured, because what they show is the comparison between the columns.
 
-## Contents
-
-- [The seam between two clips](#the-seam-between-two-clips)
-- [Clip size and format](#clip-size-and-format)
-- [Pacing](#pacing)
-- [The press queue](#the-press-queue)
-- [Undo](#undo)
-- [The ×3 button](#the-3-button)
-- [The controller's shape](#the-controllers-shape)
-- [One edit per press](#one-edit-per-press)
-- [Rebooting](#rebooting)
-- [The dropdown, and slash commands](#the-dropdown-and-slash-commands)
-- [Reporting which build is loaded](#reporting-which-build-is-loaded)
-- [Measuring a press](#measuring-a-press)
-- [What the cog forgets](#what-the-cog-forgets)
-- [Naming](#naming)
-- [The RetroCog → Retro rename](#the-retrocog--retro-rename)
-
 ## The seam between two clips
 
 One report — *"the clip seems to replay a bit from the previous clip"* — and
@@ -97,6 +79,56 @@ flash. This drops *playback*, never emulation.
 photographs its window's final frame at any cadence, so the seam is identical
 at 10, 15, 20 and 60 fps. A higher rate only brings the shutter *earlier*,
 which is the wrong direction.
+
+## The controller
+
+Laid out like the console's own pad. A Game Boy, where `·` is a spacer:
+
+```
+·  ⬆️
+⬅️  ⬇️  ➡️   B  A
+Start  Select  ⏳ Wait   A ×3   ↩️ Undo
+```
+
+Bigger consoles grow into the same shape — the GBA puts **L**/**R** on top, the
+SNES adds **Y X / B A**, the Genesis and PC Engine keep their six-button cluster.
+
+- **⏳ Wait** — one clip's worth of time with no input.
+- **↩️ Undo** — steps back one press, eight deep. Kept on disk, so it survives a
+  restart and a sleep. Updating a core empties it.
+- **A ×3** — taps the confirm button several times in one clip. Labelled with
+  the real tap count, and **hidden rather than greyed out** when only one fits:
+
+| Clip length | Taps | Button |
+| --- | --- | --- |
+| 0.2s (floor) – 0.25s | 1 | not shown |
+| 0.26s – 0.45s | 2 | `A ×2` |
+| 0.46s – 5s (ceiling) | 3 | `A ×3` |
+
+There is no Stop or Reset button. Sleeping, rebooting and ending a game are
+commands, because each is destructive to everybody's game.
+
+### What a press does
+
+Records the next **1.6 seconds** (`[p]retroset cliplength`) and posts it as an
+animated WebP that plays once. The button is held **80ms**
+(`[p]retroset hold`). Between presses the console is frozen, so a game left
+overnight is where you left it.
+
+The message carries the clip and one line:
+
+> **µCity** · Rob pressed A. *Queued: ⬅️*
+
+Names are plain text and can never notify anyone.
+
+**Presses queue rather than drop**, five deep, first come first served — one
+person may hold every slot. Every waiting press is shown. The queue is thrown
+away by anything that moves the game elsewhere (sleep, reboot, undo, an idle
+timeout, another channel taking the emulator), and the message says how many
+went.
+
+**A clip is never replaced before it has finished playing.** A press that
+arrives when nothing is playing is still instant.
 
 ## Clip size and format
 
