@@ -74,8 +74,9 @@ SNES adds **Y X / B A**, the Genesis and PC Engine keep their six-button cluster
 - **⏳ Wait** — one clip's worth of time with no input.
 - **↩️ Undo** — steps back one press, eight deep. Kept on disk, so it survives a
   restart and a sleep. Updating a core empties it.
-- **A ×3** — taps the confirm button several times in one clip. Labelled with
-  the real tap count, and **hidden rather than greyed out** when only one fits:
+- **A ×3** — repeats your **last press** several times in one clip, so `⬅️`
+  then `⬅️ ×3` walks four tiles. Labelled with the real tap count, and
+  **hidden rather than greyed out** when only one fits:
 
 | Clip length | Taps | Button |
 | --- | --- | --- |
@@ -247,8 +248,31 @@ restored.
 
 ## The ×3 button
 
-Taps the confirm button several times in one clip, so a text box takes one
-round trip instead of three.
+**It repeats your last press**, several times in one clip — so `⬅️` then
+`⬅️ ×3` walks four tiles, and `A` then `A ×3` clears a text box in one round
+trip instead of three.
+
+It used to repeat the console's confirm button and nothing else, which covered
+text boxes and menus but not the commonest intent on a controller: walking.
+A d-pad has four directions, and four more components is more than the Super
+Nintendo has room for (19 of Discord's 25 already), so the one button follows
+the last press instead.
+
+It starts on the **confirm** button — a session nobody has pressed has no last
+press, and a text box is what somebody reaches for it for first. **Wait, Undo
+and a reboot do not move it**: Wait presses nothing, and the other two put the
+game somewhere the last press no longer describes.
+
+The label follows on the same edit the press was already making, so `⬅️ ×3` is
+on screen the moment somebody walks — it costs no extra edit. The *name* is the
+button's caption rather than its label, because the d-pad has no labels, only
+arrows, and `⬅️ ×3` says which way far better than `LEFT ×3` would.
+
+A click is dispatched from the **view's** current target rather than from the
+button that was clicked: a stale copy on a message Discord has not re-rendered
+carries whatever it was labelled with when that message was drawn, and
+repeating a direction from four presses ago is not what the label somebody is
+looking at says.
 
 **Hidden, not greyed out, when only one tap fits.** One tap is exactly what the
 confirm button one row over does, and a present, dead, unexplained control

@@ -34,6 +34,10 @@ Upgrading: `[p]repo update robloach-cogs`, `[p]cog update retro`,
   the last queued press from five seconds to eight. It is a time budget now —
   about five seconds whatever the setting.
 
+- **The ×3 button repeats your last press**, not just the confirm button —
+  `⬅️` then `⬅️ ×3` walks four tiles. It starts on confirm, and Wait, Undo and
+  a reboot do not move it.
+
 ### Fixed
 
 - **A press whose clip never appeared.** If the click's acknowledgement missed

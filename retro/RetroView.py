@@ -572,6 +572,11 @@ class _RepeatButton(discord.ui.Button):
             row=row,
             custom_id=f"{CUSTOM_ID_PREFIX}:repeat",
         )
+        #: What it repeats *right now*. The confirm button to begin with, and
+        #: then whatever was last pressed -- see RetroView.repeat_target. Both
+        #: are rewritten on every redraw by _update_repeat_label, which is the
+        #: same edit the press was making anyway, so following the last press
+        #: costs nothing extra.
         self.field: str = spec.field
         self.name: str = spec.label
         # Whether this clip length has anything for it to do. Set here as
@@ -595,7 +600,16 @@ class _RepeatButton(discord.ui.Button):
             return
         # REPEAT_TAPS is what is *asked* for; press_plan decides how many of
         # them fit, and the label above says which it was.
-        await self.view._press(interaction, self.field, repeat=REPEAT_TAPS)
+        #
+        # The field is read off the view rather than off this button: a stale
+        # copy on a message Discord has not re-rendered carries whatever it
+        # was labelled with when that message was drawn, and repeating a
+        # direction somebody pressed four presses ago is not what the label
+        # they are looking at says. The view knows what it would be drawn as
+        # now, and that is what runs.
+        await self.view._press(
+            interaction, self.view.repeat_target.field, repeat=REPEAT_TAPS
+        )
 
 
 class _UndoButton(discord.ui.Button):
@@ -969,6 +983,12 @@ class RetroView(SessionMixin, discord.ui.View):
         # work, and nothing in here survives a reset, an undo, a sleep or a
         # retirement.
         self.queue: typing.Deque[Pending] = collections.deque()
+        #: The last button really pressed on this controller, or None for a
+        #: session nobody has pressed yet. The ×3 button repeats it; see
+        #: repeat_target. Deliberately *not* stored in the session record --
+        #: it is a convenience that costs one press to re-establish, and a
+        #: Config write per press to keep.
+        self.last_field: typing.Optional[str] = None
         # Bumped by forget_queue(), so an entry already taken off the front
         # cannot be run against a state it was not queued against.
         self._queue_epoch: int = 0
@@ -1305,6 +1325,40 @@ class RetroView(SessionMixin, discord.ui.View):
         return press_plan(self._fps(emulator), self.clip_seconds, self.hold_ms, taps)
 
     @property
+    def repeat_target(self):
+        """The button the ×3 control repeats: whatever was pressed last.
+
+        Walking three tiles is a far commoner intent than tapping the confirm
+        button three times, and a d-pad has four directions -- so rather than
+        four more components (which the Super Nintendo has no room for), the
+        one repeat button follows the last press.
+
+        Falls back to the console's **confirm** button, which is what it
+        always did: a session nobody has pressed yet has no last press, and a
+        text box is the thing somebody reaches for ×3 for first.
+
+        Only a real button press counts. Wait moves the game on without
+        pressing anything, and Undo and a reboot put the game somewhere the
+        last press no longer describes, so none of them become the target --
+        see :meth:`note_press`.
+        """
+        if self.last_field is not None:
+            button = self.system.button(self.last_field)
+            if button is not None:
+                return button
+        return self.system.button(self.system.confirm)
+
+    def note_press(self, field: typing.Optional[str]) -> None:
+        """Remember a real button press, so ×3 can repeat it.
+
+        ``None`` is Wait, which presses nothing and therefore leaves the
+        target where it was -- repeating "nothing" three times is what Wait
+        already is.
+        """
+        if field is not None:
+            self.last_field = field
+
+    @property
     def repeat_taps(self) -> int:
         """
         How many taps the repeat button really does at this clip length.
@@ -1400,6 +1454,20 @@ class RetroView(SessionMixin, discord.ui.View):
             (child for child in self.children if isinstance(child, _RepeatButton)), None
         )
 
+    def _repeat_name(self) -> str:
+        """What the ×3 button is called right now, for a line about it.
+
+        The *target's* name rather than the console's confirm button, since
+        the two stopped being the same thing when the button started
+        following the last press. A console with no confirm button at all
+        would have no repeat button either, so the fallback is never reached
+        by anything in systems.py.
+        """
+        target = self.repeat_target
+        return (
+            self.system.caption_for(target.field) if target is not None else "repeat"
+        )
+
     def _update_repeat_label(self) -> None:
         """
         Draw the repeat button if it can do anything, and say how much.
@@ -1454,10 +1522,19 @@ class RetroView(SessionMixin, discord.ui.View):
         taps = self.repeat_taps
         hidden = taps < MIN_REPEAT_TAPS
         if hidden and not button.hidden:
-            self.notice = REPEAT_GONE_NOTE.format(
-                button=self.system.label_for(self.system.confirm)
-            )
+            self.notice = REPEAT_GONE_NOTE.format(button=button.name)
         button.hidden = hidden
+        # The target follows the last press (see repeat_target), so the name
+        # is re-read here rather than kept from the build: this runs on every
+        # edit that redraws the row, which is the same edit the press was
+        # making anyway, so `⬅️ x3` is on screen the moment somebody walks.
+        target = self.repeat_target
+        if target is not None:
+            button.field = target.field
+            # caption_for, not the raw label: the d-pad buttons have no label
+            # at all, only an arrow, and `⬅️ x3` says which way far better than
+            # `LEFT x3` would. It is the same name the press line uses.
+            button.name = self.system.caption_for(target.field)
         # Written even while hidden, so the label is already honest on the
         # redraw that brings the button back rather than one press later.
         button.label = f"{button.name} x{taps}"
@@ -2454,6 +2531,10 @@ class RetroView(SessionMixin, discord.ui.View):
         # it, because a press only gets one edit now; see _ack_now. Taken
         # before the work for the obvious reason: the work is the wake.
         resuming = not self.live
+        # Remembered before the work rather than after it, so a press that
+        # fails still moves the ×3 button onto what was pressed: the player
+        # pressed it, and the button should offer to do it again.
+        self.note_press(field)
         # The press names itself, and whoever made it, on the message -- on the
         # very same edit that carries the clip (see :meth:`press_note`). The
         # resume line beats it when there is one, because "the game was asleep
@@ -2666,7 +2747,7 @@ class RetroView(SessionMixin, discord.ui.View):
         """
         await ephemeral(
             interaction,
-            REPEAT_STALE_NOTE.format(button=self.system.label_for(self.system.confirm)),
+            REPEAT_STALE_NOTE.format(button=self._repeat_name()),
         )
 
     async def _ack_now(self, interaction: discord.Interaction) -> None:

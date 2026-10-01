@@ -3969,3 +3969,111 @@ async def test_an_evicted_game_still_explains_itself(retro):
 
     content = first.message.edits[-1]["content"]
     assert "Another channel" in content, content
+
+
+# -- The ×3 button follows the last press -------------------------------------
+#
+# Walking three tiles is a far commoner intent than tapping confirm three
+# times, and a d-pad has four directions -- four more components than the
+# Super Nintendo has room for. So the one repeat button repeats whatever was
+# pressed last. See RetroView.repeat_target.
+
+
+async def test_the_repeat_button_starts_on_the_consoles_confirm(retro):
+    """A session nobody has pressed has no last press to repeat."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9240, "freshrepeat")
+
+    assert view.last_field is None
+    assert view.repeat_target.field == view.system.confirm
+    assert retro.control(view, "repeat").label.startswith(
+        view.system.caption_for(view.system.confirm)
+    )
+
+
+async def test_pressing_a_direction_moves_the_repeat_button_onto_it(retro):
+    """The whole point: press ⬅️, then ×3 walks."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9241, "walkrepeat")
+
+    await view._press(retro.interaction(view, message=view.message), "left")
+
+    assert view.last_field == "left"
+    assert view.repeat_target.field == "left"
+    label = retro.control(view, "repeat").label
+    assert label.startswith(view.system.caption_for("left")), label
+    assert label.endswith(f"x{view.repeat_taps}"), label
+
+
+async def test_the_repeat_button_really_presses_the_last_direction(retro):
+    """Not just the label -- the emulator is handed the direction."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9242, "walkpress")
+    await view._press(retro.interaction(view, message=view.message), "right")
+
+    await retro.control(view, "repeat").callback(
+        retro.interaction(view, message=view.message)
+    )
+
+    pressed = view.emulator.last_presses
+    assert pressed, "nothing reached the emulator"
+    assert {field for field, _start, _hold in pressed} == {"right"}
+    assert len(pressed) == view.repeat_taps
+
+
+async def test_waiting_does_not_move_the_repeat_button(retro):
+    """Wait presses nothing, so there is nothing to offer to repeat."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9243, "waitrepeat")
+    await view._press(retro.interaction(view, message=view.message), "down")
+
+    await view._press(retro.interaction(view, message=view.message), None)
+
+    assert view.last_field == "down", "Wait moved the target"
+    assert view.repeat_target.field == "down"
+
+
+async def test_the_repeat_button_repeats_itself(retro):
+    """Clicking ×3 twice does the same thing twice."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9244, "againrepeat")
+    await view._press(retro.interaction(view, message=view.message), "up")
+
+    await retro.control(view, "repeat").callback(
+        retro.interaction(view, message=view.message)
+    )
+    assert view.repeat_target.field == "up"
+
+    await retro.control(view, "repeat").callback(
+        retro.interaction(view, message=view.message)
+    )
+    assert {f for f, _s, _h in view.emulator.last_presses} == {"up"}
+
+
+async def test_the_press_line_names_the_button_that_was_repeated(retro):
+    """`Rob pressed ⬅️ x3.`, not `Rob pressed A x3.`"""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9245, "repeatline")
+    await view._press(retro.interaction(view, message=view.message), "left")
+
+    interaction = retro.interaction(view, message=view.message)
+    await retro.control(view, "repeat").callback(interaction)
+
+    said = interaction.log[-1][1]["content"]
+    assert view.system.caption_for("left") in said, said
+    assert f"x{view.repeat_taps}" in said, said
+
+
+async def test_a_stale_repeat_click_names_the_current_target(retro):
+    """The private reply has to name what the button would do now."""
+    await retro.install_cores("gambatte")
+    view, _, _ = await retro.posted_game(9246, "stalerepeat")
+    view.clip_seconds = 0.2
+    view._update_repeat_label()
+    view.last_field = "left"
+
+    interaction = retro.interaction(view, message=view.message)
+    await retro.control(view, "repeat").callback(interaction)
+
+    said = str(interaction.log[-1][1].get("content") or "")
+    assert view.system.caption_for("left") in said, said
