@@ -854,12 +854,12 @@ async def test_a_press_with_no_room_left_is_quietly_dropped(retro):
     async with view.lock:
         # Fill every slot with somebody different, so the refusal below is
         # about the queue being full rather than about one person's slot.
-        for index in range(retro.viewmod.MAX_QUEUED_PRESSES):
+        for index in range(view.queue_depth):
             clicker = FakeUser(uid=600 + index, name=f"P{index}")
             await view._press(
                 retro.interaction(view, user=clicker, message=view.message), "a"
             )
-        assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES
+        assert len(view.queue) == view.queue_depth
 
         latecomer = retro.interaction(
             view, user=FakeUser(uid=699, name="Late"), message=view.message
@@ -868,24 +868,24 @@ async def test_a_press_with_no_room_left_is_quietly_dropped(retro):
 
     # Acknowledged and nothing else -- no ephemeral, no edit of the message.
     assert latecomer.kinds() == ["response.defer"]
-    assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES, "and nothing jumped in"
+    assert len(view.queue) == view.queue_depth, "and nothing jumped in"
 
 
 async def test_the_queue_is_bounded_and_says_how_deep(retro):
     """Each waiting press is a second of latency against a state nobody saw."""
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9012, "deep")
-    assert 3 <= retro.viewmod.MAX_QUEUED_PRESSES <= 5
+    assert 3 <= view.queue_depth <= 5
 
     async with view.lock:
         accepted = []
         # One more clicker than there is room for, each a different person.
-        for index in range(retro.viewmod.MAX_QUEUED_PRESSES + 1):
+        for index in range(view.queue_depth + 1):
             clicker = FakeUser(uid=500 + index, name=f"P{index}")
             interaction = retro.interaction(view, user=clicker, message=view.message)
             accepted.append(view.enqueue_press(interaction, "a"))
-        assert accepted == [True] * retro.viewmod.MAX_QUEUED_PRESSES + [False]
-        assert len(view.queue) == retro.viewmod.MAX_QUEUED_PRESSES
+        assert accepted == [True] * view.queue_depth + [False]
+        assert len(view.queue) == view.queue_depth
 
 
 async def test_one_person_may_hold_every_waiting_slot(retro):
@@ -902,7 +902,7 @@ async def test_one_person_may_hold_every_waiting_slot(retro):
     view, _, _ = await retro.posted_game(9013, "fair")
     rob = FakeUser(uid=11, name="Rob")
 
-    depth = retro.viewmod.MAX_QUEUED_PRESSES
+    depth = view.queue_depth
     async with view.lock:
         # A run as long as the queue is deep, all from one person. Derived
         # from the constant rather than written out, so raising the depth
@@ -1546,18 +1546,17 @@ async def test_a_full_queue_costs_its_clips_and_says_so(retro):
     away the footage nobody was allowed to reach. Both numbers in the product
     are the owner's own settings.
     """
-    viewmod = retro.viewmod
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9205, "bound")
     playback = view.clip_playback()
     assert playback == pytest.approx(1.608, abs=0.001), playback
     playing_now(view)
-    await fill_the_queue(retro, view, viewmod.MAX_QUEUED_PRESSES)
+    await fill_the_queue(retro, view, view.queue_depth)
 
     # One wait per edit: the press that ran, then every queued one. The
     # running press's own wait is its author's latency and was paid whether
     # anybody queued behind it or not; what the *queue* adds is the rest.
-    assert len(retro.pace_waits) == viewmod.MAX_QUEUED_PRESSES + 1
+    assert len(retro.pace_waits) == view.queue_depth + 1
     assert all(delay <= playback for delay in retro.pace_waits)
     queued = sum(retro.pace_waits[1:])
     # An upper bound and a generous lower one, rather than an equality.
@@ -1570,8 +1569,8 @@ async def test_a_full_queue_costs_its_clips_and_says_so(retro):
     # a drain is a clip per entry, not a flat cap -- and half a clip each is
     # far below anything the old 1.25s cap could have produced at the lengths
     # that cap actually bit.
-    assert queued <= viewmod.MAX_QUEUED_PRESSES * playback
-    assert queued >= 0.5 * viewmod.MAX_QUEUED_PRESSES * playback, retro.pace_waits
+    assert queued <= view.queue_depth * playback
+    assert queued >= 0.5 * view.queue_depth * playback, retro.pace_waits
     assert not view.queue and not view._draining
 
 
@@ -1583,7 +1582,6 @@ async def test_a_long_clip_drains_in_its_clips_rather_than_the_old_cap(retro):
     of four clips with 2.75 seconds cut off each. The waits are recorded
     rather than spent, so this costs nothing to check.
     """
-    viewmod = retro.viewmod
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9214, "longdrain")
     view.clip_seconds = 4.0
@@ -1591,9 +1589,9 @@ async def test_a_long_clip_drains_in_its_clips_rather_than_the_old_cap(retro):
     assert playback == pytest.approx(4.003, abs=0.001), playback
     playing_now(view)
 
-    await fill_the_queue(retro, view, viewmod.MAX_QUEUED_PRESSES)
+    await fill_the_queue(retro, view, view.queue_depth)
 
-    assert len(retro.pace_waits) == viewmod.MAX_QUEUED_PRESSES + 1
+    assert len(retro.pace_waits) == view.queue_depth + 1
     # Bounded rather than an equality, for the same reason as the test above:
     # each delay is the time *left* on the clip it replaces, so it is short by
     # however long that entry actually spent emulating and encoding -- real

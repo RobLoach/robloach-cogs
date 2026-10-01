@@ -13,19 +13,19 @@ resume where they left off, across restarts.
 
 <img src="../assets/screenshot.png" alt="A Game Boy game in a Discord channel: a clip of µCity's title screen, the line &quot;ucity · RobLoach reset the game.&quot;, and a row of controller buttons." width="492">
 
-Why it works the way it does: [docs/DESIGN.md](../docs/DESIGN.md).
+Why it works the way it does: [docs/DESIGN.md](../docs/DESIGN.md) — and
+[docs/HISTORY.md](../docs/HISTORY.md) for what was tried and reversed.
 
 ## Contents
 
 - [Getting started](#getting-started)
 - [Starting a game](#starting-a-game)
 - [Consoles](#consoles)
-- [The controller](#the-controller)
 - [Saving and sleeping](#saving-and-sleeping)
-- [Managing saves](#managing-saves)
+- [Saves](#saves)
 - [Settings](#settings)
 - [Core options](#core-options)
-- [BIOS files](#bios-files)
+- [BIOS and System files](#bios-and-system-files)
 - [Command reference](#command-reference)
 - [Troubleshooting](#troubleshooting)
 - [Permissions](#permissions)
@@ -170,9 +170,10 @@ All owner-only and bot-wide.
 
 **No save is ever deleted to make room** — cached ROMs go, oldest first.
 
-Clip length multiplies: every edit waits out the clip it replaces, so a full
-queue of five is five whole clips — eight seconds at the default, twenty-five
-at the ceiling.
+**The press queue scales with the clip length.** Every edit waits out the clip
+it replaces, so the depth is a time budget rather than a count — about five
+seconds of waiting whatever you set: five presses at 1s, three at the 1.6s
+default, one at the 5s ceiling.
 
 ## Core options
 
@@ -251,7 +252,7 @@ supplying one you may use is up to you.
 | `[p]retroset game remove <name>` | Forget one. |
 | `[p]retroset game list` | List them. |
 | `[p]retroset coreoptions [core] [key] [value]` | See [Core options](#core-options). |
-| `[p]retroset bios add\|list\|remove` | See [BIOS files](#bios-files). |
+| `[p]retroset bios add\|list\|remove` | See [BIOS and System files](#bios-and-system-files). |
 | `[p]retroset cliplength <seconds>` | See [Settings](#settings). |
 | `[p]retroset hold <milliseconds>` | See [Settings](#settings). |
 | `[p]retroset timeout <minutes>` | See [Settings](#settings). |

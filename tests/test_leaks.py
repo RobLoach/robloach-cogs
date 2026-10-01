@@ -336,7 +336,7 @@ async def test_the_press_queue_is_bounded_and_let_go_of(retro):
     """
     await retro.install_cores("gambatte")
     view, _, _ = await retro.posted_game(9641, "queuebound")
-    cap = retro.viewmod.MAX_QUEUED_PRESSES
+    cap = view.queue_depth
 
     async with view.lock:
         # A hundred clicks from fifty people, which is the shape a busy

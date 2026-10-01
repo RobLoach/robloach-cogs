@@ -290,11 +290,11 @@ DEFAULT_TIMEOUT_MINUTES = 10
 # So a click that cannot run now is queued instead, under four rules that are
 # each there for a reason:
 #
-# * **at most MAX_QUEUED_PRESSES waiting.** Each one costs a whole clip, and
-#   a queued press is emulated against a game state its author has not seen
-#   yet. Five waiting plus the one running is about six seconds of latency at
-#   the one second default -- the last person to click waits that long to
-#   find out what their press did.
+# * **at most as many waiting as fit in QUEUE_SECONDS.** Each one costs a
+#   whole clip, and a queued press is emulated against a game state its author
+#   has not seen yet, so the depth is a *time* budget rather than a count --
+#   see queue_depth below. The last person to click waits about QUEUE_SECONDS
+#   to find out what their press did, whatever the clip length is set to.
 #
 #   It was three, on the reasoning that four seconds was the most that is
 #   still recognisably "I pressed that". Five is a deliberate trade made
@@ -304,18 +304,13 @@ DEFAULT_TIMEOUT_MINUTES = 10
 #   refuses the tail of it. The latency is the honest price and it is paid
 #   by whoever queued the run.
 #
-#   It multiplies with the clip length, which is the part worth watching:
-#   every edit now waits out the whole clip it replaces (see
-#   MAX_PACE_SECONDS in retro/timing.py), so a full drain takes about
-#   MAX_QUEUED_PRESSES * cliplength -- eight seconds at the 1.6s default, and
-#   twenty-five at the five second ceiling. Both numbers in that product are
-#   the owner's own settings.
-#
-#   Five was chosen against a *one second* clip, where a full queue was five
-#   seconds. The default is 1.6s now, so the same depth is eight -- and the
-#   depth is still a flat five rather than "whatever fits in about five
-#   seconds", which is the trade worth revisiting if anyone reports the tail
-#   of a run landing too late to recognise.
+#   It used to multiply with the clip length, which is what made a flat count
+#   wrong: every edit waits out the whole clip it replaces (see
+#   MAX_PACE_SECONDS in retro/timing.py), so a full drain took
+#   MAX_QUEUED_PRESSES * cliplength -- five seconds at the one second default
+#   the depth was chosen against, and eight once the default became 1.6s. The
+#   budget is the thing that was really meant, so it is the thing that is
+#   written down now.
 # * **first come, first served, whoever it is.** There is deliberately no
 #   per-person limit any more. There used to be one -- one waiting press
 #   each -- on the theory that it made a roomful of people take turns
@@ -342,7 +337,57 @@ DEFAULT_TIMEOUT_MINUTES = 10
 # deferred interaction -- a component defer is a DEFERRED_UPDATE_MESSAGE and
 # leaves edit_original_response available for the next fifteen minutes -- so
 # "one press, one edit" still holds exactly.
+
+#: How long the last person in a full queue may be made to wait, in seconds.
+#:
+#: This is the number the depth was always really about. Five waiting presses
+#: was chosen against a *one second* clip, where a full drain was five seconds
+#: and that was judged the limit of "I pressed that"; when the default clip
+#: became 1.6s the same five became eight seconds without anybody deciding it
+#: should. Writing the budget down instead keeps the judgement and lets the
+#: count follow the setting.
+QUEUE_SECONDS = 5.0
+
+#: The most that may ever wait, however short the clips are. A run of taps on
+#: a d-pad is the commonest thing anybody does with this controller and five
+#: holds a whole one; past that the queue stops being a run and starts being a
+#: backlog nobody can remember starting.
 MAX_QUEUED_PRESSES = 5
+
+#: ...and the fewest, however long they are. At the five second ceiling the
+#: budget alone would allow none, which would put the controller back to
+#: dropping clicks silently -- the whole complaint the queue exists to fix.
+#: One waiting press is the floor.
+MIN_QUEUED_PRESSES = 1
+
+
+def queue_depth(clip_seconds: float, fps: float = DEFAULT_FPS) -> int:
+    """How many presses may wait behind the one running, at this clip length.
+
+    ``QUEUE_SECONDS`` divided by what one clip actually plays for, clamped
+    between MIN_QUEUED_PRESSES and MAX_QUEUED_PRESSES. The division is against
+    *playback* rather than the configured length because that is what a
+    waiting press really costs: every edit waits out the clip it replaces.
+
+    Rounded to nearest rather than floored, because the budget is "about five
+    seconds" and five one second clips are 5.03 of them -- flooring would give
+    four at exactly the length the number was calibrated at.
+
+        0.2s -> 5    1s -> 5    1.6s (default) -> 3    2s -> 2    5s -> 1
+
+    One second gives five, which is the depth this was before and the point it
+    was calibrated at -- the scaling is not a new judgement, it is the old one
+    applied to lengths it was never checked against.
+
+    Worked out at ``DEFAULT_FPS`` by default, for the reason
+    ``Retro._describe_press_fit`` gives: this is about a *setting* rather than
+    one session, and every console here is within half a percent of it.
+    """
+    playback = playback_seconds(fps, clip_frame_count(fps, clip_seconds))
+    if playback <= 0:  # pragma: no cover - clamp_clip_seconds forbids it
+        return MAX_QUEUED_PRESSES
+    fits = round(QUEUE_SECONDS / playback)
+    return max(MIN_QUEUED_PRESSES, min(MAX_QUEUED_PRESSES, fits))
 
 #: How many different people one replaced controller will explain itself to.
 #:
@@ -1243,6 +1288,16 @@ class RetroView(SessionMixin, discord.ui.View):
         """
         return playback_seconds(self.fps, self.clip_frames())
 
+    @property
+    def queue_depth(self) -> int:
+        """How many presses may wait behind the one running, for this session.
+
+        :func:`queue_depth` at this session's own clip length and frame rate,
+        so a channel playing a console whose rate is not DEFAULT_FPS gets the
+        depth its own clips earn. Read on every click; it is two divisions.
+        """
+        return queue_depth(self.clip_seconds, self.fps)
+
     def press_plan(
         self, taps: int = 1, emulator: typing.Optional[RetroEmulator] = None
     ) -> typing.List[typing.Tuple[int, int]]:
@@ -1458,7 +1513,7 @@ class RetroView(SessionMixin, discord.ui.View):
 
         * the session has been replaced or retired -- there is nothing left
           for a press to reach;
-        * MAX_QUEUED_PRESSES are already waiting.
+        * :attr:`queue_depth` are already waiting.
 
         That is the whole list. **One person may hold every slot**, which is
         a deliberate change: pressing a direction four times to walk four
@@ -1477,7 +1532,7 @@ class RetroView(SessionMixin, discord.ui.View):
         boolean is the difference between "cannot happen" and "cannot happen
         *and* would be harmless".
         """
-        if self.closed or len(self.queue) >= MAX_QUEUED_PRESSES:
+        if self.closed or len(self.queue) >= self.queue_depth:
             return False
         user = user if user is not None else getattr(interaction, "user", None)
         user_id = getattr(user, "id", None)

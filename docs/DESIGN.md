@@ -1,8 +1,8 @@
 # Retro — design notes
 
-Why the cog is built this way: the decisions, the measurements behind them, and
-the attempts that were reversed. Not the manual — that is
-[retro/README.md](../retro/README.md).
+How the cog works and why, with the measurements behind each decision. The
+manual is [retro/README.md](../retro/README.md); what was tried and **reversed**
+is [HISTORY.md](HISTORY.md), kept separately so nobody re-attempts it.
 
 Measurements are on a Raspberry Pi 5, **at the defaults of the time** (mostly a
 1s clip and a 160ms hold; they are now 1.6s and 80ms). They are left as
@@ -10,35 +10,17 @@ measured, because what they show is the comparison between the columns.
 
 ## The seam between two clips
 
-One report — *"the clip seems to replay a bit from the previous clip"* — and
-two wrong answers before the right one.
+**A clip starts exactly one emulated frame after the last one ended.** A
+picture is taken *after* an emulated frame, so a clip's last picture is its
+window's final frame and the next clip picks the console up on the very next
+one. Press, clip, press, clip is one unbroken run: nothing emulated twice,
+nothing run past unaccounted for.
 
-**First, the pre-roll.** A game takes a moment to react to a press, so on a
-game that sits still until prodded the clip's opening picture was identical to
-the one the previous clip left on screen. The fix tried was a bounded
-*pre-roll*: run the console unphotographed until the picture changed.
-
-It did not fix the report, and it broke the seam to not fix it. Emulated frames
-between one clip's last picture and the next clip's first, and whether that
-first picture is the held one again:
-
-| Core / ROM | Button | Seam, with the pre-roll | Again? | Seam, without | Again? |
-| --- | --- | --- | --- | --- | --- |
-| gambatte / µCity | ← | 1, 1, 16 | no, no, yes | **1, 1, 1** | no, no, yes |
-| gambatte / Libbet | ↓ (ignored) | 16, 1, 16 | yes, no, yes | **1, 1, 1** | yes |
-| fceumm / nestest (a menu) | Start | 16, 16, 16 | yes | **1, 1, 1** | yes |
-| fceumm / nestest | ↓ | 2, 2, 2 | no | **1, 1, 1** | yes |
-| gambatte / dmg-acid2 | A | 16, 16, 16 | yes | **1, 1, 1** | yes |
-| any of the above | (no press) | 1, 1, 1 | — | **1, 1, 1** | — |
-
-The seam was `1 + the frames the pre-roll used`, exactly. On the static rows —
-what this cog is mostly played on — it ran its whole 15-frame bound, found no
-change, opened on the repeated picture anyway, and charged 251ms of game time
-per press for it. Gone.
-
-**Second, the opening picture.** A clip still opened on frame 0 of its window:
-one frame after the button went down, the one frame on which nothing can have
-happened. First emulated frame whose picture differs at all:
+**A clip photographs the end of each sampling span, not its start** — frames
+4, 8 … 60 of a one second Game Boy clip rather than 1, 5 … 57, 60. That matters
+because a game takes a moment to react, and the opening picture would otherwise
+be the state one frame after the button went down, on which nothing can have
+happened yet. First emulated frame whose picture differs at all:
 
 | Core / ROM | Button | First frame that differs |
 | --- | --- | --- |
@@ -47,11 +29,10 @@ happened. First emulated frame whose picture differs at all:
 | snes9x / rotozoom | A | 4 |
 | mgba / homebrew | A | 11 |
 
-So a clip now photographs the **end** of each sampling span rather than its
-start — frames 4, 8 … 60 instead of 1, 5 … 57, 60. That gives the console a
-whole picture's worth of emulation to answer the button, costs no game time and
-skips no frame, which is the difference between it and the pre-roll. Opening
-pictures that are the held one again:
+Sampling the end of the span gives the console a whole picture's worth of
+emulation — four frames, 67ms — to answer the button before the shutter. It
+costs no game time and skips no frame. Opening pictures that are the previous
+clip's still over again:
 
 | Core / ROM | Button | Before | Now |
 | --- | --- | --- | --- |
@@ -63,11 +44,11 @@ pictures that are the held one again:
 | gambatte / dmg-acid2 | A | 16 of 16 | 15 of 15 |
 
 **The bottom three rows must stay that way.** They are games that do not answer
-the button at all; the only escape is to skip forward until the picture
-changes, which is either a jump (the pre-roll) or an unbounded wait. A game's
-reaction latency is *shown* rather than skipped, and the encoder merges
-identical pictures into one stored frame — so it is a held picture, not a
-stutter, and it is the truth about the game.
+the button at all, and a game's reaction latency is *shown* rather than skipped.
+The encoder merges identical pictures into one stored frame and adds their
+durations, so it is a held picture rather than a stutter — and it is the truth
+about the game. Escaping it would mean skipping forward until the picture
+changes, which is [what the pre-roll did](HISTORY.md#the-pre-roll).
 
 **Repeats of the previous clip's still are dropped**, with their durations, so
 a clip opens on something new. Two rules keep that safe: the final picture is
@@ -75,10 +56,7 @@ never dropped (it is where the next clip resumes), and a clip in which nothing
 moved is left whole — trimming that is how a 1005ms clip once played as a 17ms
 flash. This drops *playback*, never emulation.
 
-**The frame rate is not a lever**, which was the first thing tried. A clip
-photographs its window's final frame at any cadence, so the seam is identical
-at 10, 15, 20 and 60 fps. A higher rate only brings the shutter *earlier*,
-which is the wrong direction.
+[The frame rate is not a lever on any of this.](HISTORY.md#the-frame-rate-as-a-lever)
 
 ## The controller
 
@@ -174,18 +152,11 @@ finish:
 | before | 207 ms | 42–68 ms of 1005 ms |
 | after | 3.08 s | 1006–1007 ms |
 
-**The wait was capped at 1.25s, and that cap was itself a stutter.** A clip cut
-off part-played is not just a shorter pause: the next clip picks up one frame
-after the truncated one's last *emulated* frame, so you were jumped forward
-over footage that was made and then painted over.
-
-| cliplength | plays for | old wait | you never saw |
-| --- | --- | --- | --- |
-| 1 s (default) | 1.005 s | 1.005 s | — |
-| 1.5 s | 1.507 s | 1.25 s | 0.26 s |
-| 2 s | 1.993 s | 1.25 s | 0.74 s |
-| 4 s | 4.003 s | 1.25 s | **2.75 s** |
-| 5 s (max) | 5.008 s | 1.25 s | 3.76 s |
+The wait is for the **whole** clip at every length. A clip cut off part-played
+is not merely a shorter pause — the next clip picks up after the truncated
+one's last *emulated* frame, so you are jumped over footage that was made and
+then painted over. That was [the 1.25 second
+cap](HISTORY.md#the-125-second-pacing-cap), and it is gone.
 
 Four things keep the waiting cheap:
 
@@ -208,15 +179,17 @@ playing, *most* clicks land there — so the controller felt intermittently dead
 
 Four rules:
 
-- **at most five wait.** Each is a whole clip of latency, and a queued press is
-  emulated against a state its author has not seen. It multiplies with clip
-  length: a full drain is five clips.
-- **first come, first served, and one person may hold every slot.** There was a
-  one-per-person rule, on the theory it made a group take turns. It broke the
-  commonest way one person plays — walking four tiles is four clicks, and the
-  last three were refused because the first was still waiting. A press with no
-  room is dropped silently: the queue is already on the message, and the moment
-  somebody is clicking fastest is the worst moment to answer every click.
+- **at most as many wait as fit in about five seconds.** Each is a whole clip
+  of latency, and a queued press is emulated against a state its author has not
+  seen — so the depth is a *time budget*, not a count: five presses at a one
+  second clip, three at the 1.6s default, one at the 5s ceiling. A flat count
+  meant the wait grew with the setting, which is what it is for.
+- **first come, first served, and one person may hold every slot.** Taking
+  turns is what the depth cap already does; a
+  [per-person limit](HISTORY.md#one-waiting-press-per-person) broke the
+  commonest way one person plays. A press with no room is dropped silently: the
+  queue is already on the message, and the moment somebody is clicking fastest
+  is the worst moment to answer every click.
 - **every waiting press is visible**, as a suffix on the line the running press
   is already rewriting, so it costs **no extra edit**. Consecutive presses by
   one person read as one run: `*Queued: Rob ⬆️⬇️⬇️*`.
@@ -278,10 +251,9 @@ Taps the confirm button several times in one clip, so a text box takes one
 round trip instead of three.
 
 **Hidden, not greyed out, when only one tap fits.** One tap is exactly what the
-confirm button one row over does. A present, dead, unexplained control reads as
-broken — the greyed-out version of this button was reported as the feature
-having been *removed*. It says one line when it goes, on an edit that was
-happening anyway; coming back says nothing.
+confirm button one row over does, and a present, dead, unexplained control
+[reads as broken](HISTORY.md#the-greyed-out-3-button). It says one line when it
+goes, on an edit that was happening anyway; coming back says nothing.
 
 | Clip length | Taps | The button |
 | --- | --- | --- |
@@ -313,30 +285,26 @@ Discord allows five rows of five. What each console uses:
 The worst case is the SNES at 19 over four rows, leaving a spare row. All three
 controls fit beside every console's bottom row.
 
-**⏳ Wait** was drawn with ⏩ once, which was a lie: nothing is sped up or
-skipped. Every emoji the cog can put on a button is checked at import, because
-a character that is not a real emoji is a `400 Invalid Form Body` that takes
-out the whole command — that has happened in production.
+Every emoji the cog can put on a button is checked at import, because a
+character that is not a real emoji is a `400 Invalid Form Body` that takes out
+the whole command — that has happened in production. (Wait's hourglass
+[replaced a fast-forward symbol](HISTORY.md#-for-wait), which was a lie.)
 
 ## One edit per press
 
-The controls used to grey themselves out on click and come back with the clip:
-two edits. **A Discord client re-renders a message on any edit**, and
-re-rendering restarts the attached animation — so the first edit replayed the
-*previous* clip from frame zero, and a moment later the new one replaced it.
-From the outside, the game jumped backwards on every press.
+**A press makes exactly one edit of the message**, which swaps the clip in and
+redraws the buttons together. A Discord client re-renders a message on *any*
+edit, and re-rendering restarts the attached animation — so a second edit
+replays the clip already there. That is [what two edits per
+press](HISTORY.md#two-edits-per-press) looked like from the channel.
 
-So a press is acknowledged silently and makes a single edit. The cost is real
-and unavoidable: instant "your click landed" feedback is gone, because anything
-that shows something either edits this message (rewinding the clip) or posts
-another one (an ephemeral notice, tried and removed for being spam). Clicks
-during a press are queued instead, so nobody sees *This interaction failed*.
+The cost is real and unavoidable: instant "your click landed" feedback is gone,
+because anything that shows something either edits this message or posts
+another one. Clicks during a press are queued instead, so nobody sees *This
+interaction failed*.
 
-**A sleeping session does not advertise itself.** The header gained a
-`· asleep` mark once. It was accurate and unhelpful: sleeping is an
-implementation detail, the controls stay live, and labelling a working
-controller "asleep" only invites somebody to think it is broken. The one moment
-worth explaining is the wake, and the press that causes it says so.
+A sleeping session [does not advertise itself](HISTORY.md#the--asleep-marker);
+the press that wakes it says so, on the edit it was making anyway.
 
 ## Rebooting
 
@@ -462,37 +430,3 @@ making. The opposite mistake costs a few hundred kilobytes.
 **One restore chain, two doors.** Starting a game and waking one run the same
 function — save state, then in-game save, then the beginning — so they cannot
 drift apart.
-
-## Naming
-
-`dropstate` was `[p]retrosaves reset`, one word from `[p]retroreset` and
-opposite in effect: one deleted a file and touched no running game, the other
-rebooted a running game and deleted no file. Each help text carried a bolded
-disclaimer about the other. Both were renamed for what they do, and all three
-disclaimers retired.
-
-`rollback` was aliased **`undo`** — the worst collision in the cog, since
-somebody who liked the Undo button and typed the word got a command that threw
-away several presses' worth of save, on disk. Gone, with three more for the
-same reason: `export`'s `download`, `import`'s `restore`, and
-`[p]retroset bios`'s `system`.
-
-## The RetroCog → Retro rename
-
-Red derives **both** storage locations from the cog's class name — Config keys
-every setting by it, and the data folder is `<data>/cogs/<class name>/`. So
-renaming the class would have orphaned every core, ROM, save and session.
-
-The first load after the rename migrates itself: the old data folder's contents
-move entry by entry (so an interrupted move finishes next time), recorded core
-paths are repointed once the file is really at the other end, and the old
-settings are copied **only** if the new namespace has never been written to.
-
-A half-done move does **not** record itself as done: one entry that could not be
-moved used to strand that entry permanently, and is now retried on the next
-load. Anything that cannot be done is logged and skipped rather than raised.
-
-Two things deliberately did not change, because both are baked into things that
-already exist: the Config identifier integer, and the `libretro` prefix on every
-button's `custom_id`, which is how Discord routes a click on a message already
-posted.

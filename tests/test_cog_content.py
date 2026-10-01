@@ -1684,46 +1684,55 @@ async def test_a_multi_game_zip_with_no_name_says_how_to_pick(retro):
 # -- Two settings that multiply ------------------------------------------------
 
 
-async def test_a_long_clip_says_what_it_costs_a_full_queue(retro):
+async def test_a_full_queue_can_never_make_anyone_wait_very_long(retro):
+    """The guarantee that replaced the slow-drain warning.
+
+    The depth used to be a flat five however long clips were, so a full queue
+    at the five second ceiling was twenty-five seconds of waiting, and
+    `[p]retroset cliplength` had to warn about it. The depth scales now (see
+    RetroView.queue_depth), so the product is bounded by construction -- which
+    is what makes removing that warning safe rather than merely tidy.
+
+    Swept across the whole settable range rather than spot-checked, because
+    the bound has to hold at every length somebody can choose.
     """
-    The clip length and the queue depth multiply, and nobody can see that.
+    viewmod, emumod = retro.viewmod, retro.emumod
+    fps = emumod.DEFAULT_FPS
+    worst, worst_at = 0.0, None
+    seconds = emumod.MIN_CLIP_SECONDS
+    while seconds <= emumod.MAX_CLIP_SECONDS + 1e-9:
+        playback = emumod.playback_seconds(fps, emumod.clip_frame_count(fps, seconds))
+        drain = viewmod.queue_depth(seconds) * playback
+        if drain > worst:
+            worst, worst_at = drain, seconds
+        seconds = round(seconds + 0.05, 2)
 
-    Every edit waits out the whole clip it replaces, so a full queue costs
-    about one clip per waiting press. At the default that is five seconds
-    and unremarkable; at the ceiling it is twenty-five, which from inside
-    the channel is indistinguishable from the bot having hung. The one
-    place it is cheap to say so is the command that changes it.
-    """
-    cliplength = retro.cogmod.Retro.retroset_cliplength.callback
-    ctx = retro.context(retro.channel(9400))
-
-    await cliplength(retro.cog, ctx, 4)
-    said = str(ctx.sent[-1])
-    assert "full queue" in said, said
-    # The real number, not a vague warning -- and it is the product of the
-    # two settings rather than a hardcoded figure.
-    assert str(retro.viewmod.MAX_QUEUED_PRESSES) in said
-    assert "20s" in said, said
+    # Comfortably inside the ten seconds the old warning fired at, which is
+    # where a queue stops reading as "mine is coming" and starts reading as
+    # "it is broken".
+    assert worst < 8.0, f"a full queue waits {worst:.1f}s at cliplength {worst_at}"
 
 
-async def test_the_ordinary_clip_lengths_say_nothing_about_the_queue(retro):
-    """Silence at the lengths anybody actually plays at; see SLOW_DRAIN_SECONDS."""
+async def test_changing_the_clip_length_says_nothing_about_the_queue(retro):
+    """There is no queue note any more, at any length."""
     cliplength = retro.cogmod.Retro.retroset_cliplength.callback
     ctx = retro.context(retro.channel(9401))
 
-    for seconds in (0.3, 0.5, 1.0, 1.5):
+    for seconds in (0.2, 0.3, 1.0, 1.6, 4.0, 5.0):
         await cliplength(retro.cog, ctx, seconds)
         assert "full queue" not in str(ctx.sent[-1]), seconds
 
 
-async def test_the_queue_cost_is_derived_from_both_settings(retro):
-    """It must follow the constants rather than restate them."""
-    describe = retro.cogmod.Retro._describe_queue_cost
-    assert describe(1.0) == "", "the default should be quiet"
-
-    long_note = describe(retro.emumod.MAX_CLIP_SECONDS)
-    assert long_note, "the ceiling should say something"
-    assert str(retro.viewmod.MAX_QUEUED_PRESSES) in long_note
+async def test_the_depth_falls_as_the_clip_length_rises(retro):
+    """And the one second calibration point is preserved exactly."""
+    depth = retro.viewmod.queue_depth
+    assert depth(1.0) == retro.viewmod.MAX_QUEUED_PRESSES == 5
+    assert depth(0.2) == 5, "short clips keep the whole run of taps"
+    assert depth(1.6) == 3, "the default"
+    assert depth(5.0) == retro.viewmod.MIN_QUEUED_PRESSES == 1
+    # Monotonic: a longer clip never allows *more* waiting presses.
+    depths = [depth(s) for s in (0.2, 0.5, 1.0, 1.6, 2.0, 3.0, 4.0, 5.0)]
+    assert depths == sorted(depths, reverse=True), depths
 
 
 # -- Extensions that are refused on purpose ------------------------------------

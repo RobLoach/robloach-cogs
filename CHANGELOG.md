@@ -29,6 +29,11 @@ Upgrading: `[p]repo update robloach-cogs`, `[p]cog update retro`,
 - **Undo survives a restart** — the history is kept on disk, read lazily, and
   wiped with the progress it describes.
 
+- **The press queue scales with the clip length.** It was a flat five however
+  long clips were, so raising the default to 1.6s silently raised the wait for
+  the last queued press from five seconds to eight. It is a time budget now —
+  about five seconds whatever the setting.
+
 ### Fixed
 
 - **A press whose clip never appeared.** If the click's acknowledgement missed
@@ -47,7 +52,8 @@ Upgrading: `[p]repo update robloach-cogs`, `[p]cog update retro`,
 ### Documentation
 
 Split by audience: [the manual](retro/README.md), and
-[docs/DESIGN.md](docs/DESIGN.md) for the reasoning behind it.
+[docs/DESIGN.md](docs/DESIGN.md) for the reasoning, and
+[docs/HISTORY.md](docs/HISTORY.md) for what was tried and reversed.
 
 ## 1.2.0 and earlier
 

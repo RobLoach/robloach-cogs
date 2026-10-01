@@ -81,10 +81,8 @@ from .emulator import (
     EmulatorError,
     RetroEmulator,
     clamp_clip_seconds,
-    clip_frame_count,
     describe_seconds,
     format_seconds,
-    playback_seconds,
     probe_core_options,
     video_driver_or_error,
 )
@@ -100,7 +98,6 @@ from .RetroView import (
     DEFAULT_HOLD_MS,
     DEFAULT_TIMEOUT_MINUTES,
     MAX_HOLD_MS,
-    MAX_QUEUED_PRESSES,
     MIN_HOLD_MS,
     MIN_REPEAT_TAPS,
     REPEAT_TAPS,
@@ -270,20 +267,6 @@ CHANNEL_START_COOLDOWN_SECONDS = 60.0
 # `[p]retrosaves import`/`export` carry the other half of this; the
 # numbers live with the commands, in retro/saves.py.
 
-# How long a full press queue may take to drain before `[p]retroset
-# cliplength` says so out loud. Two settings multiply here: every edit waits
-# out the whole clip it replaces (see MAX_PACE_SECONDS in retro/timing.py),
-# so a full queue costs about MAX_QUEUED_PRESSES clips -- five seconds at the
-# one second default, twenty-five at the five second ceiling. Nothing is
-# refused at any of those; a long drain is a legitimate thing to want. But it
-# is not a thing anybody sets *on purpose* without being told, and a
-# controller that will not answer for half a minute is indistinguishable
-# from a bot that has hung.
-#
-# Ten seconds is the threshold because that is roughly where a queue stops
-# reading as "mine is coming" and starts reading as "it is broken"; the
-# default lands at half of it and says nothing.
-SLOW_DRAIN_SECONDS = 10.0
 
 # How long the paginated core option listing stays clickable.
 OPTION_MENU_TIMEOUT = 180.0
@@ -4799,47 +4782,6 @@ class Retro(
             )
         return " ".join(notes)
 
-    @staticmethod
-    def _describe_queue_cost(clip_seconds: float) -> str:
-        """
-        What a clip this long does to a full press queue, when it is worth it.
-
-        The companion to :meth:`_describe_press_fit`, and there for the same
-        reason: two settings constrain each other and an owner who changes
-        one of them cannot see the other's half of the answer.
-
-        The pair here is the clip length and MAX_QUEUED_PRESSES. Every edit
-        waits out the whole of the clip it replaces -- that is what stops a
-        clip being cut off partway and the game appearing to jump (see
-        MAX_PACE_SECONDS in retro/timing.py) -- so a full queue costs about
-        one whole clip per waiting press. The two numbers multiply, and the
-        product is what somebody in the channel experiences as "the buttons
-        have stopped working".
-
-        Says nothing at the ordinary lengths, which is most of the point: at
-        the one second default a full queue is five seconds and needs no
-        remark. Past SLOW_DRAIN_SECONDS it is said plainly, with the number,
-        and nothing is refused -- a long clip is a legitimate thing to want
-        and this is the one place it is cheap to mention the cost.
-
-        Worked out at DEFAULT_FPS for the same reason
-        :meth:`_describe_press_fit` is: this is about a setting rather than
-        about one session, and every console here is within half a percent
-        of it.
-        """
-        playback = playback_seconds(
-            DEFAULT_FPS, clip_frame_count(DEFAULT_FPS, clip_seconds)
-        )
-        drain = MAX_QUEUED_PRESSES * playback
-        if drain <= SLOW_DRAIN_SECONDS:
-            return ""
-        return (
-            f"At this length a full queue of {MAX_QUEUED_PRESSES} waiting "
-            f"presses takes about {drain:.0f}s to play out, because each one "
-            "waits for the clip in front of it to finish. That is a long time "
-            "for the last person who clicked to wait, so keep it in mind."
-        )
-
     @retroset.command(name="cliplength", aliases=["clip"], with_app_command=False)
     async def retroset_cliplength(self, ctx: commands.Context, seconds: float) -> None:
         """
@@ -4883,14 +4825,11 @@ class Retro(
         # "This interaction failed". Editing the message closes that window
         # instead of waiting for the next press to close it.
         await self._refresh_live_controls()
-        notes = " ".join(
-            note
-            for note in (
-                self._describe_press_fit(seconds, await self.config.hold_ms()),
-                self._describe_queue_cost(seconds),
-            )
-            if note
-        )
+        # No queue-cost note any more: the depth scales with the clip length
+        # (RetroView.queue_depth), so a full drain is about QUEUE_SECONDS
+        # whatever this is set to, and there is nothing left to warn about.
+        # See test_a_full_queue_can_never_make_anyone_wait_very_long.
+        notes = self._describe_press_fit(seconds, await self.config.hold_ms())
         await ctx.send(
             f"Clips now show {describe_seconds(seconds)} of play."
             f"{' ' + notes if notes else ''}"
