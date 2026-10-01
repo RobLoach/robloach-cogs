@@ -73,7 +73,6 @@ class Metrics:
         #: How many samples were past LAG_WARN_SECONDS.
         self.bad_lag_samples: int = 0
         self.lag_samples: int = 0
-        self._started_at = time.monotonic()
 
     def record(self, name: str, seconds: float) -> None:
         """Note one occurrence. Never raises."""
@@ -110,10 +109,6 @@ class Metrics:
     @property
     def names(self) -> typing.List[str]:
         return sorted(self._stats)
-
-    @property
-    def uptime(self) -> float:
-        return time.monotonic() - self._started_at
 
     def note_lag(self, seconds: float) -> None:
         """Record one scheduling delay from the sampler."""

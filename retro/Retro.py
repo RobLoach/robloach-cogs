@@ -4259,6 +4259,9 @@ class Retro(
 
     # -- Diagnostics --------------------------------------------------------
     #
+    # `[p]retrodiagnose` and its helpers. The `[p]retroset` group that follows
+    # it has a banner of its own.
+    #
     # `[p]retroset settings` says what the cog is *configured* to do. This says
     # what it can actually do right now, which is a different question and the
     # one a bug report needs answered: a core file that is present but will not
@@ -4444,6 +4447,20 @@ class Retro(
     # surface grows by that one command rather than by the whole owner-only
     # settings group -- which would put a dozen entries in everybody's slash
     # menu that only the owner can actually run.
+    # -- `[p]retroset`: the owner's settings --------------------------------
+    #
+    # Every command in this group is declared here and most are implemented
+    # here too. The two that are not -- `coreoptions` and `bios` -- are in
+    # CoresMixin and BiosMixin, and the declaration stays behind because
+    # discord.py registers a subcommand by calling a decorator on its *parent
+    # Group object*, which lives in this module.
+    #
+    # That is also why the rest have not followed them out. About 70% of what
+    # looks like 900 lines here is docstring, and a command's docstring is
+    # what Red shows in `[p]help`, so it has to stay with the declaration --
+    # moving the bodies would relocate a couple of hundred statements and
+    # leave the bulk behind, for one more layer of indirection per setting.
+
     @commands.hybrid_group(with_app_command=True)
     @commands.is_owner()
     async def retroset(self, ctx: commands.Context):
