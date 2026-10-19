@@ -8,9 +8,7 @@ Cogs for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot).
 
 ## Retro
 
-Attach a ROM and play a retro console game in a channel, with a controller
-built out of Discord buttons. Every press posts a clip of the next second and a
-half of play.
+With the [Retro](retro) cog, you're able to play retro console games directly within a channel, with Discord buttons for a controller. Every interaction posts a clip of the next second of gameplay.
 
 <img src="assets/screenshot.png" alt="A Game Boy game in a Discord channel: a clip of µCity's title screen, the line &quot;ucity · RobLoach reset the game.&quot;, and a row of controller buttons." width="492">
 
@@ -31,4 +29,4 @@ ruff check .
 
 ## License
 
-Copyright (C) 2025-2026 Rob Loach. GPL-3.0-or-later; see [LICENSE](LICENSE).
+Copyright (C) 2026 Rob Loach. GPL-3.0-or-later; see [LICENSE](LICENSE).
